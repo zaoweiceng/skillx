@@ -30,6 +30,10 @@ class MCPHttpHandler(BaseHTTPRequestHandler):
     tool_error = False
     slow = False
     variant = "v1"
+    # 会话过期模拟：首次 tools/call 返回 404，要求客户端重新握手后重试。
+    expire_session_once = False
+    _expired = False
+    _sessions_issued = 0
 
     def _send(self, payload: dict[str, Any], *, session_id: str | None = None) -> None:
         if self.use_sse:
@@ -57,6 +61,7 @@ class MCPHttpHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if method == "initialize":
+            type(self)._sessions_issued += 1
             self._send(
                 {
                     "jsonrpc": "2.0",
@@ -67,7 +72,7 @@ class MCPHttpHandler(BaseHTTPRequestHandler):
                         "serverInfo": {"name": "loopback", "version": "1"},
                     },
                 },
-                session_id="sess-123",
+                session_id=f"sess-{type(self)._sessions_issued}",
             )
             return
         if method == "tools/list":
@@ -101,6 +106,13 @@ class MCPHttpHandler(BaseHTTPRequestHandler):
             )
             return
         if method == "tools/call":
+            # 会话过期一次：返回 404，客户端应重新握手后重试。
+            if self.expire_session_once and not type(self)._expired:
+                type(self)._expired = True
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if self.slow:
                 time.sleep(2)
             if self.tool_error:
@@ -138,6 +150,9 @@ def http_mcp() -> Iterator[type[MCPHttpHandler]]:
     MCPHttpHandler.tool_error = False
     MCPHttpHandler.slow = False
     MCPHttpHandler.variant = "v1"
+    MCPHttpHandler.expire_session_once = False
+    MCPHttpHandler._expired = False
+    MCPHttpHandler._sessions_issued = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), MCPHttpHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -322,4 +337,22 @@ async def test_scan_dependent_workflows_flags_breaking_change(
     assert finding["toolName"] == tool_name
     assert finding["status"] == "breaking"
     assert finding["reason"] == "contract_changed"
+
+
+async def test_http_reconnects_after_session_expiry(
+    http_mcp: type[MCPHttpHandler],
+) -> None:
+    """会话过期（服务端 404）时，客户端重新握手一次并成功完成调用。"""
+
+    http_mcp.expire_session_once = True
+    version_id = await _register(http_mcp)
+    async with SessionLocal() as session, session.begin():
+        snapshots = await discover_tools(session, version_id)
+        snapshot_id = snapshots[0].id
+    async with SessionLocal() as session:
+        outcome = await call_snapshot_through_contract(session, snapshot_id, {"city": "成都"})
+    assert outcome.status == "succeeded"
+    assert outcome.output == {"temperature": 21.5}
+    # 触发过一次会话过期，说明重连路径被执行。
+    assert MCPHttpHandler._expired is True
 

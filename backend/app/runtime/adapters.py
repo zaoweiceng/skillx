@@ -134,6 +134,15 @@ class StreamableHttpMCPGateway:
                 "params": params or {},
             }
             response = await client.post(self.url, headers=self._base_headers(), json=request)
+            # 会话过期（服务端返回 404 Not Found）时，重置会话并重新握手一次后重试；
+            # 这是 Streamable HTTP 断线重连的最小实现，避免因 session 失效整次失败。
+            if response.status_code == 404 and self._session_id is not None:
+                self._session_id = None
+                self._initialized = False
+                await self._ensure_initialized(client)
+                response = await client.post(
+                    self.url, headers=self._base_headers(), json=request
+                )
             response.raise_for_status()
             payload = self._decode(response)
         if not isinstance(payload, dict):
