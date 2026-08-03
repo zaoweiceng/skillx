@@ -1,23 +1,38 @@
-import { ArrowLeft, CheckCircle2, Save, Send, TriangleAlert } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { ArrowLeft, CheckCircle2, Code2, Plus, Save, Send } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
-import { api, type Workflow, type WorkflowDefinition } from '@/api/client'
+import { api, type NodeDefinition, type Workflow, type WorkflowDefinition } from '@/api/client'
+import { EditableCanvas } from '@/components/EditableCanvas'
 import { WorkflowGraph } from '@/components/WorkflowGraph'
 import { outputVariables, reachableUpstream } from '@/lib/variablePicker'
+import {
+  addNode,
+  connectNodes,
+  deleteNode,
+  disconnectNodes,
+  PALETTE_NODE_TYPES,
+  type PaletteNodeType,
+  setInputMapping,
+  updateNode,
+} from '@/lib/workflowEdit'
 
 type Diagnostic = { level: string; code: string; path: string; message: string }
 
 export default function WorkflowEditorPage() {
   const { id } = useParams()
   const [workflow, setWorkflow] = useState<Workflow>()
-  const [source, setSource] = useState('')
+  // 结构化 state 为唯一真相；JSON 仅作为高级导入/导出视图。
+  const [definition, setDefinition] = useState<WorkflowDefinition>()
+  const [showJson, setShowJson] = useState(false)
+  const [jsonDraft, setJsonDraft] = useState('')
   const [diagnostics, setDiagnostics] = useState<Diagnostic[]>([])
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [publishing, setPublishing] = useState(false)
   const [selectedNodeId, setSelectedNodeId] = useState('')
+  const [mappingField, setMappingField] = useState('')
 
   useEffect(() => {
     if (!id) return
@@ -25,41 +40,89 @@ export default function WorkflowEditorPage() {
       .getWorkflow(id)
       .then((item) => {
         setWorkflow(item)
-        setSource(JSON.stringify(item.definition, null, 2))
+        setDefinition(item.definition)
       })
       .catch((reason: Error) => setError(reason.message))
   }, [id])
 
-  const preview = useMemo(() => {
-    try {
-      return JSON.parse(source) as WorkflowDefinition
-    } catch {
-      return undefined
-    }
-  }, [source])
+  const selectedNode = useMemo(
+    () => definition?.spec.nodes.find((node) => node.id === selectedNodeId),
+    [definition, selectedNodeId],
+  )
 
-  const inspector = useMemo(() => {
-    if (!preview || !selectedNodeId) return undefined
-    const node = preview.spec.nodes.find((item) => item.id === selectedNodeId)
-    if (!node) return undefined
-    const upstream = reachableUpstream(preview, selectedNodeId)
-    const variables = upstream.flatMap((nodeId) => outputVariables(preview, nodeId))
-    return { node, variables }
-  }, [preview, selectedNodeId])
+  const upstreamVariables = useMemo(() => {
+    if (!definition || !selectedNodeId) return []
+    return reachableUpstream(definition, selectedNodeId).flatMap((nodeId) =>
+      outputVariables(definition, nodeId),
+    )
+  }, [definition, selectedNodeId])
 
   const riskSummary = useMemo(() => {
-    if (!preview) return []
-    return preview.spec.nodes
+    if (!definition) return []
+    return definition.spec.nodes
       .filter((node) => node.sideEffect || ['approval', 'browser'].includes(node.type))
       .map((node) => `${node.displayName}（${node.type}）需要确认或存在副作用`)
-  }, [preview])
+  }, [definition])
+
+  const patchDefinition = useCallback((next: WorkflowDefinition) => {
+    setDefinition(next)
+    setNotice('')
+  }, [])
+
+  function handleAddNode(type: PaletteNodeType) {
+    if (!definition) return
+    const { definition: next, nodeId } = addNode(definition, type)
+    patchDefinition(next)
+    setSelectedNodeId(nodeId)
+  }
+
+  function handleConnect(source: string, target: string) {
+    if (!definition) return
+    const result = connectNodes(definition, source, target)
+    if (!result.ok) {
+      setError(result.error)
+      return
+    }
+    setError('')
+    patchDefinition(result.definition)
+  }
+
+  function handleDeleteNode(nodeId: string) {
+    if (!definition) return
+    const result = deleteNode(definition, nodeId)
+    if (!result.ok) {
+      setError(result.error)
+      return
+    }
+    setError('')
+    patchDefinition(result.definition)
+    if (selectedNodeId === nodeId) setSelectedNodeId('')
+  }
+
+  function handleDeleteEdge(source: string, target: string) {
+    if (!definition) return
+    patchDefinition(disconnectNodes(definition, source, target))
+  }
+
+  function patchNode(patch: Partial<NodeDefinition>) {
+    if (!definition || !selectedNodeId) return
+    patchDefinition(updateNode(definition, selectedNodeId, patch))
+  }
+
+  function insertMapping(expression: string) {
+    if (!definition || !selectedNodeId || !mappingField) {
+      setError('请先填写要写入的输入字段名')
+      return
+    }
+    setError('')
+    patchDefinition(setInputMapping(definition, selectedNodeId, mappingField, expression))
+  }
 
   async function save(): Promise<Workflow | undefined> {
-    if (!workflow || !id) return
+    if (!workflow || !id || !definition) return
     setBusy(true)
     setError('')
     try {
-      const definition = JSON.parse(source) as WorkflowDefinition
       const updated = await api.updateDraft(id, workflow.draftRevision, definition)
       setWorkflow(updated)
       setNotice(`草稿已保存，修订号 ${updated.draftRevision}`)
@@ -81,8 +144,6 @@ export default function WorkflowEditorPage() {
   }
 
   async function publish() {
-    // 发布按钮在整个 save/validate/publish/create-component 流程中保持 busy，
-    // 阻止双击触发并发发布。
     if (publishing) return
     setPublishing(true)
     try {
@@ -105,7 +166,25 @@ export default function WorkflowEditorPage() {
     }
   }
 
-  if (!workflow) {
+  function toggleJson() {
+    if (!definition) return
+    if (!showJson) {
+      setJsonDraft(JSON.stringify(definition, null, 2))
+      setShowJson(true)
+      return
+    }
+    // 从 JSON 视图导入回结构化 state。
+    try {
+      const parsed = JSON.parse(jsonDraft) as WorkflowDefinition
+      setDefinition(parsed)
+      setShowJson(false)
+      setError('')
+    } catch {
+      setError('JSON 语法错误，无法导入')
+    }
+  }
+
+  if (!workflow || !definition) {
     return <div className="page loading-panel">{error || '正在加载工作流草稿...'}</div>
   }
 
@@ -120,6 +199,9 @@ export default function WorkflowEditorPage() {
           <h1>{workflow.name}</h1>
         </div>
         <div className="run-header-actions">
+          <button className="button ghost" onClick={toggleJson} disabled={busy || publishing}>
+            <Code2 size={15} /> {showJson ? '应用 JSON' : 'JSON 视图'}
+          </button>
           <button className="button ghost" onClick={save} disabled={busy || publishing}>
             <Save size={15} /> 保存
           </button>
@@ -136,106 +218,211 @@ export default function WorkflowEditorPage() {
         <div className={error ? 'error-panel' : 'notice-panel'}>{error || notice}</div>
       )}
 
-      <section className="editor-layout">
-        <div className="panel source-panel">
+      {showJson ? (
+        <section className="panel source-panel">
           <div className="panel-heading">
             <div>
               <span className="eyebrow">WORKFLOW DSL</span>
-              <h2>定义 JSON</h2>
+              <h2>定义 JSON（高级导入/导出）</h2>
             </div>
-            <span>{source.split('\n').length} 行</span>
           </div>
           <textarea
             aria-label="工作流 JSON 定义"
             className="source-editor"
             spellCheck={false}
-            value={source}
-            onChange={(event) => setSource(event.target.value)}
+            value={jsonDraft}
+            onChange={(event) => setJsonDraft(event.target.value)}
+          />
+        </section>
+      ) : (
+        <section className="editor-layout">
+          <div className="panel palette-panel">
+            <div className="panel-heading">
+              <span className="eyebrow">NODE PALETTE</span>
+            </div>
+            <div className="palette-list">
+              {PALETTE_NODE_TYPES.map((type) => (
+                <button
+                  key={type}
+                  className="palette-item"
+                  type="button"
+                  onClick={() => handleAddNode(type)}
+                >
+                  <Plus size={13} /> {type}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="panel preview-panel">
+            <div className="panel-heading">
+              <div>
+                <span className="eyebrow">CANVAS</span>
+                <h2>可视化编辑</h2>
+              </div>
+              <span className="hint">拖拽连线 · Delete 删除选中节点/连线</span>
+            </div>
+            <EditableCanvas
+              definition={definition}
+              selectedNodeId={selectedNodeId}
+              onSelectNode={setSelectedNodeId}
+              onConnect={handleConnect}
+              onDeleteNode={handleDeleteNode}
+              onDeleteEdge={handleDeleteEdge}
+            />
+            <div className="diagnostics">
+              {diagnostics.map((item) => (
+                <div className={`diagnostic ${item.level}`} key={`${item.code}-${item.path}`}>
+                  <strong>{item.code}</strong>
+                  <span>{item.message}</span>
+                  <small>{item.path}</small>
+                </div>
+              ))}
+            </div>
+            {riskSummary.length > 0 && (
+              <div className="risk-summary">
+                <span className="eyebrow">PRE-PUBLISH RISK</span>
+                <ul>
+                  {riskSummary.map((line) => (
+                    <li key={line}>{line}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+          <div className="panel inspector-panel">
+            <div className="panel-heading">
+              <span className="eyebrow">NODE INSPECTOR</span>
+            </div>
+            {!selectedNode ? (
+              <p className="inspector-empty">在画布中选择一个节点以编辑其契约。</p>
+            ) : (
+              <NodeInspector
+                node={selectedNode}
+                variables={upstreamVariables}
+                mappingField={mappingField}
+                onMappingFieldChange={setMappingField}
+                onPatch={patchNode}
+                onInsertMapping={insertMapping}
+              />
+            )}
+          </div>
+        </section>
+      )}
+
+      {/* 只读小图便于总览 */}
+      {!showJson && <WorkflowGraph definition={definition} compact />}
+    </div>
+  )
+}
+
+function NodeInspector({
+  node,
+  variables,
+  mappingField,
+  onMappingFieldChange,
+  onPatch,
+  onInsertMapping,
+}: {
+  node: NodeDefinition
+  variables: string[]
+  mappingField: string
+  onMappingFieldChange: (value: string) => void
+  onPatch: (patch: Partial<NodeDefinition>) => void
+  onInsertMapping: (expression: string) => void
+}) {
+  const configText = JSON.stringify(node.config ?? {}, null, 2)
+  const [localConfig, setLocalConfig] = useState(configText)
+  const [configError, setConfigError] = useState('')
+
+  // node 切换时同步本地 config 文本。
+  useEffect(() => {
+    setLocalConfig(JSON.stringify(node.config ?? {}, null, 2))
+    setConfigError('')
+  }, [node.id, node.config])
+
+  function commitConfig() {
+    try {
+      const parsed = JSON.parse(localConfig) as Record<string, unknown>
+      onPatch({ config: parsed })
+      setConfigError('')
+    } catch {
+      setConfigError('config JSON 语法错误')
+    }
+  }
+
+  return (
+    <div className="inspector-body">
+      <label className="inspector-field">
+        <span>名称</span>
+        <input
+          value={node.displayName}
+          onChange={(event) => onPatch({ displayName: event.target.value })}
+        />
+      </label>
+      <div className="inspector-field">
+        <span>类型</span>
+        <code>{node.type}</code>
+      </div>
+      <label className="inspector-field checkbox">
+        <input
+          type="checkbox"
+          checked={node.sideEffect ?? false}
+          onChange={(event) => onPatch({ sideEffect: event.target.checked })}
+        />
+        <span>有副作用（sideEffect）</span>
+      </label>
+
+      <div className="inspector-field">
+        <span>输入映射</span>
+        <div className="mapping-row">
+          <input
+            aria-label="输入字段名"
+            placeholder="字段名，如 name"
+            value={mappingField}
+            onChange={(event) => onMappingFieldChange(event.target.value)}
           />
         </div>
-        <div className="panel preview-panel">
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">LIVE PREVIEW</span>
-              <h2>DAG 预览</h2>
-            </div>
-          </div>
-          {preview ? (
-            <WorkflowGraph definition={preview} compact />
+        <div className="current-mapping">
+          {Object.entries(node.input ?? {}).map(([key, value]) => (
+            <code key={key} className="variable-chip">
+              {key}: {String(value)}
+            </code>
+          ))}
+        </div>
+      </div>
+
+      <div className="inspector-field">
+        <span>可达上游变量（点击写入当前字段）</span>
+        <div className="variable-list">
+          {variables.length === 0 ? (
+            <span className="inspector-empty">无上游可引用输出</span>
           ) : (
-            <div className="graph-error">
-              <TriangleAlert size={20} />
-              JSON 语法错误，无法生成预览
-            </div>
-          )}
-          <div className="diagnostics">
-            {diagnostics.map((item) => (
-              <div className={`diagnostic ${item.level}`} key={`${item.code}-${item.path}`}>
-                <strong>{item.code}</strong>
-                <span>{item.message}</span>
-                <small>{item.path}</small>
-              </div>
-            ))}
-          </div>
-          {preview && (
-            <div className="node-inspector">
-              <div className="inspector-heading">
-                <span className="eyebrow">NODE INSPECTOR</span>
-                <select
-                  aria-label="选择节点"
-                  value={selectedNodeId}
-                  onChange={(event) => setSelectedNodeId(event.target.value)}
-                >
-                  <option value="">选择节点查看契约</option>
-                  {preview.spec.nodes.map((node) => (
-                    <option key={node.id} value={node.id}>
-                      {node.displayName}（{node.type}）
-                    </option>
-                  ))}
-                </select>
-              </div>
-              {inspector && (
-                <div className="inspector-body">
-                  <dl className="inspector-fields">
-                    <div>
-                      <dt>类型</dt>
-                      <dd>{inspector.node.type}</dd>
-                    </div>
-                    <div>
-                      <dt>副作用</dt>
-                      <dd>{inspector.node.sideEffect ? '是' : '否'}</dd>
-                    </div>
-                    <div>
-                      <dt>可达上游变量</dt>
-                      <dd>
-                        {inspector.variables.length === 0 ? (
-                          <span className="inspector-empty">无上游可引用输出</span>
-                        ) : (
-                          inspector.variables.map((variable) => (
-                            <code className="variable-chip" key={variable}>
-                              {variable}
-                            </code>
-                          ))
-                        )}
-                      </dd>
-                    </div>
-                  </dl>
-                </div>
-              )}
-            </div>
-          )}
-          {riskSummary.length > 0 && (
-            <div className="risk-summary">
-              <span className="eyebrow">PRE-PUBLISH RISK</span>
-              <ul>
-                {riskSummary.map((line) => (
-                  <li key={line}>{line}</li>
-                ))}
-              </ul>
-            </div>
+            variables.map((variable) => (
+              <button
+                key={variable}
+                type="button"
+                className="variable-chip clickable"
+                onClick={() => onInsertMapping(variable)}
+                title="写入所选输入字段"
+              >
+                {variable}
+              </button>
+            ))
           )}
         </div>
-      </section>
+      </div>
+
+      <label className="inspector-field">
+        <span>config（JSON）</span>
+        <textarea
+          className="config-editor"
+          spellCheck={false}
+          value={localConfig}
+          onChange={(event) => setLocalConfig(event.target.value)}
+          onBlur={commitConfig}
+        />
+        {configError && <small className="error-code">{configError}</small>}
+      </label>
     </div>
   )
 }

@@ -981,7 +981,7 @@ button {
 .editor-layout {
   display: grid;
   min-height: 680px;
-  grid-template-columns: minmax(420px, 0.9fr) minmax(0, 1.1fr);
+  grid-template-columns: 150px minmax(0, 1.3fr) minmax(320px, 0.8fr);
   gap: 16px;
 }
 
@@ -1424,6 +1424,105 @@ button {
   color: var(--muted, #888);
   font-size: 12px;
 }
+
+/* 004-E 可视化编辑：调色板 / 画布 / Inspector 三栏 */
+.palette-panel,
+.inspector-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 680px;
+}
+
+.palette-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.palette-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #142028;
+  color: #e8ede9;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.palette-item:hover {
+  border-color: #3f8cff;
+}
+
+.workflow-graph.editable {
+  min-height: 420px;
+  flex: 1;
+}
+
+.panel-heading .hint {
+  font-size: 11px;
+  color: var(--muted, #888);
+}
+
+.inspector-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+  font-size: 12px;
+}
+
+.inspector-field.checkbox {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.inspector-field > span {
+  color: var(--muted, #9aa);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.inspector-field input,
+.inspector-field textarea,
+.mapping-row input {
+  background: #091216;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: #e8ede9;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.config-editor {
+  min-height: 140px;
+  resize: vertical;
+  font-family: "SFMono-Regular", Consolas, monospace;
+}
+
+.variable-list,
+.current-mapping {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.variable-chip.clickable {
+  cursor: pointer;
+}
+
+.variable-chip.clickable:hover {
+  border-color: #3f8cff;
+  background: rgba(63, 140, 255, 0.16);
+}
+
 
 .risk-summary {
   margin-top: 12px;
