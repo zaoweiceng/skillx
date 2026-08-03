@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -77,3 +78,42 @@ def build_contract_patch(
         differences=list(differences),
         diagnostics=diagnostics,
     )
+
+
+def apply_contract_patch(
+    definition: dict[str, Any],
+    node_id: str,
+    patch: dict[str, Any],
+) -> dict[str, Any]:
+    """把人工审核过的 ContractPatch 应用到工作流**草稿**，返回新的 definition。
+
+    安全边界（与 build_contract_patch 对称，防止绕过）：
+    - 只应用到 draft，不修改任何已发布 WorkflowVersion（由调用方保证传入 draft）；
+    - 只替换目标 browser 节点 pageContract 的 ``fields``，并把 ``contractVersion`` +1；
+    - 绝不修改 ``urlPattern``/``pageIdentity``/``submit``——这些属于 L4 安全域，
+      任何扩大授权的补丁一律拒绝。
+    """
+
+    if patch.get("kind") != "PageContractPatch":
+        raise ContractPatchViolation("非法的 ContractPatch")
+    proposed_fields = patch.get("proposedFields")
+    if not isinstance(proposed_fields, list):
+        raise ContractPatchViolation("ContractPatch 缺少 proposedFields")
+    next_definition = deepcopy(definition)
+    nodes = next_definition.get("spec", {}).get("nodes", [])
+    node = next((item for item in nodes if item.get("id") == node_id), None)
+    if node is None or node.get("type") != "browser":
+        raise ContractPatchViolation("目标节点不存在或不是 browser 节点")
+    contract = (node.get("config") or {}).get("pageContract")
+    if not isinstance(contract, dict):
+        raise ContractPatchViolation("目标节点缺少 pageContract")
+    base_version = str(patch.get("baseContractVersion", contract.get("contractVersion")))
+    if base_version != str(contract.get("contractVersion")):
+        raise ContractPatchViolation("ContractPatch 基线版本与当前草稿不一致")
+    # 只调整字段契约与版本号；L4 安全域字段保持不变。
+    contract["fields"] = proposed_fields
+    try:
+        contract["contractVersion"] = str(int(str(contract.get("contractVersion", "1"))) + 1)
+    except ValueError:
+        contract["contractVersion"] = f"{contract.get('contractVersion', '1')}-patched"
+    return next_definition

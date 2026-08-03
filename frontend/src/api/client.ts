@@ -210,6 +210,15 @@ export const api = {
       `/workflows/${id}/publish`,
       { method: 'POST' },
     ),
+  applyContractPatch: (
+    id: string,
+    nodeId: string,
+    patch: Record<string, unknown>,
+  ) =>
+    request<{ id: string; draftRevision: number; definition: WorkflowDefinition }>(
+      `/workflows/${id}/contract-patch`,
+      { method: 'POST', body: JSON.stringify({ nodeId, patch }) },
+    ),
   createComponent: (
     name: string,
     description: string,

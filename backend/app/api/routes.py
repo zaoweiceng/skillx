@@ -73,6 +73,7 @@ from app.infrastructure.database import (
     utcnow,
 )
 from app.infrastructure.migrations import alembic_head_revision
+from app.runtime.contract_patch import ContractPatchViolation, apply_contract_patch
 from app.runtime.models import OpenAICompatibleAdapter
 
 router = APIRouter()
@@ -154,6 +155,11 @@ class ConversationRunCreate(BaseModel):
     input: dict[str, Any]
     output: dict[str, Any]
     trajectory: dict[str, Any]
+
+
+class ContractPatchApply(BaseModel):
+    node_id: str = Field(alias="nodeId")
+    patch: dict[str, Any]
 
 
 class AgentRunCreate(BaseModel):
@@ -406,6 +412,38 @@ async def publish_workflow(
         "version": version.version,
         "digest": version.digest,
         "definition": version.definition_json,
+    }
+
+
+@router.post("/workflows/{workflow_id}/contract-patch", status_code=200)
+async def apply_workflow_contract_patch(
+    workflow_id: str,
+    body: ContractPatchApply,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """把人工审核过的 ContractPatch 应用到工作流草稿（不触碰已发布版本）。
+
+    仅调整目标 browser 节点 pageContract 的字段契约并 +1 版本号；URL/身份/提交动作等
+    L4 安全域字段不可通过补丁修改。应用后仍需人工在编辑器中校验并显式发布。
+    """
+
+    workflow = await session.get(Workflow, workflow_id)
+    if workflow is None:
+        raise HTTPException(404, "工作流不存在")
+    try:
+        patched = apply_contract_patch(workflow.draft_json, body.node_id, body.patch)
+    except ContractPatchViolation as exc:
+        raise HTTPException(
+            422,
+            detail={"code": "CONTRACT_PATCH_REJECTED", "message": str(exc)},
+        ) from exc
+    workflow.draft_json = patched
+    workflow.draft_revision += 1
+    await session.commit()
+    return {
+        "id": workflow.id,
+        "draftRevision": workflow.draft_revision,
+        "definition": patched,
     }
 
 
