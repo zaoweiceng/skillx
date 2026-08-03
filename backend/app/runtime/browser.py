@@ -151,3 +151,31 @@ def authorization_digest(
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def drift_authorization_digest(
+    run_id: str,
+    url: str,
+    identity: str | None,
+    business_object: str | None,
+    page_fingerprint: str,
+    form_values: dict[str, Any],
+    drift_differences: list[str],
+) -> str:
+    """一次性漂移授权摘要。
+
+    覆盖 URL、身份、业务对象、页面指纹、表单值和已确认的差异集合。任何一项在
+    重放时发生变化都会导致摘要不同，从而使旧授权失效并要求重新确认。
+    """
+
+    payload = {
+        "run_id": run_id,
+        "url": url,
+        "identity": identity,
+        "business_object": business_object,
+        "page_fingerprint": page_fingerprint,
+        "form_values": form_values,
+        "drift": sorted(drift_differences),
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()

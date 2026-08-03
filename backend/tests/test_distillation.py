@@ -1,12 +1,20 @@
 from uuid import uuid4
 
+import pytest
 from sqlalchemy import func, select
 
+from app.api.routes import publish_workflow
 from app.application.compiler import digest_json
-from app.application.distillation import compile_trajectory, distill_conversation_run
+from app.application.distillation import (
+    DistillationError,
+    compile_trajectory,
+    distill_conversation_run,
+)
+from app.application.orchestrator import Orchestrator, WorkerService
 from app.infrastructure.database import (
     Conversation,
     ConversationRun,
+    Run,
     SessionLocal,
     Workflow,
     WorkflowVersion,
@@ -93,3 +101,65 @@ async def test_distillation_creates_editable_draft_without_publishing() -> None:
             .where(WorkflowVersion.workflow_id == workflow.id)
         )
         assert versions == 0
+
+
+async def test_distillation_rejects_imported_trajectory() -> None:
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="导入")
+        session.add(conversation)
+        await session.flush()
+        imported = ConversationRun(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            status="succeeded",
+            run_type="trajectory_import",
+            input_json={"name": "Alice"},
+            output_json={"message": "你好，Alice"},
+            trajectory_json=fixed_trajectory(),
+        )
+        session.add(imported)
+        await session.flush()
+        with pytest.raises(DistillationError):
+            await distill_conversation_run(session, imported)
+
+
+async def test_distilled_draft_publishes_and_reuses_with_new_input() -> None:
+    # 1) 从服务端成功运行生成草稿（保留来源 run id）。
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="固化复用")
+        session.add(conversation)
+        await session.flush()
+        conversation_run = ConversationRun(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            status="succeeded",
+            run_type="agent_run",
+            input_json={"name": "Alice"},
+            output_json={"message": "你好，Alice"},
+            trajectory_json=fixed_trajectory(),
+        )
+        session.add(conversation_run)
+        await session.flush()
+        result = await distill_conversation_run(session, conversation_run)
+        draft_workflow_id = result.draft_workflow_id
+        assert result.analysis_json["sourceRunId"] == conversation_run.id
+
+    # 2) 人工发布草稿为不可变版本（系统不自动发布）。
+    async with SessionLocal() as session:
+        published = await publish_workflow(draft_workflow_id, session)
+    version_id = published["id"]
+
+    # 3) 用不同输入启动发布版本并验证复用输出。
+    async with SessionLocal() as session, session.begin():
+        version = await session.get(WorkflowVersion, version_id)
+        assert version is not None
+        run = await Orchestrator().create_run(session, version, {"name": "Bob"})
+        run_id = run.id
+    worker = WorkerService("distill-reuse-worker")
+    for _ in range(3):
+        assert await worker.run_once()
+    async with SessionLocal() as session:
+        completed = await session.get(Run, run_id)
+        assert completed is not None
+        assert completed.status == "succeeded"
+        assert completed.output_json == {"message": "你好，Bob"}

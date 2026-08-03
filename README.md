@@ -10,14 +10,18 @@ SkillX Workflow 是一个契约驱动的可视化工作流平台。首次任务�
 |---|---|---|
 | Workflow Compiler、SQLite 队列、Direct 节点、审批、SSE | `available` | 已接入 API/Worker/UI 主路径 |
 | SkillX Direct | `available` | Registry 锁定 digest，独立子进程执行 |
-| MCP HTTP/STDIO | `available` | Registry、Tool Snapshot、Executor 与本地 E2E 已接通 |
-| LLM、Agent/TraeX | `available` | Executor 已接通；真实运行需要环境配置，测试使用 Fake Adapter |
-| 轨迹固化 | `available` | 成功 ConversationRun 可生成可编辑草稿，不自动发布 |
-| 浏览器契约与一次性授权 | `available` | Playwright 隔离 Context、重放审批、截图与 DOM 摘要 E2E 已接通 |
+| MCP STDIO | `available` | Registry、Tool Snapshot、Executor 与本地 E2E 已接通 |
+| MCP Streamable HTTP | `partial` | 已实现 initialize/会话 id/JSON+SSE 与 loopback E2E；仍缺流式增量与重连 |
+| LLM 节点 | `available` | Executor 已接通；真实运行需环境配置，测试用 Fake Adapter |
+| Agent/TraeX | `available` | 服务端 TraeX Adapter 记录 plan/Tool/step/Token，Host 校验能力白名单；仓库内 fixture 可重复验收 |
+| 通用对话调用组件 | `available` | 结构化意图候选、锁定版本令牌、补参确认启动 Workflow；单次模型答记为 `llm_response` |
+| 轨迹固化 | `available` | 仅固化服务端成功运行；草稿人工发布后可用新输入复用，不自动发布 |
+| 浏览器契约与一次性授权 | `available` | Playwright 隔离 Context、L2 漂移一次性授权重放、提交确认、L3 ContractPatch 草稿 |
+| 六场景黑盒 E2E | `available` | 真实 API + 独立 Worker 子进程，`make demo-check` 执行 |
 | 可视化拖放编辑器 | `not-configured` | 当前仍以 JSON DSL 编辑和有界 DAG 预览为主 |
 
-`available` 表示已接入主路径并有自动化测试；`adapter-only` 只表示安全状态机或协议适配代码
-存在；`not-configured` 不应在 UI 中标记为可运行能力。SkillX 的唯一规范源是
+`available` 表示已接入主路径并有自动化测试；`partial` 表示主路径部分实现、仍有已知缺口；
+`not-configured` 不应在 UI 中标记为可运行能力。SkillX 的唯一规范源是
 [`docs/skillx.md`](docs/skillx.md)，版本为 `skillx.dev/v1alpha1`。
 
 ## 本地启动
@@ -86,7 +90,7 @@ SkillX 注册只接受 `SKILLX_CAPABILITY_ROOT` 下的相对路径。Secret API 
 
 ```bash
 cd backend
-uv run ruff check app tests migrations
+uv run ruff check app tests migrations e2e
 uv run pytest -q
 
 cd ../frontend
@@ -96,9 +100,15 @@ npm run test
 npm run build
 ```
 
-也可在仓库根目录执行 `make demo-check`。测试覆盖双 Worker 租约/CAS、取消、
-超时、并行汇聚、SkillX 版本锁定、MCP、Hybrid/Agent、轨迹固化、浏览器一次性
-授权、迁移和前端环图阻断。
+在仓库根目录：
+
+- `make quality-check`：较快的静态/单元/进程内集成检查与前端构建。
+- `make demo-check`：在 `quality-check` 之上再执行六条真实 API + 独立 Worker 子进程的黑盒 E2E
+  （`backend/e2e`），其成功等价于 `docs/demo-acceptance.md` 六条均成功。
+
+测试覆盖双 Worker 租约/CAS、原子并发配额、取消、超时、并行汇聚、SkillX 版本锁定、
+MCP STDIO/HTTP 与契约漂移、Hybrid/真实 TraeX Agent、轨迹固化与发布复用、浏览器一次性
+授权与 L2 漂移重放、Artifact 暂存落位、迁移历史与前端环图阻断。
 
 ## 安全边界
 

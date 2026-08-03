@@ -117,11 +117,21 @@ export default function RunDetailPage() {
                     <strong>{node.nodeId}</strong>
                     <small>
                       {node.type} · attempt {node.attempt}
+                      {typeof node.durationMs === 'number' && ` · ${node.durationMs}ms`}
                     </small>
                   </div>
                   <StatusBadge status={node.status} />
                 </summary>
                 <div className="node-detail">
+                  {node.metrics && Object.keys(node.metrics).length > 0 && (
+                    <div className="node-metrics">
+                      {Object.entries(node.metrics).map(([key, value]) => (
+                        <span className="metric-chip" key={key}>
+                          {key}: {String(value)}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                   <div>
                     <small>输入</small>
                     <JsonBlock value={node.input} />
@@ -172,6 +182,21 @@ export default function RunDetailPage() {
             <StatusBadge status={run.status} />
           </div>
           <JsonBlock value={run.error ?? run.output} />
+        </section>
+      )}
+
+      {run.dependencyVersions && (
+        <section className="panel result-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">DEPENDENCY VERSIONS</span>
+              <h2>依赖版本</h2>
+            </div>
+            {run.dependencyVersions.executionClass && (
+              <span className="effect-label">{run.dependencyVersions.executionClass}</span>
+            )}
+          </div>
+          <JsonBlock value={run.dependencyVersions} />
         </section>
       )}
 

@@ -4,6 +4,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import OperationalError
 
 from app.application.compiler import WorkflowCompiler
 from app.application.orchestrator import Orchestrator, WorkerService
@@ -323,6 +324,57 @@ async def test_max_parallel_nodes_limits_claims() -> None:
         assert await first.claim(session) is not None
     async with SessionLocal() as session, session.begin():
         assert await second.claim(session) is None
+
+
+async def test_concurrent_claim_never_exceeds_quota_of_one() -> None:
+    """两个独立 session 同时领取，maxParallelNodes=1 时永不超额。
+
+    循环多轮以放大竞态窗口；每轮领取后立即断言数据库中最多一个 running NodeRun。
+    """
+
+    run_id = await create_run(diamond_workflow(max_parallel=1))
+    first = WorkerService("worker-race-1")
+    second = WorkerService("worker-race-2")
+    # 先推进 input 完成，使 left/right 两个分支同时 ready。
+    await first.run_once()
+
+    async def claim_in_session(worker: WorkerService) -> str | None:
+        try:
+            async with SessionLocal() as session, session.begin():
+                claimed = await worker.claim(session)
+                return claimed.node_run_id if claimed else None
+        except OperationalError:
+            return None
+
+    claimed_ids: set[str] = set()
+    for _ in range(25):
+        results = await asyncio.gather(
+            claim_in_session(first),
+            claim_in_session(second),
+        )
+        async with SessionLocal() as session:
+            running = await session.scalar(
+                select(func.count())
+                .select_from(NodeRun)
+                .where(NodeRun.run_id == run_id, NodeRun.status == "running")
+            )
+        # 任意时刻最多一个 running NodeRun，绝不越过 Run 级配额。
+        assert (running or 0) <= 1
+        for node_run_id in results:
+            if node_run_id is None:
+                continue
+            claimed_ids.add(node_run_id)
+            # 归还 slot，模拟节点完成，进入下一轮竞态。
+            async with SessionLocal() as session, session.begin():
+                await session.execute(
+                    update(NodeRun)
+                    .where(NodeRun.id == node_run_id, NodeRun.status == "running")
+                    .values(status="succeeded", output_json={"value": "ok"}, finished_at=utcnow())
+                )
+        if len(claimed_ids) >= 2:
+            break
+    # 两个并行分支最终都应被领取过，证明配额是限流而非死锁。
+    assert len(claimed_ids) == 2
 
 
 async def test_concurrent_diamond_advance_creates_single_output_and_unique_events() -> None:

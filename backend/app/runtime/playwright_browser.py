@@ -36,9 +36,11 @@ class PlaywrightPageSession:
         url: str,
         contract: PageContract,
         config: dict[str, Any],
+        node_run_id: str,
     ) -> None:
         self.run_id = run_id
         self.node_id = node_id
+        self.node_run_id = node_run_id
         self.url = url
         self.contract = contract
         self.config = config
@@ -289,7 +291,10 @@ class PlaywrightPageSession:
 
     def _artifact_target(self) -> tuple[str, Path]:
         artifact_id = str(uuid4())
-        root = (get_settings().artifact_root / self.run_id).resolve()
+        # 先写到按 node_run 隔离的暂存目录，落位与登记由编排器在 CAS 成功后完成。
+        root = (
+            get_settings().artifact_root / self.run_id / ".staging" / self.node_run_id
+        ).resolve()
         root.mkdir(parents=True, exist_ok=True)
         return artifact_id, root / artifact_id
 
@@ -311,5 +316,6 @@ class PlaywrightPageSession:
             "size": len(content),
             "mediaType": media_type,
             "storageKey": artifact_id,
+            "stagingKey": {"nodeRunId": self.node_run_id, "file": artifact_id},
             "metadata": {"nodeId": self.node_id},
         }

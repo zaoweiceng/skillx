@@ -107,8 +107,22 @@ async def distill_conversation_run(
     conversation_run: ConversationRun,
 ) -> Distillation:
     if conversation_run.status != "succeeded":
-        raise DistillationError("只有成功的 Agent Run 可以固化")
+        raise DistillationError("只有成功的运行可以固化")
+    # 只固化服务端生成的运行事实；外部导入的轨迹不可作为固化来源。
+    run_type = getattr(conversation_run, "run_type", "agent_run")
+    if run_type == "trajectory_import":
+        raise DistillationError("外部导入轨迹不可直接固化，请使用服务端生成的运行")
     definition, analysis = compile_trajectory(conversation_run.trajectory_json)
+    # 保留来源 run id 与事件摘要，保证固化结果可审计。
+    analysis = {
+        **analysis,
+        "sourceRunId": conversation_run.id,
+        "sourceRunType": run_type,
+        "stepSummary": [
+            {"id": step.get("id"), "kind": step.get("kind")}
+            for step in conversation_run.trajectory_json.get("steps", [])
+        ],
+    }
     workflow = Workflow(
         id=str(uuid4()),
         name=definition["metadata"]["name"],

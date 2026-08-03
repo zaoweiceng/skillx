@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -11,18 +13,20 @@ from uuid import uuid4
 from jsonschema import Draft202012Validator
 
 from app.application.compiler import digest_json
-from app.application.mcp import open_gateway
-from app.application.secrets import contains_secret, redact_secret_text
+from app.application.mcp import call_mcp_contract
+from app.application.secrets import contains_secret
 from app.application.security import redact
 from app.config import get_settings
 from app.domain.workflow import ExecutionError, NodeResult, NodeType, WorkflowNode
-from app.runtime.adapters import AdapterError, AgentRunRequest, TraeXSubprocessAdapter
+from app.runtime.adapters import AgentRunRequest, TraeXSubprocessAdapter
 from app.runtime.browser import (
     ObservedPage,
     PageContract,
     authorization_digest,
     detect_drift,
+    drift_authorization_digest,
 )
+from app.runtime.contract_patch import ContractPatchViolation, build_contract_patch
 from app.runtime.models import FakeModelAdapter, OpenAICompatibleAdapter
 from app.runtime.playwright_browser import (
     BrowserExecutionError,
@@ -36,17 +40,52 @@ class ExecutionCancelledError(Exception):
     pass
 
 
+class AgentToolViolation(Exception):
+    """Agent 调用了 allowedCapabilities 之外的工具。"""
+
+
+def _staging_dir(run_id: str, node_run_id: str) -> Path:
+    """节点执行期间的暂存目录，按 node_run 隔离。
+
+    Executor 先把 Artifact 写到这里；只有 NodeRun 结果 CAS 成功后，编排器才把文件
+    原子落位到最终路径并登记数据库记录。CAS 失败、取消或超时时暂存目录整体清理，
+    不会留下孤儿文件。
+    """
+
+    return (get_settings().artifact_root / run_id / ".staging" / node_run_id).resolve()
+
+
+def clear_staging(run_id: str, node_run_id: str) -> None:
+    shutil.rmtree(_staging_dir(run_id, node_run_id), ignore_errors=True)
+
+
+def promote_staged_artifact(run_id: str, artifact: dict[str, Any]) -> None:
+    """把暂存文件原子移动到 run 根下的最终 storageKey 位置。"""
+
+    staging_key = artifact.get("stagingKey")
+    if not staging_key:
+        return
+    run_root = (get_settings().artifact_root / run_id).resolve()
+    run_root.mkdir(parents=True, exist_ok=True)
+    source = (_staging_dir(run_id, staging_key["nodeRunId"]) / staging_key["file"]).resolve()
+    target = (run_root / artifact["storageKey"]).resolve()
+    if not target.is_relative_to(run_root):
+        raise ValueError("Artifact 落位路径越界")
+    os.replace(source, target)
+
+
 def write_json_artifact(
     run_id: str,
+    node_run_id: str,
     node_id: str,
     name: str,
     kind: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
     artifact_id = str(uuid4())
-    root = (get_settings().artifact_root / run_id).resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    target = (root / artifact_id).resolve()
+    staging = _staging_dir(run_id, node_run_id)
+    staging.mkdir(parents=True, exist_ok=True)
+    target = (staging / artifact_id).resolve()
     content = json.dumps(redact(payload), ensure_ascii=False, indent=2).encode()
     target.write_bytes(content)
     return {
@@ -58,6 +97,7 @@ def write_json_artifact(
         "size": len(content),
         "mediaType": "application/json",
         "storageKey": artifact_id,
+        "stagingKey": {"nodeRunId": node_run_id, "file": artifact_id},
         "metadata": {"nodeId": node_id},
     }
 
@@ -259,74 +299,40 @@ class MCPExecutor:
                     message="MCP 节点未解析锁定的 ToolSnapshot",
                 ),
             )
-        errors = list(Draft202012Validator(resolved["inputSchema"]).iter_errors(inputs))
-        if errors:
-            return NodeResult(
-                status="failed",
-                error=ExecutionError(code="INVALID_INPUT", message=errors[0].message),
-            )
         context.cancellation.check()
-        try:
-            async with open_gateway(resolved["transport"], resolved["serverConfig"]) as gateway:
-                raw = await gateway.call(resolved["toolName"], inputs)
-            output = self._normalize_output(raw)
-            if contains_secret(output, resolved.get("secretValues", [])):
-                raise ValueError("MCP Tool 输出包含 Secret，已阻止持久化")
-            if resolved.get("outputSchema"):
-                Draft202012Validator(resolved["outputSchema"]).validate(output)
+        outcome = await call_mcp_contract(
+            transport=resolved["transport"],
+            server_config=resolved["serverConfig"],
+            tool_name=resolved["toolName"],
+            tool_digest=resolved["digest"],
+            input_schema=resolved["inputSchema"],
+            output_schema=resolved.get("outputSchema"),
+            arguments=inputs,
+            secret_values=resolved.get("secretValues", []),
+        )
+        if outcome.status == "succeeded":
             return NodeResult(
                 status="succeeded",
-                output=output,
+                output=outcome.output,
                 events=[
                     {
                         "type": "mcp.call.completed",
                         "payload": {
-                            "toolName": resolved["toolName"],
-                            "toolDigest": resolved["digest"],
+                            "toolName": outcome.tool_name,
+                            "toolDigest": outcome.tool_digest,
                         },
                     }
                 ],
                 metrics={"mcpCallCount": 1},
             )
-        except AdapterError as exc:
-            message = redact_secret_text(
-                str(exc),
-                resolved.get("secretValues", []),
-            )
-            return NodeResult(
-                status="failed",
-                error=ExecutionError(
-                    code="DEPENDENCY_UNAVAILABLE",
-                    message=message,
-                    retryable=True,
-                ),
-            )
-        except Exception as exc:
-            message = redact_secret_text(
-                str(exc),
-                resolved.get("secretValues", []),
-            )
-            return NodeResult(
-                status="failed",
-                error=ExecutionError(
-                    code="CONTRACT_VIOLATION",
-                    message=f"MCP Tool 输出不符合契约: {message}",
-                ),
-            )
-
-    @staticmethod
-    def _normalize_output(raw: dict[str, Any]) -> dict[str, Any]:
-        structured = raw.get("structuredContent")
-        if isinstance(structured, dict):
-            return structured
-        for item in raw.get("content", []):
-            if item.get("type") == "text":
-                parsed = json.loads(item.get("text", "{}"))
-                if isinstance(parsed, dict):
-                    return parsed
-        if isinstance(raw, dict) and "content" not in raw:
-            return raw
-        raise ValueError("MCP Tool 未返回结构化对象")
+        return NodeResult(
+            status="failed",
+            error=ExecutionError(
+                code=outcome.error_code or "EXECUTION_FAILED",
+                message=outcome.error_message or "MCP 调用失败",
+                retryable=outcome.retryable,
+            ),
+        )
 
 
 class LLMExecutor:
@@ -424,6 +430,7 @@ class AgentExecutor:
             ]
             artifact = write_json_artifact(
                 context.run_id,
+                context.node_run_id,
                 node.id,
                 "agent-trajectory.json",
                 "agent-trajectory",
@@ -449,8 +456,11 @@ class AgentExecutor:
             settings.traex_command,
             set(settings.traex_allowed_executables),
         )
+        allowed_capabilities = set(node.config.get("allowedCapabilities", []))
         events: list[dict[str, Any]] = []
         output: dict[str, Any] | None = None
+        total_tokens = 0
+        step_count = 0
         request = AgentRunRequest(
             prompt=node.config.get("prompt", "")
             + "\n输入："
@@ -462,16 +472,31 @@ class AgentExecutor:
         )
         try:
             async for event in adapter.events(context.node_run_id, request):
+                context.cancellation.check()
                 event_type = event.get("type", "log.emitted")
                 payload = event.get("payload", {})
+                # Host 校验：每个 Tool 事件的能力必须在 allowlist 内，越权立即失败。
+                if event_type.startswith("tool.") and "tool" in payload:
+                    tool_name = payload.get("tool")
+                    if tool_name not in allowed_capabilities:
+                        raise AgentToolViolation(
+                            f"Agent 调用了未授权工具 {tool_name}，不在 allowedCapabilities 内"
+                        )
+                if event_type == "agent.step.completed":
+                    step_count += 1
+                    total_tokens += int(payload.get("inputTokens", 0)) + int(
+                        payload.get("outputTokens", 0)
+                    )
                 events.append({"type": event_type, "payload": payload})
                 if event_type == "agent.completed":
                     output = payload.get("output")
+                    total_tokens = int(payload.get("totalTokens", total_tokens))
             if output is None:
                 raise ValueError("Agent 未返回结构化输出")
             Draft202012Validator(output_schema).validate(output)
             artifact = write_json_artifact(
                 context.run_id,
+                context.node_run_id,
                 node.id,
                 "agent-trajectory.json",
                 "agent-trajectory",
@@ -481,8 +506,20 @@ class AgentExecutor:
                 status="succeeded",
                 output=output,
                 events=events,
-                metrics={"agentSteps": len(events)},
+                metrics={"agentSteps": step_count or len(events), "totalTokens": total_tokens},
                 artifacts=[artifact],
+            )
+        except ExecutionCancelledError:
+            return NodeResult(
+                status="cancelled",
+                error=ExecutionError(code="CANCELLED", message="Agent 执行已取消"),
+                events=events,
+            )
+        except AgentToolViolation as exc:
+            return NodeResult(
+                status="failed",
+                error=ExecutionError(code="PERMISSION_DENIED", message=str(exc)),
+                events=events,
             )
         except Exception as exc:
             return NodeResult(
@@ -525,6 +562,7 @@ class BrowserContractExecutor:
                     url,
                     contract,
                     node.config,
+                    context.node_run_id,
                 ) as browser:
                     context.cancellation.check()
                     observed = await browser.inspect_and_fill(
@@ -592,39 +630,6 @@ class BrowserContractExecutor:
             "drift": drift.model_dump(),
             "formValues": inputs.get("formValues", {}),
         }
-        if drift.level == "L2":
-            snapshot = {
-                "runId": context.run_id,
-                "nodeId": node.id,
-                "title": f"{node.display_name}页面变化",
-                "description": "页面存在可解释变化，请确认是否继续本次只读步骤。",
-                "payload": output,
-                "effect": "browser.read",
-            }
-            return NodeResult(
-                status="waiting_user",
-                output={
-                    **output,
-                    "approvalSnapshot": snapshot,
-                    "snapshotDigest": digest_json(snapshot),
-                },
-                artifacts=artifacts,
-                error=ExecutionError(
-                    code="PAGE_DRIFT",
-                    message="页面发生变化，需要用户处理",
-                    details=drift.model_dump(),
-                ),
-            )
-        if drift.level == "L3":
-            return NodeResult(
-                status="failed",
-                artifacts=artifacts,
-                error=ExecutionError(
-                    code="PAGE_DRIFT",
-                    message="页面发生结构性变化，禁止继续当前发布版本",
-                    details=drift.model_dump(),
-                ),
-            )
         if drift.level == "L4":
             return NodeResult(
                 status="failed",
@@ -635,6 +640,67 @@ class BrowserContractExecutor:
                     details=drift.model_dump(),
                 ),
             )
+        if drift.level == "L3":
+            # L3 只生成 ContractPatch 草稿与差异说明，不修改当前 WorkflowVersion/PageContract。
+            patch_payload: dict[str, Any] | None = None
+            try:
+                patch_payload = build_contract_patch(
+                    contract, observed, drift.differences
+                ).to_dict()
+            except ContractPatchViolation as exc:
+                patch_payload = {"status": "rejected", "reason": str(exc)}
+            return NodeResult(
+                status="failed",
+                output={**output, "contractPatch": patch_payload},
+                artifacts=artifacts,
+                error=ExecutionError(
+                    code="PAGE_DRIFT",
+                    message="页面结构性变化已阻止当前版本，已生成 ContractPatch 草稿待人工审核",
+                    details={**drift.model_dump(), "contractPatch": patch_payload},
+                ),
+            )
+        if drift.level == "L2":
+            form_values = inputs.get("formValues", {})
+            fingerprint = observed.fingerprint or digest_json(observed_data)
+            current_drift_digest = drift_authorization_digest(
+                context.run_id,
+                observed.url,
+                observed.identity,
+                observed.business_object,
+                fingerprint,
+                form_values,
+                drift.differences,
+            )
+            approved_drift = inputs.get("_driftAuthorization")
+            if approved_drift != current_drift_digest:
+                snapshot = self._drift_snapshot(
+                    context,
+                    node,
+                    observed,
+                    form_values,
+                    drift.model_dump(),
+                    current_drift_digest,
+                )
+                message = (
+                    "页面存在可解释变化，请确认是否允许重新评估并继续"
+                    if approved_drift is None
+                    else "页面在授权后再次变化，原漂移授权失效，请重新确认"
+                )
+                return NodeResult(
+                    status="waiting_user",
+                    output={
+                        **output,
+                        "approvalSnapshot": snapshot,
+                        "snapshotDigest": digest_json(snapshot),
+                    },
+                    artifacts=artifacts,
+                    error=ExecutionError(
+                        code="PAGE_DRIFT",
+                        message=message,
+                        details=drift.model_dump(),
+                    ),
+                )
+            # 漂移已获得一次性授权，继续按只读或提交语义处理当前页面。
         if node.config.get("submit"):
             form_values = inputs.get("formValues", {})
             fingerprint = observed.fingerprint or digest_json(observed_data)
@@ -750,6 +816,31 @@ class BrowserContractExecutor:
         return NodeResult(status="succeeded", output=output, artifacts=artifacts)
 
     @staticmethod
+    def _drift_snapshot(
+        context: RunContext,
+        node: WorkflowNode,
+        observed: ObservedPage,
+        form_values: dict[str, Any],
+        drift: dict[str, Any],
+        drift_digest: str,
+    ) -> dict[str, Any]:
+        return {
+            "runId": context.run_id,
+            "nodeId": node.id,
+            "title": f"确认页面变化 {node.display_name}",
+            "description": "页面存在可解释变化。批准仅代表允许重新评估并继续，不代表动作已经完成。",
+            "payload": {
+                "target": observed.url,
+                "identity": observed.identity,
+                "businessObject": observed.business_object,
+                "formValues": form_values,
+                "drift": drift,
+            },
+            "effect": "browser.drift",
+            "driftAuthorization": drift_digest,
+        }
+
+    @staticmethod
     def _authorization_snapshot(
         context: RunContext,
         node: WorkflowNode,
@@ -780,16 +871,15 @@ class ArtifactExecutor:
     async def execute(
         self, context: RunContext, node: WorkflowNode, inputs: dict[str, Any]
     ) -> NodeResult:
-        settings = get_settings()
         context.cancellation.check()
         name = Path(node.config.get("name", f"{node.id}.json")).name
         media_type = node.config.get("mediaType", "application/json")
         artifact_id = str(uuid4())
-        run_root = (settings.artifact_root / context.run_id).resolve()
-        run_root.mkdir(parents=True, exist_ok=True)
-        storage_key = artifact_id
-        target = (run_root / storage_key).resolve()
-        if not target.is_relative_to(run_root):
+        # 先写暂存目录；CAS 成功后由编排器原子落位并登记。
+        staging = _staging_dir(context.run_id, context.node_run_id)
+        staging.mkdir(parents=True, exist_ok=True)
+        target = (staging / artifact_id).resolve()
+        if not target.is_relative_to(staging):
             return NodeResult(
                 status="failed",
                 error=ExecutionError(code="PERMISSION_DENIED", message="Artifact 路径越界"),
@@ -808,13 +898,18 @@ class ArtifactExecutor:
             "sha256": sha256,
             "size": len(content),
             "mediaType": media_type,
-            "storageKey": storage_key,
+            "storageKey": artifact_id,
+            "stagingKey": {"nodeRunId": context.node_run_id, "file": artifact_id},
             "metadata": {"nodeId": node.id},
         }
         return NodeResult(
             status="succeeded",
             output={
-                "artifact": {key: value for key, value in artifact.items() if key != "storageKey"}
+                "artifact": {
+                    key: value
+                    for key, value in artifact.items()
+                    if key not in ("storageKey", "stagingKey")
+                }
             },
             artifacts=[artifact],
         )

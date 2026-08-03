@@ -28,7 +28,7 @@ async def seed() -> str:
             component = await _create_component(
                 session,
                 name="确定性问候",
-                description="输入姓名，由 Direct 节点生成结构化问候；不加载任何模型。",
+                description="输入姓名，Direct 节点生成结构化问候 greeting 欢迎语，不加载模型。",
                 workflow_name="问候工作流",
                 definition=definition,
                 validation={
@@ -72,6 +72,39 @@ async def seed() -> str:
                         }
                     ],
                 },
+            )
+        if await session.scalar(select(Component).where(Component.name == "反馈分类")) is None:
+            hybrid = _hybrid_workflow()
+            await _create_component(
+                session,
+                name="反馈分类",
+                description="固定 DAG 中单个 LLM 节点做分类，仅显式节点产生 Token。",
+                workflow_name="反馈分类工作流",
+                definition=hybrid,
+                validation={"diagnostics": [], "executionClass": "hybrid"},
+            )
+        agent_exists = await session.scalar(
+            select(Component).where(Component.name == "受限 Agent 摘要")
+        )
+        if agent_exists is None:
+            agent = _agent_workflow()
+            await _create_component(
+                session,
+                name="受限 Agent 摘要",
+                description="固化后的受限 Agent 节点，用于演示 Agent 类组件运行。",
+                workflow_name="Agent 摘要工作流",
+                definition=agent,
+                validation={"diagnostics": [], "executionClass": "agent"},
+            )
+        if await session.scalar(select(Component).where(Component.name == "费用提交")) is None:
+            browser = _browser_workflow()
+            await _create_component(
+                session,
+                name="费用提交",
+                description="浏览器契约填写并提交，需一次性授权；页面/身份变化即失效。",
+                workflow_name="费用提交工作流",
+                definition=browser,
+                validation={"diagnostics": [], "executionClass": "zero_llm"},
             )
         await session.commit()
         return component.id
@@ -165,6 +198,181 @@ def _weather_workflow(snapshot_id: str) -> dict:
             "edges": [
                 {"source": "input", "target": "weather"},
                 {"source": "weather", "target": "output"},
+            ],
+        },
+    }
+
+
+def _hybrid_workflow() -> dict:
+    output_schema = {
+        "type": "object",
+        "properties": {"category": {"type": "string"}},
+        "required": ["category"],
+        "additionalProperties": False,
+    }
+    return {
+        "apiVersion": "workflow.platform/v1",
+        "kind": "Workflow",
+        "metadata": {"name": "feedback-classify"},
+        "spec": {
+            "inputSchema": {
+                "type": "object",
+                "properties": {"text": {"type": "string", "title": "反馈内容"}},
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+            "outputSchema": output_schema,
+            "nodes": [
+                {"id": "input", "type": "input", "displayName": "输入"},
+                {
+                    "id": "classify",
+                    "type": "llm",
+                    "displayName": "分类",
+                    "input": {"text": "${input.text}"},
+                    "config": {
+                        "modelProfile": "fake",
+                        "outputSchema": output_schema,
+                        "fakeOutput": {"category": "feedback"},
+                        "prompt": "对以下反馈分类：{input}",
+                    },
+                },
+                {
+                    "id": "output",
+                    "type": "output",
+                    "displayName": "输出",
+                    "input": {"category": "${classify.output.category}"},
+                },
+            ],
+            "edges": [
+                {"source": "input", "target": "classify"},
+                {"source": "classify", "target": "output"},
+            ],
+        },
+    }
+
+
+def _agent_workflow() -> dict:
+    output_schema = {
+        "type": "object",
+        "properties": {"summary": {"type": "string"}},
+        "required": ["summary"],
+        "additionalProperties": False,
+    }
+    return {
+        "apiVersion": "workflow.platform/v1",
+        "kind": "Workflow",
+        "metadata": {"name": "agent-summary"},
+        "spec": {
+            "inputSchema": {
+                "type": "object",
+                "properties": {"topic": {"type": "string", "title": "主题"}},
+                "required": ["topic"],
+                "additionalProperties": False,
+            },
+            "outputSchema": output_schema,
+            "nodes": [
+                {"id": "input", "type": "input", "displayName": "输入"},
+                {
+                    "id": "agent",
+                    "type": "agent",
+                    "displayName": "受限 Agent",
+                    "input": {"topic": "${input.topic}"},
+                    "config": {
+                        "agentProfile": "fake",
+                        "outputSchema": output_schema,
+                        "fakeOutput": {"summary": "已完成受限 Agent 摘要"},
+                        "maxSteps": 3,
+                        "maxTotalTokens": 500,
+                        "allowedCapabilities": [],
+                    },
+                },
+                {
+                    "id": "output",
+                    "type": "output",
+                    "displayName": "输出",
+                    "input": {"summary": "${agent.output.summary}"},
+                },
+            ],
+            "edges": [
+                {"source": "input", "target": "agent"},
+                {"source": "agent", "target": "output"},
+            ],
+        },
+    }
+
+
+def _browser_workflow() -> dict:
+    contract = {
+        "contractVersion": "1",
+        "urlPattern": "https://forms.example.org/apply*",
+        "pageIdentity": {"identity": "user-1", "businessObject": "expense"},
+        "fields": [
+            {
+                "id": "amount",
+                "required": True,
+                "type": "number",
+                "locator": {"role": "spinbutton", "label": "金额"},
+            }
+        ],
+        "submit": {"role": "button", "name": "提交申请"},
+    }
+    return {
+        "apiVersion": "workflow.platform/v1",
+        "kind": "Workflow",
+        "metadata": {"name": "expense-submit"},
+        "spec": {
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "observedPage": {"type": "object", "title": "观察页面"},
+                    "formValues": {"type": "object", "title": "表单值"},
+                },
+                "required": ["observedPage", "formValues"],
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "businessId": {"type": "string"},
+                    "evidence": {"type": "object"},
+                },
+                "required": ["status", "businessId", "evidence"],
+            },
+            "nodes": [
+                {"id": "input", "type": "input", "displayName": "输入"},
+                {
+                    "id": "submit",
+                    "type": "browser",
+                    "displayName": "提交表单",
+                    "input": {
+                        "observedPage": "${input.observedPage}",
+                        "formValues": "${input.formValues}",
+                    },
+                    "config": {
+                        "pageContract": contract,
+                        "submit": True,
+                        "fakeSubmitResult": {
+                            "status": "succeeded",
+                            "businessId": "EXP-DEMO-001",
+                        },
+                    },
+                    "sideEffect": True,
+                    "idempotent": False,
+                },
+                {
+                    "id": "output",
+                    "type": "output",
+                    "displayName": "输出",
+                    "input": {
+                        "status": "${submit.output.status}",
+                        "businessId": "${submit.output.businessId}",
+                        "evidence": "${submit.output.evidence}",
+                    },
+                },
+            ],
+            "edges": [
+                {"source": "input", "target": "submit"},
+                {"source": "submit", "target": "output"},
             ],
         },
     }

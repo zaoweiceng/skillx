@@ -1,22 +1,15 @@
+import Form from '@rjsf/core'
+import validator from '@rjsf/validator-ajv8'
 import { Bot, CornerDownLeft, Link2Off, MessageSquareText, Plus } from 'lucide-react'
 import { FormEvent, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 
-import { api } from '@/api/client'
+import { api, ChatMessageContent } from '@/api/client'
 
 type Message = {
   id: string
   role: string
-  content: {
-    type: string
-    text: string
-    code?: string
-    componentId?: string
-    componentName?: string
-    runId?: string
-    conversationRunId?: string
-    required?: string[]
-  }
+  content: ChatMessageContent
 }
 
 export default function ChatPage() {
@@ -26,6 +19,10 @@ export default function ChatPage() {
   const [sending, setSending] = useState(false)
   const [error, setError] = useState('')
   const [drafts, setDrafts] = useState<Record<string, string>>({})
+  // 候选卡片补参与降级状态，按消息 id 索引。
+  const [candidateInputs, setCandidateInputs] = useState<Record<string, Record<string, unknown>>>({})
+  const [dismissed, setDismissed] = useState<Record<string, boolean>>({})
+  const [confirming, setConfirming] = useState('')
 
   useEffect(() => {
     api
@@ -33,6 +30,11 @@ export default function ChatPage() {
       .then((item) => setConversationId(item.id))
       .catch((reason: Error) => setError(reason.message))
   }, [])
+
+  async function refresh() {
+    const conversation = await api.getConversation(conversationId)
+    setMessages(conversation.messages)
+  }
 
   async function send(event: FormEvent) {
     event.preventDefault()
@@ -48,12 +50,30 @@ export default function ChatPage() {
     setMessages((current) => [...current, optimistic])
     try {
       await api.sendMessage(conversationId, text)
-      const conversation = await api.getConversation(conversationId)
-      setMessages(conversation.messages)
+      await refresh()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '发送失败')
     } finally {
       setSending(false)
+    }
+  }
+
+  async function startComponent(message: Message) {
+    const content = message.content
+    if (!content.componentId || !content.candidateToken) return
+    setConfirming(message.id)
+    setError('')
+    try {
+      await api.confirmComponent(conversationId, {
+        componentId: content.componentId,
+        candidateToken: content.candidateToken,
+        inputs: candidateInputs[message.id] ?? {},
+      })
+      await refresh()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '组件启动失败')
+    } finally {
+      setConfirming('')
     }
   }
 
@@ -67,6 +87,56 @@ export default function ChatPage() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '固化失败')
     }
+  }
+
+  function renderCandidate(message: Message) {
+    const content = message.content
+    if (dismissed[message.id]) {
+      return <span className="effect-label">已选择继续通用 Agent，未启动组件。</span>
+    }
+    return (
+      <div className="candidate-card">
+        <div className="candidate-meta">
+          <strong>候选组件：{content.componentName}</strong>
+          {typeof content.confidence === 'number' && (
+            <span className="effect-label">置信度 {(content.confidence * 100).toFixed(0)}%</span>
+          )}
+          {content.reason && <span className="candidate-reason">匹配依据：{content.reason}</span>}
+        </div>
+        {content.inputSchema && (
+          <Form
+            schema={content.inputSchema}
+            uiSchema={content.uiSchema ?? {}}
+            validator={validator}
+            formData={candidateInputs[message.id] ?? {}}
+            onChange={(event) =>
+              setCandidateInputs((current) => ({
+                ...current,
+                [message.id]: (event.formData as Record<string, unknown>) ?? {},
+              }))
+            }
+            onSubmit={() => startComponent(message)}
+          >
+            <div className="candidate-actions">
+              <button
+                className="button primary"
+                type="submit"
+                disabled={confirming === message.id || !content.candidateToken}
+              >
+                {confirming === message.id ? '正在启动...' : '使用该组件'}
+              </button>
+              <button
+                className="button ghost"
+                type="button"
+                onClick={() => setDismissed((current) => ({ ...current, [message.id]: true }))}
+              >
+                继续通用 Agent
+              </button>
+            </div>
+          </Form>
+        )}
+      </div>
+    )
   }
 
   return (
@@ -113,12 +183,7 @@ export default function ChatPage() {
                 {message.content.code && (
                   <span className="error-code">{message.content.code}</span>
                 )}
-                {message.content.type === 'component_candidate' && (
-                  <span className="effect-label">
-                    候选组件：{message.content.componentName} · 待补参数{' '}
-                    {(message.content.required ?? []).join(', ') || '无'}
-                  </span>
-                )}
+                {message.content.type === 'component_candidate' && renderCandidate(message)}
                 {message.content.runId && (
                   <Link className="button ghost" to={`/runs/${message.content.runId}`}>
                     查看运行

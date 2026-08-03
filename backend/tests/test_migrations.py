@@ -28,5 +28,10 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
-    assert revision == ("0005",)
+        run_type_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(conversation_runs)")
+        }
+    assert revision == ("0006",)
     assert {"runs", "capability_versions", "mcp_tool_snapshots", "distillations"} <= tables
+    assert "run_type" in run_type_columns

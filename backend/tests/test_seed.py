@@ -12,4 +12,5 @@ async def test_seed_is_idempotent() -> None:
         count = await session.scalar(select(func.count()).select_from(Component))
 
     assert first == second
-    assert count == 2
+    # 六条 Demo 场景中，可作为组件直接启动的有 5 个（E2E-4 走对话候选，不单独 seed 组件）。
+    assert count == 5

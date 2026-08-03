@@ -10,6 +10,7 @@ from uuid import uuid4
 from jsonschema import Draft202012Validator
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.capabilities import CapabilityResolutionError, resolve_skillx_node
@@ -33,6 +34,8 @@ from app.runtime.executors import (
     ExecutionCancelledError,
     ExecutorRegistry,
     RunContext,
+    clear_staging,
+    promote_staged_artifact,
 )
 
 FINAL_RUN_STATES = {"succeeded", "failed", "cancelled"}
@@ -550,19 +553,22 @@ class WorkerService:
             if version is None:
                 continue
             definition = WorkflowDefinition.model_validate(version.definition_json)
-            active = await session.scalar(
+            max_parallel = definition.spec.policies.max_parallel_nodes
+            # 将并发配额检查折叠进领取 UPDATE：running 计数与所有权 CAS 是同一条
+            # 原子语句。SQLite 串行化写入，两个 Worker 不会同时越过 Run 级上限。
+            running_slots = (
                 select(func.count())
                 .select_from(NodeRun)
                 .where(NodeRun.run_id == run.id, NodeRun.status == "running")
+                .scalar_subquery()
             )
-            if (active or 0) >= definition.spec.policies.max_parallel_nodes:
-                continue
             result = await session.execute(
                 update(NodeRun)
                 .where(
                     NodeRun.id == candidate.id,
                     NodeRun.status.in_(["ready", "retry_waiting"]),
                     NodeRun.attempt == candidate.attempt,
+                    running_slots < max_parallel,
                 )
                 .values(
                     status="running",
@@ -818,6 +824,8 @@ class WorkerService:
                 .values(**values)
             )
             if cas.rowcount != 1:
+                # 节点已被接管、取消或此结果迟到：清理暂存文件，避免留下孤儿 Artifact。
+                clear_staging(claimed.run_id, claimed.node_run_id)
                 await append_event(
                     session,
                     claimed.run_id,
@@ -844,6 +852,8 @@ class WorkerService:
             if result.status == "waiting_user":
                 await self._create_approval(session, claimed, result)
             for item in result.artifacts:
+                # CAS 已成功，先把暂存文件原子落位再登记数据库记录。
+                promote_staged_artifact(claimed.run_id, item)
                 session.add(
                     Artifact(
                         id=item["id"],
@@ -871,6 +881,8 @@ class WorkerService:
                     },
                     claimed.node_run_id,
                 )
+            # 无论结果如何，落位后清理该 node_run 的剩余暂存文件。
+            clear_staging(claimed.run_id, claimed.node_run_id)
             if result.status == "failed":
                 await self._schedule_retry(session, claimed, result)
 
@@ -983,10 +995,15 @@ class WorkerService:
         )
 
     async def run_once(self) -> bool:
-        async with SessionLocal() as session, session.begin():
-            await self.recover_expired(session)
-        async with SessionLocal() as session, session.begin():
-            claimed = await self.claim(session)
+        with suppress(OperationalError):
+            async with SessionLocal() as session, session.begin():
+                await self.recover_expired(session)
+        try:
+            async with SessionLocal() as session, session.begin():
+                claimed = await self.claim(session)
+        except OperationalError:
+            # 并发写入竞争（SQLite 快照冲突/锁定）：本轮不领取，交由下一轮重试。
+            return False
         if claimed is None:
             return False
         await self.execute_claimed(claimed)

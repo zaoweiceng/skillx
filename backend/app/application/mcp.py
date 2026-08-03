@@ -1,24 +1,35 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
 
+import httpx
+from jsonschema import Draft202012Validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.compiler import digest_json
-from app.application.secrets import SecretResolutionError, resolve_secret_handles
+from app.application.secrets import (
+    SecretResolutionError,
+    contains_secret,
+    redact_secret_text,
+    resolve_secret_handles,
+)
 from app.config import get_settings
 from app.infrastructure.database import (
     MCPServer,
     MCPServerVersion,
     MCPToolSnapshot,
+    WorkflowVersion,
 )
 from app.runtime.adapters import (
+    AdapterError,
     MCPGateway,
     StdioMCPGateway,
     StreamableHttpMCPGateway,
@@ -27,6 +38,14 @@ from app.runtime.adapters import (
 
 class MCPConfigurationError(ValueError):
     pass
+
+
+class MCPContractDriftError(MCPConfigurationError):
+    """同一 ServerVersion 下同名 Tool 的契约 digest 发生变化。
+
+    远端服务在配置不变时升级了 Tool 的输入/输出 Schema，静默复用旧快照会破坏
+    历史可复现性。必须注册新的 ServerVersion 而不是覆盖既有快照。
+    """
 
 
 def validate_server_config(
@@ -159,6 +178,20 @@ async def discover_tools(
     resolved_config, _ = await resolve_server_config(session, version.config_json)
     async with open_gateway(server.transport, resolved_config) as gateway:
         descriptors = await gateway.discover()
+    discovered_names = {descriptor.name for descriptor in descriptors}
+    existing_snapshots = (
+        await session.scalars(
+            select(MCPToolSnapshot).where(MCPToolSnapshot.server_version_id == version.id)
+        )
+    ).all()
+    # Tool 在同一 ServerVersion 下消失，同样破坏契约锁定，必须显式感知。
+    disappeared = sorted(
+        item.name for item in existing_snapshots if item.name not in discovered_names
+    )
+    if disappeared:
+        raise MCPContractDriftError(
+            "MCP Tool 在同一 ServerVersion 下消失: " + ", ".join(disappeared)
+        )
     snapshots: list[MCPToolSnapshot] = []
     for descriptor in descriptors:
         contract = {
@@ -167,6 +200,7 @@ async def discover_tools(
             "inputSchema": descriptor.input_schema,
             "outputSchema": descriptor.output_schema,
         }
+        contract_digest = digest_json(contract)
         existing = await session.scalar(
             select(MCPToolSnapshot).where(
                 MCPToolSnapshot.server_version_id == version.id,
@@ -174,6 +208,11 @@ async def discover_tools(
             )
         )
         if existing:
+            if existing.digest != contract_digest:
+                raise MCPContractDriftError(
+                    f"MCP Tool {descriptor.name} 的契约 digest 已变化，"
+                    "请注册新的 ServerVersion 而非静默覆盖"
+                )
             snapshots.append(existing)
             continue
         snapshot = MCPToolSnapshot(
@@ -183,7 +222,7 @@ async def discover_tools(
             description=descriptor.description,
             input_schema_json=descriptor.input_schema,
             output_schema_json=descriptor.output_schema,
-            digest=digest_json(contract),
+            digest=contract_digest,
             side_effect="none",
             idempotent=True,
             timeout_seconds=version.config_json.get("timeoutSeconds", 30),
@@ -192,6 +231,86 @@ async def discover_tools(
         snapshots.append(snapshot)
     await session.flush()
     return snapshots
+
+
+async def scan_dependent_workflows(
+    session: AsyncSession,
+    server_id: str,
+    new_server_version_id: str,
+) -> list[dict[str, Any]]:
+    """扫描依赖某 MCP Server 早期 ToolSnapshot 的 WorkflowVersion。
+
+    对每个受影响的 WorkflowVersion，比较其锁定的 Tool 与新 ServerVersion 中同名
+    Tool 的契约 digest：digest 一致标记为 compatible，变化或消失标记为 breaking。
+    仅做只读分析，不修改任何已发布版本。
+    """
+
+    new_snapshots = (
+        await session.scalars(
+            select(MCPToolSnapshot).where(
+                MCPToolSnapshot.server_version_id == new_server_version_id
+            )
+        )
+    ).all()
+    new_by_name = {item.name: item for item in new_snapshots}
+    # 该 Server 所有 ServerVersion 下的快照 id → (toolName, digest)。
+    server_versions = (
+        await session.scalars(
+            select(MCPServerVersion.id).where(MCPServerVersion.server_id == server_id)
+        )
+    ).all()
+    server_snapshots = (
+        await session.scalars(
+            select(MCPToolSnapshot).where(
+                MCPToolSnapshot.server_version_id.in_(server_versions)
+            )
+        )
+    ).all()
+    snapshot_by_id = {item.id: item for item in server_snapshots}
+
+    results: list[dict[str, Any]] = []
+    versions = (await session.scalars(select(WorkflowVersion))).all()
+    for workflow_version in versions:
+        locks = (workflow_version.validation_json or {}).get("mcpLocks") or []
+        findings: list[dict[str, Any]] = []
+        for lock in locks:
+            locked = snapshot_by_id.get(lock.get("mcpToolSnapshotId"))
+            if locked is None:
+                continue
+            if locked.server_version_id == new_server_version_id:
+                continue  # 已锁定到新版本本身，无需比较。
+            candidate = new_by_name.get(locked.name)
+            if candidate is None:
+                findings.append(
+                    {"toolName": locked.name, "status": "breaking", "reason": "tool_removed"}
+                )
+            elif candidate.digest != locked.digest:
+                findings.append(
+                    {
+                        "toolName": locked.name,
+                        "status": "breaking",
+                        "reason": "contract_changed",
+                        "newSnapshotId": candidate.id,
+                    }
+                )
+            else:
+                findings.append(
+                    {
+                        "toolName": locked.name,
+                        "status": "compatible",
+                        "newSnapshotId": candidate.id,
+                    }
+                )
+        if findings:
+            results.append(
+                {
+                    "workflowVersionId": workflow_version.id,
+                    "workflowId": workflow_version.workflow_id,
+                    "findings": findings,
+                    "hasBreaking": any(item["status"] == "breaking" for item in findings),
+                }
+            )
+    return results
 
 
 async def validate_mcp_nodes(
@@ -273,3 +392,117 @@ async def call_tool_snapshot(
     resolved_config, _ = await resolve_server_config(session, version.config_json)
     async with open_gateway(server.transport, resolved_config) as gateway:
         return await gateway.call(snapshot.name, arguments)
+
+
+def normalize_mcp_output(raw: dict[str, Any]) -> dict[str, Any]:
+    """把 MCP Tool 原始响应归一化为结构化对象。"""
+
+    structured = raw.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+    for item in raw.get("content", []):
+        if item.get("type") == "text":
+            parsed = json.loads(item.get("text", "{}"))
+            if isinstance(parsed, dict):
+                return parsed
+    if isinstance(raw, dict) and "content" not in raw:
+        return raw
+    raise ValueError("MCP Tool 未返回结构化对象")
+
+
+@dataclass
+class MCPCallOutcome:
+    status: str  # "succeeded" | "failed"
+    output: dict[str, Any] | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    retryable: bool = False
+    tool_name: str | None = None
+    tool_digest: str | None = None
+
+
+async def call_mcp_contract(
+    transport: str,
+    server_config: dict[str, Any],
+    tool_name: str,
+    tool_digest: str,
+    input_schema: dict[str, Any],
+    output_schema: dict[str, Any] | None,
+    arguments: dict[str, Any],
+    secret_values: list[str],
+) -> MCPCallOutcome:
+    """MCP 单一调用路径：输入校验 → 调用 → 归一化 → 输出校验 → 脱敏 → 错误映射。
+
+    Workflow Executor 与 `/mcp-tools/{id}/test` 共用此函数，保证“测试成功”与真实
+    节点运行行为一致。
+    """
+
+    errors = list(Draft202012Validator(input_schema).iter_errors(arguments))
+    if errors:
+        return MCPCallOutcome(
+            status="failed",
+            error_code="INVALID_INPUT",
+            error_message=errors[0].message,
+            tool_name=tool_name,
+            tool_digest=tool_digest,
+        )
+    try:
+        async with open_gateway(transport, server_config) as gateway:
+            raw = await gateway.call(tool_name, arguments)
+        output = normalize_mcp_output(raw)
+        if contains_secret(output, secret_values):
+            raise ValueError("MCP Tool 输出包含 Secret，已阻止持久化")
+        if output_schema:
+            Draft202012Validator(output_schema).validate(output)
+        return MCPCallOutcome(
+            status="succeeded",
+            output=output,
+            tool_name=tool_name,
+            tool_digest=tool_digest,
+        )
+    except (AdapterError, httpx.HTTPError, TimeoutError) as exc:
+        # 传输层不可用（超时、连接失败、HTTP 状态错误、进程退出）映射为可重试依赖错误。
+        return MCPCallOutcome(
+            status="failed",
+            error_code="DEPENDENCY_UNAVAILABLE",
+            error_message=redact_secret_text(str(exc), secret_values),
+            retryable=True,
+            tool_name=tool_name,
+            tool_digest=tool_digest,
+        )
+    except Exception as exc:
+        message = redact_secret_text(str(exc), secret_values)
+        return MCPCallOutcome(
+            status="failed",
+            error_code="CONTRACT_VIOLATION",
+            error_message=f"MCP Tool 输出不符合契约: {message}",
+            tool_name=tool_name,
+            tool_digest=tool_digest,
+        )
+
+
+async def call_snapshot_through_contract(
+    session: AsyncSession,
+    snapshot_id: str,
+    arguments: dict[str, Any],
+) -> MCPCallOutcome:
+    """从 ToolSnapshot 解析上下文并走统一契约调用路径（供测试接口使用）。"""
+
+    snapshot = await session.get(MCPToolSnapshot, snapshot_id)
+    if snapshot is None:
+        raise MCPConfigurationError("MCP ToolSnapshot 不存在")
+    version = await session.get(MCPServerVersion, snapshot.server_version_id)
+    server = await session.get(MCPServer, version.server_id if version else "")
+    if version is None or server is None:
+        raise MCPConfigurationError("MCP ServerVersion 不存在")
+    resolved_config, secret_values = await resolve_server_config(session, version.config_json)
+    return await call_mcp_contract(
+        transport=server.transport,
+        server_config=resolved_config,
+        tool_name=snapshot.name,
+        tool_digest=snapshot.digest,
+        input_schema=snapshot.input_schema_json,
+        output_schema=snapshot.output_schema_json,
+        arguments=arguments,
+        secret_values=secret_values,
+    )

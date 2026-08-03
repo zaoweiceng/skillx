@@ -262,6 +262,7 @@ class ConversationRun(Base, TimestampMixin):
         ForeignKey("conversations.id", ondelete="CASCADE"), index=True
     )
     status: Mapped[str] = mapped_column(String(20))
+    run_type: Mapped[str] = mapped_column(String(24), default="agent_run")
     input_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     output_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     trajectory_json: Mapped[dict[str, Any]] = mapped_column(JSON)

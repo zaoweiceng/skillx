@@ -59,6 +59,43 @@ export default function ComponentDetailPage() {
         </span>
       </header>
 
+      {(component.businessView || component.technicalView) && (
+        <section className="dual-view">
+          <div className="panel dual-view-card">
+            <span className="eyebrow">BUSINESS VIEW</span>
+            <ul className="dual-view-list">
+              <li>
+                副作用节点：{component.businessView?.sideEffectNodes.length ?? 0} 个
+                {(component.businessView?.sideEffectNodes ?? []).map((node) => (
+                  <span className="metric-chip" key={node.nodeId}>
+                    {node.displayName ?? node.nodeId}
+                  </span>
+                ))}
+              </li>
+              <li>需确认节点：{component.businessView?.confirmationNodes.length ?? 0} 个</li>
+              <li>
+                最近成功率：
+                {component.businessView?.recentSuccessRate === null ||
+                component.businessView?.recentSuccessRate === undefined
+                  ? '暂无运行'
+                  : `${(component.businessView.recentSuccessRate * 100).toFixed(0)}% （近 ${component.businessView.recentRunCount} 次）`}
+              </li>
+            </ul>
+          </div>
+          <div className="panel dual-view-card">
+            <span className="eyebrow">TECHNICAL VIEW</span>
+            <ul className="dual-view-list">
+              <li>节点数：{component.technicalView?.nodeCount ?? 0}</li>
+              <li>能力锁定：{component.technicalView?.capabilityLocks.length ?? 0} 项</li>
+              <li>MCP 锁定：{component.technicalView?.mcpLocks.length ?? 0} 项</li>
+              {component.technicalView?.digest && (
+                <li className="digest-line">digest：{component.technicalView.digest}</li>
+              )}
+            </ul>
+          </div>
+        </section>
+      )}
+
       <section className="detail-grid">
         <div className="graph-panel panel">
           <div className="panel-heading">

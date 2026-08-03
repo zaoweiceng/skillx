@@ -1266,6 +1266,147 @@ button {
   margin-bottom: 16px;
 }
 
+.candidate-card {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  display: grid;
+  gap: 10px;
+}
+
+.candidate-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.candidate-reason {
+  font-size: 11px;
+  color: var(--muted, #888);
+}
+
+.candidate-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.node-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.metric-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  margin-left: 6px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  font-size: 11px;
+  color: var(--muted, #888);
+}
+
+.dual-view {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.dual-view-card {
+  padding: 14px;
+}
+
+.dual-view-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.digest-line {
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  color: var(--muted, #888);
+  word-break: break-all;
+}
+
+.node-inspector {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+}
+
+.inspector-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.inspector-fields {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.inspector-fields > div {
+  display: grid;
+  grid-template-columns: 100px 1fr;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.inspector-fields dt {
+  color: var(--muted, #888);
+}
+
+.inspector-fields dd {
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.variable-chip {
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  background: rgba(63, 140, 255, 0.08);
+  font-size: 11px;
+}
+
+.inspector-empty {
+  color: var(--muted, #888);
+  font-size: 12px;
+}
+
+.risk-summary {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(220, 101, 79, 0.06);
+}
+
+.risk-summary ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+}
+
 .registry-summary > div {
   display: grid;
   min-height: 88px;

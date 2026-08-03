@@ -4,6 +4,7 @@ import { Link, useParams } from 'react-router-dom'
 
 import { api, type Workflow, type WorkflowDefinition } from '@/api/client'
 import { WorkflowGraph } from '@/components/WorkflowGraph'
+import { outputVariables, reachableUpstream } from '@/lib/variablePicker'
 
 type Diagnostic = { level: string; code: string; path: string; message: string }
 
@@ -15,6 +16,7 @@ export default function WorkflowEditorPage() {
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [selectedNodeId, setSelectedNodeId] = useState('')
 
   useEffect(() => {
     if (!id) return
@@ -34,6 +36,22 @@ export default function WorkflowEditorPage() {
       return undefined
     }
   }, [source])
+
+  const inspector = useMemo(() => {
+    if (!preview || !selectedNodeId) return undefined
+    const node = preview.spec.nodes.find((item) => item.id === selectedNodeId)
+    if (!node) return undefined
+    const upstream = reachableUpstream(preview, selectedNodeId)
+    const variables = upstream.flatMap((nodeId) => outputVariables(preview, nodeId))
+    return { node, variables }
+  }, [preview, selectedNodeId])
+
+  const riskSummary = useMemo(() => {
+    if (!preview) return []
+    return preview.spec.nodes
+      .filter((node) => node.sideEffect || ['approval', 'browser'].includes(node.type))
+      .map((node) => `${node.displayName}（${node.type}）需要确认或存在副作用`)
+  }, [preview])
 
   async function save(): Promise<Workflow | undefined> {
     if (!workflow || !id) return
@@ -148,6 +166,63 @@ export default function WorkflowEditorPage() {
               </div>
             ))}
           </div>
+          {preview && (
+            <div className="node-inspector">
+              <div className="inspector-heading">
+                <span className="eyebrow">NODE INSPECTOR</span>
+                <select
+                  aria-label="选择节点"
+                  value={selectedNodeId}
+                  onChange={(event) => setSelectedNodeId(event.target.value)}
+                >
+                  <option value="">选择节点查看契约</option>
+                  {preview.spec.nodes.map((node) => (
+                    <option key={node.id} value={node.id}>
+                      {node.displayName}（{node.type}）
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {inspector && (
+                <div className="inspector-body">
+                  <dl className="inspector-fields">
+                    <div>
+                      <dt>类型</dt>
+                      <dd>{inspector.node.type}</dd>
+                    </div>
+                    <div>
+                      <dt>副作用</dt>
+                      <dd>{inspector.node.sideEffect ? '是' : '否'}</dd>
+                    </div>
+                    <div>
+                      <dt>可达上游变量</dt>
+                      <dd>
+                        {inspector.variables.length === 0 ? (
+                          <span className="inspector-empty">无上游可引用输出</span>
+                        ) : (
+                          inspector.variables.map((variable) => (
+                            <code className="variable-chip" key={variable}>
+                              {variable}
+                            </code>
+                          ))
+                        )}
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+              )}
+            </div>
+          )}
+          {riskSummary.length > 0 && (
+            <div className="risk-summary">
+              <span className="eyebrow">PRE-PUBLISH RISK</span>
+              <ul>
+                {riskSummary.map((line) => (
+                  <li key={line}>{line}</li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       </section>
     </div>

@@ -4,6 +4,7 @@ export type NodeDefinition = {
   displayName: string
   input?: Record<string, unknown>
   config?: Record<string, unknown>
+  sideEffect?: boolean
 }
 
 export type WorkflowDefinition = {
@@ -28,6 +29,18 @@ export type ComponentSummary = {
   visibility: string
   executionClass: 'zero_llm' | 'hybrid' | 'agent'
   definition?: WorkflowDefinition
+  businessView?: {
+    sideEffectNodes: Array<{ nodeId: string; type: string; displayName?: string }>
+    confirmationNodes: Array<{ nodeId: string; type: string }>
+    recentSuccessRate: number | null
+    recentRunCount: number
+  }
+  technicalView?: {
+    digest: string | null
+    capabilityLocks: unknown[]
+    mcpLocks: unknown[]
+    nodeCount: number
+  }
 }
 
 export type NodeRun = {
@@ -39,6 +52,10 @@ export type NodeRun = {
   input: Record<string, unknown>
   output: Record<string, unknown> | null
   error: Record<string, unknown> | null
+  startedAt?: string | null
+  finishedAt?: string | null
+  durationMs?: number | null
+  metrics?: Record<string, unknown>
 }
 
 export type Approval = {
@@ -76,6 +93,13 @@ export type Run = {
     sha256: string
     downloadUrl: string
   }>
+  dependencyVersions?: {
+    workflowVersionId: string
+    workflowDigest: string | null
+    executionClass?: string | null
+    capabilityLocks?: unknown[]
+    mcpLocks?: unknown[]
+  }
 }
 
 export type Workflow = {
@@ -85,6 +109,26 @@ export type Workflow = {
   definition: WorkflowDefinition
   createdAt: string
   updatedAt: string
+}
+
+export type ChatMessageContent = {
+  type: string
+  state?: string
+  text: string
+  code?: string
+  componentId?: string
+  componentName?: string
+  workflowVersionId?: string
+  runId?: string
+  conversationRunId?: string
+  runType?: string
+  required?: string[]
+  confidence?: number
+  reason?: string
+  candidateToken?: string
+  inputSchema?: Record<string, unknown>
+  uiSchema?: Record<string, unknown>
+  executionClass?: string
 }
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? '/api'
@@ -185,22 +229,21 @@ export const api = {
       messages: Array<{
         id: string
         role: string
-        content: {
-          type: string
-          text: string
-          code?: string
-          componentId?: string
-          componentName?: string
-          runId?: string
-          conversationRunId?: string
-          required?: string[]
-        }
+        content: ChatMessageContent
       }>
     }>(`/conversations/${id}`),
   sendMessage: (id: string, content: string) =>
-    request<{ userMessageId: string; assistant: { type: string; text: string } }>(
+    request<{ userMessageId: string; assistant: ChatMessageContent }>(
       `/conversations/${id}/messages`,
       { method: 'POST', body: JSON.stringify({ content }) },
+    ),
+  confirmComponent: (
+    conversationId: string,
+    payload: { componentId: string; candidateToken: string; inputs: Record<string, unknown> },
+  ) =>
+    request<{ runId: string; assistant: ChatMessageContent }>(
+      `/conversations/${conversationId}/confirm-component`,
+      { method: 'POST', body: JSON.stringify(payload) },
     ),
   distillConversationRun: (id: string) =>
     request<{

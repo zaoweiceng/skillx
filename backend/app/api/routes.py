@@ -17,15 +17,23 @@ from app.application.capabilities import (
     validate_workflow_capabilities,
 )
 from app.application.compiler import WorkflowCompiler, WorkflowValidationError, digest_json
+from app.application.conversation import (
+    ComponentCandidate,
+    candidate_message,
+    candidate_token,
+    match_component,
+)
 from app.application.distillation import (
     DistillationError,
     distill_conversation_run,
 )
 from app.application.mcp import (
     MCPConfigurationError,
-    call_tool_snapshot,
+    MCPContractDriftError,
+    call_snapshot_through_contract,
     discover_tools,
     register_server,
+    scan_dependent_workflows,
     validate_mcp_nodes,
 )
 from app.application.orchestrator import Orchestrator, append_event
@@ -54,6 +62,7 @@ from app.infrastructure.database import (
     get_session,
     utcnow,
 )
+from app.infrastructure.migrations import alembic_head_revision
 from app.runtime.models import OpenAICompatibleAdapter
 
 router = APIRouter()
@@ -120,6 +129,12 @@ class MessageCreate(BaseModel):
     inputs: dict[str, Any] | None = None
 
 
+class ComponentConfirm(BaseModel):
+    component_id: str = Field(alias="componentId")
+    candidate_token: str = Field(alias="candidateToken")
+    inputs: dict[str, Any] = Field(default_factory=dict)
+
+
 class ConversationRunCreate(BaseModel):
     input: dict[str, Any]
     output: dict[str, Any]
@@ -167,10 +182,19 @@ def run_view(
                 "input": redact(item.input_json),
                 "output": redact(item.output_json),
                 "error": redact(item.error_json),
+                "startedAt": item.started_at,
+                "finishedAt": item.finished_at,
+                "durationMs": _duration_ms(item.started_at, item.finished_at),
             }
             for item in node_runs
         ]
     return payload
+
+
+def _duration_ms(started: Any, finished: Any) -> int | None:
+    if started is None or finished is None:
+        return None
+    return int((finished - started).total_seconds() * 1000)
 
 
 @router.get("/health/live")
@@ -182,8 +206,9 @@ async def health_live() -> dict[str, str]:
 async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str, str]:
     try:
         revision = await session.scalar(text("SELECT version_num FROM alembic_version"))
-        if revision != "0005":
-            raise RuntimeError(f"数据库迁移版本应为 0005，实际为 {revision}")
+        expected = alembic_head_revision()
+        if revision != expected:
+            raise RuntimeError(f"数据库迁移版本应为 {expected}，实际为 {revision}")
         await session.execute(text("CREATE TEMP TABLE IF NOT EXISTS readiness_probe (id INTEGER)"))
         root = get_settings().artifact_root.resolve()
         root.mkdir(parents=True, exist_ok=True)
@@ -428,6 +453,32 @@ async def get_component(
     if item is None:
         raise HTTPException(404, "组件不存在")
     version = await session.get(WorkflowVersion, item.default_version_id)
+    spec = (version.definition_json.get("spec", {}) if version else {}) or {}
+    nodes = spec.get("nodes", [])
+    # 业务/技术双视图：副作用节点、确认要求与能力/MCP 依赖。
+    side_effect_nodes = [
+        {"nodeId": node["id"], "type": node["type"], "displayName": node.get("displayName")}
+        for node in nodes
+        if node.get("sideEffect")
+    ]
+    confirmation_nodes = [
+        {"nodeId": node["id"], "type": node["type"]}
+        for node in nodes
+        if node["type"] in {"approval", "browser"} or node.get("sideEffect")
+    ]
+    validation = version.validation_json if version else {}
+    # 最近成功率（最多取该组件最近 20 次运行）。
+    recent = (
+        await session.scalars(
+            select(Run)
+            .where(Run.component_id == component_id)
+            .order_by(Run.created_at.desc())
+            .limit(20)
+        )
+    ).all()
+    terminal = [r for r in recent if r.status in {"succeeded", "failed", "cancelled"}]
+    success = [r for r in terminal if r.status == "succeeded"]
+    success_rate = round(len(success) / len(terminal), 3) if terminal else None
     return {
         "id": item.id,
         "name": item.name,
@@ -437,6 +488,18 @@ async def get_component(
         "visibility": item.visibility,
         "executionClass": item.execution_class,
         "definition": version.definition_json if version else None,
+        "businessView": {
+            "sideEffectNodes": side_effect_nodes,
+            "confirmationNodes": confirmation_nodes,
+            "recentSuccessRate": success_rate,
+            "recentRunCount": len(terminal),
+        },
+        "technicalView": {
+            "digest": version.digest if version else None,
+            "capabilityLocks": validation.get("capabilityLocks", []),
+            "mcpLocks": validation.get("mcpLocks", []),
+            "nodeCount": len(nodes),
+        },
     }
 
 
@@ -521,6 +584,34 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
         }
         for item in artifacts
     ]
+    # 从事件流聚合每个节点的可观测指标：Token、Agent steps、MCP 调用数与重试次数。
+    events = (
+        await session.scalars(
+            select(RunEvent).where(RunEvent.run_id == run_id).order_by(RunEvent.seq)
+        )
+    ).all()
+    node_metrics: dict[str, dict[str, Any]] = {}
+    for event in events:
+        node_id = event.payload_json.get("nodeId")
+        if node_id is None:
+            continue
+        bucket = node_metrics.setdefault(node_id, {"retries": 0})
+        if event.type == "node.completed":
+            # node.completed 的 metrics 已含 Token/agentSteps/mcpCallCount。
+            bucket.update(event.payload_json.get("metrics") or {})
+        elif event.type == "node.retry_scheduled":
+            bucket["retries"] = bucket.get("retries", 0) + 1
+    for node in result.get("nodes", []):
+        node["metrics"] = node_metrics.get(node["nodeId"], {})
+    # 依赖版本：暴露 WorkflowVersion 锁定的 Capability/MCP digest 摘要。
+    validation = version.validation_json if version else {}
+    result["dependencyVersions"] = {
+        "workflowVersionId": run.workflow_version_id,
+        "workflowDigest": version.digest if version else None,
+        "executionClass": validation.get("executionClass"),
+        "capabilityLocks": validation.get("capabilityLocks", []),
+        "mcpLocks": validation.get("mcpLocks", []),
+    }
     return result
 
 
@@ -562,10 +653,8 @@ async def approve(
     approval.status = "approved"
     approval.decided_by = "local-user"
     approval.decided_at = utcnow()
-    if (
-        node_run.node_type == "browser"
-        and approval.snapshot_json.get("effect") == "form.submit"
-    ):
+    effect = approval.snapshot_json.get("effect")
+    if node_run.node_type == "browser" and effect == "form.submit":
         authorization_digest_value = approval.snapshot_json.get("authorizationDigest")
         if not authorization_digest_value:
             raise HTTPException(409, "浏览器审批缺少服务端授权摘要")
@@ -573,6 +662,18 @@ async def approve(
         node_run.input_json = {
             **node_run.input_json,
             "_authorizationDigest": authorization_digest_value,
+        }
+        node_run.output_json = None
+        node_run.error_json = None
+        node_run.available_at = utcnow()
+    elif node_run.node_type == "browser" and effect == "browser.drift":
+        drift_authorization_value = approval.snapshot_json.get("driftAuthorization")
+        if not drift_authorization_value:
+            raise HTTPException(409, "浏览器审批缺少服务端漂移授权摘要")
+        node_run.status = "ready"
+        node_run.input_json = {
+            **node_run.input_json,
+            "_driftAuthorization": drift_authorization_value,
         }
         node_run.output_json = None
         node_run.error_json = None
@@ -821,6 +922,12 @@ async def discover_mcp_server(
     try:
         snapshots = await discover_tools(session, server.current_version_id)
         await session.commit()
+    except MCPContractDriftError as exc:
+        await session.rollback()
+        raise HTTPException(
+            409,
+            detail={"code": "MCP_CONTRACT_DRIFT", "message": str(exc)},
+        ) from exc
     except Exception as exc:
         await session.rollback()
         raise HTTPException(
@@ -838,6 +945,19 @@ async def discover_mcp_server(
         }
         for item in snapshots
     ]
+
+
+@router.get("/mcp-servers/{server_id}/dependents")
+async def scan_mcp_dependents(
+    server_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    """扫描依赖该 Server 早期 Tool 契约的 WorkflowVersion，标出兼容/破坏性变化。"""
+
+    server = await session.get(MCPServer, server_id)
+    if server is None or not server.current_version_id:
+        raise HTTPException(404, "MCP Server 不存在")
+    return await scan_dependent_workflows(session, server_id, server.current_version_id)
 
 
 @router.post("/mcp-servers/{server_id}/health")
@@ -865,12 +985,28 @@ async def test_mcp_tool(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     try:
-        return await call_tool_snapshot(session, snapshot_id, body.arguments)
-    except Exception as exc:
+        outcome = await call_snapshot_through_contract(session, snapshot_id, body.arguments)
+    except MCPConfigurationError as exc:
         raise HTTPException(
-            502,
-            detail={"code": "MCP_CALL_FAILED", "message": str(exc)},
+            404,
+            detail={"code": "MCP_SNAPSHOT_UNAVAILABLE", "message": str(exc)},
         ) from exc
+    if outcome.status == "succeeded":
+        return {
+            "status": "succeeded",
+            "output": outcome.output,
+            "toolName": outcome.tool_name,
+            "toolDigest": outcome.tool_digest,
+        }
+    # 与 Workflow MCPExecutor 一致的结构化失败结果，而非裸异常。
+    raise HTTPException(
+        502,
+        detail={
+            "code": outcome.error_code or "MCP_CALL_FAILED",
+            "message": outcome.error_message or "MCP 调用失败",
+            "retryable": outcome.retryable,
+        },
+    )
 
 
 @router.post("/capabilities", status_code=201)
@@ -956,129 +1092,18 @@ async def create_message(
     assistant_content: dict[str, Any]
     conversation_run: ConversationRun | None = None
     if component_id:
-        component = await session.get(Component, component_id)
-        version = (
-            await session.get(WorkflowVersion, component.default_version_id) if component else None
+        # 绑定组件或显式指定组件：补参齐全则启动 Workflow，否则请求补参。
+        assistant_content = await _bound_component_message(
+            session, component_id, body.content, body.inputs
         )
-        if component is None or version is None:
-            raise HTTPException(404, "组件或默认版本不存在")
-        schema = version.definition_json["spec"]["inputSchema"]
-        required = schema.get("required", [])
-        inputs = body.inputs
-        if inputs is None and len(required) == 1:
-            inputs = {required[0]: body.content}
-        missing = [field for field in required if not inputs or field not in inputs]
-        if missing:
-            assistant_content = {
-                "type": "component_candidate",
-                "componentId": component.id,
-                "componentName": component.name,
-                "required": missing,
-                "text": "请补充组件必填参数后确认启动。",
-            }
-        else:
-            try:
-                run = await orchestrator.create_run(
-                    session,
-                    version,
-                    inputs or {},
-                    component.id,
-                )
-            except ValueError as exc:
-                raise HTTPException(
-                    422,
-                    detail={"code": "INVALID_INPUT", "message": str(exc)},
-                ) from exc
-            assistant_content = {
-                "type": "component_run",
-                "componentId": component.id,
-                "componentName": component.name,
-                "runId": run.id,
-                "text": "组件已启动，后续执行由 Workflow Runtime 接管。",
-            }
     else:
-        components = (await session.scalars(select(Component))).all()
-        candidate = next(
-            (item for item in components if item.name.lower() in body.content.lower()),
-            None,
-        )
-        if candidate:
-            version = await session.get(WorkflowVersion, candidate.default_version_id)
-            assistant_content = {
-                "type": "component_candidate",
-                "componentId": candidate.id,
-                "componentName": candidate.name,
-                "required": (
-                    version.definition_json["spec"]["inputSchema"].get("required", [])
-                    if version
-                    else []
-                ),
-                "text": "发现匹配组件，请确认并补充参数后启动。",
-            }
+        candidate = await match_component(session, body.content)
+        if candidate is not None:
+            assistant_content = candidate_message(candidate)
         else:
-            settings = get_settings()
-            if not settings.model_endpoint or not settings.model_name:
-                assistant_content = {
-                    "type": "error",
-                    "code": "MODEL_NOT_CONFIGURED",
-                    "text": "未匹配到组件，且通用 LLM/Agent Runtime 尚未配置。",
-                }
-            else:
-                await session.commit()
-                output_schema = {
-                    "type": "object",
-                    "properties": {"reply": {"type": "string"}},
-                    "required": ["reply"],
-                    "additionalProperties": False,
-                }
-                try:
-                    model_result = await OpenAICompatibleAdapter().generate(
-                        "请直接回答用户请求，并输出结构化 reply 字段。\n用户："
-                        + body.content,
-                        output_schema,
-                        1200,
-                    )
-                except Exception as exc:
-                    raise HTTPException(
-                        502,
-                        detail={"code": "MODEL_CALL_FAILED", "message": str(exc)},
-                    ) from exc
-                conversation_run = ConversationRun(
-                    id=str(uuid4()),
-                    conversation_id=conversation.id,
-                    status="succeeded",
-                    input_json={"message": body.content},
-                    output_json=model_result.output,
-                    trajectory_json={
-                        "name": "conversation-draft",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {"message": {"type": "string"}},
-                            "required": ["message"],
-                        },
-                        "outputSchema": output_schema,
-                        "steps": [
-                            {
-                                "id": "answer",
-                                "kind": "llm",
-                                "displayName": "生成回答",
-                                "input": {"message": "${input.message}"},
-                                "config": {
-                                    "prompt": "请回答输入消息：{input}",
-                                    "outputSchema": output_schema,
-                                    "maxOutputTokens": 1200,
-                                },
-                            }
-                        ],
-                        "outputMapping": {"reply": "${answer.output.reply}"},
-                        "originalModelCalls": 1,
-                    },
-                )
-                assistant_content = {
-                    "type": "agent_run",
-                    "text": model_result.output["reply"],
-                    "conversationRunId": conversation_run.id,
-                }
+            assistant_content, conversation_run = await _general_agent_message(
+                conversation, body.content
+            )
     assistant_message = Message(
         id=str(uuid4()),
         conversation_id=conversation.id,
@@ -1099,25 +1124,224 @@ async def create_message(
     }
 
 
-@router.post("/conversations/{conversation_id}/agent-runs", status_code=201)
-async def create_conversation_run(
+async def _bound_component_message(
+    session: AsyncSession,
+    component_id: str,
+    content: str,
+    inputs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    component = await session.get(Component, component_id)
+    version = (
+        await session.get(WorkflowVersion, component.default_version_id) if component else None
+    )
+    if component is None or version is None:
+        raise HTTPException(404, "组件或默认版本不存在")
+    spec = version.definition_json["spec"]
+    schema = spec["inputSchema"]
+    required = schema.get("required", [])
+    if inputs is None and len(required) == 1:
+        inputs = {required[0]: content}
+    missing = [field for field in required if not inputs or field not in inputs]
+    if missing:
+        candidate = ComponentCandidate(
+            component_id=component.id,
+            component_name=component.name,
+            workflow_version_id=version.id,
+            input_schema=schema,
+            ui_schema=spec.get("uiSchema", {}),
+            execution_class=component.execution_class,
+            confidence=1.0,
+            reason="已绑定组件",
+        )
+        return candidate_message(candidate, missing=missing)
+    try:
+        run = await orchestrator.create_run(session, version, inputs or {}, component.id)
+    except ValueError as exc:
+        raise HTTPException(
+            422,
+            detail={"code": "INVALID_INPUT", "message": str(exc)},
+        ) from exc
+    return {
+        "type": "component_run",
+        "state": "component_run",
+        "componentId": component.id,
+        "componentName": component.name,
+        "workflowVersionId": version.id,
+        "runId": run.id,
+        "text": "组件已启动，后续执行由 Workflow Runtime 接管。",
+    }
+
+
+async def _general_agent_message(
+    conversation: Conversation,
+    content: str,
+) -> tuple[dict[str, Any], ConversationRun | None]:
+    """未匹配组件的通用任务。
+
+    区分运行类型：单次模型回答记为 ``llm_response``，绝不伪装成 ``agent_run``。
+    真实 Agent 运行事实只能由服务端 TraeX Adapter 通过 /agent-runs 创建。
+    """
+
+    settings = get_settings()
+    if not settings.model_endpoint or not settings.model_name:
+        return (
+            {
+                "type": "error",
+                "code": "MODEL_NOT_CONFIGURED",
+                "text": "未匹配到组件，且通用 LLM/Agent Runtime 尚未配置。",
+            },
+            None,
+        )
+    output_schema = {
+        "type": "object",
+        "properties": {"reply": {"type": "string"}},
+        "required": ["reply"],
+        "additionalProperties": False,
+    }
+    try:
+        model_result = await OpenAICompatibleAdapter().generate(
+            "请直接回答用户请求，并输出结构化 reply 字段。\n用户：" + content,
+            output_schema,
+            1200,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            detail={"code": "MODEL_CALL_FAILED", "message": str(exc)},
+        ) from exc
+    conversation_run = ConversationRun(
+        id=str(uuid4()),
+        conversation_id=conversation.id,
+        status="succeeded",
+        run_type="llm_response",
+        input_json={"message": content},
+        output_json=model_result.output,
+        trajectory_json={
+            "runType": "llm_response",
+            "name": "conversation-draft",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+                "required": ["message"],
+            },
+            "outputSchema": output_schema,
+            "steps": [
+                {
+                    "id": "answer",
+                    "kind": "llm",
+                    "displayName": "生成回答",
+                    "input": {"message": "${input.message}"},
+                    "config": {
+                        "prompt": "请回答输入消息：{input}",
+                        "outputSchema": output_schema,
+                        "maxOutputTokens": 1200,
+                    },
+                }
+            ],
+            "outputMapping": {"reply": "${answer.output.reply}"},
+            "originalModelCalls": 1,
+        },
+    )
+    assistant_content = {
+        "type": "llm_response",
+        "state": "llm_response",
+        "text": model_result.output["reply"],
+        "conversationRunId": conversation_run.id,
+        "runType": "llm_response",
+    }
+    return assistant_content, conversation_run
+
+
+@router.post("/conversations/{conversation_id}/confirm-component", status_code=201)
+async def confirm_component(
+    conversation_id: str,
+    body: ComponentConfirm,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """用户在候选卡片上确认并补参后显式启动组件。
+
+    服务端重新计算候选令牌，确认组件版本与 inputSchema 自展示以来未变化，再校验补参
+    并启动 Workflow。
+    """
+
+    conversation = await session.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(404, "对话不存在")
+    component = await session.get(Component, body.component_id)
+    version = (
+        await session.get(WorkflowVersion, component.default_version_id) if component else None
+    )
+    if component is None or version is None:
+        raise HTTPException(404, "组件或默认版本不存在")
+    spec = version.definition_json["spec"]
+    schema = spec["inputSchema"]
+    expected_token = candidate_token(component.id, version.id, schema)
+    if expected_token != body.candidate_token:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "CANDIDATE_STALE",
+                "message": "组件默认版本或输入契约已变化，请重新获取候选。",
+            },
+        )
+    missing = [field for field in schema.get("required", []) if field not in body.inputs]
+    if missing:
+        raise HTTPException(
+            422,
+            detail={"code": "MISSING_INPUTS", "message": "缺少必填参数", "fields": missing},
+        )
+    try:
+        run = await orchestrator.create_run(session, version, body.inputs, component.id)
+    except ValueError as exc:
+        raise HTTPException(
+            422,
+            detail={"code": "INVALID_INPUT", "message": str(exc)},
+        ) from exc
+    assistant_message = Message(
+        id=str(uuid4()),
+        conversation_id=conversation.id,
+        role="assistant",
+        content_json={
+            "type": "component_run",
+            "state": "component_run",
+            "componentId": component.id,
+            "componentName": component.name,
+            "workflowVersionId": version.id,
+            "runId": run.id,
+            "text": "组件已启动，后续执行由 Workflow Runtime 接管。",
+        },
+    )
+    session.add(assistant_message)
+    await session.commit()
+    return {"runId": run.id, "assistant": assistant_message.content_json}
+
+
+@router.post("/conversations/{conversation_id}/trajectory-imports", status_code=201)
+async def import_conversation_trajectory(
     conversation_id: str,
     body: ConversationRunCreate,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
+    """导入外部轨迹。
+
+    标记为 ``trajectory_import``，不得作为真实成功 Agent 运行事实。``agent_run`` 只能
+    由服务端 TraeX Adapter 创建，见 /conversations/{id}/agent-runs。
+    """
+
     if await session.get(Conversation, conversation_id) is None:
         raise HTTPException(404, "对话不存在")
     run = ConversationRun(
         id=str(uuid4()),
         conversation_id=conversation_id,
         status="succeeded",
+        run_type="trajectory_import",
         input_json=body.input,
         output_json=body.output,
-        trajectory_json=body.trajectory,
+        trajectory_json={**body.trajectory, "runType": "trajectory_import"},
     )
     session.add(run)
     await session.commit()
-    return {"id": run.id, "status": run.status}
+    return {"id": run.id, "status": run.status, "runType": run.run_type}
 
 
 @router.post("/conversation-runs/{conversation_run_id}/distill", status_code=201)
