@@ -16,7 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.application.capabilities import CapabilityResolutionError, resolve_skillx_node
 from app.application.compiler import digest_json
 from app.application.expressions import ExpressionError, resolve_mapping
-from app.application.mcp import MCPConfigurationError, resolve_mcp_node
+from app.application.mcp import MCPConfigurationError, MCPLockDriftError, resolve_mcp_node
+from app.application.retries import auto_retry_allowed
 from app.application.security import event_payload
 from app.domain.workflow import NodeResult, NodeType, WorkflowDefinition, WorkflowNode
 from app.infrastructure.database import (
@@ -581,44 +582,27 @@ class WorkerService:
             if result.rowcount != 1:
                 continue
             node = next(item for item in definition.spec.nodes if item.id == candidate.node_id)
+            # 运行前用 WorkflowVersion 中锁定的 mcpLock 逐项核对 Tool 契约。
+            mcp_lock = next(
+                (
+                    lock
+                    for lock in (version.validation_json or {}).get("mcpLocks", [])
+                    if lock.get("nodeId") == node.id
+                ),
+                None,
+            )
             try:
                 node = await resolve_skillx_node(session, node)
-                node = await resolve_mcp_node(session, node)
+                node = await resolve_mcp_node(session, node, mcp_lock)
+            except MCPLockDriftError as exc:
+                await self._fail_claimed_resolution(
+                    session, candidate, run, "MCP_CONTRACT_DRIFT", str(exc)
+                )
+                continue
             except (CapabilityResolutionError, MCPConfigurationError) as exc:
-                await session.execute(
-                    update(NodeRun)
-                    .where(
-                        NodeRun.id == candidate.id,
-                        NodeRun.status == "running",
-                        NodeRun.worker_id == self.worker_id,
-                    )
-                    .values(
-                        status="failed",
-                        worker_id=None,
-                        lease_expires_at=None,
-                        error_json={
-                            "code": "CAPABILITY_INCOMPATIBLE",
-                            "message": str(exc),
-                            "retryable": False,
-                        },
-                        finished_at=utcnow(),
-                    )
+                await self._fail_claimed_resolution(
+                    session, candidate, run, "CAPABILITY_INCOMPATIBLE", str(exc)
                 )
-                await append_event(
-                    session,
-                    run.id,
-                    "node.failed",
-                    {
-                        "nodeId": candidate.node_id,
-                        "attempt": candidate.attempt,
-                        "error": {
-                            "code": "CAPABILITY_INCOMPATIBLE",
-                            "message": str(exc),
-                        },
-                    },
-                    candidate.id,
-                )
-                await self.orchestrator.advance_run(session, run.id)
                 continue
             await append_event(
                 session,
@@ -638,6 +622,44 @@ class WorkerService:
                 max_duration_seconds=definition.spec.policies.max_duration_seconds,
             )
         return None
+
+    async def _fail_claimed_resolution(
+        self,
+        session: AsyncSession,
+        candidate: NodeRun,
+        run: Run,
+        code: str,
+        message: str,
+    ) -> None:
+        """领取后解析/契约核对失败：把节点置为 failed 并推进 Run，不执行 Tool。"""
+
+        await session.execute(
+            update(NodeRun)
+            .where(
+                NodeRun.id == candidate.id,
+                NodeRun.status == "running",
+                NodeRun.worker_id == self.worker_id,
+            )
+            .values(
+                status="failed",
+                worker_id=None,
+                lease_expires_at=None,
+                error_json={"code": code, "message": message, "retryable": False},
+                finished_at=utcnow(),
+            )
+        )
+        await append_event(
+            session,
+            run.id,
+            "node.failed",
+            {
+                "nodeId": candidate.node_id,
+                "attempt": candidate.attempt,
+                "error": {"code": code, "message": message},
+            },
+            candidate.id,
+        )
+        await self.orchestrator.advance_run(session, run.id)
 
     async def execute_claimed(self, claimed: ClaimedExecution) -> None:
         cancellation = CancellationToken(asyncio.Event())
@@ -893,11 +915,14 @@ class WorkerService:
         result: NodeResult,
     ) -> None:
         error = result.error
+        # 统一重试策略：有副作用且非幂等禁止自动重试，结果未知不重试。
+        node_effect = "write" if claimed.node.side_effect else "none"
+        outcome = "unknown" if (error and error.code == "UNKNOWN_OUTCOME") else None
         if (
             not error
             or not error.retryable
             or claimed.attempt >= claimed.node.retry.max_attempts
-            or (claimed.node.side_effect and not claimed.node.idempotent)
+            or not auto_retry_allowed(node_effect, claimed.node.idempotent, outcome=outcome)
         ):
             return
         next_attempt = claimed.attempt + 1

@@ -10,7 +10,7 @@ from uuid import uuid4
 from sqlalchemy import select
 
 from app.application.compiler import WorkflowCompiler
-from app.application.mcp import discover_tools, register_server
+from app.application.mcp import classify_snapshot, discover_tools, register_server
 from app.infrastructure.database import (
     Component,
     SessionLocal,
@@ -53,6 +53,11 @@ async def seed() -> str:
                 },
             )
             snapshot = (await discover_tools(session, server_version.id))[0]
+            # 天气 Tool 仅有 readOnlyHint 提示，仍需本地 Registry 显式审核为
+            # none/idempotent 才能锁定发布；分类产生新的不可变快照。
+            snapshot = await classify_snapshot(
+                session, snapshot.id, effect="none", idempotent=True
+            )
             weather_definition = _weather_workflow(snapshot.id)
             weather_compiled = WorkflowCompiler().compile(weather_definition)
             await _create_component(
@@ -70,6 +75,10 @@ async def seed() -> str:
                             "nodeId": "weather",
                             "mcpToolSnapshotId": snapshot.id,
                             "digest": snapshot.digest,
+                            "toolName": snapshot.name,
+                            "effect": snapshot.side_effect,
+                            "idempotent": snapshot.idempotent,
+                            "timeoutSeconds": snapshot.timeout_seconds,
                         }
                     ],
                 },

@@ -159,21 +159,37 @@ async def test_publish_blocked_until_effect_reviewed(tmp_path: Path) -> None:
             await validate_mcp_nodes(session, compiled.definition.spec.nodes)
     assert "未分类或未审核" in str(exc_info.value)
 
-    # 人工审核为写操作、非幂等后可锁定。
+    # 人工审核为写操作、非幂等后产生新的不可变快照；旧快照保持不变。
     async with SessionLocal() as session, session.begin():
-        await classify_snapshot(session, snapshot_id, effect="write", idempotent=False)
+        new_snapshot = await classify_snapshot(
+            session, snapshot_id, effect="write", idempotent=False
+        )
+        new_id = new_snapshot.id
+    assert new_id != snapshot_id
+    reviewed_definition = _mcp_workflow(new_id, side_effect=True)
+    reviewed_compiled = WorkflowCompiler().compile(reviewed_definition)
     async with SessionLocal() as session:
-        locks = await validate_mcp_nodes(session, compiled.definition.spec.nodes)
+        locks = await validate_mcp_nodes(session, reviewed_compiled.definition.spec.nodes)
     assert locks[0]["effect"] == "write"
     assert locks[0]["idempotent"] is False
+    # 旧快照未被原地修改，仍为 unknown/unreviewed。
+    async with SessionLocal() as session:
+        from app.infrastructure.database import MCPToolSnapshot
+
+        old = await session.get(MCPToolSnapshot, snapshot_id)
+        assert old.side_effect == "unknown"
+        assert old.effect_review_status == "unreviewed"
 
 
 async def test_non_idempotent_tool_rejects_auto_retry(tmp_path: Path) -> None:
     snapshot_id = await _register_and_discover(tmp_path)
     async with SessionLocal() as session, session.begin():
-        await classify_snapshot(session, snapshot_id, effect="write", idempotent=False)
+        new_snapshot = await classify_snapshot(
+            session, snapshot_id, effect="write", idempotent=False
+        )
+        new_id = new_snapshot.id
     # 节点声明幂等以绕过编译期检查，暴露 Tool 快照非幂等与自动重试的冲突。
-    definition = _mcp_workflow(snapshot_id, side_effect=True, max_attempts=3, node_idempotent=True)
+    definition = _mcp_workflow(new_id, side_effect=True, max_attempts=3, node_idempotent=True)
     compiled = WorkflowCompiler().compile(definition)
     with pytest.raises(MCPConfigurationError) as exc_info:
         async with SessionLocal() as session:
@@ -184,8 +200,11 @@ async def test_non_idempotent_tool_rejects_auto_retry(tmp_path: Path) -> None:
 async def test_write_tool_requires_side_effect_declaration(tmp_path: Path) -> None:
     snapshot_id = await _register_and_discover(tmp_path)
     async with SessionLocal() as session, session.begin():
-        await classify_snapshot(session, snapshot_id, effect="write", idempotent=False)
-    definition = _mcp_workflow(snapshot_id, side_effect=False)
+        new_snapshot = await classify_snapshot(
+            session, snapshot_id, effect="write", idempotent=False
+        )
+        new_id = new_snapshot.id
+    definition = _mcp_workflow(new_id, side_effect=False)
     compiled = WorkflowCompiler().compile(definition)
     with pytest.raises(MCPConfigurationError) as exc_info:
         async with SessionLocal() as session:
@@ -193,13 +212,22 @@ async def test_write_tool_requires_side_effect_declaration(tmp_path: Path) -> No
     assert "未声明" in str(exc_info.value)
 
 
-async def test_classify_changes_digest(tmp_path: Path) -> None:
+async def test_classify_creates_new_snapshot_and_preserves_old(tmp_path: Path) -> None:
     snapshot_id = await _register_and_discover(tmp_path)
-    async with SessionLocal() as session:
-        from app.infrastructure.database import MCPToolSnapshot
+    from app.infrastructure.database import MCPToolSnapshot
 
-        before = (await session.get(MCPToolSnapshot, snapshot_id)).digest
+    async with SessionLocal() as session:
+        before = await session.get(MCPToolSnapshot, snapshot_id)
+        before_digest = before.digest
     async with SessionLocal() as session, session.begin():
         updated = await classify_snapshot(session, snapshot_id, effect="write", idempotent=False)
-        after = updated.digest
-    assert before != after
+        new_id = updated.id
+        after_digest = updated.digest
+    # 分类产生新 id 与新 digest；旧快照原样保留。
+    assert new_id != snapshot_id
+    assert after_digest != before_digest
+    async with SessionLocal() as session:
+        old = await session.get(MCPToolSnapshot, snapshot_id)
+        assert old is not None
+        assert old.digest == before_digest
+        assert old.side_effect == "unknown"

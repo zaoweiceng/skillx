@@ -48,13 +48,22 @@ class MCPContractDriftError(MCPConfigurationError):
     """
 
 
+class MCPLockDriftError(MCPConfigurationError):
+    """运行前发现 WorkflowVersion 锁定的 Tool 契约与当前快照不一致。
+
+    已发布版本保存了 snapshot id + digest + effect + idempotent + timeout 的完整
+    lock。运行时任何一项不一致（快照被删除、被原地改写、digest 变化等）都必须
+    fail closed，不得调用 Tool——映射为 ``MCP_CONTRACT_DRIFT``。
+    """
+
+
 def classify_effect(annotations: dict[str, Any]) -> tuple[str, bool, str]:
-    """从 MCP annotations 推断 effect/idempotent，仅作为提示。
+    """从 MCP annotations 推断 effect/idempotent，仅作为**提示**。
 
     返回 ``(effect, idempotent, effect_source)``。annotations 缺失时默认
     ``effect="unknown"``、``idempotent=False``、来源 ``unknown``——未知 Tool 绝不被
-    当作安全的幂等读操作。只有 annotations 明确声明只读/幂等时才降级为宽松语义，
-    且来源标记为 ``annotation`` 以便审核区分。
+    当作安全的幂等读操作。即便 annotations 明确声明只读/幂等，来源也只标记为
+    ``annotation``，审核状态保持 ``unreviewed``，必须经本地 Registry 显式确认才能发布。
     """
 
     if not isinstance(annotations, dict) or not annotations:
@@ -256,8 +265,9 @@ async def discover_tools(
             idempotent=idempotent,
             timeout_seconds=timeout_seconds,
             effect_source=effect_source,
-            # annotation 来源视为已审核提示；unknown 必须人工确认后方可发布写节点。
-            effect_review_status="reviewed" if effect_source == "annotation" else "unreviewed",
+            # annotation 仅作提示，审核状态一律保持 unreviewed，直到本地 Registry
+            # 显式确认；未审核 Tool 不得发布写节点。
+            effect_review_status="unreviewed",
         )
         session.add(snapshot)
         snapshots.append(snapshot)
@@ -352,34 +362,68 @@ async def classify_snapshot(
     effect: str,
     idempotent: bool,
 ) -> MCPToolSnapshot:
-    """人工审核并覆盖某 ToolSnapshot 的 effect/idempotent 分类。
+    """人工审核 effect/idempotent 分类，并创建**新的**不可变 ToolSnapshot。
 
-    effect/idempotent 属于契约语义，变更后 digest 必须随之变化，从而使锁定旧 digest 的
-    历史版本显式感知漂移。审核后来源标记为 ``registry``、状态为 ``reviewed``。
+    绝不 UPDATE 已存在的 ToolSnapshot：已被 WorkflowVersion 锁定的旧快照必须保持
+    原样（id/digest/effect 都不变），否则历史发布版本的执行语义会被事后改变。分类在
+    该 Server 下新建一个 ServerVersion（分类修订），把重分类后的快照写入其中并成为
+    Server 的 current。effect/idempotent 属于契约语义，digest 随之变化。
     """
 
     valid_effects = {"none", "write", "destructive", "unknown"}
     if effect not in valid_effects:
         raise MCPConfigurationError(f"effect 仅支持 {sorted(valid_effects)}")
-    snapshot = await session.get(MCPToolSnapshot, snapshot_id)
-    if snapshot is None:
+    old = await session.get(MCPToolSnapshot, snapshot_id)
+    if old is None:
         raise MCPConfigurationError("MCP ToolSnapshot 不存在")
+    old_version = await session.get(MCPServerVersion, old.server_version_id)
+    if old_version is None:
+        raise MCPConfigurationError("MCP ServerVersion 不存在")
     contract = {
-        "name": snapshot.name,
-        "description": snapshot.description,
-        "inputSchema": snapshot.input_schema_json,
-        "outputSchema": snapshot.output_schema_json,
+        "name": old.name,
+        "description": old.description,
+        "inputSchema": old.input_schema_json,
+        "outputSchema": old.output_schema_json,
         "effect": effect,
         "idempotent": idempotent,
-        "timeoutSeconds": snapshot.timeout_seconds,
+        "timeoutSeconds": old.timeout_seconds,
     }
-    snapshot.side_effect = effect
-    snapshot.idempotent = idempotent
-    snapshot.effect_source = "registry"
-    snapshot.effect_review_status = "unreviewed" if effect == "unknown" else "reviewed"
-    snapshot.digest = digest_json(contract)
+    # 新建分类修订 ServerVersion：不破坏旧版本，也不复用旧 (server_version_id, name) 键。
+    latest = await session.scalar(
+        select(func.max(MCPServerVersion.version)).where(
+            MCPServerVersion.server_id == old_version.server_id
+        )
+    )
+    new_version = MCPServerVersion(
+        id=str(uuid4()),
+        server_id=old_version.server_id,
+        version=(latest or 0) + 1,
+        config_json=old_version.config_json,
+        digest=digest_json({"classifyOf": old_version.digest, "tool": old.name}),
+        status="published",
+    )
+    session.add(new_version)
     await session.flush()
-    return snapshot
+    new_snapshot = MCPToolSnapshot(
+        id=str(uuid4()),
+        server_version_id=new_version.id,
+        name=old.name,
+        description=old.description,
+        input_schema_json=old.input_schema_json,
+        output_schema_json=old.output_schema_json,
+        digest=digest_json(contract),
+        side_effect=effect,
+        idempotent=idempotent,
+        timeout_seconds=old.timeout_seconds,
+        effect_source="registry",
+        effect_review_status="unreviewed" if effect == "unknown" else "reviewed",
+    )
+    session.add(new_snapshot)
+    server = await session.get(MCPServer, old_version.server_id)
+    if server is not None:
+        server.current_version_id = new_version.id
+    await session.flush()
+    return new_snapshot
 
 
 async def validate_mcp_nodes(
@@ -410,6 +454,8 @@ async def validate_mcp_nodes(
             raise MCPConfigurationError(
                 f"MCP 节点 {node.id} 的非幂等 Tool 不得自动重试（maxAttempts 必须为 1）"
             )
+        # 发布时保存完整 lock：运行前逐项核对 id + digest + effect + idempotent + timeout，
+        # 任何不一致 fail closed，保证已发布版本的执行语义不被事后分类/升级改变。
         locks.append(
             {
                 "nodeId": node.id,
@@ -418,6 +464,7 @@ async def validate_mcp_nodes(
                 "toolName": snapshot.name,
                 "effect": snapshot.side_effect,
                 "idempotent": snapshot.idempotent,
+                "timeoutSeconds": snapshot.timeout_seconds,
                 "effectSource": snapshot.effect_source,
             }
         )
@@ -427,12 +474,47 @@ async def validate_mcp_nodes(
 async def resolve_mcp_node(
     session: AsyncSession,
     node: Any,
+    lock: dict[str, Any] | None = None,
 ) -> Any:
+    """解析 MCP 节点为可执行配置，并在运行前逐项核对 WorkflowVersion 中的锁定契约。
+
+    ``lock`` 来自发布时 ``validate_mcp_nodes`` 写入 WorkflowVersion 的 ``mcpLocks``。
+    若提供 lock，则 snapshot id + digest + effect + idempotent + timeout 必须逐项一致，
+    任何漂移抛出 :class:`MCPLockDriftError`，不调用 Tool。
+    """
+
     if node.type.value != "mcp":
         return node
-    snapshot = await session.get(MCPToolSnapshot, node.config.get("mcpToolSnapshotId"))
+    snapshot_id = node.config.get("mcpToolSnapshotId")
+    if lock is not None and lock.get("mcpToolSnapshotId") != snapshot_id:
+        raise MCPLockDriftError(
+            f"MCP 节点 {node.id} 锁定的 ToolSnapshot id 与运行配置不一致"
+        )
+    snapshot = await session.get(MCPToolSnapshot, snapshot_id)
     if snapshot is None:
-        raise MCPConfigurationError("锁定的 MCP ToolSnapshot 不存在")
+        raise MCPLockDriftError(f"MCP 节点 {node.id} 锁定的 ToolSnapshot 已不存在")
+    if lock is not None:
+        expected = {
+            "digest": lock.get("digest"),
+            "effect": lock.get("effect"),
+            "idempotent": lock.get("idempotent"),
+            "timeoutSeconds": lock.get("timeoutSeconds"),
+        }
+        actual = {
+            "digest": snapshot.digest,
+            "effect": snapshot.side_effect,
+            "idempotent": snapshot.idempotent,
+            "timeoutSeconds": snapshot.timeout_seconds,
+        }
+        # timeoutSeconds 在早期 lock 可能缺失，缺失时不参与核对。
+        if expected["timeoutSeconds"] is None:
+            expected.pop("timeoutSeconds")
+            actual.pop("timeoutSeconds")
+        drift = {key: actual[key] for key in expected if expected[key] != actual[key]}
+        if drift:
+            raise MCPLockDriftError(
+                f"MCP 节点 {node.id} 的 Tool {snapshot.name} 契约与发布锁定不一致: {drift}"
+            )
     version = await session.get(MCPServerVersion, snapshot.server_version_id)
     server = await session.get(MCPServer, version.server_id if version else "")
     if version is None or server is None or version.status != "published":

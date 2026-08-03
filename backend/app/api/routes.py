@@ -44,6 +44,7 @@ from app.application.mcp import (
     validate_mcp_nodes,
 )
 from app.application.orchestrator import Orchestrator, append_event
+from app.application.retries import auto_retry_allowed
 from app.application.secrets import (
     SecretResolutionError,
     register_secret_reference,
@@ -1053,7 +1054,8 @@ async def test_mcp_tool(
         {
             "effect": snapshot.side_effect,
             "idempotent": snapshot.idempotent,
-            "autoRetryAllowed": snapshot.idempotent and snapshot.side_effect == "none",
+            # 与 Orchestrator 共用唯一重试策略，避免测试页与运行时语义不一致。
+            "autoRetryAllowed": auto_retry_allowed(snapshot.side_effect, snapshot.idempotent),
             "effectReviewStatus": snapshot.effect_review_status,
         }
         if snapshot is not None
