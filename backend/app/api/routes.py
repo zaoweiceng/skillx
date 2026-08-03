@@ -11,6 +11,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.application.agent_run import (
+    AgentRunConfig,
+    AgentRunService,
+    summarize_run,
+)
 from app.application.capabilities import (
     CapabilityResolutionError,
     register_skillx,
@@ -20,7 +25,7 @@ from app.application.compiler import WorkflowCompiler, WorkflowValidationError, 
 from app.application.conversation import (
     ComponentCandidate,
     candidate_message,
-    candidate_token,
+    candidate_snapshot_digest,
     match_component,
 )
 from app.application.distillation import (
@@ -31,6 +36,7 @@ from app.application.mcp import (
     MCPConfigurationError,
     MCPContractDriftError,
     call_snapshot_through_contract,
+    classify_snapshot,
     discover_tools,
     register_server,
     scan_dependent_workflows,
@@ -50,8 +56,10 @@ from app.infrastructure.database import (
     Component,
     Conversation,
     ConversationRun,
+    ConversationRunEvent,
     Distillation,
     MCPServer,
+    MCPToolSnapshot,
     Message,
     NodeRun,
     Run,
@@ -68,6 +76,7 @@ from app.runtime.models import OpenAICompatibleAdapter
 router = APIRouter()
 compiler = WorkflowCompiler()
 orchestrator = Orchestrator()
+agent_run_service = AgentRunService()
 
 
 class WorkflowCreate(BaseModel):
@@ -112,6 +121,11 @@ class MCPToolTest(BaseModel):
     arguments: dict[str, Any]
 
 
+class MCPToolClassify(BaseModel):
+    effect: str
+    idempotent: bool
+
+
 class SecretReferenceCreate(BaseModel):
     name: str
     environment_variable: str = Field(alias="environmentVariable")
@@ -131,7 +145,7 @@ class MessageCreate(BaseModel):
 
 class ComponentConfirm(BaseModel):
     component_id: str = Field(alias="componentId")
-    candidate_token: str = Field(alias="candidateToken")
+    candidate_snapshot_digest: str = Field(alias="candidateSnapshotDigest")
     inputs: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -139,6 +153,12 @@ class ConversationRunCreate(BaseModel):
     input: dict[str, Any]
     output: dict[str, Any]
     trajectory: dict[str, Any]
+
+
+class AgentRunCreate(BaseModel):
+    content: str = Field(min_length=1)
+    allowed_capabilities: list[str] | None = Field(default=None, alias="allowedCapabilities")
+    max_steps: int | None = Field(default=None, alias="maxSteps", ge=1, le=32)
 
 
 def workflow_view(item: Workflow) -> dict[str, Any]:
@@ -942,6 +962,10 @@ async def discover_mcp_server(
             "inputSchema": item.input_schema_json,
             "outputSchema": item.output_schema_json,
             "digest": item.digest,
+            "effect": item.side_effect,
+            "idempotent": item.idempotent,
+            "effectSource": item.effect_source,
+            "effectReviewStatus": item.effect_review_status,
         }
         for item in snapshots
     ]
@@ -978,6 +1002,39 @@ async def health_mcp_server(
     return {"status": "healthy", "toolCount": len(snapshots)}
 
 
+@router.post("/mcp-tools/{snapshot_id}/classify")
+async def classify_mcp_tool(
+    snapshot_id: str,
+    body: MCPToolClassify,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """人工审核并覆盖某 ToolSnapshot 的 effect/idempotent 分类。"""
+
+    try:
+        snapshot = await classify_snapshot(
+            session,
+            snapshot_id,
+            effect=body.effect,
+            idempotent=body.idempotent,
+        )
+        await session.commit()
+    except MCPConfigurationError as exc:
+        await session.rollback()
+        raise HTTPException(
+            422,
+            detail={"code": "INVALID_MCP_CLASSIFICATION", "message": str(exc)},
+        ) from exc
+    return {
+        "id": snapshot.id,
+        "name": snapshot.name,
+        "effect": snapshot.side_effect,
+        "idempotent": snapshot.idempotent,
+        "effectSource": snapshot.effect_source,
+        "effectReviewStatus": snapshot.effect_review_status,
+        "digest": snapshot.digest,
+    }
+
+
 @router.post("/mcp-tools/{snapshot_id}/test")
 async def test_mcp_tool(
     snapshot_id: str,
@@ -991,12 +1048,24 @@ async def test_mcp_tool(
             404,
             detail={"code": "MCP_SNAPSHOT_UNAVAILABLE", "message": str(exc)},
         ) from exc
+    snapshot = await session.get(MCPToolSnapshot, snapshot_id)
+    effect_view = (
+        {
+            "effect": snapshot.side_effect,
+            "idempotent": snapshot.idempotent,
+            "autoRetryAllowed": snapshot.idempotent and snapshot.side_effect == "none",
+            "effectReviewStatus": snapshot.effect_review_status,
+        }
+        if snapshot is not None
+        else {}
+    )
     if outcome.status == "succeeded":
         return {
             "status": "succeeded",
             "output": outcome.output,
             "toolName": outcome.tool_name,
             "toolDigest": outcome.tool_digest,
+            **effect_view,
         }
     # 与 Workflow MCPExecutor 一致的结构化失败结果，而非裸异常。
     raise HTTPException(
@@ -1005,6 +1074,7 @@ async def test_mcp_tool(
             "code": outcome.error_code or "MCP_CALL_FAILED",
             "message": outcome.error_message or "MCP 调用失败",
             "retryable": outcome.retryable,
+            **effect_view,
         },
     )
 
@@ -1179,7 +1249,9 @@ async def _general_agent_message(
     """未匹配组件的通用任务。
 
     区分运行类型：单次模型回答记为 ``llm_response``，绝不伪装成 ``agent_run``。
-    真实 Agent 运行事实只能由服务端 TraeX Adapter 通过 /agent-runs 创建。
+    真实 Agent 运行事实只能由服务端 AgentRunService 通过
+    ``POST /conversations/{id}/agent-runs`` 创建。此处始终附带 ``offerAgentRun`` 提示，
+    前端据此提供“启动通用 Agent”入口。
     """
 
     settings = get_settings()
@@ -1189,6 +1261,7 @@ async def _general_agent_message(
                 "type": "error",
                 "code": "MODEL_NOT_CONFIGURED",
                 "text": "未匹配到组件，且通用 LLM/Agent Runtime 尚未配置。",
+                "offerAgentRun": bool(settings.traex_command),
             },
             None,
         )
@@ -1248,6 +1321,8 @@ async def _general_agent_message(
         "text": model_result.output["reply"],
         "conversationRunId": conversation_run.id,
         "runType": "llm_response",
+        # 单次回答不是可固化的 Agent 运行；提示前端可升级为真实通用 Agent。
+        "offerAgentRun": bool(get_settings().traex_command),
     }
     return assistant_content, conversation_run
 
@@ -1260,8 +1335,8 @@ async def confirm_component(
 ) -> dict[str, Any]:
     """用户在候选卡片上确认并补参后显式启动组件。
 
-    服务端重新计算候选令牌，确认组件版本与 inputSchema 自展示以来未变化，再校验补参
-    并启动 Workflow。
+    服务端重新计算候选快照摘要，确认组件版本与 inputSchema 自展示以来未变化，再校验补参
+    并启动 Workflow。该摘要仅用于检测 stale，不是授权或一次性令牌。
     """
 
     conversation = await session.get(Conversation, conversation_id)
@@ -1275,8 +1350,8 @@ async def confirm_component(
         raise HTTPException(404, "组件或默认版本不存在")
     spec = version.definition_json["spec"]
     schema = spec["inputSchema"]
-    expected_token = candidate_token(component.id, version.id, schema)
-    if expected_token != body.candidate_token:
+    expected_digest = candidate_snapshot_digest(component.id, version.id, schema)
+    if expected_digest != body.candidate_snapshot_digest:
         raise HTTPException(
             409,
             detail={
@@ -1316,6 +1391,114 @@ async def confirm_component(
     return {"runId": run.id, "assistant": assistant_message.content_json}
 
 
+@router.post("/conversations/{conversation_id}/agent-runs", status_code=201)
+async def start_agent_run(
+    conversation_id: str,
+    body: AgentRunCreate,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """从通用对话启动一次受限 TraeX Agent 探索。
+
+    唯一创建 ``ConversationRun(run_type="agent_run")`` 的入口：由 AgentRunService
+    启动 TraeX、归一化事件并在成功时固定结构化输出。事件持久化在
+    conversation_run_events，页面刷新后可恢复。
+    """
+
+    conversation = await session.get(Conversation, conversation_id)
+    if conversation is None:
+        raise HTTPException(404, "对话不存在")
+    default_config = AgentRunConfig.default()
+    config = AgentRunConfig(
+        output_schema=default_config.output_schema,
+        max_steps=body.max_steps or default_config.max_steps,
+        max_total_tokens=default_config.max_total_tokens,
+        allowed_capabilities=tuple(
+            body.allowed_capabilities
+            if body.allowed_capabilities is not None
+            else default_config.allowed_capabilities
+        ),
+        max_duration_seconds=default_config.max_duration_seconds,
+    )
+    conversation_run = await agent_run_service.start_agent_run(
+        session,
+        conversation,
+        body.content,
+        config=config,
+    )
+    assistant_content: dict[str, Any]
+    if conversation_run.status == "succeeded":
+        assistant_content = {
+            "type": "agent_run",
+            "state": "agent_run",
+            "text": conversation_run.output_json.get("reply", "Agent 已完成任务。"),
+            "conversationRunId": conversation_run.id,
+            "runType": "agent_run",
+        }
+    else:
+        error = conversation_run.error_json or {}
+        assistant_content = {
+            "type": "agent_run_error",
+            "state": "agent_run",
+            "code": error.get("code", "EXECUTION_FAILED"),
+            "text": f"通用 Agent 运行失败：{error.get('message', '未知错误')}",
+            "conversationRunId": conversation_run.id,
+            "runType": "agent_run",
+        }
+    assistant_message = Message(
+        id=str(uuid4()),
+        conversation_id=conversation.id,
+        role="assistant",
+        content_json=assistant_content,
+    )
+    session.add(assistant_message)
+    await session.commit()
+    return {
+        "conversationRunId": conversation_run.id,
+        "status": conversation_run.status,
+        "assistant": assistant_content,
+    }
+
+
+@router.get("/conversation-runs/{conversation_run_id}")
+async def get_conversation_run(
+    conversation_run_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    conversation_run = await session.get(ConversationRun, conversation_run_id)
+    if conversation_run is None:
+        raise HTTPException(404, "ConversationRun 不存在")
+    return summarize_run(conversation_run)
+
+
+@router.get("/conversation-runs/{conversation_run_id}/events")
+async def list_conversation_run_events(
+    conversation_run_id: str,
+    after: int = Query(default=0, ge=0),
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    if await session.get(ConversationRun, conversation_run_id) is None:
+        raise HTTPException(404, "ConversationRun 不存在")
+    events = (
+        await session.scalars(
+            select(ConversationRunEvent)
+            .where(
+                ConversationRunEvent.conversation_run_id == conversation_run_id,
+                ConversationRunEvent.seq > after,
+            )
+            .order_by(ConversationRunEvent.seq)
+        )
+    ).all()
+    return [
+        {
+            "seq": item.seq,
+            "type": item.type,
+            "payload": item.payload_json,
+            "createdAt": item.created_at,
+        }
+        for item in events
+    ]
+
+
 @router.post("/conversations/{conversation_id}/trajectory-imports", status_code=201)
 async def import_conversation_trajectory(
     conversation_id: str,
@@ -1325,7 +1508,7 @@ async def import_conversation_trajectory(
     """导入外部轨迹。
 
     标记为 ``trajectory_import``，不得作为真实成功 Agent 运行事实。``agent_run`` 只能
-    由服务端 TraeX Adapter 创建，见 /conversations/{id}/agent-runs。
+    由服务端 AgentRunService 创建，见 ``POST /conversations/{id}/agent-runs``。
     """
 
     if await session.get(Conversation, conversation_id) is None:

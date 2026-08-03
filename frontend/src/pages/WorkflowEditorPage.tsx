@@ -16,6 +16,7 @@ export default function WorkflowEditorPage() {
   const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [publishing, setPublishing] = useState(false)
   const [selectedNodeId, setSelectedNodeId] = useState('')
 
   useEffect(() => {
@@ -80,18 +81,28 @@ export default function WorkflowEditorPage() {
   }
 
   async function publish() {
-    const valid = await validate()
-    if (!id || !workflow) return
-    if (!valid) return
-    const version = await api.publishWorkflow(id)
-    const component = await api.createComponent(
-      workflow.name,
-      '由工作流编辑器发布的锁定版本组件。',
-      version.id,
-    )
-    setNotice(
-      `已发布不可变版本 v${version.version}，组件入口 ${component.id.slice(0, 8)} 已创建`,
-    )
+    // 发布按钮在整个 save/validate/publish/create-component 流程中保持 busy，
+    // 阻止双击触发并发发布。
+    if (publishing) return
+    setPublishing(true)
+    try {
+      const valid = await validate()
+      if (!id || !workflow) return
+      if (!valid) return
+      const version = await api.publishWorkflow(id)
+      const component = await api.createComponent(
+        workflow.name,
+        '由工作流编辑器发布的锁定版本组件。',
+        version.id,
+      )
+      setNotice(
+        `已发布不可变版本 v${version.version}，组件入口 ${component.id.slice(0, 8)} 已创建`,
+      )
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '发布失败')
+    } finally {
+      setPublishing(false)
+    }
   }
 
   if (!workflow) {
@@ -109,14 +120,14 @@ export default function WorkflowEditorPage() {
           <h1>{workflow.name}</h1>
         </div>
         <div className="run-header-actions">
-          <button className="button ghost" onClick={save} disabled={busy}>
+          <button className="button ghost" onClick={save} disabled={busy || publishing}>
             <Save size={15} /> 保存
           </button>
-          <button className="button ghost" onClick={validate} disabled={busy}>
+          <button className="button ghost" onClick={validate} disabled={busy || publishing}>
             <CheckCircle2 size={15} /> 静态检查
           </button>
-          <button className="button primary" onClick={publish} disabled={busy}>
-            <Send size={15} /> 发布版本
+          <button className="button primary" onClick={publish} disabled={busy || publishing}>
+            <Send size={15} /> {publishing ? '发布中...' : '发布版本'}
           </button>
         </div>
       </header>

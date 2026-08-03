@@ -22,6 +22,9 @@ class ToolDescriptor:
     description: str
     input_schema: dict[str, Any]
     output_schema: dict[str, Any] | None = None
+    # MCP tools/list 可选返回的 annotations（如 readOnlyHint / destructiveHint /
+    # idempotentHint）。仅作为提示，最终 effect/idempotent 由本地 Registry 审核决定。
+    annotations: dict[str, Any] = field(default_factory=dict)
 
 
 class MCPGateway(Protocol):
@@ -147,6 +150,7 @@ class StreamableHttpMCPGateway:
                 description=item.get("description", ""),
                 input_schema=item.get("inputSchema", {"type": "object"}),
                 output_schema=item.get("outputSchema"),
+                annotations=item.get("annotations") or {},
             )
             for item in result.get("tools", [])
         ]
@@ -245,6 +249,7 @@ class StdioMCPGateway:
                 description=item.get("description", ""),
                 input_schema=item.get("inputSchema", {"type": "object"}),
                 output_schema=item.get("outputSchema"),
+                annotations=item.get("annotations") or {},
             )
             for item in result.get("tools", [])
         ]

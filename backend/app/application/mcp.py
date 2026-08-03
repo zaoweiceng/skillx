@@ -48,6 +48,28 @@ class MCPContractDriftError(MCPConfigurationError):
     """
 
 
+def classify_effect(annotations: dict[str, Any]) -> tuple[str, bool, str]:
+    """从 MCP annotations 推断 effect/idempotent，仅作为提示。
+
+    返回 ``(effect, idempotent, effect_source)``。annotations 缺失时默认
+    ``effect="unknown"``、``idempotent=False``、来源 ``unknown``——未知 Tool 绝不被
+    当作安全的幂等读操作。只有 annotations 明确声明只读/幂等时才降级为宽松语义，
+    且来源标记为 ``annotation`` 以便审核区分。
+    """
+
+    if not isinstance(annotations, dict) or not annotations:
+        return "unknown", False, "unknown"
+    read_only = annotations.get("readOnlyHint")
+    destructive = annotations.get("destructiveHint")
+    idempotent_hint = annotations.get("idempotentHint")
+    if read_only is True:
+        return "none", True, "annotation"
+    if destructive is True:
+        return "destructive", bool(idempotent_hint is True), "annotation"
+    # 存在 annotations 但未显式声明只读：视为写操作，除非显式 idempotentHint。
+    return "write", bool(idempotent_hint is True), "annotation"
+
+
 def validate_server_config(
     transport: str,
     config: dict[str, Any],
@@ -194,11 +216,18 @@ async def discover_tools(
         )
     snapshots: list[MCPToolSnapshot] = []
     for descriptor in descriptors:
+        effect, idempotent, effect_source = classify_effect(descriptor.annotations)
+        timeout_seconds = version.config_json.get("timeoutSeconds", 30)
+        # 契约 digest 纳入副作用/幂等/超时：这些语义变化必须产生新快照或新
+        # ServerVersion，不能静默沿用旧的乐观默认。
         contract = {
             "name": descriptor.name,
             "description": descriptor.description,
             "inputSchema": descriptor.input_schema,
             "outputSchema": descriptor.output_schema,
+            "effect": effect,
+            "idempotent": idempotent,
+            "timeoutSeconds": timeout_seconds,
         }
         contract_digest = digest_json(contract)
         existing = await session.scalar(
@@ -223,9 +252,12 @@ async def discover_tools(
             input_schema_json=descriptor.input_schema,
             output_schema_json=descriptor.output_schema,
             digest=contract_digest,
-            side_effect="none",
-            idempotent=True,
-            timeout_seconds=version.config_json.get("timeoutSeconds", 30),
+            side_effect=effect,
+            idempotent=idempotent,
+            timeout_seconds=timeout_seconds,
+            effect_source=effect_source,
+            # annotation 来源视为已审核提示；unknown 必须人工确认后方可发布写节点。
+            effect_review_status="reviewed" if effect_source == "annotation" else "unreviewed",
         )
         session.add(snapshot)
         snapshots.append(snapshot)
@@ -313,6 +345,43 @@ async def scan_dependent_workflows(
     return results
 
 
+async def classify_snapshot(
+    session: AsyncSession,
+    snapshot_id: str,
+    *,
+    effect: str,
+    idempotent: bool,
+) -> MCPToolSnapshot:
+    """人工审核并覆盖某 ToolSnapshot 的 effect/idempotent 分类。
+
+    effect/idempotent 属于契约语义，变更后 digest 必须随之变化，从而使锁定旧 digest 的
+    历史版本显式感知漂移。审核后来源标记为 ``registry``、状态为 ``reviewed``。
+    """
+
+    valid_effects = {"none", "write", "destructive", "unknown"}
+    if effect not in valid_effects:
+        raise MCPConfigurationError(f"effect 仅支持 {sorted(valid_effects)}")
+    snapshot = await session.get(MCPToolSnapshot, snapshot_id)
+    if snapshot is None:
+        raise MCPConfigurationError("MCP ToolSnapshot 不存在")
+    contract = {
+        "name": snapshot.name,
+        "description": snapshot.description,
+        "inputSchema": snapshot.input_schema_json,
+        "outputSchema": snapshot.output_schema_json,
+        "effect": effect,
+        "idempotent": idempotent,
+        "timeoutSeconds": snapshot.timeout_seconds,
+    }
+    snapshot.side_effect = effect
+    snapshot.idempotent = idempotent
+    snapshot.effect_source = "registry"
+    snapshot.effect_review_status = "unreviewed" if effect == "unknown" else "reviewed"
+    snapshot.digest = digest_json(contract)
+    await session.flush()
+    return snapshot
+
+
 async def validate_mcp_nodes(
     session: AsyncSession,
     nodes: list[Any],
@@ -325,13 +394,21 @@ async def validate_mcp_nodes(
         snapshot = await session.get(MCPToolSnapshot, snapshot_id)
         if snapshot is None:
             raise MCPConfigurationError(f"MCP 节点 {node.id} 未锁定有效 ToolSnapshot")
+        # 未分类 Tool 不得按乐观默认发布：必须经 Registry 审核确定 effect/idempotent。
+        if snapshot.side_effect == "unknown" or snapshot.effect_review_status == "unreviewed":
+            raise MCPConfigurationError(
+                f"MCP 节点 {node.id} 的 Tool {snapshot.name} 副作用未分类或未审核，"
+                "发布前必须显式确认 effect 与 idempotent"
+            )
+        # 写/破坏性 Tool 必须由 Workflow 节点显式声明 sideEffect。
         if snapshot.side_effect != "none" and not node.side_effect:
             raise MCPConfigurationError(
                 f"MCP 节点 {node.id} 未声明 Tool 的 {snapshot.side_effect} 副作用"
             )
+        # 非幂等 Tool 的 maxAttempts 必须为 1，禁止自动重试。
         if not snapshot.idempotent and node.retry.max_attempts > 1:
             raise MCPConfigurationError(
-                f"MCP 节点 {node.id} 的非幂等 Tool 不得自动重试"
+                f"MCP 节点 {node.id} 的非幂等 Tool 不得自动重试（maxAttempts 必须为 1）"
             )
         locks.append(
             {
@@ -339,6 +416,9 @@ async def validate_mcp_nodes(
                 "mcpToolSnapshotId": snapshot.id,
                 "digest": snapshot.digest,
                 "toolName": snapshot.name,
+                "effect": snapshot.side_effect,
+                "idempotent": snapshot.idempotent,
+                "effectSource": snapshot.effect_source,
             }
         )
     return locks

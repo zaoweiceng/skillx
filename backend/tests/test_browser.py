@@ -158,3 +158,19 @@ def test_contract_patch_rejects_identity_widening() -> None:
     except ContractPatchViolation:
         return
     raise AssertionError("身份变化应被 ContractPatch 拒绝")
+
+
+def test_contract_patch_rejects_url_mismatch() -> None:
+    # 作为独立安全边界：观察 URL 不命中契约模式时必须直接拒绝，即使身份/字段一致。
+    observed = ObservedPage(
+        url="https://evil.example.net/apply",
+        identity="user-1",
+        businessObject="expense",
+        fields=contract().fields,
+        submit=contract().submit,
+    )
+    try:
+        build_contract_patch(contract(), observed, ["URL 变化"])
+    except ContractPatchViolation:
+        return
+    raise AssertionError("URL 不匹配应被 ContractPatch 拒绝")

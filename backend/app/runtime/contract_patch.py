@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.runtime.browser import ObservedPage, PageContract
+from app.runtime.browser import ObservedPage, PageContract, url_matches
 
 
 class ContractPatchViolation(ValueError):
@@ -48,6 +48,10 @@ def build_contract_patch(
 
     if observed.security_warning:
         raise ContractPatchViolation("存在安全告警，禁止生成 ContractPatch")
+    # URL 属于 L4 安全域：作为独立安全边界，函数内部再次校验观察 URL 命中契约模式，
+    # 避免其它调用方绕过 Executor 的 L4 分类误用本函数扩大授权。
+    if not url_matches(contract.url_pattern, observed.url):
+        raise ContractPatchViolation("目标 URL 不符合 PageContract，禁止生成 ContractPatch")
     expected_identity = contract.page_identity.get("identity")
     expected_object = contract.page_identity.get("businessObject")
     if expected_identity is not None and observed.identity != expected_identity:

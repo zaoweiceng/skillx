@@ -18,6 +18,9 @@ async def run_worker(worker_id: str | None = None) -> None:
     loop = asyncio.get_running_loop()
     for event in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(event, stopping.set)
+    # 明确的轮询就绪信号：黑盒 harness 据此确认 Worker 已进入领取循环，
+    # 而不是仅检查进程尚未退出。
+    print(f"worker polling worker_id={service.worker_id}", flush=True)
     while not stopping.is_set():
         processed = await service.run_once()
         if not processed:

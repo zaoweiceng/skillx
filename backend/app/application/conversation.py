@@ -31,14 +31,16 @@ class ComponentCandidate:
     reason: str
 
 
-def candidate_token(
+def candidate_snapshot_digest(
     component_id: str,
     workflow_version_id: str,
     input_schema: dict[str, Any],
 ) -> str:
-    """锁定候选组件版本与其输入契约的一次性令牌。
+    """候选组件版本与输入契约的快照摘要。
 
-    确认时服务端重新计算并比对该令牌，确保 UI 展示后默认版本或输入 Schema 未变化。
+    这不是密钥令牌，也不保证一次性：它是对公开的 component/version/inputSchema 的
+    确定性 digest。确认时服务端重新计算并比对，用于检测“候选展示后默认版本或输入
+    Schema 已变化”（stale），而不是授权。
     """
 
     payload = {
@@ -134,7 +136,7 @@ def candidate_message(
         "executionClass": candidate.execution_class,
         "confidence": candidate.confidence,
         "reason": candidate.reason,
-        "candidateToken": candidate_token(
+        "candidateSnapshotDigest": candidate_snapshot_digest(
             candidate.component_id,
             candidate.workflow_version_id,
             candidate.input_schema,

@@ -14,10 +14,11 @@ SkillX Workflow 是一个契约驱动的可视化工作流平台。首次任务�
 | MCP Streamable HTTP | `partial` | 已实现 initialize/会话 id/JSON+SSE 与 loopback E2E；仍缺流式增量与重连 |
 | LLM 节点 | `available` | Executor 已接通；真实运行需环境配置，测试用 Fake Adapter |
 | Agent/TraeX | `available` | 服务端 TraeX Adapter 记录 plan/Tool/step/Token，Host 校验能力白名单；仓库内 fixture 可重复验收 |
-| 通用对话调用组件 | `available` | 结构化意图候选、锁定版本令牌、补参确认启动 Workflow；单次模型答记为 `llm_response` |
-| 轨迹固化 | `available` | 仅固化服务端成功运行；草稿人工发布后可用新输入复用，不自动发布 |
+| 通用对话调用组件 | `available` | 结构化意图候选、锁定版本快照摘要、补参确认启动 Workflow；单次模型答记为 `llm_response` |
+| 通用 Agent 探索与固化 | `available` | 对话经 `AgentRunService` 启动受限 TraeX 生成 `agent_run`，事件可恢复；成功运行经人工发布后可用新输入复用 |
+| MCP 副作用与幂等分类 | `available` | annotations 仅作提示，Registry 显式审核 effect/idempotent；未分类默认 `unknown/非幂等`，发布写节点前必须确认 |
 | 浏览器契约与一次性授权 | `available` | Playwright 隔离 Context、L2 漂移一次性授权重放、提交确认、L3 ContractPatch 草稿 |
-| 六场景黑盒 E2E | `available` | 真实 API + 独立 Worker 子进程，`make demo-check` 执行 |
+| 六场景黑盒 E2E | `available` | 真实 API + 独立 Worker + 本地表单站点子进程，E2E-5 走真实 Agent 固化复用、E2E-6 走真实 Playwright 提交，`make demo-check` 执行 |
 | 可视化拖放编辑器 | `not-configured` | 当前仍以 JSON DSL 编辑和有界 DAG 预览为主 |
 
 `available` 表示已接入主路径并有自动化测试；`partial` 表示主路径部分实现、仍有已知缺口；

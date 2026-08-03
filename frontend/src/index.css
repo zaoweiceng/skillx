@@ -1216,6 +1216,38 @@ button {
   box-shadow: 0 0 0 8px rgba(229, 155, 69, 0.05);
 }
 
+.trace-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 18px;
+  list-style: none;
+}
+
+.trace-item {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.trace-type {
+  font-family: var(--mono, monospace);
+  font-size: 10px;
+  color: var(--accent);
+}
+
+.trace-tool,
+.trace-summary {
+  font-size: 9px;
+  color: var(--muted);
+}
+
 .chat-composer {
   position: absolute;
   right: 356px;

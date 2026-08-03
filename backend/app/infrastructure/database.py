@@ -215,6 +215,9 @@ class MCPToolSnapshot(Base, TimestampMixin):
     side_effect: Mapped[str] = mapped_column(String(30), default="none")
     idempotent: Mapped[bool] = mapped_column(default=True)
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=30)
+    # effect 分类的可信来源与审核状态：未知 Tool 不得被默认当作安全读操作。
+    effect_source: Mapped[str] = mapped_column(String(20), default="unknown")
+    effect_review_status: Mapped[str] = mapped_column(String(20), default="unreviewed")
 
 
 class Artifact(Base, TimestampMixin):
@@ -266,6 +269,27 @@ class ConversationRun(Base, TimestampMixin):
     input_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     output_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     trajectory_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
+class ConversationRunEvent(Base):
+    """通用 Agent 运行的规范化事件流。
+
+    与工作流 RunEvent 分离：这里记录 AgentRunService 归一化后的 plan/tool/step/
+    终态事件，供轨迹抽屉订阅并在页面刷新后恢复状态，不依赖前端本地 state。
+    """
+
+    __tablename__ = "conversation_run_events"
+    __table_args__ = (Index("uq_conversation_run_seq", "conversation_run_id", "seq", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_run_id: Mapped[str] = mapped_column(
+        ForeignKey("conversation_runs.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer)
+    type: Mapped[str] = mapped_column(String(80))
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Distillation(Base, TimestampMixin):

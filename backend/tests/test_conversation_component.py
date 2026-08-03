@@ -176,7 +176,7 @@ async def test_structured_intent_matches_without_literal_name() -> None:
     assistant = response["assistant"]
     assert assistant["type"] == "component_candidate"
     assert assistant["confidence"] > 0
-    assert "candidateToken" in assistant
+    assert "candidateSnapshotDigest" in assistant
     assert assistant["inputSchema"]["required"] == ["name"]
 
 
@@ -190,13 +190,13 @@ async def test_confirm_component_starts_run_with_locked_token() -> None:
             MessageCreate(content="生成 greeting"),
             session,
         )
-    token = candidate["assistant"]["candidateToken"]
+    token = candidate["assistant"]["candidateSnapshotDigest"]
     async with SessionLocal() as session:
         confirmed = await confirm_component(
             conversation_id,
             ComponentConfirm(
                 componentId=component_id,
-                candidateToken=token,
+                candidateSnapshotDigest=token,
                 inputs={"name": "Bob"},
             ),
             session,
@@ -222,7 +222,7 @@ async def test_confirm_component_rejects_stale_token() -> None:
                 conversation_id,
                 ComponentConfirm(
                     componentId=component_id,
-                    candidateToken="sha256:stale",
+                    candidateSnapshotDigest="sha256:stale",
                     inputs={"name": "Bob"},
                 ),
                 session,

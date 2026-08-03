@@ -32,6 +32,18 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
             row[1]
             for row in connection.execute("PRAGMA table_info(conversation_runs)")
         }
-    assert revision == ("0006",)
-    assert {"runs", "capability_versions", "mcp_tool_snapshots", "distillations"} <= tables
+        snapshot_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(mcp_tool_snapshots)")
+        }
+    assert revision == ("0007",)
+    assert {
+        "runs",
+        "capability_versions",
+        "mcp_tool_snapshots",
+        "distillations",
+        "conversation_run_events",
+    } <= tables
     assert "run_type" in run_type_columns
+    assert "error_json" in run_type_columns
+    assert {"effect_source", "effect_review_status"} <= snapshot_columns

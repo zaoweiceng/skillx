@@ -1,10 +1,10 @@
 import Form from '@rjsf/core'
 import validator from '@rjsf/validator-ajv8'
-import { Bot, CornerDownLeft, Link2Off, MessageSquareText, Plus } from 'lucide-react'
-import { FormEvent, useEffect, useState } from 'react'
+import { Bot, CornerDownLeft, Link2Off, MessageSquareText } from 'lucide-react'
+import { FormEvent, useCallback, useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 
-import { api, ChatMessageContent } from '@/api/client'
+import { api, ChatMessageContent, ConversationRunEvent } from '@/api/client'
 
 type Message = {
   id: string
@@ -19,10 +19,16 @@ export default function ChatPage() {
   const [sending, setSending] = useState(false)
   const [error, setError] = useState('')
   const [drafts, setDrafts] = useState<Record<string, string>>({})
-  // 候选卡片补参与降级状态，按消息 id 索引。
+  // 候选卡片补参状态，按消息 id 索引。
   const [candidateInputs, setCandidateInputs] = useState<Record<string, Record<string, unknown>>>({})
-  const [dismissed, setDismissed] = useState<Record<string, boolean>>({})
   const [confirming, setConfirming] = useState('')
+  const [startingAgent, setStartingAgent] = useState(false)
+  // 最近一次用户输入，用于「继续/启动通用 Agent」时复用原始任务描述。
+  const [lastPrompt, setLastPrompt] = useState('')
+  // 轨迹抽屉：追踪最近一次通用 Agent 运行及其规范化事件。
+  const [activeRunId, setActiveRunId] = useState('')
+  const [runStatus, setRunStatus] = useState('')
+  const [traceEvents, setTraceEvents] = useState<ConversationRunEvent[]>([])
 
   useEffect(() => {
     api
@@ -31,16 +37,50 @@ export default function ChatPage() {
       .catch((reason: Error) => setError(reason.message))
   }, [])
 
-  async function refresh() {
+  const refresh = useCallback(async () => {
     const conversation = await api.getConversation(conversationId)
     setMessages(conversation.messages)
-  }
+    // 从服务端消息恢复最近一次 Agent 运行，刷新后仍可展示轨迹，不依赖本地 state。
+    const latestAgent = [...conversation.messages]
+      .reverse()
+      .find((message) => message.content.conversationRunId && message.content.runType === 'agent_run')
+    if (latestAgent?.content.conversationRunId) {
+      setActiveRunId(latestAgent.content.conversationRunId)
+    }
+  }, [conversationId])
+
+  // 订阅活动 Agent 运行的规范化事件，直到进入终态。
+  useEffect(() => {
+    if (!activeRunId) return
+    let cancelled = false
+    async function poll() {
+      try {
+        const [summary, events] = await Promise.all([
+          api.getConversationRun(activeRunId),
+          api.listConversationRunEvents(activeRunId),
+        ])
+        if (cancelled) return
+        setRunStatus(summary.status)
+        setTraceEvents(events)
+        if (summary.status === 'running') {
+          window.setTimeout(poll, 800)
+        }
+      } catch (reason) {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : '加载轨迹失败')
+      }
+    }
+    poll()
+    return () => {
+      cancelled = true
+    }
+  }, [activeRunId])
 
   async function send(event: FormEvent) {
     event.preventDefault()
     if (!input.trim() || !conversationId) return
     const text = input.trim()
     setInput('')
+    setLastPrompt(text)
     setSending(true)
     const optimistic: Message = {
       id: `local-${Date.now()}`,
@@ -60,13 +100,13 @@ export default function ChatPage() {
 
   async function startComponent(message: Message) {
     const content = message.content
-    if (!content.componentId || !content.candidateToken) return
+    if (!content.componentId || !content.candidateSnapshotDigest) return
     setConfirming(message.id)
     setError('')
     try {
       await api.confirmComponent(conversationId, {
         componentId: content.componentId,
-        candidateToken: content.candidateToken,
+        candidateSnapshotDigest: content.candidateSnapshotDigest,
         inputs: candidateInputs[message.id] ?? {},
       })
       await refresh()
@@ -74,6 +114,22 @@ export default function ChatPage() {
       setError(reason instanceof Error ? reason.message : '组件启动失败')
     } finally {
       setConfirming('')
+    }
+  }
+
+  // 「继续通用 Agent」/「启动通用 Agent」：真正调用 Agent endpoint，不再只隐藏卡片。
+  async function startAgent(prompt: string) {
+    if (!conversationId || !prompt.trim()) return
+    setStartingAgent(true)
+    setError('')
+    try {
+      const result = await api.startAgentRun(conversationId, prompt.trim())
+      setActiveRunId(result.conversationRunId)
+      await refresh()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '通用 Agent 启动失败')
+    } finally {
+      setStartingAgent(false)
     }
   }
 
@@ -89,11 +145,14 @@ export default function ChatPage() {
     }
   }
 
+  function lastUserPrompt(): string {
+    if (lastPrompt) return lastPrompt
+    const lastUser = [...messages].reverse().find((message) => message.role === 'user')
+    return lastUser?.content.text ?? ''
+  }
+
   function renderCandidate(message: Message) {
     const content = message.content
-    if (dismissed[message.id]) {
-      return <span className="effect-label">已选择继续通用 Agent，未启动组件。</span>
-    }
     return (
       <div className="candidate-card">
         <div className="candidate-meta">
@@ -121,21 +180,56 @@ export default function ChatPage() {
               <button
                 className="button primary"
                 type="submit"
-                disabled={confirming === message.id || !content.candidateToken}
+                disabled={confirming === message.id || !content.candidateSnapshotDigest}
               >
                 {confirming === message.id ? '正在启动...' : '使用该组件'}
               </button>
               <button
                 className="button ghost"
                 type="button"
-                onClick={() => setDismissed((current) => ({ ...current, [message.id]: true }))}
+                disabled={startingAgent}
+                onClick={() => startAgent(lastUserPrompt())}
               >
-                继续通用 Agent
+                {startingAgent ? '正在启动 Agent...' : '继续通用 Agent'}
               </button>
             </div>
           </Form>
         )}
       </div>
+    )
+  }
+
+  function renderTrace() {
+    if (!activeRunId || traceEvents.length === 0) {
+      return (
+        <div className="trace-empty">
+          <span className="pulse-ring" />
+          <p>Agent 启动后，这里只展示可审计的行动摘要与 Tool 事件。</p>
+        </div>
+      )
+    }
+    return (
+      <ol className="trace-timeline" aria-label="Agent 轨迹">
+        {traceEvents.map((event) => (
+          <li className="trace-item" key={event.seq}>
+            <span className="trace-type">{event.type}</span>
+            {typeof event.payload.tool === 'string' && (
+              <span className="trace-tool">工具 {event.payload.tool as string}</span>
+            )}
+            {typeof event.payload.summary === 'object' && event.payload.summary !== null && (
+              <span className="trace-summary">
+                步数 {(event.payload.summary as Record<string, unknown>).steps as number} · Tokens{' '}
+                {(event.payload.summary as Record<string, unknown>).totalTokens as number}
+              </span>
+            )}
+            {typeof event.payload.error === 'object' && event.payload.error !== null && (
+              <span className="error-code">
+                {(event.payload.error as Record<string, unknown>).code as string}
+              </span>
+            )}
+          </li>
+        ))}
+      </ol>
     )
   }
 
@@ -184,12 +278,23 @@ export default function ChatPage() {
                   <span className="error-code">{message.content.code}</span>
                 )}
                 {message.content.type === 'component_candidate' && renderCandidate(message)}
+                {message.content.offerAgentRun && (
+                  <button
+                    className="button ghost"
+                    type="button"
+                    disabled={startingAgent}
+                    onClick={() => startAgent(lastUserPrompt())}
+                  >
+                    {startingAgent ? '正在启动 Agent...' : '启动通用 Agent 探索'}
+                  </button>
+                )}
                 {message.content.runId && (
                   <Link className="button ghost" to={`/runs/${message.content.runId}`}>
                     查看运行
                   </Link>
                 )}
                 {message.content.conversationRunId &&
+                  message.content.runType === 'agent_run' &&
                   (drafts[message.content.conversationRunId] ? (
                     <Link
                       className="button ghost"
@@ -215,12 +320,9 @@ export default function ChatPage() {
               <span className="eyebrow">EXECUTION TRACE</span>
               <h2>执行轨迹</h2>
             </div>
-            <Plus size={16} />
+            {runStatus && <span className={`status-badge ${runStatus}`}>{runStatus}</span>}
           </div>
-          <div className="trace-empty">
-            <span className="pulse-ring" />
-            <p>Agent 启动后，这里只展示可审计的行动摘要与 Tool 事件。</p>
-          </div>
+          {renderTrace()}
         </aside>
       </div>
       <form className="chat-composer" onSubmit={send}>

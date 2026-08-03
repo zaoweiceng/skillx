@@ -10,6 +10,10 @@ from typing import Any
 TOOL = {
     "name": "weather.get_current",
     "description": "返回本地演示用的确定性天气数据",
+    "annotations": {
+        "readOnlyHint": True,
+        "idempotentHint": True,
+    },
     "inputSchema": {
         "type": "object",
         "properties": {"city": {"type": "string", "minLength": 1}},

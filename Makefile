@@ -7,7 +7,7 @@ demo-check: quality-check e2e-check
 quality-check: backend-check migration-check frontend-check
 
 backend-check:
-	cd backend && uv run ruff check app tests migrations e2e ../examples/local_weather_mcp.py ../examples/traex_stub.py
+	cd backend && uv run ruff check app tests migrations e2e ../examples/local_weather_mcp.py ../examples/traex_stub.py ../examples/local_form_site.py
 	cd backend && uv run pytest -q
 
 browser-install:

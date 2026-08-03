@@ -1,14 +1,17 @@
 """六场景黑盒验收 Harness。
 
 为每次验收创建独立的临时目录、SQLite 数据库和 Artifact 根目录；只通过
-`alembic upgrade head` 建库并 seed；启动独立的 API 与 Worker 子进程；通过 HTTP/SSE
-驱动场景。结束后优雅停止子进程，失败时保留日志。
+`alembic upgrade head` 建库并 seed；启动独立的 API、Worker 与本地表单站点子进程；
+通过 HTTP/SSE 驱动场景。端口动态分配；结束后优雅停止子进程；失败时保留临时目录并打印
+所有子进程日志，成功时清理临时目录。
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -20,18 +23,33 @@ import httpx
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 REPO_DIR = BACKEND_DIR.parent
+TRAEX_STUB = REPO_DIR / "examples" / "traex_stub.py"
+FORM_SITE = REPO_DIR / "examples" / "local_form_site.py"
 
 
 @dataclass
 class DemoStack:
     base_url: str
+    form_url: str
     workdir: Path
     _api: subprocess.Popen
     _worker: subprocess.Popen
+    _form: subprocess.Popen
     _logs: dict[str, Path] = field(default_factory=dict)
 
     def client(self) -> httpx.Client:
         return httpx.Client(base_url=self.base_url, timeout=30)
+
+    def form_stats(self) -> dict:
+        response = httpx.get(f"{self.form_url}/__stats", timeout=5)
+        response.raise_for_status()
+        return response.json()
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def _wait_http(url: str, timeout: float, proc: subprocess.Popen) -> None:
@@ -51,11 +69,27 @@ def _wait_http(url: str, timeout: float, proc: subprocess.Popen) -> None:
     raise TimeoutError(f"等待 {url} 就绪超时：{last_error}")
 
 
+def _wait_worker_polling(worker: subprocess.Popen, log_path: Path, timeout: float) -> None:
+    """确认 Worker 已进入领取循环，而不只是进程尚未退出。"""
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if worker.poll() is not None:
+            raise RuntimeError(f"Worker 在就绪前退出，返回码 {worker.returncode}")
+        if log_path.exists() and "worker polling" in log_path.read_text(encoding="utf-8"):
+            return
+        time.sleep(0.2)
+    raise TimeoutError("Worker 未在超时内进入轮询状态")
+
+
 def start_stack(
     *,
-    port: int = 8799,
+    port: int | None = None,
+    form_port: int | None = None,
     model_env: dict[str, str] | None = None,
 ) -> DemoStack:
+    port = port or _free_port()
+    form_port = form_port or _free_port()
     workdir = Path(mkdtemp(prefix="skillx-demo-"))
     db_path = workdir / "demo.db"
     artifact_root = workdir / "artifacts"
@@ -67,6 +101,11 @@ def start_stack(
         "SKILLX_DATABASE_URL": database_url,
         "SKILLX_ARTIFACT_ROOT": str(artifact_root),
         "SKILLX_AUTO_CREATE_SCHEMA": "false",
+        # 配置仓库内 TraeX-compatible fixture，使真实 Agent 主路径可达。
+        "SKILLX_TRAEX_COMMAND": f'["{sys.executable}", "{TRAEX_STUB}"]',
+        "SKILLX_TRAEX_ALLOWED_EXECUTABLES": f'["{Path(sys.executable).name}"]',
+        # 本地表单站点 URL：seed 据此创建真实 Playwright 提交组件（E2E-6）。
+        "SKILLX_DEMO_FORM_URL": f"http://127.0.0.1:{form_port}/apply",
         **(model_env or {}),
     }
 
@@ -96,7 +135,14 @@ def start_stack(
         raise RuntimeError(f"Seed 失败：{seed.stderr}")
 
     api_log = open(workdir / "api.log", "w", encoding="utf-8")  # noqa: SIM115
-    worker_log = open(workdir / "worker.log", "w", encoding="utf-8")  # noqa: SIM115
+    worker_log_path = workdir / "worker.log"
+    worker_log = open(worker_log_path, "w", encoding="utf-8")  # noqa: SIM115
+    form_log = open(workdir / "form.log", "w", encoding="utf-8")  # noqa: SIM115
+    logs = {
+        "api": workdir / "api.log",
+        "worker": worker_log_path,
+        "form": workdir / "form.log",
+    }
     api = subprocess.Popen(
         [
             sys.executable,
@@ -120,31 +166,31 @@ def start_stack(
         stdout=worker_log,
         stderr=subprocess.STDOUT,
     )
+    form = subprocess.Popen(
+        [sys.executable, "-m", "examples.local_form_site", "--port", str(form_port)],
+        cwd=REPO_DIR,
+        env=env,
+        stdout=form_log,
+        stderr=subprocess.STDOUT,
+    )
     base_url = f"http://127.0.0.1:{port}/api"
+    form_url = f"http://127.0.0.1:{form_port}"
+    stack = DemoStack(base_url, form_url, workdir, api, worker, form, logs)
     try:
         _wait_http(f"{base_url}/health/ready", timeout=30, proc=api)
-        if worker.poll() is not None:
-            raise RuntimeError(f"Worker 在就绪前退出，返回码 {worker.returncode}")
+        _wait_worker_polling(worker, worker_log_path, timeout=30)
+        _wait_http(f"{form_url}/__stats", timeout=15, proc=form)
     except Exception:
-        stop_stack(
-            DemoStack(base_url, workdir, api, worker, {"api": workdir / "api.log"}),
-            failed=True,
-        )
+        stop_stack(stack, failed=True)
         raise
-    return DemoStack(
-        base_url,
-        workdir,
-        api,
-        worker,
-        {"api": workdir / "api.log", "worker": workdir / "worker.log"},
-    )
+    return stack
 
 
 def stop_stack(stack: DemoStack, *, failed: bool = False) -> None:
-    for proc in (stack._worker, stack._api):
+    for proc in (stack._worker, stack._api, stack._form):
         if proc.poll() is None:
             proc.send_signal(signal.SIGTERM)
-    for proc in (stack._worker, stack._api):
+    for proc in (stack._worker, stack._api, stack._form):
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -154,9 +200,12 @@ def stop_stack(stack: DemoStack, *, failed: bool = False) -> None:
             if path.exists():
                 sys.stderr.write(f"\n===== {name} 日志 ({path}) =====\n")
                 sys.stderr.write(path.read_text(encoding="utf-8")[-4000:])
+        sys.stderr.write(f"\n失败：临时目录已保留于 {stack.workdir}\n")
+    else:
+        shutil.rmtree(stack.workdir, ignore_errors=True)
 
 
-def poll_run(client: httpx.Client, run_id: str, *, timeout: float = 20) -> dict:
+def poll_run(client: httpx.Client, run_id: str, *, timeout: float = 30) -> dict:
     """轮询 Run 直到进入终态或等待审批。"""
 
     deadline = time.time() + timeout

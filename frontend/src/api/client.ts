@@ -125,10 +125,28 @@ export type ChatMessageContent = {
   required?: string[]
   confidence?: number
   reason?: string
-  candidateToken?: string
+  candidateSnapshotDigest?: string
+  offerAgentRun?: boolean
   inputSchema?: Record<string, unknown>
   uiSchema?: Record<string, unknown>
   executionClass?: string
+}
+
+export type ConversationRunEvent = {
+  seq: number
+  type: string
+  payload: Record<string, unknown>
+  createdAt?: string
+}
+
+export type ConversationRunSummary = {
+  id: string
+  conversationId: string
+  status: string
+  runType: string
+  input: Record<string, unknown>
+  output: Record<string, unknown>
+  error: Record<string, unknown> | null
 }
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? '/api'
@@ -239,11 +257,29 @@ export const api = {
     ),
   confirmComponent: (
     conversationId: string,
-    payload: { componentId: string; candidateToken: string; inputs: Record<string, unknown> },
+    payload: {
+      componentId: string
+      candidateSnapshotDigest: string
+      inputs: Record<string, unknown>
+    },
   ) =>
     request<{ runId: string; assistant: ChatMessageContent }>(
       `/conversations/${conversationId}/confirm-component`,
       { method: 'POST', body: JSON.stringify(payload) },
+    ),
+  startAgentRun: (
+    conversationId: string,
+    content: string,
+  ) =>
+    request<{ conversationRunId: string; status: string; assistant: ChatMessageContent }>(
+      `/conversations/${conversationId}/agent-runs`,
+      { method: 'POST', body: JSON.stringify({ content }) },
+    ),
+  getConversationRun: (id: string) =>
+    request<ConversationRunSummary>(`/conversation-runs/${id}`),
+  listConversationRunEvents: (id: string, after = 0) =>
+    request<ConversationRunEvent[]>(
+      `/conversation-runs/${id}/events?after=${after}`,
     ),
   distillConversationRun: (id: string) =>
     request<{

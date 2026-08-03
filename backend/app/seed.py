@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from uuid import uuid4
@@ -104,6 +105,24 @@ async def seed() -> str:
                 description="浏览器契约填写并提交，需一次性授权；页面/身份变化即失效。",
                 workflow_name="费用提交工作流",
                 definition=browser,
+                validation={"diagnostics": [], "executionClass": "zero_llm"},
+            )
+        # 真实 Playwright 提交组件：仅当提供本地表单站点 URL 时 seed，供黑盒 E2E-6 使用。
+        form_url = os.environ.get("SKILLX_DEMO_FORM_URL")
+        if (
+            form_url
+            and await session.scalar(
+                select(Component).where(Component.name == "费用提交（真实浏览器）")
+            )
+            is None
+        ):
+            playwright_browser = _playwright_browser_workflow(form_url)
+            await _create_component(
+                session,
+                name="费用提交（真实浏览器）",
+                description="真实 Playwright 打开本地表单站点，填写并在一次性授权后提交。",
+                workflow_name="费用提交（真实浏览器）工作流",
+                definition=playwright_browser,
                 validation={"diagnostics": [], "executionClass": "zero_llm"},
             )
         await session.commit()
@@ -358,6 +377,84 @@ def _browser_workflow() -> dict:
                     },
                     "sideEffect": True,
                     "idempotent": False,
+                },
+                {
+                    "id": "output",
+                    "type": "output",
+                    "displayName": "输出",
+                    "input": {
+                        "status": "${submit.output.status}",
+                        "businessId": "${submit.output.businessId}",
+                        "evidence": "${submit.output.evidence}",
+                    },
+                },
+            ],
+            "edges": [
+                {"source": "input", "target": "submit"},
+                {"source": "submit", "target": "output"},
+            ],
+        },
+    }
+
+
+def _playwright_browser_workflow(form_url: str) -> dict:
+    """真实 Playwright 提交工作流：打开本地表单站点，填写并在授权后提交。"""
+
+    contract = {
+        "contractVersion": "1",
+        "urlPattern": form_url,
+        "pageIdentity": {"identity": "user-1"},
+        "fields": [
+            {
+                "id": "amount",
+                "required": True,
+                "type": "number",
+                "locator": {"role": "spinbutton", "label": "金额"},
+            }
+        ],
+        "submit": {"role": "button", "name": "提交申请"},
+    }
+    return {
+        "apiVersion": "workflow.platform/v1",
+        "kind": "Workflow",
+        "metadata": {"name": "expense-submit-playwright"},
+        "spec": {
+            "inputSchema": {
+                "type": "object",
+                "properties": {"amount": {"type": "number", "title": "金额"}},
+                "required": ["amount"],
+                "additionalProperties": False,
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "businessId": {"type": "string"},
+                    "evidence": {"type": "object"},
+                },
+                "required": ["status", "businessId", "evidence"],
+            },
+            "nodes": [
+                {"id": "input", "type": "input", "displayName": "输入"},
+                {
+                    "id": "submit",
+                    "type": "browser",
+                    "displayName": "提交费用",
+                    "input": {"formValues": {"amount": "${input.amount}"}},
+                    "config": {
+                        "runtime": "playwright",
+                        "url": form_url,
+                        "pageContract": contract,
+                        "identitySelector": "[data-testid='identity']",
+                        "submit": True,
+                        "successAssertions": [
+                            {"type": "text", "value": "提交成功", "timeoutMs": 3000}
+                        ],
+                        "resultSelectors": {"businessId": "#business-id"},
+                    },
+                    "sideEffect": True,
+                    "idempotent": False,
+                    "timeoutSeconds": 30,
                 },
                 {
                     "id": "output",

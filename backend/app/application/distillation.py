@@ -108,10 +108,13 @@ async def distill_conversation_run(
 ) -> Distillation:
     if conversation_run.status != "succeeded":
         raise DistillationError("只有成功的运行可以固化")
-    # 只固化服务端生成的运行事实；外部导入的轨迹不可作为固化来源。
+    # 默认只固化 AgentRunService 生成的成功 agent_run：这是“探索一次，固化复用”的
+    # 唯一生产者。外部导入轨迹与单次 llm_response 都不作为固化来源。
     run_type = getattr(conversation_run, "run_type", "agent_run")
-    if run_type == "trajectory_import":
-        raise DistillationError("外部导入轨迹不可直接固化，请使用服务端生成的运行")
+    if run_type != "agent_run":
+        raise DistillationError(
+            "只有服务端生成的 agent_run 可固化；单次回答或导入轨迹请勿作为固化来源"
+        )
     definition, analysis = compile_trajectory(conversation_run.trajectory_json)
     # 保留来源 run id 与事件摘要，保证固化结果可审计。
     analysis = {
