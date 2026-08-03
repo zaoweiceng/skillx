@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import signal
 
+from app.application.agent_run import AgentRunWorker
 from app.application.orchestrator import WorkerService
 from app.config import get_settings
 from app.infrastructure.database import init_database
@@ -14,6 +15,9 @@ async def run_worker(worker_id: str | None = None) -> None:
     if settings.auto_create_schema:
         await init_database()
     service = WorkerService(worker_id or settings.worker_id, settings.lease_seconds)
+    # Agent 长任务与工作流节点共用同一 Worker 进程：先持久化后执行的 ConversationRun
+    # 由 AgentRunWorker 领取租约执行，API 重启不影响已领取/待领取任务。
+    agent_worker = AgentRunWorker(f"{service.worker_id}-agent")
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     for event in (signal.SIGINT, signal.SIGTERM):
@@ -23,7 +27,11 @@ async def run_worker(worker_id: str | None = None) -> None:
     print(f"worker polling worker_id={service.worker_id}", flush=True)
     while not stopping.is_set():
         processed = await service.run_once()
-        if not processed:
+        try:
+            processed_agent = await agent_worker.poll_once()
+        except Exception:  # noqa: BLE001 - Agent 领取失败不应终止工作流循环。
+            processed_agent = False
+        if not processed and not processed_agent:
             try:
                 await asyncio.wait_for(stopping.wait(), timeout=settings.worker_poll_seconds)
             except TimeoutError:

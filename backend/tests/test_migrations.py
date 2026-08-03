@@ -36,7 +36,7 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
             row[1]
             for row in connection.execute("PRAGMA table_info(mcp_tool_snapshots)")
         }
-    assert revision == ("0007",)
+    assert revision == ("0008",)
     assert {
         "runs",
         "capability_versions",
@@ -46,4 +46,5 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
     } <= tables
     assert "run_type" in run_type_columns
     assert "error_json" in run_type_columns
+    assert {"lease_owner", "lease_expires_at", "next_event_seq"} <= run_type_columns
     assert {"effect_source", "effect_review_status"} <= snapshot_columns

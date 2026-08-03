@@ -26,6 +26,14 @@ class Settings(BaseSettings):
     model_api_key_env: str = "SKILLX_MODEL_API_KEY"
     traex_command: list[str] | None = None
     traex_allowed_executables: list[str] = ["traex"]
+    # Agent Host policy：Host 授予的 Tool 集合是安全边界，请求只能取交集缩小范围，
+    # 不能扩大。步数/Token/时长上限由 Host 独立强制，畸形事件 fail closed。
+    agent_host_capabilities: list[str] = ["search.web", "read.local"]
+    agent_max_steps: int = 6
+    agent_max_total_tokens: int = 30000
+    agent_max_duration_seconds: int = 120
+    agent_max_event_payload_bytes: int = 65536
+    agent_lease_seconds: int = 30
 
 
 @lru_cache

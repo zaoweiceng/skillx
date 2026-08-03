@@ -259,6 +259,9 @@ class Message(Base):
 
 class ConversationRun(Base, TimestampMixin):
     __tablename__ = "conversation_runs"
+    __table_args__ = (
+        Index("ix_conversation_runs_claim", "status", "lease_expires_at", "created_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     conversation_id: Mapped[str] = mapped_column(
@@ -270,6 +273,22 @@ class ConversationRun(Base, TimestampMixin):
     output_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     trajectory_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # 长任务持久化状态机：queued → running → succeeded|failed|cancelled。
+    # 存在、状态与事件都不依赖 HTTP 连接或进程内存，可跨进程恢复。
+    config_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    queued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancellation_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    next_event_seq: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class ConversationRunEvent(Base):

@@ -12,16 +12,24 @@ from collections.abc import Iterator
 import httpx
 import pytest
 
-from e2e.harness import DemoStack, poll_run, start_stack, stop_stack
+from e2e.harness import (
+    DemoStack,
+    poll_conversation_run,
+    poll_run,
+    start_stack,
+    stop_stack,
+)
 
 
 @pytest.fixture(scope="module")
-def stack() -> Iterator[DemoStack]:
+def stack(request: pytest.FixtureRequest) -> Iterator[DemoStack]:
     stack = start_stack()
     try:
         yield stack
     finally:
-        stop_stack(stack)
+        # 若本模块内任一用例在 call 阶段失败，保留现场并打印子进程日志（B-03）。
+        failed = bool(getattr(request.session, "_e2e_call_failed", False))
+        stop_stack(stack, failed=failed)
 
 
 def _component(client: httpx.Client, name: str) -> dict:
@@ -101,32 +109,47 @@ def test_e2e_4_conversation_component(stack: DemoStack) -> None:
 
 def test_e2e_5_agent_distillation_reuse(stack: DemoStack) -> None:
     with stack.client() as client:
-        # 1) 通过 HTTP 创建对话并启动仓库内 TraeX-compatible Agent。
+        # 1) 通过 HTTP 创建对话并启动持久化长任务 Agent（先持久化，后执行）。
         conversation = client.post("/conversations", json={"title": "Agent 固化"}).json()
         started = client.post(
             f"/conversations/{conversation['id']}/agent-runs",
-            json={"content": "探索并总结季度复盘 [[MODE:ok]][[REPLY:季度复盘要点]]"},
+            json={
+                "content": "q1 [[MODE:deterministic]]",
+                "allowedCapabilities": ["lookup.table"],
+            },
         )
-        assert started.status_code == 201, started.text
+        # POST 立即返回 202 + queued handle，不阻塞到 TraeX 终态。
+        assert started.status_code == 202, started.text
         payload = started.json()
-        assert payload["status"] == "succeeded"
+        assert payload["status"] == "queued"
         conversation_run_id = payload["conversationRunId"]
 
-        # 2) 服务端生成成功 agent_run，事件含 agent.* 与 Tool 事件。
-        summary = client.get(f"/conversation-runs/{conversation_run_id}").json()
+        # 2) 独立 Agent Worker 领取租约并执行，运行事件跨连接可见、可恢复。
+        summary = poll_conversation_run(client, conversation_run_id)
+        assert summary["status"] == "succeeded", summary
         assert summary["runType"] == "agent_run"
+        assert summary["output"] == {"reply": "第一季度：营收增长 12%"}
         events = client.get(f"/conversation-runs/{conversation_run_id}/events").json()
         event_types = {item["type"] for item in events}
-        assert {"agent.run.created", "agent.plan", "agent.run.succeeded"} <= event_types
+        assert {
+            "agent.run.created",
+            "agent.run.started",
+            "agent.plan",
+            "agent.run.succeeded",
+        } <= event_types
         assert any(item["type"].startswith("tool.") for item in events)
 
-        # 3) 固化只生成草稿，不产生 WorkflowVersion。
+        # 3) 固化消费真实 Tool 轨迹，提炼出确定节点（非单 Agent 节点），只生成草稿。
         distilled = client.post(f"/conversation-runs/{conversation_run_id}/distill")
         assert distilled.status_code == 201, distilled.text
         draft = distilled.json()
         draft_workflow_id = draft["draftWorkflowId"]
         assert draft["status"] == "draft_created"
         assert draft["analysis"]["sourceRunType"] == "agent_run"
+        # 提炼出确定节点、锁定 Tool，且固化后预计模型调用降为 0。
+        assert draft["analysis"]["directNodes"] >= 1
+        assert draft["analysis"]["estimatedLlmCallsAfter"] == 0
+        assert draft["analysis"]["toolLocks"] == ["lookup.table"]
 
         # 4) 通过 API 人工发布并创建组件。
         published = client.post(f"/workflows/{draft_workflow_id}/publish")
@@ -135,7 +158,7 @@ def test_e2e_5_agent_distillation_reuse(stack: DemoStack) -> None:
         component = client.post(
             "/components",
             json={
-                "name": "固化-季度复盘 Agent",
+                "name": "固化-季度复盘查表",
                 "description": "由对话 Agent 探索固化并人工发布。",
                 "workflowVersionId": version_id,
             },
@@ -143,18 +166,19 @@ def test_e2e_5_agent_distillation_reuse(stack: DemoStack) -> None:
         assert component.status_code == 201, component.text
         component_id = component.json()["id"]
 
-        # 5) 用不同输入运行发布组件并验证复用输出。
-        # 固化后的受限 Agent 复现该次探索：新输入作为数据注入，探索行为已冻结，
-        # 因此以不同输入仍稳定产生结构化输出。
+        # 5) 用与探索时不同的输入运行发布组件：结果随输入变化，且零模型调用。
         created = client.post(
             f"/components/{component_id}/runs",
-            json={"input": {"message": "换一个季度继续复用探索"}},
+            json={"input": {"message": "q2"}},
         )
         assert created.status_code == 202, created.text
         run = poll_run(client, created.json()["id"])
         assert run["status"] == "succeeded", run
-        assert run["output"] == {"reply": "季度复盘要点"}
-        assert "agent.completed" in _events(client, run["id"])
+        # 新输入 q2 选出不同结果（编译复用，而非重跑同一 prompt）。
+        assert run["output"] == {"reply": "第二季度：营收增长 8%"}
+        reuse_events = _events(client, run["id"])
+        assert "agent.completed" not in reuse_events
+        assert "llm.call.completed" not in reuse_events
 
 
 def test_e2e_6_browser_submit_with_one_time_approval(stack: DemoStack) -> None:

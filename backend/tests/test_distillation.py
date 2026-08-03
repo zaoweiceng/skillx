@@ -7,7 +7,7 @@ from app.api.routes import publish_workflow
 from app.application.compiler import digest_json
 from app.application.distillation import (
     DistillationError,
-    compile_trajectory,
+    compile_agent_trajectory,
     distill_conversation_run,
 )
 from app.application.orchestrator import Orchestrator, WorkerService
@@ -15,65 +15,76 @@ from app.infrastructure.database import (
     Conversation,
     ConversationRun,
     Run,
+    RunEvent,
     SessionLocal,
     Workflow,
     WorkflowVersion,
 )
 
+# 真实 Agent 轨迹：一次确定性 Tool 调用读取整张本地表，参数来自用户输入。
+LOOKUP_TABLE = {
+    "q1": "第一季度：营收增长 12%",
+    "q2": "第二季度：营收增长 8%",
+}
 
-def fixed_trajectory() -> dict:
+
+def agent_trajectory(*, message: str = "q1") -> dict:
     return {
-        "name": "distilled-greeting",
+        "runType": "agent_run",
+        "name": "distilled-lookup",
+        "prompt": message,
         "inputSchema": {
-            "type": "object",
-            "properties": {"name": {"type": "string"}},
-            "required": ["name"],
-        },
-        "outputSchema": {
             "type": "object",
             "properties": {"message": {"type": "string"}},
             "required": ["message"],
+            "additionalProperties": False,
         },
-        "steps": [
+        "outputSchema": {
+            "type": "object",
+            "properties": {"reply": {"type": "string"}},
+            "required": ["reply"],
+            "additionalProperties": False,
+        },
+        "actions": [
             {
-                "id": "format",
-                "kind": "transform",
-                "displayName": "格式化",
-                "input": {"name": "${input.name}"},
-                "config": {"operation": "template", "template": "你好，{name}"},
+                "callId": "call-1",
+                "tool": "lookup.table",
+                "arguments": {"key": message},
+                "result": dict(LOOKUP_TABLE),
             }
         ],
-        "outputMapping": {"message": "${format.output.text}"},
-        "originalModelCalls": 3,
+        "output": {"reply": LOOKUP_TABLE[message]},
+        "config": {"maxSteps": 6, "maxTotalTokens": 30000, "allowedCapabilities": ["lookup.table"]},
+        "originalModelCalls": 1,
     }
 
 
-def test_fixed_trajectory_produces_stable_zero_llm_draft() -> None:
-    first, analysis = compile_trajectory(fixed_trajectory())
-    second, _ = compile_trajectory(fixed_trajectory())
+def test_tool_action_becomes_deterministic_lookup_node() -> None:
+    first, analysis = compile_agent_trajectory(agent_trajectory())
+    second, _ = compile_agent_trajectory(agent_trajectory())
 
+    # 提炼稳定、可发布、零模型调用，且锁定了 Tool。
     assert digest_json(first) == digest_json(second)
     assert analysis["publishable"] is True
-    assert analysis["estimatedLlmCallsBefore"] == 3
+    assert analysis["directNodes"] == 1
+    assert analysis["llmOrAgentNodes"] == 0
+    assert analysis["estimatedLlmCallsBefore"] == 1
     assert analysis["estimatedLlmCallsAfter"] == 0
+    assert analysis["toolLocks"] == ["lookup.table"]
+    # 第二个节点是确定性 lookup Transform，不是 Agent。
+    node = first["spec"]["nodes"][1]
+    assert node["type"] == "transform"
+    assert node["config"]["operation"] == "lookup"
 
 
-def test_unknown_step_stays_agent_and_is_not_publishable() -> None:
-    trajectory = fixed_trajectory()
-    trajectory["steps"][0] = {
-        "id": "dynamic",
-        "kind": "dynamic-planning",
-        "summary": "动态选择工具",
-        "outputSchema": {"type": "object"},
-        "allowedCapabilities": ["tool-a"],
-    }
-    trajectory["outputMapping"] = {"message": "${dynamic.output.message}"}
-
-    definition, analysis = compile_trajectory(trajectory)
-
+def test_trajectory_without_parameterizable_action_falls_back_to_agent() -> None:
+    trajectory = agent_trajectory()
+    # 参数与用户输入不相等：无法安全参数化，退回受限 Agent 节点。
+    trajectory["actions"][0]["arguments"] = {"key": "hardcoded"}
+    definition, analysis = compile_agent_trajectory(trajectory)
     assert definition["spec"]["nodes"][1]["type"] == "agent"
-    assert analysis["publishable"] is False
-    assert analysis["diagnostics"][0]["code"] == "UNSTABLE_STEP"
+    assert analysis["llmOrAgentNodes"] == 1
+    assert analysis["diagnostics"][0]["code"] == "NO_DETERMINISTIC_ACTION"
 
 
 async def test_distillation_creates_editable_draft_without_publishing() -> None:
@@ -85,9 +96,9 @@ async def test_distillation_creates_editable_draft_without_publishing() -> None:
             id=str(uuid4()),
             conversation_id=conversation.id,
             status="succeeded",
-            input_json={"name": "Alice"},
-            output_json={"message": "你好，Alice"},
-            trajectory_json=fixed_trajectory(),
+            input_json={"message": "q1"},
+            output_json={"reply": LOOKUP_TABLE["q1"]},
+            trajectory_json=agent_trajectory(),
         )
         session.add(conversation_run)
         await session.flush()
@@ -113,9 +124,9 @@ async def test_distillation_rejects_imported_trajectory() -> None:
             conversation_id=conversation.id,
             status="succeeded",
             run_type="trajectory_import",
-            input_json={"name": "Alice"},
-            output_json={"message": "你好，Alice"},
-            trajectory_json=fixed_trajectory(),
+            input_json={"message": "q1"},
+            output_json={"reply": LOOKUP_TABLE["q1"]},
+            trajectory_json=agent_trajectory(),
         )
         session.add(imported)
         await session.flush()
@@ -123,8 +134,9 @@ async def test_distillation_rejects_imported_trajectory() -> None:
             await distill_conversation_run(session, imported)
 
 
-async def test_distilled_draft_publishes_and_reuses_with_new_input() -> None:
-    # 1) 从服务端成功运行生成草稿（保留来源 run id）。
+async def test_distilled_draft_reuse_varies_with_new_input() -> None:
+    """固化后用不同输入运行，结果随输入变化且零模型调用（证明真实提炼）。"""
+
     async with SessionLocal() as session, session.begin():
         conversation = Conversation(id=str(uuid4()), title="固化复用")
         session.add(conversation)
@@ -134,9 +146,9 @@ async def test_distilled_draft_publishes_and_reuses_with_new_input() -> None:
             conversation_id=conversation.id,
             status="succeeded",
             run_type="agent_run",
-            input_json={"name": "Alice"},
-            output_json={"message": "你好，Alice"},
-            trajectory_json=fixed_trajectory(),
+            input_json={"message": "q1"},
+            output_json={"reply": LOOKUP_TABLE["q1"]},
+            trajectory_json=agent_trajectory(message="q1"),
         )
         session.add(conversation_run)
         await session.flush()
@@ -144,22 +156,29 @@ async def test_distilled_draft_publishes_and_reuses_with_new_input() -> None:
         draft_workflow_id = result.draft_workflow_id
         assert result.analysis_json["sourceRunId"] == conversation_run.id
 
-    # 2) 人工发布草稿为不可变版本（系统不自动发布）。
     async with SessionLocal() as session:
         published = await publish_workflow(draft_workflow_id, session)
     version_id = published["id"]
 
-    # 3) 用不同输入启动发布版本并验证复用输出。
+    # 用与探索时不同的输入（q2）运行发布版本：结果应随输入变化。
     async with SessionLocal() as session, session.begin():
         version = await session.get(WorkflowVersion, version_id)
         assert version is not None
-        run = await Orchestrator().create_run(session, version, {"name": "Bob"})
+        run = await Orchestrator().create_run(session, version, {"message": "q2"})
         run_id = run.id
     worker = WorkerService("distill-reuse-worker")
     for _ in range(3):
-        assert await worker.run_once()
+        if not await worker.run_once():
+            break
     async with SessionLocal() as session:
         completed = await session.get(Run, run_id)
         assert completed is not None
         assert completed.status == "succeeded"
-        assert completed.output_json == {"message": "你好，Bob"}
+        # 新输入 q2 选出不同结果，未运行任何 Agent/LLM。
+        assert completed.output_json == {"reply": LOOKUP_TABLE["q2"]}
+        event_types = set(
+            await session.scalars(
+                select(RunEvent.type).where(RunEvent.run_id == run_id)
+            )
+        )
+    assert not {"agent.completed", "llm.call.completed"} & event_types

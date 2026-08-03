@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import mkdtemp
+from typing import Any
 
 import httpx
 
@@ -36,6 +37,8 @@ class DemoStack:
     _worker: subprocess.Popen
     _form: subprocess.Popen
     _logs: dict[str, Path] = field(default_factory=dict)
+    # 父进程持有的日志文件句柄，停止时显式关闭，避免泄漏描述符。
+    _log_handles: list[Any] = field(default_factory=list)
 
     def client(self) -> httpx.Client:
         return httpx.Client(base_url=self.base_url, timeout=30)
@@ -104,6 +107,8 @@ def start_stack(
         # 配置仓库内 TraeX-compatible fixture，使真实 Agent 主路径可达。
         "SKILLX_TRAEX_COMMAND": f'["{sys.executable}", "{TRAEX_STUB}"]',
         "SKILLX_TRAEX_ALLOWED_EXECUTABLES": f'["{Path(sys.executable).name}"]',
+        # Host policy 授予的 Agent Tool 集合：请求方能力只能取交集缩小，不能扩大。
+        "SKILLX_AGENT_HOST_CAPABILITIES": '["search.web", "lookup.table"]',
         # 本地表单站点 URL：seed 据此创建真实 Playwright 提交组件（E2E-6）。
         "SKILLX_DEMO_FORM_URL": f"http://127.0.0.1:{form_port}/apply",
         **(model_env or {}),
@@ -175,7 +180,16 @@ def start_stack(
     )
     base_url = f"http://127.0.0.1:{port}/api"
     form_url = f"http://127.0.0.1:{form_port}"
-    stack = DemoStack(base_url, form_url, workdir, api, worker, form, logs)
+    stack = DemoStack(
+        base_url,
+        form_url,
+        workdir,
+        api,
+        worker,
+        form,
+        logs,
+        [api_log, worker_log, form_log],
+    )
     try:
         _wait_http(f"{base_url}/health/ready", timeout=30, proc=api)
         _wait_worker_polling(worker, worker_log_path, timeout=30)
@@ -195,6 +209,12 @@ def stop_stack(stack: DemoStack, *, failed: bool = False) -> None:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+    # 显式关闭父进程持有的日志文件句柄，再读取内容/清理目录。
+    for handle in stack._log_handles:
+        try:
+            handle.close()
+        except Exception:  # noqa: BLE001 - 关闭失败不影响后续清理。
+            pass
     if failed:
         for name, path in stack._logs.items():
             if path.exists():
@@ -215,3 +235,17 @@ def poll_run(client: httpx.Client, run_id: str, *, timeout: float = 30) -> dict:
             return run
         time.sleep(0.3)
     raise TimeoutError(f"Run {run_id} 未在超时内进入终态")
+
+
+def poll_conversation_run(
+    client: httpx.Client, conversation_run_id: str, *, timeout: float = 30
+) -> dict:
+    """轮询 ConversationRun 长任务 handle 直到进入终态。"""
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        run = client.get(f"/conversation-runs/{conversation_run_id}").json()
+        if run["status"] in {"succeeded", "failed", "cancelled"}:
+            return run
+        time.sleep(0.3)
+    raise TimeoutError(f"ConversationRun {conversation_run_id} 未在超时内进入终态")

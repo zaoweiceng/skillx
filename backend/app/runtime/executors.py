@@ -173,6 +173,16 @@ class TransformExecutor:
                 output = json.loads(inputs["text"])
                 if not isinstance(output, dict):
                     raise ValueError("JSON 根节点必须为对象")
+            elif operation == "lookup":
+                # 固化后的确定查表节点：以输入 key 从冻结的本地表选出结果。
+                # 这是“探索一次，编译复用”的落点——新 key 产生不同结果，零模型调用。
+                table = node.config.get("table", {})
+                if not isinstance(table, dict):
+                    raise ValueError("lookup 操作的 table 必须为对象")
+                key_field = node.config.get("keyField", "key")
+                key = inputs.get(key_field)
+                default = node.config.get("default")
+                output = {"value": table.get(str(key), default)}
             else:
                 raise ValueError(f"不支持的转换操作: {operation}")
             return NodeResult(status="succeeded", output=output)

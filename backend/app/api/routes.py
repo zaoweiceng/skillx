@@ -13,7 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.agent_run import (
     AgentRunConfig,
-    AgentRunService,
+    enqueue_agent_run,
+    request_cancellation,
     summarize_run,
 )
 from app.application.capabilities import (
@@ -76,7 +77,6 @@ from app.runtime.models import OpenAICompatibleAdapter
 router = APIRouter()
 compiler = WorkflowCompiler()
 orchestrator = Orchestrator()
-agent_run_service = AgentRunService()
 
 
 class WorkflowCreate(BaseModel):
@@ -1391,17 +1391,18 @@ async def confirm_component(
     return {"runId": run.id, "assistant": assistant_message.content_json}
 
 
-@router.post("/conversations/{conversation_id}/agent-runs", status_code=201)
+@router.post("/conversations/{conversation_id}/agent-runs", status_code=202)
 async def start_agent_run(
     conversation_id: str,
     body: AgentRunCreate,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    """从通用对话启动一次受限 TraeX Agent 探索。
+    """从通用对话启动一次受限 TraeX Agent 探索（先持久化，后执行）。
 
-    唯一创建 ``ConversationRun(run_type="agent_run")`` 的入口：由 AgentRunService
-    启动 TraeX、归一化事件并在成功时固定结构化输出。事件持久化在
-    conversation_run_events，页面刷新后可恢复。
+    只在短事务内创建 ``queued`` ConversationRun、``agent.run.created`` 事件与关联的
+    assistant message，随即返回 202 + handle。真正的 TraeX 执行由独立 Agent Worker
+    领取租约后完成，运行中事件逐批提交、可跨连接/进程恢复。请求方提交的
+    ``allowedCapabilities`` 只能收窄，实际权限为它与 Host policy 的交集。
     """
 
     conversation = await session.get(Conversation, conversation_id)
@@ -1410,7 +1411,7 @@ async def start_agent_run(
     default_config = AgentRunConfig.default()
     config = AgentRunConfig(
         output_schema=default_config.output_schema,
-        max_steps=body.max_steps or default_config.max_steps,
+        max_steps=min(body.max_steps or default_config.max_steps, default_config.max_steps),
         max_total_tokens=default_config.max_total_tokens,
         allowed_capabilities=tuple(
             body.allowed_capabilities
@@ -1419,31 +1420,19 @@ async def start_agent_run(
         ),
         max_duration_seconds=default_config.max_duration_seconds,
     )
-    conversation_run = await agent_run_service.start_agent_run(
+    conversation_run = await enqueue_agent_run(
         session,
         conversation,
         body.content,
         config=config,
     )
-    assistant_content: dict[str, Any]
-    if conversation_run.status == "succeeded":
-        assistant_content = {
-            "type": "agent_run",
-            "state": "agent_run",
-            "text": conversation_run.output_json.get("reply", "Agent 已完成任务。"),
-            "conversationRunId": conversation_run.id,
-            "runType": "agent_run",
-        }
-    else:
-        error = conversation_run.error_json or {}
-        assistant_content = {
-            "type": "agent_run_error",
-            "state": "agent_run",
-            "code": error.get("code", "EXECUTION_FAILED"),
-            "text": f"通用 Agent 运行失败：{error.get('message', '未知错误')}",
-            "conversationRunId": conversation_run.id,
-            "runType": "agent_run",
-        }
+    assistant_content = {
+        "type": "agent_run",
+        "state": "agent_run",
+        "text": "通用 Agent 已进入队列，运行事件将实时更新。",
+        "conversationRunId": conversation_run.id,
+        "runType": "agent_run",
+    }
     assistant_message = Message(
         id=str(uuid4()),
         conversation_id=conversation.id,
@@ -1457,6 +1446,25 @@ async def start_agent_run(
         "status": conversation_run.status,
         "assistant": assistant_content,
     }
+
+
+@router.post("/conversation-runs/{conversation_run_id}/cancel", status_code=202)
+async def cancel_conversation_run(
+    conversation_run_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """请求取消一次 Agent 运行。
+
+    queued 直接置为 cancelled；running 记录取消请求，由持有租约的 Worker 传播到子进程
+    并最终写入 ``cancelled`` 终态。
+    """
+
+    try:
+        run = await request_cancellation(session, conversation_run_id)
+    except LookupError as exc:
+        raise HTTPException(404, "ConversationRun 不存在") from exc
+    await session.commit()
+    return {"conversationRunId": run.id, "status": run.status}
 
 
 @router.get("/conversation-runs/{conversation_run_id}")
