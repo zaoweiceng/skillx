@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from sqlalchemy import select, update
 
-from app.application.orchestrator import Orchestrator, WorkerService
+from app.application.orchestrator import Orchestrator, WorkerService, reconcile_run_artifacts
 from app.config import get_settings
 from app.domain.workflow import NodeResult
 from app.infrastructure.database import (
@@ -160,3 +160,75 @@ async def test_late_result_after_takeover_leaves_no_orphan_file() -> None:
     assert rows == []
     assert not (_run_root(run_id) / artifact["storageKey"]).exists()
     assert not (_run_root(run_id) / ".staging" / claimed.node_run_id).exists()
+
+
+async def test_reconcile_removes_orphan_file_without_db_record() -> None:
+    """DB 回滚后最终目录残留的孤儿文件应被 GC 回收。"""
+
+    run_id, _ = await _make_run()
+    run_root = _run_root(run_id)
+    run_root.mkdir(parents=True, exist_ok=True)
+    orphan = run_root / "orphan-artifact"
+    orphan.write_bytes(b"stale bytes")
+    assert orphan.exists()
+    async with SessionLocal() as session, session.begin():
+        report = await reconcile_run_artifacts(session, run_id)
+    assert "orphan-artifact" in report["orphanFilesRemoved"]
+    assert not orphan.exists()
+
+
+async def test_reconcile_recovers_missing_file_from_staging() -> None:
+    """提交后落位未完成（DB 有记录、文件缺失）时，GC 从暂存补落位。"""
+
+    run_id, _ = await _make_run()
+    node_run_id = str(uuid4())
+    # 写入暂存文件但不落位，模拟“提交后进程崩溃、落位未执行”。
+    artifact = write_json_artifact(
+        run_id, node_run_id, "agent", "trajectory.json", "agent-trajectory", {"v": 1}
+    )
+    async with SessionLocal() as session, session.begin():
+        session.add(
+            Artifact(
+                id=artifact["id"],
+                run_id=run_id,
+                kind=artifact["kind"],
+                name=artifact["name"],
+                uri=artifact["uri"],
+                sha256=artifact["sha256"],
+                size=artifact["size"],
+                media_type=artifact["mediaType"],
+                metadata_json={
+                    "storageKey": artifact["storageKey"],
+                    "stagingKey": artifact["stagingKey"],
+                },
+            )
+        )
+    # 落位前最终文件缺失。
+    assert not (_run_root(run_id) / artifact["storageKey"]).exists()
+    async with SessionLocal() as session, session.begin():
+        report = await reconcile_run_artifacts(session, run_id)
+    assert artifact["id"] in report["recovered"]
+    assert (_run_root(run_id) / artifact["storageKey"]).is_file()
+
+
+async def test_reconcile_reports_unrecoverable_missing_file() -> None:
+    """暂存与最终都缺失时报告为需人工处理的缺失，不误删记录。"""
+
+    run_id, _ = await _make_run()
+    async with SessionLocal() as session, session.begin():
+        session.add(
+            Artifact(
+                id=str(uuid4()),
+                run_id=run_id,
+                kind="report",
+                name="gone.json",
+                uri="artifact://gone",
+                sha256="0" * 64,
+                size=0,
+                media_type="application/json",
+                metadata_json={"storageKey": "gone"},
+            )
+        )
+    async with SessionLocal() as session, session.begin():
+        report = await reconcile_run_artifacts(session, run_id)
+    assert len(report["missing"]) == 1

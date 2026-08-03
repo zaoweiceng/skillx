@@ -19,6 +19,7 @@ from app.application.expressions import ExpressionError, resolve_mapping
 from app.application.mcp import MCPConfigurationError, MCPLockDriftError, resolve_mcp_node
 from app.application.retries import auto_retry_allowed
 from app.application.security import event_payload
+from app.config import get_settings
 from app.domain.workflow import NodeResult, NodeType, WorkflowDefinition, WorkflowNode
 from app.infrastructure.database import (
     Approval,
@@ -36,6 +37,7 @@ from app.runtime.executors import (
     ExecutorRegistry,
     RunContext,
     clear_staging,
+    list_final_files,
     promote_staged_artifact,
 )
 
@@ -874,8 +876,9 @@ class WorkerService:
             if result.status == "waiting_user":
                 await self._create_approval(session, claimed, result)
             for item in result.artifacts:
-                # CAS 已成功，先把暂存文件原子落位再登记数据库记录。
-                promote_staged_artifact(claimed.run_id, item)
+                # 先登记数据库记录（引用最终 storageKey），暂不落位文件。
+                # 文件在事务提交后再从暂存原子落位：提交失败则文件从未离开暂存，
+                # 不会在最终目录留下孤儿。
                 session.add(
                     Artifact(
                         id=item["id"],
@@ -889,6 +892,8 @@ class WorkerService:
                         metadata_json={
                             **item.get("metadata", {}),
                             "storageKey": item["storageKey"],
+                            # 保留 stagingKey：提交后落位若中断，GC 可据此从暂存补落位。
+                            "stagingKey": item.get("stagingKey"),
                         },
                     )
                 )
@@ -903,10 +908,14 @@ class WorkerService:
                     },
                     claimed.node_run_id,
                 )
-            # 无论结果如何，落位后清理该 node_run 的剩余暂存文件。
-            clear_staging(claimed.run_id, claimed.node_run_id)
             if result.status == "failed":
                 await self._schedule_retry(session, claimed, result)
+        # 事务已提交：现在把暂存文件原子落位。提交后落位保证“DB 有记录、文件缺失”
+        # 可由 GC 从暂存补落位，而“文件已落位、DB 未提交”这一孤儿窗口不再存在。
+        for item in result.artifacts:
+            promote_staged_artifact(claimed.run_id, item)
+        # 落位后清理该 node_run 的剩余暂存文件。
+        clear_staging(claimed.run_id, claimed.node_run_id)
 
     async def _schedule_retry(
         self,
@@ -1033,3 +1042,46 @@ class WorkerService:
             return False
         await self.execute_claimed(claimed)
         return True
+
+
+async def reconcile_run_artifacts(session: AsyncSession, run_id: str) -> dict[str, list[str]]:
+    """Artifact 一致性 GC：双向扫描“DB 有记录但文件缺失”和“文件无 DB 记录”。
+
+    - missingFile：数据库登记了 Artifact 但最终文件缺失（提交后落位未完成）。若暂存中
+      仍有源文件则补落位，否则报告为需人工处理的缺失。
+    - orphanFile：最终目录存在但无对应 Artifact 记录（DB 回滚后残留），删除以回收。
+    返回各类处理结果，便于审计。
+    """
+
+    artifacts = (
+        await session.scalars(select(Artifact).where(Artifact.run_id == run_id))
+    ).all()
+    recorded_keys = {
+        (item.metadata_json or {}).get("storageKey") or item.uri.removeprefix("artifact://")
+        for item in artifacts
+    }
+    files = list_final_files(run_id)
+    recovered: list[str] = []
+    missing: list[str] = []
+    for item in artifacts:
+        storage_key = (item.metadata_json or {}).get("storageKey") or item.uri.removeprefix(
+            "artifact://"
+        )
+        if storage_key in files:
+            continue
+        # 尝试从暂存补落位；stagingKey 由执行器写入 metadata 时可能缺失。
+        staging_key = (item.metadata_json or {}).get("stagingKey")
+        if staging_key:
+            promote_staged_artifact(
+                run_id, {"storageKey": storage_key, "stagingKey": staging_key}
+            )
+        if storage_key in list_final_files(run_id):
+            recovered.append(item.id)
+        else:
+            missing.append(item.id)
+    orphan_files = sorted(files - {key for key in recorded_keys if key})
+    for name in orphan_files:
+        target = (get_settings().artifact_root / run_id / name).resolve()
+        with suppress(FileNotFoundError):
+            target.unlink()
+    return {"recovered": recovered, "missing": missing, "orphanFilesRemoved": orphan_files}

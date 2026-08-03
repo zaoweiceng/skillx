@@ -62,7 +62,8 @@ export default function ChatPage() {
         if (cancelled) return
         setRunStatus(summary.status)
         setTraceEvents(events)
-        if (summary.status === 'running') {
+        // queued/running 均为非终态：长任务由独立 Worker 执行，持续轮询直到终态。
+        if (summary.status === 'queued' || summary.status === 'running') {
           window.setTimeout(poll, 800)
         }
       } catch (reason) {
@@ -130,6 +131,15 @@ export default function ChatPage() {
       setError(reason instanceof Error ? reason.message : '通用 Agent 启动失败')
     } finally {
       setStartingAgent(false)
+    }
+  }
+
+  async function cancelActiveRun() {
+    if (!activeRunId) return
+    try {
+      await api.cancelConversationRun(activeRunId)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '取消失败')
     }
   }
 
@@ -321,6 +331,11 @@ export default function ChatPage() {
               <h2>执行轨迹</h2>
             </div>
             {runStatus && <span className={`status-badge ${runStatus}`}>{runStatus}</span>}
+            {(runStatus === 'queued' || runStatus === 'running') && (
+              <button className="button ghost" type="button" onClick={cancelActiveRun}>
+                取消运行
+              </button>
+            )}
           </div>
           {renderTrace()}
         </aside>

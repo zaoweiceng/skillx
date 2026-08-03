@@ -35,8 +35,10 @@ export function reachableUpstream(
 
 /**
  * 从 JSON Schema 展开可引用的路径后缀，支持嵌套对象与数组。
+ * 数组同时提供整体引用与首元素索引引用（后端支持 `[整数]` 索引语法），
  * 例如 { user: { name: string }, tags: [string] } →
- *   ['.user', '.user.name', '.tags', '.tags[]']
+ *   ['.user', '.user.name', '.tags', '.tags[0]']
+ * 绝不生成后端无法解析的 `[]`。
  */
 function expandSchemaPaths(schema: JsonSchema | undefined, prefix: string, depth = 0): string[] {
   if (!schema || depth > 4) return []
@@ -48,9 +50,10 @@ function expandSchemaPaths(schema: JsonSchema | undefined, prefix: string, depth
       paths.push(...expandSchemaPaths(child, path, depth + 1))
     }
   } else if (schema.type === 'array' && schema.items) {
-    const path = `${prefix}[]`
-    paths.push(path)
-    paths.push(...expandSchemaPaths(schema.items, path, depth + 1))
+    // 整体数组引用由父级属性路径提供；这里补充首元素索引引用（后端支持 [整数] 索引）。
+    const indexed = `${prefix}[0]`
+    paths.push(indexed)
+    paths.push(...expandSchemaPaths(schema.items, indexed, depth + 1))
   }
   return paths
 }

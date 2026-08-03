@@ -59,11 +59,11 @@ describe('variablePicker', () => {
     ])
   })
 
-  it('其他节点从 outputSchema 推断变量路径，支持嵌套数组', () => {
+  it('其他节点从 outputSchema 推断变量路径，数组提供整体与索引引用', () => {
     expect(outputVariables(definition, 'format')).toEqual([
       '${format.output.text}',
       '${format.output.tags}',
-      '${format.output.tags[]}',
+      '${format.output.tags[0]}',
     ])
   })
 

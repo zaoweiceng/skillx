@@ -59,8 +59,25 @@ def clear_staging(run_id: str, node_run_id: str) -> None:
     shutil.rmtree(_staging_dir(run_id, node_run_id), ignore_errors=True)
 
 
+def list_final_files(run_id: str) -> set[str]:
+    """列出某 run 最终目录下已落位的文件名（不含 .staging）。"""
+
+    run_root = (get_settings().artifact_root / run_id).resolve()
+    if not run_root.exists():
+        return set()
+    return {
+        entry.name
+        for entry in run_root.iterdir()
+        if entry.is_file() and entry.name != ".staging"
+    }
+
+
 def promote_staged_artifact(run_id: str, artifact: dict[str, Any]) -> None:
-    """把暂存文件原子移动到 run 根下的最终 storageKey 位置。"""
+    """把暂存文件原子移动到 run 根下的最终 storageKey 位置。
+
+    幂等：若最终文件已存在（例如重复落位），直接跳过；若暂存源已不存在但目标已存在，
+    视为已落位。仅当源与目标都缺失时才是真正的数据缺失，由 GC/恢复流程处理。
+    """
 
     staging_key = artifact.get("stagingKey")
     if not staging_key:
@@ -71,6 +88,10 @@ def promote_staged_artifact(run_id: str, artifact: dict[str, Any]) -> None:
     target = (run_root / artifact["storageKey"]).resolve()
     if not target.is_relative_to(run_root):
         raise ValueError("Artifact 落位路径越界")
+    if target.exists():
+        return
+    if not source.exists():
+        return
     os.replace(source, target)
 
 

@@ -4,23 +4,41 @@ import re
 from copy import deepcopy
 from typing import Any
 
-REFERENCE = re.compile(r"\$\{(?P<root>input|[a-zA-Z][\w-]*)\.(?P<path>[\w.-]+)}")
-EXACT_REFERENCE = re.compile(r"^\$\{(?P<root>input|[a-zA-Z][\w-]*)\.(?P<path>[\w.-]+)}$")
+# 统一表达式语法：路径段支持 `字段` 与 `字段[整数索引]` 两种形式，例如
+# `${node.output.items[0].name}`。数组整体引用直接用字段名（`${node.output.tags}`）。
+# 前端 VariablePicker 生成的路径必须落在此语法内，避免出现后端无法解析的 `[]`。
+_SEGMENT = r"[a-zA-Z0-9_-]+(?:\[\d+\])*"
+_PATH = rf"{_SEGMENT}(?:\.{_SEGMENT})*"
+REFERENCE = re.compile(rf"\$\{{(?P<root>input|[a-zA-Z][\w-]*)\.(?P<path>{_PATH})}}")
+EXACT_REFERENCE = re.compile(rf"^\$\{{(?P<root>input|[a-zA-Z][\w-]*)\.(?P<path>{_PATH})}}$")
+
+_INDEX = re.compile(r"^(?P<name>[a-zA-Z0-9_-]+)(?P<indices>(?:\[\d+\])*)$")
+_INDEX_VALUES = re.compile(r"\[(\d+)\]")
 
 
 class ExpressionError(ValueError):
     pass
 
 
+def _descend(current: Any, key: str) -> Any:
+    if isinstance(current, dict) and key in current:
+        return current[key]
+    if isinstance(current, list) and key.isdigit() and int(key) < len(current):
+        return current[int(key)]
+    raise ExpressionError(f"无法解析路径段 {key}")
+
+
 def _get_path(value: Any, path: str) -> Any:
     current = value
     for part in path.split("."):
-        if isinstance(current, dict) and part in current:
-            current = current[part]
-        elif isinstance(current, list) and part.isdigit() and int(part) < len(current):
-            current = current[int(part)]
-        else:
-            raise ExpressionError(f"无法解析路径 {path}")
+        matched = _INDEX.match(part)
+        if not matched:
+            raise ExpressionError(f"非法路径段 {part}")
+        current = _descend(current, matched.group("name"))
+        for index in _INDEX_VALUES.findall(matched.group("indices")):
+            if not isinstance(current, list) or int(index) >= len(current):
+                raise ExpressionError(f"数组索引越界 {part}")
+            current = current[int(index)]
     return current
 
 

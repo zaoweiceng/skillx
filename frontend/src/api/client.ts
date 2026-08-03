@@ -277,6 +277,11 @@ export const api = {
     ),
   getConversationRun: (id: string) =>
     request<ConversationRunSummary>(`/conversation-runs/${id}`),
+  cancelConversationRun: (id: string) =>
+    request<{ conversationRunId: string; status: string }>(
+      `/conversation-runs/${id}/cancel`,
+      { method: 'POST' },
+    ),
   listConversationRunEvents: (id: string, after = 0) =>
     request<ConversationRunEvent[]>(
       `/conversation-runs/${id}/events?after=${after}`,
