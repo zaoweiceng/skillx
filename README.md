@@ -4,22 +4,21 @@ SkillX Workflow 是一个契约驱动的可视化工作流平台。首次任务�
 探索，稳定任务发布为不可变工作流版本，并由独立 Worker 持久化执行。模型只在
 显式的 LLM/Agent 节点介入。
 
-## 已实现
+## 能力状态
 
-- Workflow DSL 静态检查：DAG、引用可达性、JSON Schema、危险重试和 SkillX
-  接口锁定。
-- SQLite WAL 持久化：工作流版本、组件、Run、NodeRun、事件、审批、Artifact
-  和能力版本。
-- 独立 Worker：数据库领取、租约恢复、重试、取消、条件分支与审批暂停。
-- 节点执行器：Input、Transform、Condition、Approval、Output、Artifact、
-  SkillX Direct 和浏览器页面契约检查。
-- REST API、SSE 事件补发、JSON Schema 表单、DAG、运行详情、审批和工作流编辑器。
-- SkillX Python Callable Host、MCP Streamable HTTP/STDIO Adapter 和 TraeX
-  子进程 Adapter。
-- 示例 SkillX 包 `capabilities/skillx/text-stats` 和无模型示例组件。
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| Workflow Compiler、SQLite 队列、Direct 节点、审批、SSE | `available` | 已接入 API/Worker/UI 主路径 |
+| SkillX Direct | `available` | Registry 锁定 digest，独立子进程执行 |
+| MCP HTTP/STDIO | `available` | Registry、Tool Snapshot、Executor 与本地 E2E 已接通 |
+| LLM、Agent/TraeX | `available` | Executor 已接通；真实运行需要环境配置，测试使用 Fake Adapter |
+| 轨迹固化 | `available` | 成功 ConversationRun 可生成可编辑草稿，不自动发布 |
+| 浏览器契约与一次性授权 | `available` | Playwright 隔离 Context、重放审批、截图与 DOM 摘要 E2E 已接通 |
+| 可视化拖放编辑器 | `not-configured` | 当前仍以 JSON DSL 编辑和有界 DAG 预览为主 |
 
-LLM、真实 TraeX 命令、MCP Server、Secret Provider 和浏览器提交运行时需要按
-部署环境配置。未配置时节点会返回明确错误，不会隐式切换到 Agent。
+`available` 表示已接入主路径并有自动化测试；`adapter-only` 只表示安全状态机或协议适配代码
+存在；`not-configured` 不应在 UI 中标记为可运行能力。SkillX 的唯一规范源是
+[`docs/skillx.md`](docs/skillx.md)，版本为 `skillx.dev/v1alpha1`。
 
 ## 本地启动
 
@@ -28,6 +27,7 @@ LLM、真实 TraeX 命令、MCP Server、Secret Provider 和浏览器提交运�
 ```bash
 cd backend
 uv sync --extra dev
+uv run playwright install chromium
 uv run alembic upgrade head
 uv run python -m app.seed
 uv run uvicorn app.main:app --reload
@@ -48,7 +48,8 @@ npm install
 npm run dev
 ```
 
-访问 `http://localhost:5173`。OpenAPI 位于
+API 默认只允许按上述命令监听 `127.0.0.1`。本版本是单用户 Local Demo，禁止
+直接绑定 `0.0.0.0` 或暴露到共享网络。访问 `http://localhost:5173`。OpenAPI 位于
 `http://127.0.0.1:8000/docs`。
 
 ## 工程结构
@@ -70,6 +71,17 @@ docs/                 # 产品、开发与规范文档
 API 和 Worker 必须使用相同的 `SKILLX_DATABASE_URL`。生产启动应先执行
 Alembic 迁移，并设置 `SKILLX_AUTO_CREATE_SCHEMA=false`。
 
+SkillX 注册只接受 `SKILLX_CAPABILITY_ROOT` 下的相对路径。Secret API 只保存
+`name -> environmentVariable` 引用，值由 Worker 进程环境提供；只有 Manifest
+`permissions.secrets.use` 声明的句柄会注入 SkillXContext。MCP STDIO 的
+`environment` 同样只接受 `{"API_KEY": {"secretRef": "name"}}`，禁止明文值。
+
+真实模型通过
+`SKILLX_MODEL_ENDPOINT`、`SKILLX_MODEL_NAME` 和
+`SKILLX_MODEL_API_KEY_ENV` 指向的环境变量配置；TraeX 命令通过
+`SKILLX_TRAEX_COMMAND` 配置。Secret 值不得写入 `.env` 以外的工作流定义、
+事件或 Artifact。
+
 ## 验证
 
 ```bash
@@ -84,13 +96,15 @@ npm run test
 npm run build
 ```
 
-测试覆盖工作流编译、循环与危险重试、确定性执行、审批暂停、页面漂移、
-一次性授权摘要、SkillX 契约和幂等种子初始化。
+也可在仓库根目录执行 `make demo-check`。测试覆盖双 Worker 租约/CAS、取消、
+超时、并行汇聚、SkillX 版本锁定、MCP、Hybrid/Agent、轨迹固化、浏览器一次性
+授权、迁移和前端环图阻断。
 
 ## 安全边界
 
 - Direct SkillX 只运行受信任包；Python venv 不是安全沙箱。
 - SkillX 包路径会执行根目录约束，输入输出均通过 Draft 2020-12 校验。
 - MCP 和 TraeX 子进程命令必须命中可执行文件白名单。
-- 浏览器提交没有审批和有效快照时不得执行。
+- 浏览器提交没有审批和有效快照时不得执行；点击后断言失败归类为
+  `UNKNOWN_OUTCOME`，不得自动重试。
 - Secret 仅允许保存引用；当前仓库不提供明文 Secret 存储。

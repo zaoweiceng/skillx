@@ -26,6 +26,7 @@ export type ComponentSummary = {
   workflowId: string
   defaultVersionId: string
   visibility: string
+  executionClass: 'zero_llm' | 'hybrid' | 'agent'
   definition?: WorkflowDefinition
 }
 
@@ -66,6 +67,15 @@ export type Run = {
   finishedAt: string | null
   nodes?: NodeRun[]
   approvals?: Approval[]
+  artifacts?: Array<{
+    id: string
+    kind: string
+    name: string
+    mediaType: string
+    size: number
+    sha256: string
+    downloadUrl: string
+  }>
 }
 
 export type Workflow = {
@@ -175,7 +185,16 @@ export const api = {
       messages: Array<{
         id: string
         role: string
-        content: { type: string; text: string; code?: string }
+        content: {
+          type: string
+          text: string
+          code?: string
+          componentId?: string
+          componentName?: string
+          runId?: string
+          conversationRunId?: string
+          required?: string[]
+        }
       }>
     }>(`/conversations/${id}`),
   sendMessage: (id: string, content: string) =>
@@ -183,6 +202,20 @@ export const api = {
       `/conversations/${id}/messages`,
       { method: 'POST', body: JSON.stringify({ content }) },
     ),
+  distillConversationRun: (id: string) =>
+    request<{
+      id: string
+      status: string
+      draftWorkflowId: string
+      analysis: {
+        directNodes: number
+        llmOrAgentNodes: number
+        estimatedLlmCallsBefore: number
+        estimatedLlmCallsAfter: number
+        publishable: boolean
+        diagnostics: Array<{ level: string; code: string; message: string }>
+      }
+    }>(`/conversation-runs/${id}/distill`, { method: 'POST' }),
 }
 
 export function eventStreamUrl(runId: string): string {

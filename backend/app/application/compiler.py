@@ -149,13 +149,13 @@ class WorkflowCompiler:
                     message="工作流必须且只能包含一个 Input 节点",
                 )
             )
-        if not outputs:
+        if len(outputs) != 1:
             diagnostics.append(
                 Diagnostic(
                     level="error",
-                    code="OUTPUT_NODE_REQUIRED",
+                    code="OUTPUT_NODE_COUNT",
                     path="spec.nodes",
-                    message="工作流至少需要一个 Output 节点",
+                    message="Local Demo 必须且只能包含一个 Output 节点",
                 )
             )
         for index, node in enumerate(definition.spec.nodes):
@@ -168,15 +168,64 @@ class WorkflowCompiler:
                         message="非幂等副作用节点不得自动重试",
                     )
                 )
-            if node.type == NodeType.SKILLX and not node.config.get("interface"):
+            if node.type == NodeType.SKILLX:
+                if node.config.get("package"):
+                    diagnostics.append(
+                        Diagnostic(
+                            level="error",
+                            code="SKILLX_PACKAGE_PATH_FORBIDDEN",
+                            path=f"spec.nodes.{index}.config.package",
+                            message="Workflow 不得携带 SkillX 宿主机路径",
+                        )
+                    )
+                if not node.config.get("interface") or not node.config.get("capabilityVersionId"):
+                    diagnostics.append(
+                        Diagnostic(
+                            level="error",
+                            code="SKILLX_VERSION_REQUIRED",
+                            path=f"spec.nodes.{index}.config",
+                            message="SkillX 节点必须锁定 capabilityVersionId 和 interface",
+                        )
+                    )
+            if node.type == NodeType.MCP and not node.config.get("mcpToolSnapshotId"):
                 diagnostics.append(
                     Diagnostic(
                         level="error",
-                        code="SKILLX_INTERFACE_REQUIRED",
-                        path=f"spec.nodes.{index}.config.interface",
-                        message="SkillX 节点必须锁定接口",
+                        code="MCP_TOOL_SNAPSHOT_REQUIRED",
+                        path=f"spec.nodes.{index}.config",
+                        message="MCP 节点必须锁定 mcpToolSnapshotId",
                     )
                 )
+            if node.type == NodeType.LLM and not isinstance(node.config.get("outputSchema"), dict):
+                diagnostics.append(
+                    Diagnostic(
+                        level="error",
+                        code="LLM_OUTPUT_SCHEMA_REQUIRED",
+                        path=f"spec.nodes.{index}.config.outputSchema",
+                        message="LLM 节点必须声明结构化输出 Schema",
+                    )
+                )
+            if node.type == NodeType.AGENT:
+                if not isinstance(node.config.get("outputSchema"), dict):
+                    diagnostics.append(
+                        Diagnostic(
+                            level="error",
+                            code="AGENT_OUTPUT_SCHEMA_REQUIRED",
+                            path=f"spec.nodes.{index}.config.outputSchema",
+                            message="Agent 节点必须声明结构化输出 Schema",
+                        )
+                    )
+                if not node.config.get("maxSteps") or not isinstance(
+                    node.config.get("allowedCapabilities"), list
+                ):
+                    diagnostics.append(
+                        Diagnostic(
+                            level="error",
+                            code="AGENT_LIMITS_REQUIRED",
+                            path=f"spec.nodes.{index}.config",
+                            message="Agent 节点必须声明 maxSteps 和 allowedCapabilities",
+                        )
+                    )
 
     @staticmethod
     def _validate_references(

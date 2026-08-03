@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+from fnmatch import fnmatchcase
 from typing import Any, Literal
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from pydantic import BaseModel, Field
 
@@ -14,6 +15,7 @@ class FieldContract(BaseModel):
     type: str = "text"
     locator: dict[str, str] = Field(default_factory=dict)
     options: list[str] = Field(default_factory=list)
+    sensitive: bool = False
 
 
 class PageContract(BaseModel):
@@ -28,6 +30,8 @@ class ObservedPage(BaseModel):
     url: str
     title: str = ""
     identity: str | None = None
+    business_object: str | None = Field(default=None, alias="businessObject")
+    fingerprint: str | None = None
     fields: list[FieldContract]
     submit: dict[str, str] | None = None
     security_warning: bool = False
@@ -41,14 +45,30 @@ class DriftResult(BaseModel):
 
 def detect_drift(contract: PageContract, observed: ObservedPage) -> DriftResult:
     differences: list[str] = []
-    expected_url = urlparse(contract.url_pattern.replace("*", ""))
-    current_url = urlparse(observed.url)
-    if observed.security_warning or (
-        expected_url.hostname and current_url.hostname != expected_url.hostname
+    if observed.security_warning or not url_matches(contract.url_pattern, observed.url):
+        return DriftResult(
+            level="L4",
+            differences=["目标 URL 或安全状态异常"],
+            can_continue=False,
+        )
+    expected_identity = contract.page_identity.get("identity")
+    expected_object = contract.page_identity.get("businessObject")
+    if (
+        expected_identity is not None
+        and observed.identity != expected_identity
+        or expected_object is not None
+        and observed.business_object != expected_object
     ):
         return DriftResult(
             level="L4",
-            differences=["目标域名或安全状态异常"],
+            differences=["登录身份或业务对象发生变化"],
+            can_continue=False,
+        )
+    expected_title = contract.page_identity.get("title")
+    if expected_title is not None and observed.title != expected_title:
+        return DriftResult(
+            level="L3",
+            differences=["页面标题与契约不一致"],
             can_continue=False,
         )
 
@@ -92,6 +112,27 @@ def detect_drift(contract: PageContract, observed: ObservedPage) -> DriftResult:
     if observed.url != contract.url_pattern and "*" in contract.url_pattern:
         return DriftResult(level="L1", differences=["URL 与通配模式匹配"], can_continue=True)
     return DriftResult(level="L0", can_continue=True)
+
+
+def url_matches(pattern: str, actual: str) -> bool:
+    expected = urlparse(pattern)
+    current = urlparse(actual)
+    if (
+        expected.scheme.lower() != current.scheme.lower()
+        or (expected.hostname or "").lower() != (current.hostname or "").lower()
+        or expected.port != current.port
+        or current.username
+        or current.password
+        or current.fragment
+    ):
+        return False
+    expected_path = unquote(expected.path)
+    current_path = unquote(current.path)
+    if not fnmatchcase(current_path, expected_path):
+        return False
+    if expected.query and not fnmatchcase(current.query, expected.query):
+        return False
+    return True
 
 
 def authorization_digest(

@@ -64,6 +64,7 @@ class Component(Base, TimestampMixin):
     workflow_id: Mapped[str] = mapped_column(ForeignKey("workflows.id"))
     default_version_id: Mapped[str] = mapped_column(ForeignKey("workflow_versions.id"))
     visibility: Mapped[str] = mapped_column(String(20), default="private")
+    execution_class: Mapped[str] = mapped_column(String(20), default="zero_llm")
 
 
 class Run(Base, TimestampMixin):
@@ -77,6 +78,7 @@ class Run(Base, TimestampMixin):
     input_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     output_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    next_event_seq: Mapped[int] = mapped_column(Integer, default=0)
     cancellation_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -164,6 +166,57 @@ class CapabilityVersion(Base, TimestampMixin):
     package_path: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class SecretReference(Base, TimestampMixin):
+    __tablename__ = "secret_references"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    provider: Mapped[str] = mapped_column(String(20), default="env")
+    external_key: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(Text, default="")
+
+
+class MCPServer(Base, TimestampMixin):
+    __tablename__ = "mcp_servers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    transport: Mapped[str] = mapped_column(String(20))
+    current_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+
+class MCPServerVersion(Base, TimestampMixin):
+    __tablename__ = "mcp_server_versions"
+    __table_args__ = (Index("uq_mcp_server_version", "server_id", "version", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    server_id: Mapped[str] = mapped_column(
+        ForeignKey("mcp_servers.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer)
+    config_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    digest: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(20), default="published")
+
+
+class MCPToolSnapshot(Base, TimestampMixin):
+    __tablename__ = "mcp_tool_snapshots"
+    __table_args__ = (Index("uq_mcp_tool_name", "server_version_id", "name", unique=True),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    server_version_id: Mapped[str] = mapped_column(
+        ForeignKey("mcp_server_versions.id", ondelete="CASCADE"), index=True
+    )
+    name: Mapped[str] = mapped_column(String(160))
+    description: Mapped[str] = mapped_column(Text, default="")
+    input_schema_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    output_schema_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    digest: Mapped[str] = mapped_column(String(80))
+    side_effect: Mapped[str] = mapped_column(String(30), default="none")
+    idempotent: Mapped[bool] = mapped_column(default=True)
+    timeout_seconds: Mapped[int] = mapped_column(Integer, default=30)
+
+
 class Artifact(Base, TimestampMixin):
     __tablename__ = "artifacts"
 
@@ -199,6 +252,31 @@ class Message(Base):
     role: Mapped[str] = mapped_column(String(20))
     content_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ConversationRun(Base, TimestampMixin):
+    __tablename__ = "conversation_runs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(20))
+    input_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    output_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    trajectory_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
+class Distillation(Base, TimestampMixin):
+    __tablename__ = "distillations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_run_id: Mapped[str] = mapped_column(
+        ForeignKey("conversation_runs.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(20))
+    draft_workflow_id: Mapped[str | None] = mapped_column(ForeignKey("workflows.id"), nullable=True)
+    analysis_json: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
 settings = get_settings()

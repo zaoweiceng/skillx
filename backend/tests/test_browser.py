@@ -11,6 +11,10 @@ def contract() -> PageContract:
         {
             "contractVersion": "1",
             "urlPattern": "https://forms.example.org/apply*",
+            "pageIdentity": {
+                "identity": "user-1",
+                "businessObject": "expense",
+            },
             "fields": [
                 {
                     "id": "name",
@@ -28,6 +32,8 @@ def test_required_field_added_is_structural_drift() -> None:
     observed = ObservedPage.model_validate(
         {
             "url": "https://forms.example.org/apply",
+            "identity": "user-1",
+            "businessObject": "expense",
             "fields": [
                 {
                     "id": "name",
@@ -55,6 +61,32 @@ def test_required_field_added_is_structural_drift() -> None:
 def test_domain_change_is_security_drift() -> None:
     observed = ObservedPage(
         url="https://evil.example.net/apply",
+        identity="user-1",
+        businessObject="expense",
+        fields=contract().fields,
+        submit=contract().submit,
+    )
+
+    assert detect_drift(contract(), observed).level == "L4"
+
+
+def test_same_domain_wrong_path_is_security_drift() -> None:
+    observed = ObservedPage(
+        url="https://forms.example.org/admin/delete",
+        identity="user-1",
+        businessObject="expense",
+        fields=contract().fields,
+        submit=contract().submit,
+    )
+
+    assert detect_drift(contract(), observed).level == "L4"
+
+
+def test_identity_change_is_security_drift() -> None:
+    observed = ObservedPage(
+        url="https://forms.example.org/apply",
+        identity="user-2",
+        businessObject="expense",
         fields=contract().fields,
         submit=contract().submit,
     )

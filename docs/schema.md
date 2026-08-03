@@ -452,136 +452,21 @@ skill-name/
 
 ## 6. SkillX 执行模式
 
-一个 SkillX 可以声明一个或多个入口。
+SkillX 的唯一规范源为 [`skillx.md`](skillx.md)，当前 Host 固定支持
+`skillx.dev/v1alpha1`。接口统一定义在 `spec.interfaces` 下，支持
+`direct`、`llm` 和 `agent`；Guide 入口定义在 `spec.guide`，不是可执行接口。
 
-### 6.1 Guide 入口
-
-供 Agent 阅读并理解任务方法。
-
-```yaml
-interfaces:
-  guide:
-    entry: SKILL.md
-```
-
-该入口本身不保证能够脱离 LLM 执行。
-
-### 6.2 Direct 入口
-
-供 Workflow Runtime 直接调用。
-
-```yaml
-interfaces:
-  direct:
-    runtime: python
-    entry: executors/default.py:execute
-```
-
-特点：
-
-* 不调用 LLM。
-* 输入输出受 Schema 约束。
-* 执行结果可预测。
-* 必须具备自动测试。
-
-### 6.3 LLM 入口
-
-用于一次受限的模型调用，而不是完整 Agent Loop。
-
-```yaml
-interfaces:
-  llm:
-    prompt: prompts/extract.md
-    model_profile: structured-extraction
-    output_schema: schemas/output.schema.json
-```
-
-适用于：
-
-* 分类。
-* 抽取。
-* 结构化生成。
-* 内容判断。
-
-### 6.4 Agent 入口
-
-允许 Agent 在限定范围内使用工具。
-
-```yaml
-interfaces:
-  agent:
-    prompt: prompts/agent.md
-    allowed_tools:
-      - issue.get
-      - issue.get_comments
-    max_steps: 6
-```
-
-只有确实需要动态工具选择时才使用。
+本文件只描述 SkillX 与工作流的产品关系，不再复制 Manifest 字段，避免形成第二套
+协议。接口字段、运行协议、权限、Effect、版本与兼容性要求均以
+[`skillx.md`](skillx.md) 为准。
 
 ---
 
 ## 7. SkillX 清单规范
 
-示例：
-
-```yaml
-apiVersion: skillx.platform/v1
-kind: SkillX
-
-metadata:
-  name: weather-query
-  displayName: 天气查询
-  version: 1.0.0
-  description: 根据城市查询当前天气
-
-compatibility:
-  skillSpec: ">=1.0"
-  platform: ">=0.1.0"
-
-interfaces:
-  guide:
-    entry: SKILL.md
-
-  direct:
-    runtime: python
-    entry: executors/default.py:execute
-    inputSchema: schemas/input.schema.json
-    outputSchema: schemas/output.schema.json
-
-execution:
-  defaultMode: direct
-  timeoutSeconds: 30
-  maxRetries: 2
-  idempotent: true
-  sideEffect: false
-
-dependencies:
-  mcpTools:
-    - id: weather.get_current
-      version: ">=1.0,<2.0"
-
-permissions:
-  network:
-    - weather-service
-  filesystem:
-    mode: none
-  secrets:
-    - WEATHER_API_KEY
-
-observability:
-  redact:
-    - WEATHER_API_KEY
-  metrics:
-    - duration
-    - mcp_call_count
-
-tests:
-  contract:
-    - tests/test_contract.py
-  runtime:
-    - tests/test_executor.py
-```
+清单必须使用 `apiVersion: skillx.dev/v1alpha1`，完整模板和字段定义见
+[`skillx.md` 第 7-30 章](skillx.md#7-skillx-清单)。仓库内可执行示例为
+[`capabilities/skillx/text-stats`](../capabilities/skillx/text-stats/skillx.yaml)。
 
 ---
 

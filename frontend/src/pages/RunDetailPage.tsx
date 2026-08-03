@@ -1,4 +1,13 @@
-import { AlertTriangle, ArrowLeft, Ban, Check, Clock, RotateCw, X } from 'lucide-react'
+import {
+  AlertTriangle,
+  ArrowLeft,
+  Ban,
+  Check,
+  Clock,
+  Download,
+  RotateCw,
+  X,
+} from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
@@ -163,6 +172,30 @@ export default function RunDetailPage() {
             <StatusBadge status={run.status} />
           </div>
           <JsonBlock value={run.error ?? run.output} />
+        </section>
+      )}
+
+      {(run.artifacts?.length ?? 0) > 0 && (
+        <section className="panel result-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">RUN EVIDENCE</span>
+              <h2>产物与执行证据</h2>
+            </div>
+          </div>
+          <div className="node-table">
+            {run.artifacts?.map((artifact) => (
+              <a className="node-row" href={artifact.downloadUrl} key={artifact.id}>
+                <Download size={15} />
+                <div>
+                  <strong>{artifact.name}</strong>
+                  <small>
+                    {artifact.kind} · {artifact.mediaType} · {artifact.size} bytes
+                  </small>
+                </div>
+              </a>
+            ))}
+          </div>
         </section>
       )}
     </div>

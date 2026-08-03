@@ -10,6 +10,7 @@ import {
 import { useMemo } from 'react'
 
 import type { NodeDefinition, WorkflowDefinition } from '@/api/client'
+import { layerNodes } from '@/lib/workflowLayout'
 
 import '@xyflow/react/dist/style.css'
 
@@ -25,30 +26,6 @@ const nodeColors: Record<string, string> = {
   agent: '#b47dcb',
   browser: '#da7445',
   artifact: '#82959f',
-}
-
-function layerNodes(definition: WorkflowDefinition): Map<string, number> {
-  const layers = new Map<string, number>()
-  const incoming = new Map<string, string[]>()
-  definition.spec.nodes.forEach((node) => incoming.set(node.id, []))
-  definition.spec.edges.forEach((edge) => {
-    incoming.get(edge.target)?.push(edge.source)
-  })
-  let changed = true
-  while (changed) {
-    changed = false
-    definition.spec.nodes.forEach((node) => {
-      const parents = incoming.get(node.id) ?? []
-      const layer = parents.length
-        ? Math.max(...parents.map((parent) => layers.get(parent) ?? -1)) + 1
-        : 0
-      if (layers.get(node.id) !== layer) {
-        layers.set(node.id, layer)
-        changed = true
-      }
-    })
-  }
-  return layers
 }
 
 function toNode(item: NodeDefinition, x: number, y: number): Node {
@@ -82,11 +59,12 @@ export function WorkflowGraph({
   definition: WorkflowDefinition
   compact?: boolean
 }) {
-  const { nodes, edges } = useMemo(() => {
-    const layers = layerNodes(definition)
+  const { nodes, edges, cyclic } = useMemo(() => {
+    const layout = layerNodes(definition)
+    if (layout.cyclic) return { nodes: [], edges: [], cyclic: true }
     const counts = new Map<number, number>()
     const graphNodes = definition.spec.nodes.map((item) => {
-      const layer = layers.get(item.id) ?? 0
+      const layer = layout.layers.get(item.id) ?? 0
       const row = counts.get(layer) ?? 0
       counts.set(layer, row + 1)
       return toNode(item, layer * 230, row * 120)
@@ -100,8 +78,16 @@ export function WorkflowGraph({
       style: { stroke: '#72838a', strokeWidth: 1.5 },
       labelStyle: { fill: '#d8a354', fontSize: 11 },
     }))
-    return { nodes: graphNodes, edges: graphEdges }
+    return { nodes: graphNodes, edges: graphEdges, cyclic: false }
   }, [definition])
+
+  if (cyclic) {
+    return (
+      <div className={compact ? 'workflow-graph compact graph-error' : 'workflow-graph graph-error'}>
+        CYCLIC_GRAPH：工作流包含环，已停止布局
+      </div>
+    )
+  }
 
   return (
     <div className={compact ? 'workflow-graph compact' : 'workflow-graph'}>

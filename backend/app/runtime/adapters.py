@@ -209,6 +209,8 @@ class TraeXSubprocessAdapter:
             str(request.max_steps),
             "--max-tokens",
             str(request.max_tokens),
+            "--allowed-tools",
+            json.dumps(request.allowed_tools, ensure_ascii=False),
             cwd=working_directory,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
@@ -229,6 +231,12 @@ class TraeXSubprocessAdapter:
             if code != 0:
                 raise AdapterError(f"TraeX 进程退出码: {code}")
         finally:
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                except TimeoutError:
+                    process.kill()
             self._processes.pop(run_id, None)
 
     async def cancel(self, run_id: str) -> None:

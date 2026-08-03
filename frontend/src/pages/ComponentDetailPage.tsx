@@ -48,7 +48,15 @@ export default function ComponentDetailPage() {
           <h1>{component.name}</h1>
           <p>{component.description || '通过结构化输入直接启动锁定的工作流版本。'}</p>
         </div>
-        <span className="mode-tag large">零 LLM 可运行</span>
+        <span className="mode-tag large">
+          {
+            {
+              zero_llm: '零 LLM',
+              hybrid: '局部 LLM',
+              agent: 'Agent 工作流',
+            }[component.executionClass]
+          }
+        </span>
       </header>
 
       <section className="detail-grid">

@@ -12,4 +12,4 @@ async def test_seed_is_idempotent() -> None:
         count = await session.scalar(select(func.count()).select_from(Component))
 
     assert first == second
-    assert count == 1
+    assert count == 2

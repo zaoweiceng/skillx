@@ -24,7 +24,7 @@ class RetryPolicy(BaseModel):
     max_attempts: int = Field(default=1, alias="maxAttempts", ge=1, le=10)
     backoff_seconds: float = Field(default=1, alias="backoffSeconds", ge=0, le=3600)
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
 class WorkflowNode(BaseModel):
@@ -40,7 +40,7 @@ class WorkflowNode(BaseModel):
     side_effect: bool = Field(default=False, alias="sideEffect")
     idempotent: bool = True
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
 class WorkflowEdge(BaseModel):
@@ -48,12 +48,14 @@ class WorkflowEdge(BaseModel):
     target: str
     when: bool | None = None
 
+    model_config = ConfigDict(extra="forbid")
+
 
 class WorkflowPolicies(BaseModel):
     max_duration_seconds: int = Field(default=300, alias="maxDurationSeconds", ge=1)
     max_parallel_nodes: int = Field(default=4, alias="maxParallelNodes", ge=1, le=64)
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
 class WorkflowSpec(BaseModel):
@@ -64,7 +66,7 @@ class WorkflowSpec(BaseModel):
     edges: list[WorkflowEdge] = Field(default_factory=list)
     policies: WorkflowPolicies = Field(default_factory=WorkflowPolicies)
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
     @model_validator(mode="after")
     def unique_node_ids(self) -> WorkflowSpec:
@@ -80,7 +82,7 @@ class WorkflowDefinition(BaseModel):
     metadata: dict[str, Any]
     spec: WorkflowSpec
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
 class Diagnostic(BaseModel):
@@ -106,8 +108,10 @@ class ExecutionError(BaseModel):
 
 
 class NodeResult(BaseModel):
-    status: Literal["succeeded", "waiting_user", "failed"]
+    status: Literal["succeeded", "waiting_user", "failed", "cancelled"]
     output: dict[str, Any] | None = None
     error: ExecutionError | None = None
     metrics: dict[str, int | float | str] = Field(default_factory=dict)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    events: list[dict[str, Any]] = Field(default_factory=list)
     resume_token: str | None = None

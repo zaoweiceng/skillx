@@ -14,7 +14,18 @@ class Settings(BaseSettings):
     worker_id: str = "worker-local"
     worker_poll_seconds: float = 0.5
     lease_seconds: int = 30
-    auto_create_schema: bool = True
+    auto_create_schema: bool = False
+    mcp_allowed_executables: list[str] = [
+        "python",
+        "python3",
+        "python3.12",
+        "python3.13",
+    ]
+    model_endpoint: str | None = None
+    model_name: str | None = None
+    model_api_key_env: str = "SKILLX_MODEL_API_KEY"
+    traex_command: list[str] | None = None
+    traex_allowed_executables: list[str] = ["traex"]
 
 
 @lru_cache

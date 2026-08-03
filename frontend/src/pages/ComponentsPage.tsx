@@ -63,7 +63,11 @@ export default function ComponentsPage() {
               <span className="component-icon">
                 <Sparkles size={17} />
               </span>
-              <span className="mode-tag">DIRECT READY</span>
+              <span className="mode-tag">
+                {component.executionClass === 'zero_llm'
+                  ? 'ZERO LLM'
+                  : component.executionClass.toUpperCase()}
+              </span>
               <ArrowUpRight size={17} />
             </div>
             <h2>{component.name}</h2>

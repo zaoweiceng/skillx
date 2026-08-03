@@ -378,33 +378,10 @@ class NodeResult(BaseModel):
 
 ## 8.1 skillx.yaml
 
-```yaml
-apiVersion: skillx.platform/v1
-kind: SkillX
-metadata:
-  name: weather-query
-  version: 1.0.0
-interfaces:
-  guide:
-    entry: SKILL.md
-  direct:
-    runtime: python
-    entry: executors/default.py:execute
-    inputSchema: schemas/input.schema.json
-    outputSchema: schemas/output.schema.json
-execution:
-  defaultMode: direct
-  timeoutSeconds: 30
-  idempotent: true
-  sideEffect: false
-dependencies:
-  mcpTools:
-    - id: weather.get_current
-      version: ">=1.0,<2.0"
-permissions:
-  network: [weather-service]
-  secrets: [WEATHER_API_KEY]
-```
+SkillX 的唯一规范源为 [`skillx.md`](skillx.md)，当前版本固定为
+`skillx.dev/v1alpha1`。Manifest 的接口统一位于 `spec.interfaces`，Guide 位于
+`spec.guide`。工程文档不再复制另一套字段结构；实现、Fixture 和 Host 测试必须
+直接按规范文档及 `capabilities/skillx/text-stats/skillx.yaml` 示例校验。
 
 ## 8.2 Python Direct 入口
 

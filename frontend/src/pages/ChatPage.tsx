@@ -1,12 +1,22 @@
 import { Bot, CornerDownLeft, Link2Off, MessageSquareText, Plus } from 'lucide-react'
 import { FormEvent, useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 
 import { api } from '@/api/client'
 
 type Message = {
   id: string
   role: string
-  content: { type: string; text: string; code?: string }
+  content: {
+    type: string
+    text: string
+    code?: string
+    componentId?: string
+    componentName?: string
+    runId?: string
+    conversationRunId?: string
+    required?: string[]
+  }
 }
 
 export default function ChatPage() {
@@ -15,6 +25,7 @@ export default function ChatPage() {
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
   const [error, setError] = useState('')
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
 
   useEffect(() => {
     api
@@ -43,6 +54,18 @@ export default function ChatPage() {
       setError(reason instanceof Error ? reason.message : '发送失败')
     } finally {
       setSending(false)
+    }
+  }
+
+  async function distill(conversationRunId: string) {
+    try {
+      const result = await api.distillConversationRun(conversationRunId)
+      setDrafts((current) => ({
+        ...current,
+        [conversationRunId]: result.draftWorkflowId,
+      }))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '固化失败')
     }
   }
 
@@ -90,6 +113,33 @@ export default function ChatPage() {
                 {message.content.code && (
                   <span className="error-code">{message.content.code}</span>
                 )}
+                {message.content.type === 'component_candidate' && (
+                  <span className="effect-label">
+                    候选组件：{message.content.componentName} · 待补参数{' '}
+                    {(message.content.required ?? []).join(', ') || '无'}
+                  </span>
+                )}
+                {message.content.runId && (
+                  <Link className="button ghost" to={`/runs/${message.content.runId}`}>
+                    查看运行
+                  </Link>
+                )}
+                {message.content.conversationRunId &&
+                  (drafts[message.content.conversationRunId] ? (
+                    <Link
+                      className="button ghost"
+                      to={`/workflows/${drafts[message.content.conversationRunId]}/edit`}
+                    >
+                      打开固化草稿
+                    </Link>
+                  ) : (
+                    <button
+                      className="button ghost"
+                      onClick={() => distill(message.content.conversationRunId!)}
+                    >
+                      固化为组件
+                    </button>
+                  ))}
               </div>
             </article>
           ))}
