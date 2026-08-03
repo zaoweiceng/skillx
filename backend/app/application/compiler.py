@@ -11,7 +11,10 @@ from pydantic import ValidationError
 
 from app.domain.workflow import CompiledWorkflow, Diagnostic, NodeType, WorkflowDefinition
 
-REFERENCE_PATTERN = re.compile(r"\$\{(?P<root>input|[a-zA-Z][\w-]*)\.(?P<path>[\w.-]+)}")
+# 与 app.application.expressions 统一的引用语法：路径段支持 `字段` 与 `字段[整数索引]`。
+_SEGMENT = r"[a-zA-Z0-9_-]+(?:\[\d+\])*"
+_PATH = rf"{_SEGMENT}(?:\.{_SEGMENT})*"
+REFERENCE_PATTERN = re.compile(rf"\$\{{(?P<root>input|[a-zA-Z][\w-]*)\.(?P<path>{_PATH})}}")
 
 
 def canonical_json(value: Any) -> str:
@@ -270,6 +273,48 @@ class WorkflowCompiler:
                             message=f"只能引用可达上游节点，{root} 不是 {node.id} 的上游",
                         )
                     )
+                else:
+                    WorkflowCompiler._check_output_field(
+                        nodes[root], match.group("path"), index, diagnostics
+                    )
+
+    @staticmethod
+    def _check_output_field(
+        source_node: Any,
+        path: str,
+        index: int,
+        diagnostics: list[Diagnostic],
+    ) -> None:
+        """节点间 Schema 兼容（warning）：若上游声明 outputSchema，引用字段必须存在。
+
+        仅当路径形如 ``output.<field>...`` 且上游 config.outputSchema 是对象 Schema 时检查
+        第一层属性是否声明；无法确定时不报，避免误伤动态输出。这是发布前的早期提示，
+        而非硬性阻断。
+        """
+
+        output_schema = source_node.config.get("outputSchema")
+        if not isinstance(output_schema, dict):
+            return
+        properties = output_schema.get("properties")
+        if not isinstance(properties, dict):
+            return
+        parts = path.split(".")
+        if len(parts) < 2 or parts[0] != "output":
+            return
+        # 去除首字段上的数组索引后取属性名。
+        first = re.sub(r"\[\d+\]", "", parts[1])
+        if first and first not in properties:
+            diagnostics.append(
+                Diagnostic(
+                    level="warning",
+                    code="OUTPUT_FIELD_NOT_IN_SCHEMA",
+                    path=f"spec.nodes.{index}.input",
+                    message=(
+                        f"引用字段 {first} 不在上游节点 {source_node.id} 的 outputSchema 中，"
+                        "运行时可能解析失败"
+                    ),
+                )
+            )
 
     @staticmethod
     def _validate_reachability(

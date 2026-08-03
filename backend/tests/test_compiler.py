@@ -30,3 +30,51 @@ def test_compiler_rejects_unsafe_side_effect_retry() -> None:
         WorkflowCompiler().compile(definition)
 
     assert "UNSAFE_SIDE_EFFECT_RETRY" in {item.code for item in error.value.diagnostics}
+
+
+def test_compiler_warns_on_output_field_not_in_upstream_schema() -> None:
+    # 上游 LLM 节点声明 outputSchema 只有 category，下游引用不存在的 missing 字段。
+    definition = deterministic_workflow()
+    definition["spec"]["nodes"].insert(
+        2,
+        {
+            "id": "classify",
+            "type": "llm",
+            "displayName": "分类",
+            "input": {"text": "${format.output.text}"},
+            "config": {
+                "modelProfile": "fake",
+                "outputSchema": {
+                    "type": "object",
+                    "properties": {"category": {"type": "string"}},
+                },
+                "fakeOutput": {"category": "x"},
+                "prompt": "{input}",
+            },
+        },
+    )
+    definition["spec"]["edges"] = [
+        {"source": "input", "target": "format"},
+        {"source": "format", "target": "classify"},
+        {"source": "classify", "target": "output"},
+    ]
+    # output 引用 classify 不存在的字段 missing。
+    output = next(node for node in definition["spec"]["nodes"] if node["id"] == "output")
+    output["input"] = {"message": "${classify.output.missing}"}
+
+    compiled = WorkflowCompiler().compile(definition)
+    codes = {item.code for item in compiled.diagnostics}
+    assert "OUTPUT_FIELD_NOT_IN_SCHEMA" in codes
+
+
+def test_compiler_allows_indexed_array_reference() -> None:
+    # 统一表达式语法：${node.output.items[0]} 应被引用校验接受（不报未知引用）。
+    definition = deterministic_workflow()
+    definition["spec"]["nodes"][1]["config"] = {
+        "operation": "passthrough",
+    }
+    output = next(node for node in definition["spec"]["nodes"] if node["id"] == "output")
+    output["input"] = {"message": "${format.output.items[0]}"}
+    compiled = WorkflowCompiler().compile(definition)
+    # transform 无 outputSchema，不触发字段告警；引用语法被接受。
+    assert "UNKNOWN_REFERENCE" not in {item.code for item in compiled.diagnostics}
