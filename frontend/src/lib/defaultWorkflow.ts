@@ -1,0 +1,46 @@
+import type { WorkflowDefinition } from '@/api/client'
+
+export const defaultWorkflow: WorkflowDefinition = {
+  apiVersion: 'workflow.platform/v1',
+  kind: 'Workflow',
+  metadata: { name: 'greeting' },
+  spec: {
+    inputSchema: {
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      type: 'object',
+      required: ['name'],
+      properties: {
+        name: { type: 'string', title: '姓名', minLength: 1 },
+      },
+      additionalProperties: false,
+    },
+    uiSchema: {},
+    outputSchema: {
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      type: 'object',
+      required: ['message'],
+      properties: { message: { type: 'string' } },
+      additionalProperties: false,
+    },
+    nodes: [
+      { id: 'input', type: 'input', displayName: '输入' },
+      {
+        id: 'format',
+        type: 'transform',
+        displayName: '生成问候',
+        input: { name: '${input.name}' },
+        config: { operation: 'template', template: '你好，{name}' },
+      },
+      {
+        id: 'output',
+        type: 'output',
+        displayName: '输出',
+        input: { message: '${format.output.text}' },
+      },
+    ],
+    edges: [
+      { source: 'input', target: 'format' },
+      { source: 'format', target: 'output' },
+    ],
+  },
+}

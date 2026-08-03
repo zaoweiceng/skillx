@@ -1,0 +1,47 @@
+apiVersion: skillx.dev/v1alpha1
+kind: SkillX
+metadata:
+  namespace: dev.skillx
+  name: text-stats
+  version: 1.0.0
+  displayName: 文本统计
+  description: 确定性统计文本长度和单词数
+  license: Apache-2.0
+spec:
+  guide:
+    entry: SKILL.md
+  defaultInterface: count
+  interfaces:
+    count:
+      kind: direct
+      title: 统计文本
+      description: 返回字符、非空白字符和单词数量
+      inputSchema: schemas/count.input.schema.json
+      outputSchema: schemas/count.output.schema.json
+      execution:
+        timeoutSeconds: 5
+        idempotency: inherent
+        retry:
+          maxAttempts: 1
+      permissions:
+        model:
+          invoke: false
+      effects: []
+      runtime:
+        environment: python
+        protocol: skillx.python-callable/v1
+        entry: executors/count.py:execute
+  environments:
+    python:
+      kind: python-venv
+      python: ">=3.12,<3.14"
+  permissions:
+    filesystem:
+      read: []
+      write: []
+    network:
+      connect: []
+    secrets:
+      use: []
+    model:
+      invoke: false
