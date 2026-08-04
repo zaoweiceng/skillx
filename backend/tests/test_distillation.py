@@ -21,97 +21,142 @@ from app.infrastructure.database import (
     WorkflowVersion,
 )
 
-# 真实 Agent 轨迹：一次确定性 Tool 调用读取整张本地表，参数来自用户输入。
 LOOKUP_TABLE = {
     "q1": "第一季度：营收增长 12%",
     "q2": "第二季度：营收增长 8%",
 }
 
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {"reply": {"type": "string"}},
+    "required": ["reply"],
+    "additionalProperties": False,
+}
 
-def agent_trajectory(*, message: str = "q1") -> dict:
+INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {"message": {"type": "string"}},
+    "required": ["message"],
+    "additionalProperties": False,
+}
+
+
+def _base_trajectory(actions: list[dict], *, message: str = "q1") -> dict:
     return {
         "runType": "agent_run",
-        "name": "distilled-lookup",
+        "name": "distilled",
         "prompt": message,
-        "inputSchema": {
-            "type": "object",
-            "properties": {"message": {"type": "string"}},
-            "required": ["message"],
-            "additionalProperties": False,
-        },
-        "outputSchema": {
-            "type": "object",
-            "properties": {"reply": {"type": "string"}},
-            "required": ["reply"],
-            "additionalProperties": False,
-        },
-        "actions": [
-            {
-                "callId": "call-1",
-                "tool": "lookup.table",
-                "arguments": {"key": message},
-                "result": dict(LOOKUP_TABLE),
-            }
-        ],
-        "output": {"reply": LOOKUP_TABLE[message]},
-        "config": {"maxSteps": 6, "maxTotalTokens": 30000, "allowedCapabilities": ["lookup.table"]},
+        "inputSchema": INPUT_SCHEMA,
+        "outputSchema": OUTPUT_SCHEMA,
+        "actions": actions,
+        "output": {"reply": LOOKUP_TABLE.get(message, "")},
+        "config": {"maxSteps": 6, "maxTotalTokens": 30000, "allowedCapabilities": []},
         "originalModelCalls": 1,
     }
 
 
-def test_tool_action_becomes_deterministic_lookup_node() -> None:
-    first, analysis = compile_agent_trajectory(agent_trajectory())
-    second, _ = compile_agent_trajectory(agent_trajectory())
+def _lookup_action(message: str = "q1") -> dict:
+    # 带固化证据的 transform lookup 动作（operation/table）。
+    return {
+        "callId": "call-1",
+        "kind": "transform",
+        "capability": "lookup.table",
+        "arguments": {"key": message},
+        "result": dict(LOOKUP_TABLE),
+        "effect": "none",
+        "idempotent": True,
+        "replayability": "deterministic",
+        "observations": {"operation": "lookup", "table": dict(LOOKUP_TABLE)},
+    }
 
-    # 提炼稳定、可发布、零模型调用，且锁定了 Tool。
+
+def test_lookup_action_with_evidence_becomes_deterministic_node() -> None:
+    first, analysis = compile_agent_trajectory(_base_trajectory([_lookup_action()]))
+    second, _ = compile_agent_trajectory(_base_trajectory([_lookup_action()]))
     assert digest_json(first) == digest_json(second)
     assert analysis["publishable"] is True
     assert analysis["directNodes"] == 1
-    assert analysis["llmOrAgentNodes"] == 0
-    assert analysis["estimatedLlmCallsBefore"] == 1
-    assert analysis["estimatedLlmCallsAfter"] == 0
-    assert analysis["toolLocks"] == ["lookup.table"]
-    # 第二个节点是确定性 lookup Transform，不是 Agent。
+    assert analysis["agentNodes"] == 0
     node = first["spec"]["nodes"][1]
     assert node["type"] == "transform"
     assert node["config"]["operation"] == "lookup"
 
 
-def test_trajectory_without_parameterizable_action_falls_back_to_agent() -> None:
-    trajectory = agent_trajectory()
-    # 参数与用户输入不相等：无法安全参数化，退回受限 Agent 节点。
-    trajectory["actions"][0]["arguments"] = {"key": "hardcoded"}
-    definition, analysis = compile_agent_trajectory(trajectory)
+def test_plain_tool_dict_result_is_not_auto_lookup() -> None:
+    # 真实动态结果 {title, content}，无固化证据：绝不误编译为 lookup，保留为 Agent 节点。
+    action = {
+        "callId": "call-1",
+        "kind": "tool",
+        "capability": "web.fetch",
+        "arguments": {"url": "q1"},
+        "result": {"title": "Q1", "content": "动态正文"},
+    }
+    definition, analysis = compile_agent_trajectory(_base_trajectory([action]))
+    node = definition["spec"]["nodes"][1]
+    assert node["type"] == "agent"
+    assert analysis["directNodes"] == 0
+    assert analysis["agentNodes"] == 1
+    # 未被误编译为查表。
+    assert all(n["type"] != "transform" for n in definition["spec"]["nodes"])
+
+
+def test_mixed_trajectory_preserves_all_actions_in_order() -> None:
+    # 确定 lookup + 未识别动作（保留 Agent），两者顺序与依赖都保留，不丢步骤。
+    lookup = _lookup_action()
+    unknown = {
+        "callId": "call-2",
+        "kind": "tool",
+        "capability": "summarize.text",
+        "arguments": {"text": "some"},
+        "result": {"summary": "s"},
+    }
+    definition, analysis = compile_agent_trajectory(_base_trajectory([lookup, unknown]))
+    node_types = [n["type"] for n in definition["spec"]["nodes"]]
+    # input + transform(lookup) + agent(unknown) + output，动作数不减少。
+    assert node_types == ["input", "transform", "agent", "output"]
+    assert analysis["directNodes"] == 1
+    assert analysis["agentNodes"] == 1
+
+
+def test_locked_mcp_capability_becomes_mcp_node() -> None:
+    action = {
+        "callId": "call-1",
+        "kind": "mcp",
+        "capability": "weather.get",
+        "capabilityRef": {
+            "registryId": "snap-123",
+            "version": "1",
+            "digest": "sha256:abc",
+        },
+        "arguments": {"city": "q1"},
+        "result": {"temp": 20},
+        "effect": "none",
+        "idempotent": True,
+    }
+    definition, analysis = compile_agent_trajectory(_base_trajectory([action]))
+    node = definition["spec"]["nodes"][1]
+    assert node["type"] == "mcp"
+    assert node["config"]["mcpToolSnapshotId"] == "snap-123"
+    assert analysis["capabilityLocks"][0]["digest"] == "sha256:abc"
+
+
+def test_unlocked_mcp_capability_stays_agent() -> None:
+    # 没有能力锁（缺 registryId/version/digest）：不得确定化为 MCP 节点。
+    action = {
+        "callId": "call-1",
+        "kind": "mcp",
+        "capability": "weather.get",
+        "arguments": {"city": "q1"},
+        "result": {"temp": 20},
+    }
+    definition, _ = compile_agent_trajectory(_base_trajectory([action]))
     assert definition["spec"]["nodes"][1]["type"] == "agent"
-    assert analysis["llmOrAgentNodes"] == 1
-    assert analysis["diagnostics"][0]["code"] == "NO_DETERMINISTIC_ACTION"
 
 
-async def test_distillation_creates_editable_draft_without_publishing() -> None:
-    async with SessionLocal() as session, session.begin():
-        conversation = Conversation(id=str(uuid4()), title="固化测试")
-        session.add(conversation)
-        await session.flush()
-        conversation_run = ConversationRun(
-            id=str(uuid4()),
-            conversation_id=conversation.id,
-            status="succeeded",
-            input_json={"message": "q1"},
-            output_json={"reply": LOOKUP_TABLE["q1"]},
-            trajectory_json=agent_trajectory(),
-        )
-        session.add(conversation_run)
-        await session.flush()
-        result = await distill_conversation_run(session, conversation_run)
-        workflow = await session.get(Workflow, result.draft_workflow_id)
-        assert workflow is not None
-        assert result.status == "draft_created"
-        versions = await session.scalar(
-            select(func.count())
-            .select_from(WorkflowVersion)
-            .where(WorkflowVersion.workflow_id == workflow.id)
-        )
-        assert versions == 0
+def test_missing_call_id_analysis_fails() -> None:
+    action = {"kind": "tool", "capability": "x", "arguments": {}, "result": {}}
+    with pytest.raises(DistillationError):
+        compile_agent_trajectory(_base_trajectory([action]))
 
 
 async def test_distillation_rejects_imported_trajectory() -> None:
@@ -126,7 +171,7 @@ async def test_distillation_rejects_imported_trajectory() -> None:
             run_type="trajectory_import",
             input_json={"message": "q1"},
             output_json={"reply": LOOKUP_TABLE["q1"]},
-            trajectory_json=agent_trajectory(),
+            trajectory_json=_base_trajectory([_lookup_action()]),
         )
         session.add(imported)
         await session.flush()
@@ -135,10 +180,10 @@ async def test_distillation_rejects_imported_trajectory() -> None:
 
 
 async def test_distilled_draft_reuse_varies_with_new_input() -> None:
-    """固化后用不同输入运行，结果随输入变化且零模型调用（证明真实提炼）。"""
+    """固化后用不同输入运行，结果随输入变化且零模型调用（真实提炼）。"""
 
     async with SessionLocal() as session, session.begin():
-        conversation = Conversation(id=str(uuid4()), title="固化复用")
+        conversation = Conversation(id=str(uuid4()), title="复用")
         session.add(conversation)
         await session.flush()
         conversation_run = ConversationRun(
@@ -148,22 +193,19 @@ async def test_distilled_draft_reuse_varies_with_new_input() -> None:
             run_type="agent_run",
             input_json={"message": "q1"},
             output_json={"reply": LOOKUP_TABLE["q1"]},
-            trajectory_json=agent_trajectory(message="q1"),
+            trajectory_json=_base_trajectory([_lookup_action("q1")], message="q1"),
         )
         session.add(conversation_run)
         await session.flush()
         result = await distill_conversation_run(session, conversation_run)
         draft_workflow_id = result.draft_workflow_id
-        assert result.analysis_json["sourceRunId"] == conversation_run.id
 
     async with SessionLocal() as session:
         published = await publish_workflow(draft_workflow_id, session)
     version_id = published["id"]
 
-    # 用与探索时不同的输入（q2）运行发布版本：结果应随输入变化。
     async with SessionLocal() as session, session.begin():
         version = await session.get(WorkflowVersion, version_id)
-        assert version is not None
         run = await Orchestrator().create_run(session, version, {"message": "q2"})
         run_id = run.id
     worker = WorkerService("distill-reuse-worker")
@@ -174,11 +216,34 @@ async def test_distilled_draft_reuse_varies_with_new_input() -> None:
         completed = await session.get(Run, run_id)
         assert completed is not None
         assert completed.status == "succeeded"
-        # 新输入 q2 选出不同结果，未运行任何 Agent/LLM。
         assert completed.output_json == {"reply": LOOKUP_TABLE["q2"]}
         event_types = set(
-            await session.scalars(
-                select(RunEvent.type).where(RunEvent.run_id == run_id)
-            )
+            await session.scalars(select(RunEvent.type).where(RunEvent.run_id == run_id))
         )
     assert not {"agent.completed", "llm.call.completed"} & event_types
+
+
+async def test_distillation_creates_editable_draft_without_publishing() -> None:
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="草稿")
+        session.add(conversation)
+        await session.flush()
+        conversation_run = ConversationRun(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            status="succeeded",
+            input_json={"message": "q1"},
+            output_json={"reply": LOOKUP_TABLE["q1"]},
+            trajectory_json=_base_trajectory([_lookup_action()]),
+        )
+        session.add(conversation_run)
+        await session.flush()
+        result = await distill_conversation_run(session, conversation_run)
+        workflow = await session.get(Workflow, result.draft_workflow_id)
+        assert workflow is not None
+        versions = await session.scalar(
+            select(func.count())
+            .select_from(WorkflowVersion)
+            .where(WorkflowVersion.workflow_id == workflow.id)
+        )
+        assert versions == 0

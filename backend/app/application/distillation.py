@@ -6,7 +6,12 @@ from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.application.action_compilers import ActionCompilerRegistry, CompileContext
 from app.application.compiler import WorkflowCompiler, WorkflowValidationError
+from app.application.distillation_ir import (
+    TrajectoryAnalysisError,
+    build_action_ir,
+)
 from app.infrastructure.database import ConversationRun, Distillation, Workflow
 
 STEP_ID = re.compile(r"[^a-zA-Z0-9_-]+")
@@ -37,109 +42,79 @@ def _node_id(base: str, taken: set[str]) -> str:
 def compile_agent_trajectory(
     trajectory: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """从真实 Agent 轨迹的成功 action 序列提炼确定节点。
+    """从真实 Agent 轨迹的成功 action 序列提炼混合工作流。
 
-    依次判断每个 action 能否参数化为确定节点：
-    - Tool 调用（含 callId）→ 锁定为 Transform 查表节点，参数来自 ``${input.message}``；
-    - 无法确定化的动作 → 保留为受限 Agent 节点。
-
-    最后一个确定节点的输出映射到 workflow output。若没有任何可确定化的 action，则退回
-    单个受限 Agent 节点（并在分析中标注原因）。
+    流程：NormalizedAction IR → Action Compiler Registry 逐个裁决 → 保留顺序与数据依赖
+    生成“确定前缀 + 局部 Agent/LLM + 确定后缀”的混合图。绝不因为存在一个确定节点就
+    丢弃其它动作；未识别动作保留为显式 Agent 节点，被拒绝的确定化建议产生 error 级
+    diagnostic 使草稿不可发布。
     """
 
     input_schema = trajectory.get("inputSchema")
     output_schema = trajectory.get("outputSchema")
     if not isinstance(input_schema, dict) or not isinstance(output_schema, dict):
         raise DistillationError("轨迹缺少 inputSchema/outputSchema")
-    raw_prompt = str(trajectory.get("prompt", ""))
-    message = _clean_message(raw_prompt)
-    actions = trajectory.get("actions") or []
+    trajectory = {**trajectory, "prompt": _clean_message(str(trajectory.get("prompt", "")))}
 
+    try:
+        actions = build_action_ir(trajectory)
+    except TrajectoryAnalysisError as exc:
+        raise DistillationError(str(exc)) from exc
+
+    registry = ActionCompilerRegistry()
     nodes: list[dict[str, Any]] = [{"id": "input", "type": "input", "displayName": "输入"}]
     edges: list[dict[str, str]] = []
     taken = {"input", "output"}
     previous = "input"
     diagnostics: list[dict[str, str]] = []
     deterministic_nodes = 0
-    llm_or_agent_nodes = 0
-    last_result_ref = "${input.message}"
+    agent_nodes = 0
+    capability_locks: list[dict[str, Any]] = []
+    last_node = "input"
+    last_output_ref = "${input.message}"
 
     for action in actions:
-        tool = action.get("capability") or action.get("tool")
-        if not isinstance(tool, str) or not tool:
-            continue
-        result = action.get("result", {})
-        arguments = action.get("arguments", {})
-        # 只有当 Tool 结果是可查表的字典、且某个参数等于用户输入时，才能安全参数化为
-        # 确定节点：把整表冻结进 config，运行时以 ${input.message} 作为 key 选出结果。
-        key_field = next(
-            (name for name, value in arguments.items() if value == message and message),
-            None,
+        cap_name = action.capability_ref.name if action.capability_ref else action.kind
+        node_id = _node_id(f"{action.kind}-{cap_name}", taken)
+        ctx = CompileContext(
+            node_id=node_id, message=trajectory["prompt"], output_schema=output_schema
         )
-        if not isinstance(result, dict) or key_field is None:
-            continue
-        node_id = _node_id(f"tool-{tool}", taken)
-        node = {
-            "id": node_id,
-            "type": "transform",
-            "displayName": f"锁定 Tool {tool}",
-            "input": {"key": "${input.message}"},
-            "config": {
-                "operation": "lookup",
-                "tool": tool,
-                # 冻结探索时读取的整张本地表；新输入 key 选出不同结果。
-                "table": result,
-                "keyField": "key",
-                "default": "未知项",
-            },
-        }
+        result = registry.compile(action, ctx)
+        if result.decision == "rejected":
+            diagnostics.extend(result.diagnostics)
+            # 被拒绝的动作仍需保留位置：退回显式 Agent 节点，避免丢步骤，但草稿不可发布。
+            fallback = registry._compilers["agent"].compile(action, ctx)  # noqa: SLF001
+            node = fallback.node
+            agent_nodes += 1
+        elif result.decision == "agent":
+            node = result.node
+            agent_nodes += 1
+        else:
+            node = result.node
+            deterministic_nodes += 1
+            if action.capability_ref and action.capability_ref.digest:
+                capability_locks.append(
+                    {
+                        "nodeId": node_id,
+                        "kind": action.kind,
+                        "capability": action.capability_ref.name,
+                        "registryId": action.capability_ref.registry_id,
+                        "version": action.capability_ref.version,
+                        "digest": action.capability_ref.digest,
+                    }
+                )
+        assert node is not None
         nodes.append(node)
         edges.append({"source": previous, "target": node_id})
         previous = node_id
-        deterministic_nodes += 1
-        last_result_ref = f"${{{node_id}.output.value}}"
+        last_node = node_id
+        # 输出引用：确定节点用其结构化输出，Agent/LLM 节点用 output 字段。
+        last_output_ref = _node_output_ref(node_id, node)
 
-    if deterministic_nodes == 0:
-        # 没有可确定化的 action：保留一个受限 Agent 节点复现探索，但显式标注。
-        diagnostics.append(
-            {
-                "level": "warning",
-                "code": "NO_DETERMINISTIC_ACTION",
-                "path": "actions",
-                "message": "轨迹无可参数化的 Tool 动作，退回受限 Agent 节点",
-            }
-        )
-        agent_id = _node_id("agent", taken)
-        nodes.append(
-            {
-                "id": agent_id,
-                "type": "agent",
-                "displayName": "受限通用 Agent",
-                "input": {"message": "${input.message}"},
-                "config": {
-                    "outputSchema": output_schema,
-                    "maxSteps": trajectory.get("config", {}).get("maxSteps", 6),
-                    "maxTotalTokens": trajectory.get("config", {}).get("maxTotalTokens", 30000),
-                    "allowedCapabilities": trajectory.get("config", {}).get(
-                        "allowedCapabilities", []
-                    ),
-                    "prompt": trajectory.get("prompt", "完成该任务"),
-                },
-            }
-        )
-        edges.append({"source": previous, "target": agent_id})
-        previous = agent_id
-        llm_or_agent_nodes += 1
-        output_mapping = {
-            key: f"${{{agent_id}.output.{key}}}"
-            for key in output_schema.get("properties", {})
-        }
-    else:
-        # 确定节点链：把最后一个 Tool 结果映射到 output 的每个属性。
-        output_mapping = {
-            key: last_result_ref for key in output_schema.get("properties", {})
-        }
+    if not actions:
+        raise DistillationError("轨迹不含任何可分析动作")
 
+    output_mapping = _build_output_mapping(output_schema, last_node, nodes, last_output_ref)
     nodes.append(
         {"id": "output", "type": "output", "displayName": "输出", "input": output_mapping}
     )
@@ -166,18 +141,47 @@ def compile_agent_trajectory(
         diagnostics.extend(item.model_dump() for item in exc.diagnostics)
     analysis = {
         "directNodes": deterministic_nodes,
-        "llmOrAgentNodes": llm_or_agent_nodes,
+        "agentNodes": agent_nodes,
+        "llmOrAgentNodes": agent_nodes,
         "estimatedLlmCallsBefore": trajectory.get("originalModelCalls", 0),
-        "estimatedLlmCallsAfter": llm_or_agent_nodes,
-        "toolLocks": [
-            action.get("capability") or action.get("tool")
-            for action in actions
-            if action.get("capability") or action.get("tool")
+        "estimatedLlmCallsAfter": agent_nodes,
+        "capabilityLocks": capability_locks,
+        "unsupportedActions": [
+            action.action_id for action in actions if action.replayability == "unsupported"
         ],
         "diagnostics": diagnostics,
         "publishable": not any(item["level"] == "error" for item in diagnostics),
     }
     return definition, analysis
+
+
+def _node_output_ref(node_id: str, node: dict[str, Any]) -> str:
+    """给定节点，返回可映射到 workflow output 的引用表达式。"""
+
+    if node["type"] == "transform" and node.get("config", {}).get("operation") == "lookup":
+        return f"${{{node_id}.output.value}}"
+    return f"${{{node_id}.output}}"
+
+
+def _build_output_mapping(
+    output_schema: dict[str, Any],
+    last_node: str,
+    nodes: list[dict[str, Any]],
+    last_output_ref: str,
+) -> dict[str, Any]:
+    """把最后一个节点的输出映射到 workflow output 的每个属性。
+
+    - lookup 节点：单 scalar value 映射到唯一输出属性；
+    - 结构化输出节点（agent/llm）：按属性名逐字段映射 ${node.output.<field>}。
+    """
+
+    properties = list(output_schema.get("properties", {}))
+    node = next((item for item in nodes if item["id"] == last_node), None)
+    node_type = node["type"] if node else "agent"
+    if node_type in ("agent", "llm"):
+        return {key: f"${{{last_node}.output.{key}}}" for key in properties}
+    # 确定节点（如 lookup）：所有输出属性映射到该节点的 scalar 结果引用。
+    return {key: last_output_ref for key in properties}
 
 
 async def distill_conversation_run(
@@ -194,15 +198,10 @@ async def distill_conversation_run(
             "只有服务端生成的 agent_run 可固化；单次回答或导入轨迹请勿作为固化来源"
         )
     definition, analysis = compile_agent_trajectory(conversation_run.trajectory_json)
-    # 保留来源 run id 与 action 摘要，保证固化结果可审计。
     analysis = {
         **analysis,
         "sourceRunId": conversation_run.id,
         "sourceRunType": run_type,
-        "actionSummary": [
-            {"tool": action.get("capability") or action.get("tool")}
-            for action in conversation_run.trajectory_json.get("actions", [])
-        ],
     }
     workflow = Workflow(
         id=str(uuid4()),

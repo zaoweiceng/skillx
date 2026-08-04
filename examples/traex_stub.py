@@ -86,11 +86,28 @@ def main() -> int:
     emit({"type": "agent.plan", "payload": {"summary": "解析输入并调用允许的工具", "steps": 2}})
 
     if mode == "deterministic":
-        # 调用确定性查表 Tool：探索时读取整张本地表并返回，Agent 用输入 key 选择结果。
-        # 关键：Tool 结果携带整表，使固化后的确定节点能以新 key 选出不同结果。
+        # 确定性查表：Tool 事件显式携带固化证据（kind=transform、operation=lookup、整表），
+        # Compiler 据此裁决为确定节点，而非依赖“结果恰好是 dict”。
         key = _clean_message(args.prompt)
         tool_name = allowed[0] if allowed else "lookup.table"
-        _emit_tool_call("call-1", tool_name, {"key": key}, dict(LOOKUP_TABLE))
+        started = {
+            "callId": "call-1",
+            "tool": tool_name,
+            "arguments": {"key": key},
+            "actionKind": "transform",
+        }
+        completed = {
+            "callId": "call-1",
+            "tool": tool_name,
+            "result": dict(LOOKUP_TABLE),
+            "actionKind": "transform",
+            "replayability": "deterministic",
+            "effect": "none",
+            "idempotent": True,
+            "observations": {"operation": "lookup", "table": dict(LOOKUP_TABLE)},
+        }
+        emit({"type": "tool.call.started", "payload": started})
+        emit({"type": "tool.call.completed", "payload": completed})
         emit(
             {
                 "type": "agent.step.completed",

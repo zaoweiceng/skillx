@@ -146,10 +146,10 @@ def test_e2e_5_agent_distillation_reuse(stack: DemoStack) -> None:
         draft_workflow_id = draft["draftWorkflowId"]
         assert draft["status"] == "draft_created"
         assert draft["analysis"]["sourceRunType"] == "agent_run"
-        # 提炼出确定节点、锁定 Tool，且固化后预计模型调用降为 0。
+        # 提炼出确定节点，且固化后预计模型调用降为 0。
         assert draft["analysis"]["directNodes"] >= 1
+        assert draft["analysis"]["agentNodes"] == 0
         assert draft["analysis"]["estimatedLlmCallsAfter"] == 0
-        assert draft["analysis"]["toolLocks"] == ["lookup.table"]
 
         # 4) 通过 API 人工发布并创建组件。
         published = client.post(f"/workflows/{draft_workflow_id}/publish")

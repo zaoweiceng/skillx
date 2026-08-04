@@ -206,7 +206,12 @@ class AgentHost:
         started: dict[str, Any],
         completed: dict[str, Any],
     ) -> dict[str, Any]:
-        """把一对 started/completed 事件归一化为动作记录（供 IR 构建消费）。"""
+        """把一对 started/completed 事件归一化为动作记录（供 IR 构建消费）。
+
+        透传事件可选携带的固化证据：``capabilityRef``（已发布能力锁）、``outputSchema``、
+        ``replayability`` 与 ``observations``（如 transform lookup 的 operation/table）。
+        这些是 Compiler 做确定化裁决的证据来源，而非依赖“结果恰好是 dict”。
+        """
 
         if event_type == "browser.action.completed":
             kind = "browser"
@@ -214,14 +219,24 @@ class AgentHost:
         else:
             kind = "tool"
             capability = completed.get("tool", "")
-        return {
+        action: dict[str, Any] = {
             "callId": completed["callId"],
-            "kind": kind,
+            "kind": completed.get("actionKind") or kind,
             "capability": capability,
             "action": completed.get("action") or started.get("action"),
             "arguments": started.get("arguments", {}),
             "result": completed.get("result", {}),
         }
+        # 透传固化证据（如果 Runtime 提供）。
+        for key in ("capabilityRef", "outputSchema", "replayability", "effect", "idempotent"):
+            if key in completed:
+                action[key] = completed[key]
+            elif key in started:
+                action[key] = started[key]
+        observations = completed.get("observations") or started.get("observations")
+        if isinstance(observations, dict):
+            action["observations"] = observations
+        return action
 
     @staticmethod
     async def _cancel(adapter: TraeXSubprocessAdapter, run_id: str) -> None:
