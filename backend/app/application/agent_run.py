@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
-from jsonschema import Draft202012Validator
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.application.agent_events import AgentEventError, AgentEventValidator
+from app.application.agent_host import (
+    AgentHost,
+    AgentHostError,
+    AgentHostRequest,
+    resolve_effective_capabilities,
+)
 from app.config import get_settings
 from app.infrastructure.database import (
     Conversation,
@@ -20,7 +25,7 @@ from app.infrastructure.database import (
     SessionLocal,
     utcnow,
 )
-from app.runtime.adapters import AdapterError, AgentRunRequest, TraeXSubprocessAdapter
+from app.runtime.adapters import TraeXSubprocessAdapter
 
 FINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
 
@@ -86,19 +91,6 @@ class AgentRunConfig:
                 data.get("maxDurationSeconds", default.max_duration_seconds)
             ),
         )
-
-
-def resolve_effective_capabilities(requested: tuple[str, ...]) -> tuple[list[str], list[str]]:
-    """实际能力 = 请求集合 ∩ Host 授予集合。
-
-    返回 ``(effective, denied)``。请求方无法通过 body 扩大 Tool 范围；越权的能力被记录
-    为 denied 并在运行中作为 ``PERMISSION_DENIED`` fail closed。
-    """
-
-    host_granted = set(get_settings().agent_host_capabilities)
-    effective = [item for item in requested if item in host_granted]
-    denied = [item for item in requested if item not in host_granted]
-    return effective, denied
 
 
 async def _append_event(
@@ -220,17 +212,6 @@ class AgentRunWorker:
         self._adapter = adapter
         self.lease_seconds = lease_seconds or get_settings().agent_lease_seconds
 
-    def _resolve_adapter(self) -> TraeXSubprocessAdapter:
-        if self._adapter is not None:
-            return self._adapter
-        settings = get_settings()
-        if not settings.traex_command:
-            raise AgentRunError("MODEL_NOT_CONFIGURED", "TraeX Runtime 尚未配置")
-        return TraeXSubprocessAdapter(
-            settings.traex_command,
-            set(settings.traex_allowed_executables),
-        )
-
     async def poll_once(self) -> bool:
         """恢复过期租约并领取执行一次；返回是否处理了任务。"""
 
@@ -336,113 +317,50 @@ class AgentRunWorker:
             content = run.input_json.get("message", "")
             prompt = run.input_json.get("prompt", content)
 
-        try:
-            adapter = self._resolve_adapter()
-        except AgentRunError as exc:
-            await self._finalize_failure(run_id, exc)
-            return
-
-        effective, denied = resolve_effective_capabilities(config.allowed_capabilities)
+        # denied 能力在 Host 内 fail closed（PERMISSION_DENIED）；这里仅提前记录审计事件。
+        _, denied = resolve_effective_capabilities(config.allowed_capabilities)
         if denied:
             await self._append_committed(
                 run_id,
-                "agent.capabilities.narrowed",
-                {
-                    "requested": list(config.allowed_capabilities),
-                    "denied": denied,
-                    "granted": effective,
-                },
+                "agent.capabilities.denied",
+                {"requested": list(config.allowed_capabilities), "denied": denied},
             )
 
-        request = AgentRunRequest(
-            prompt=prompt,
-            working_directory=(
-                get_settings().artifact_root / "conversation-agents" / run_id
-            ),
-            allowed_tools=effective,
-            max_steps=config.max_steps,
-            max_tokens=config.max_total_tokens,
-        )
-        validator = AgentEventValidator(
-            set(effective),
-            max_payload_bytes=get_settings().agent_max_event_payload_bytes,
-        )
-
-        actions: list[dict[str, Any]] = []
-        open_calls: dict[str, dict[str, Any]] = {}
-        raw_events: list[dict[str, Any]] = []
-        output: dict[str, Any] | None = None
-        total_tokens = 0
-        step_count = 0
-
-        # 由后台 watcher 传播取消/租约丢失，主循环观察 signal 决定终态。
+        # 后台 watcher 负责租约心跳与取消/丢失检测，主执行交给统一 AgentHost。
         signal: dict[str, Any] = {}
         stop_watch = asyncio.Event()
-        watcher = asyncio.create_task(self._watch(run_id, adapter, signal, stop_watch))
+        watcher = asyncio.create_task(self._watch(run_id, signal, stop_watch))
+
+        host = AgentHost(adapter=self._adapter)
+
+        async def event_sink(_runtime: dict[str, Any], audit: dict[str, Any]) -> None:
+            # 只把脱敏的审计事件写入数据库；原始 payload 不落库。
+            await self._append_committed(run_id, audit["type"], audit["payload"])
+
+        async def cancellation() -> bool:
+            return bool(signal)
+
+        request = AgentHostRequest(
+            run_id=run_id,
+            prompt=prompt,
+            output_schema=config.output_schema,
+            working_directory=get_settings().artifact_root / "conversation-agents" / run_id,
+            requested_capabilities=config.allowed_capabilities,
+            max_steps=config.max_steps,
+            max_total_tokens=config.max_total_tokens,
+            max_duration_seconds=config.max_duration_seconds,
+        )
 
         terminal: AgentRunError | None = None
+        result = None
         try:
-            async with asyncio.timeout(config.max_duration_seconds):
-                async for raw in adapter.events(run_id, request):
-                    if signal:
-                        break
-                    try:
-                        event = validator.validate(raw)
-                    except PermissionError as exc:
-                        terminal = AgentRunError(
-                            "PERMISSION_DENIED",
-                            f"Agent 调用了未授权工具 {exc}，不在生效能力集合内",
-                        )
-                        await self._cancel_adapter(adapter, run_id)
-                        break
-                    except AgentEventError as exc:
-                        terminal = AgentRunError("AGENT_EVENT_INVALID", str(exc))
-                        await self._cancel_adapter(adapter, run_id)
-                        break
-                    raw_events.append(event)
-                    await self._append_committed(run_id, event["type"], event["payload"])
-                    payload = event["payload"]
-                    if event["type"] == "tool.call.started":
-                        open_calls[payload["callId"]] = payload
-                    elif event["type"] == "tool.call.completed":
-                        started = open_calls.pop(payload["callId"], {})
-                        actions.append(
-                            {
-                                "callId": payload["callId"],
-                                "tool": payload["tool"],
-                                "arguments": started.get("arguments", {}),
-                                "result": payload.get("result", {}),
-                            }
-                        )
-                    elif event["type"] == "agent.step.completed":
-                        step_count += 1
-                        total_tokens += payload.get("inputTokens", 0) + payload.get(
-                            "outputTokens", 0
-                        )
-                        if step_count > config.max_steps:
-                            terminal = AgentRunError(
-                                "STEP_BUDGET_EXCEEDED",
-                                f"Agent 步数超过 Host 上限 {config.max_steps}",
-                            )
-                            await self._cancel_adapter(adapter, run_id)
-                            break
-                        if total_tokens > config.max_total_tokens:
-                            terminal = AgentRunError(
-                                "TOKEN_BUDGET_EXCEEDED",
-                                f"Agent Token 超过 Host 上限 {config.max_total_tokens}",
-                            )
-                            await self._cancel_adapter(adapter, run_id)
-                            break
-                    elif event["type"] == "agent.completed":
-                        output = payload.get("output")
-                        if payload.get("totalTokens") is not None:
-                            total_tokens = payload["totalTokens"]
-        except TimeoutError:
-            terminal = AgentRunError("TIMEOUT", "Agent 运行超时，已取消")
-            await self._cancel_adapter(adapter, run_id)
-        except AdapterError as exc:
-            if not signal and terminal is None:
-                terminal = AgentRunError("EXECUTION_FAILED", str(exc))
+            result = await host.execute(
+                request, event_sink=event_sink, cancellation=cancellation
+            )
+        except AgentHostError as exc:
+            terminal = AgentRunError(exc.code, exc.message)
+        except asyncio.CancelledError:
+            terminal = None  # 由 signal 决定 cancelled/lost
         finally:
             stop_watch.set()
             await watcher
@@ -456,40 +374,29 @@ class AgentRunWorker:
         if terminal is not None:
             await self._finalize_failure(run_id, terminal)
             return
-        if output is None:
+        if result is None:
             await self._finalize_failure(
-                run_id, AgentRunError("EXECUTION_FAILED", "Agent 未返回结构化输出")
-            )
-            return
-        errors = list(Draft202012Validator(config.output_schema).iter_errors(output))
-        if errors:
-            await self._finalize_failure(
-                run_id,
-                AgentRunError(
-                    "CONTRACT_VIOLATION",
-                    f"Agent 输出不符合 outputSchema: {errors[0].message}",
-                ),
+                run_id, AgentRunError("EXECUTION_FAILED", "Agent 未产生结果")
             )
             return
         await self._finalize_success(
             run_id,
             config,
             prompt,
-            output,
-            actions,
-            raw_events,
-            step_count,
-            total_tokens,
+            result.output,
+            result.actions,
+            result.runtime_events,
+            result.step_count,
+            result.total_tokens,
         )
 
     async def _watch(
         self,
         run_id: str,
-        adapter: TraeXSubprocessAdapter,
         signal: dict[str, Any],
         stop: asyncio.Event,
     ) -> None:
-        """周期性刷新租约并观察取消请求；必要时终止子进程。"""
+        """周期性刷新租约并观察取消请求；置位 signal 让 AgentHost 停止。"""
 
         interval = get_settings().agent_lease_seconds
         tick = max(0.2, min(0.5, interval / 3))
@@ -507,8 +414,8 @@ class AgentRunWorker:
                     signal["kind"] = "lost"
                     break
                 if run.cancellation_requested_at is not None:
+                    # 置位 signal，AgentHost 的 cancellation 回调会终止子进程。
                     signal["kind"] = "cancelled"
-                    await self._cancel_adapter(adapter, run_id)
                     break
                 result = await session.execute(
                     update(ConversationRun)
@@ -524,7 +431,6 @@ class AgentRunWorker:
                 )
                 if result.rowcount != 1:
                     signal["kind"] = "lost"
-                    await self._cancel_adapter(adapter, run_id)
                     break
 
     async def _append_committed(
@@ -532,13 +438,6 @@ class AgentRunWorker:
     ) -> None:
         async with SessionLocal() as session, session.begin():
             await _append_event(session, run_id, event_type, payload)
-
-    @staticmethod
-    async def _cancel_adapter(adapter: TraeXSubprocessAdapter, run_id: str) -> None:
-        try:
-            await adapter.cancel(run_id)
-        except Exception:  # noqa: BLE001 - 取消失败不应掩盖原始终态。
-            pass
 
     async def _finalize_failure(self, run_id: str, error: AgentRunError) -> None:
         async with SessionLocal() as session, session.begin():
@@ -593,15 +492,20 @@ class AgentRunWorker:
         step_count: int,
         total_tokens: int,
     ) -> None:
-        # 原始轨迹写入 Artifact 文件，数据库只保存脱敏摘要与引用。
-        artifact_uri = self._write_trajectory_artifact(run_id, raw_events, output)
-        trajectory = build_trajectory(config, prompt, output, actions, step_count, artifact_uri)
+        # 先把原始轨迹写入 staging（不落最终目录），DB 只保存受控 artifact:// 引用与 hash。
+        staged = self._stage_trajectory(run_id, raw_events, output)
+        trajectory = build_trajectory(config, prompt, output, actions, step_count, staged["uri"])
         summary = {
             "totalTokens": total_tokens,
             "steps": step_count,
-            "toolCalls": [{"tool": item["tool"]} for item in actions],
-            "trajectoryArtifactUri": artifact_uri,
+            "toolCalls": [{"capability": item.get("capability")} for item in actions],
+            "trajectoryArtifact": {
+                "uri": staged["uri"],
+                "sha256": staged["sha256"],
+                "bytes": staged["bytes"],
+            },
         }
+        committed = False
         async with SessionLocal() as session, session.begin():
             run = await session.get(ConversationRun, run_id)
             if run is None or run.status in FINAL_STATES:
@@ -618,19 +522,39 @@ class AgentRunWorker:
                 "agent.run.succeeded",
                 {"conversationRunId": run_id, "summary": summary},
             )
+            committed = True
+        # 事务提交后再从 staging 原子落位；提交失败则 staging 文件由 reconcile 清理。
+        if committed:
+            self._promote_trajectory(run_id)
 
     @staticmethod
-    def _write_trajectory_artifact(
-        run_id: str, raw_events: list[dict[str, Any]], output: dict[str, Any]
-    ) -> str:
-        directory = (get_settings().artifact_root / "conversation-agents" / run_id).resolve()
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / "trajectory.json"
-        path.write_text(
-            json.dumps({"events": raw_events, "output": output}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        return f"file://{path}"
+    def _trajectory_dir(run_id: str) -> Any:
+        return (get_settings().artifact_root / "conversation-agents" / run_id).resolve()
+
+    @classmethod
+    def _stage_trajectory(
+        cls, run_id: str, raw_events: list[dict[str, Any]], output: dict[str, Any]
+    ) -> dict[str, Any]:
+        directory = cls._trajectory_dir(run_id)
+        staging = directory / ".staging"
+        staging.mkdir(parents=True, exist_ok=True)
+        content = json.dumps(
+            {"events": raw_events, "output": output}, ensure_ascii=False, indent=2
+        ).encode()
+        (staging / "trajectory.json").write_bytes(content)
+        return {
+            "uri": f"artifact://conversation-agents/{run_id}/trajectory.json",
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "bytes": len(content),
+        }
+
+    @classmethod
+    def _promote_trajectory(cls, run_id: str) -> None:
+        directory = cls._trajectory_dir(run_id)
+        source = directory / ".staging" / "trajectory.json"
+        target = directory / "trajectory.json"
+        if source.exists():
+            source.replace(target)
 
 
 def build_trajectory(

@@ -160,4 +160,4 @@ async def test_traex_bad_schema_fails(traex_stub: None) -> None:
         node = await session.scalar(
             select(NodeRun).where(NodeRun.run_id == run_id, NodeRun.node_id == "agent")
         )
-        assert node is not None and node.error_json["code"] == "EXECUTION_FAILED"
+        assert node is not None and node.error_json["code"] == "CONTRACT_VIOLATION"

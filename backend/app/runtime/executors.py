@@ -12,13 +12,13 @@ from uuid import uuid4
 
 from jsonschema import Draft202012Validator
 
+from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
 from app.application.compiler import digest_json
 from app.application.mcp import call_mcp_contract
 from app.application.secrets import contains_secret
 from app.application.security import redact
 from app.config import get_settings
 from app.domain.workflow import ExecutionError, NodeResult, NodeType, WorkflowNode
-from app.runtime.adapters import AgentRunRequest, TraeXSubprocessAdapter
 from app.runtime.browser import (
     ObservedPage,
     PageContract,
@@ -38,10 +38,6 @@ from app.runtime.skillx_host import execute_in_subprocess
 
 class ExecutionCancelledError(Exception):
     pass
-
-
-class AgentToolViolation(Exception):
-    """Agent 调用了 allowedCapabilities 之外的工具。"""
 
 
 def _staging_dir(run_id: str, node_run_id: str) -> Path:
@@ -483,81 +479,65 @@ class AgentExecutor:
                     message="TraeX Runtime 尚未配置",
                 ),
             )
-        adapter = TraeXSubprocessAdapter(
-            settings.traex_command,
-            set(settings.traex_allowed_executables),
-        )
-        allowed_capabilities = set(node.config.get("allowedCapabilities", []))
-        events: list[dict[str, Any]] = []
-        output: dict[str, Any] | None = None
-        total_tokens = 0
-        step_count = 0
-        request = AgentRunRequest(
+        # 005-A：Workflow Agent 节点与 Conversation Agent 共享同一 AgentHost，
+        # 得到一致的权限交集、事件契约、预算与取消语义；差异只在事件 sink。
+        runtime_events: list[dict[str, Any]] = []
+        audit_events: list[dict[str, Any]] = []
+
+        async def event_sink(runtime_event: dict[str, Any], audit_event: dict[str, Any]) -> None:
+            runtime_events.append(runtime_event)
+            audit_events.append(audit_event)
+
+        async def cancellation() -> bool:
+            return context.cancellation.cancelled
+
+        request = AgentHostRequest(
+            run_id=context.node_run_id,
             prompt=node.config.get("prompt", "")
             + "\n输入："
             + json.dumps(inputs, ensure_ascii=False),
-            working_directory=(get_settings().artifact_root / context.run_id / f"agent-{node.id}"),
-            allowed_tools=node.config.get("allowedCapabilities", []),
+            output_schema=output_schema,
+            working_directory=get_settings().artifact_root / context.run_id / f"agent-{node.id}",
+            requested_capabilities=tuple(node.config.get("allowedCapabilities", [])),
             max_steps=int(node.config["maxSteps"]),
-            max_tokens=int(node.config.get("maxTotalTokens", 30000)),
+            max_total_tokens=int(node.config.get("maxTotalTokens", 30000)),
+            max_duration_seconds=int(node.config.get("maxDurationSeconds", node.timeout_seconds)),
         )
         try:
-            async for event in adapter.events(context.node_run_id, request):
-                context.cancellation.check()
-                event_type = event.get("type", "log.emitted")
-                payload = event.get("payload", {})
-                # Host 校验：每个 Tool 事件的能力必须在 allowlist 内，越权立即失败。
-                if event_type.startswith("tool.") and "tool" in payload:
-                    tool_name = payload.get("tool")
-                    if tool_name not in allowed_capabilities:
-                        raise AgentToolViolation(
-                            f"Agent 调用了未授权工具 {tool_name}，不在 allowedCapabilities 内"
-                        )
-                if event_type == "agent.step.completed":
-                    step_count += 1
-                    total_tokens += int(payload.get("inputTokens", 0)) + int(
-                        payload.get("outputTokens", 0)
-                    )
-                events.append({"type": event_type, "payload": payload})
-                if event_type == "agent.completed":
-                    output = payload.get("output")
-                    total_tokens = int(payload.get("totalTokens", total_tokens))
-            if output is None:
-                raise ValueError("Agent 未返回结构化输出")
-            Draft202012Validator(output_schema).validate(output)
-            artifact = write_json_artifact(
-                context.run_id,
-                context.node_run_id,
-                node.id,
-                "agent-trajectory.json",
-                "agent-trajectory",
-                {"events": events, "output": output},
+            result = await AgentHost().execute(
+                request, event_sink=event_sink, cancellation=cancellation
             )
-            return NodeResult(
-                status="succeeded",
-                output=output,
-                events=events,
-                metrics={"agentSteps": step_count or len(events), "totalTokens": total_tokens},
-                artifacts=[artifact],
-            )
-        except ExecutionCancelledError:
-            return NodeResult(
-                status="cancelled",
-                error=ExecutionError(code="CANCELLED", message="Agent 执行已取消"),
-                events=events,
-            )
-        except AgentToolViolation as exc:
+        except AgentHostError as exc:
+            if context.cancellation.cancelled:
+                return NodeResult(
+                    status="cancelled",
+                    error=ExecutionError(code="CANCELLED", message="Agent 执行已取消"),
+                    events=audit_events,
+                )
             return NodeResult(
                 status="failed",
-                error=ExecutionError(code="PERMISSION_DENIED", message=str(exc)),
-                events=events,
+                error=ExecutionError(code=exc.code, message=exc.message),
+                events=audit_events,
             )
-        except Exception as exc:
-            return NodeResult(
-                status="failed",
-                error=ExecutionError(code="EXECUTION_FAILED", message=str(exc)),
-                events=events,
-            )
+        # 原始轨迹写受控 Artifact；数据库事件只保留脱敏审计事件。
+        artifact = write_json_artifact(
+            context.run_id,
+            context.node_run_id,
+            node.id,
+            "agent-trajectory.json",
+            "agent-trajectory",
+            {"events": result.runtime_events, "output": result.output},
+        )
+        return NodeResult(
+            status="succeeded",
+            output=result.output,
+            events=audit_events,
+            metrics={
+                "agentSteps": result.step_count or len(audit_events),
+                "totalTokens": result.total_tokens,
+            },
+            artifacts=[artifact],
+        )
 
 
 class BrowserContractExecutor:

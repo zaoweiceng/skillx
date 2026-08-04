@@ -65,7 +65,7 @@ def compile_agent_trajectory(
     last_result_ref = "${input.message}"
 
     for action in actions:
-        tool = action.get("tool")
+        tool = action.get("capability") or action.get("tool")
         if not isinstance(tool, str) or not tool:
             continue
         result = action.get("result", {})
@@ -169,7 +169,11 @@ def compile_agent_trajectory(
         "llmOrAgentNodes": llm_or_agent_nodes,
         "estimatedLlmCallsBefore": trajectory.get("originalModelCalls", 0),
         "estimatedLlmCallsAfter": llm_or_agent_nodes,
-        "toolLocks": [action.get("tool") for action in actions if action.get("tool")],
+        "toolLocks": [
+            action.get("capability") or action.get("tool")
+            for action in actions
+            if action.get("capability") or action.get("tool")
+        ],
         "diagnostics": diagnostics,
         "publishable": not any(item["level"] == "error" for item in diagnostics),
     }
@@ -196,7 +200,7 @@ async def distill_conversation_run(
         "sourceRunId": conversation_run.id,
         "sourceRunType": run_type,
         "actionSummary": [
-            {"tool": action.get("tool")}
+            {"tool": action.get("capability") or action.get("tool")}
             for action in conversation_run.trajectory_json.get("actions", [])
         ],
     }

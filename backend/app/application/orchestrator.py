@@ -24,6 +24,7 @@ from app.domain.workflow import NodeResult, NodeType, WorkflowDefinition, Workfl
 from app.infrastructure.database import (
     Approval,
     Artifact,
+    ConversationRun,
     NodeRun,
     Run,
     RunEvent,
@@ -1085,3 +1086,35 @@ async def reconcile_run_artifacts(session: AsyncSession, run_id: str) -> dict[st
         with suppress(FileNotFoundError):
             target.unlink()
     return {"recovered": recovered, "missing": missing, "orphanFilesRemoved": orphan_files}
+
+
+async def reconcile_recent_runs(session: AsyncSession, *, limit: int = 50) -> dict[str, Any]:
+    """扫描最近若干个 Run 并调用 Artifact reconcile，补落位提交后未完成的文件。
+
+    Worker 启动与周期任务调用；限制批量大小，避免全表扫描。同时补落位 Conversation Agent
+    轨迹（成功但落位未完成的 staging）。
+    """
+
+    run_ids = (
+        await session.scalars(
+            select(Run.id).order_by(Run.created_at.desc()).limit(limit)
+        )
+    ).all()
+    recovered = 0
+    for run_id in run_ids:
+        report = await reconcile_run_artifacts(session, run_id)
+        recovered += len(report["recovered"])
+    # Conversation Agent 轨迹：成功 run 若 staging 仍有文件，补落位。
+    from app.application.agent_run import AgentRunWorker
+
+    conversation_runs = (
+        await session.scalars(
+            select(ConversationRun.id)
+            .where(ConversationRun.status == "succeeded")
+            .order_by(ConversationRun.created_at.desc())
+            .limit(limit)
+        )
+    ).all()
+    for cr_id in conversation_runs:
+        AgentRunWorker._promote_trajectory(cr_id)
+    return {"runsScanned": len(run_ids), "artifactsRecovered": recovered}

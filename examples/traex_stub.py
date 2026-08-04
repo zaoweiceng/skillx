@@ -8,6 +8,7 @@ agent.completed）。行为完全确定，不依赖真实模型。
 TraeXSubprocessAdapter 只透传 PATH，不透传业务环境变量，因此故障注入通过 prompt 内的
 指令携带（Host 把 node.config.prompt 拼进 --prompt）：
 - [[MODE:ok|no_output|bad_schema|unauthorized_tool|hang|many_steps|big_tokens|deterministic]]
+- [[MODE:secret_result]]（Tool 参数/结果含 secret-like 字段与多字节大内容，用于验证审计脱敏）
 - [[REPLY:文本]]
 在 deterministic 模式下，去除指令后的用户输入作为查表 key，Tool 返回整张本地表，
 Agent 用 key 选出结果。固化后确定节点用 ${input.message} 作为 key 复现选择。
@@ -133,6 +134,28 @@ def main() -> int:
 
     # 选择要调用的工具：unauthorized_tool 模式下故意越权。
     tool_name = "banned.tool" if mode == "unauthorized_tool" else (allowed[0] if allowed else None)
+    if mode == "secret_result":
+        # Tool 参数/结果携带 secret-like 字段与多字节大内容，用于验证审计事件脱敏与限流。
+        secret_tool = allowed[0] if allowed else "lookup.table"
+        _emit_tool_call(
+            "call-1",
+            secret_tool,
+            {"api_key": "sk-should-not-leak", "q": "查询"},
+            {"password": "p@ss-should-not-leak", "content": "机密正文" * 50},
+        )
+        emit(
+            {
+                "type": "agent.step.completed",
+                "payload": {"step": 1, "inputTokens": 5, "outputTokens": 5},
+            }
+        )
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {"steps": 1, "totalTokens": 10, "output": {"reply": reply}},
+            }
+        )
+        return 0
     if tool_name is not None:
         _emit_tool_call("call-1", tool_name, {"q": "demo"}, {"ok": True})
     emit(
