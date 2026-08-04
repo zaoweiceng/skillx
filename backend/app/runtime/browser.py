@@ -22,8 +22,30 @@ class PageContract(BaseModel):
     contract_version: str = Field(default="1", alias="contractVersion")
     url_pattern: str = Field(alias="urlPattern")
     page_identity: dict[str, Any] = Field(default_factory=dict, alias="pageIdentity")
-    fields: list[FieldContract]
+    fields: list[FieldContract] = Field(default_factory=list)
     submit: dict[str, str] | None = None
+
+
+class BrowserReadContract(BaseModel):
+    """浏览器只读/抽取契约：Read/Extract adapter 的编译期与运行期契约。
+
+    - ``url_pattern``：允许导航的 URL 通配（安全边界，L4 检查）；
+    - ``body_selector``：正文抽取的 CSS selector（默认 body）；
+    - ``fields``：结构化字段抽取 selector（fieldId → CSS selector）；
+    - ``output_schema``：抽取结果的输出 Schema，编译期与运行期共用校验；
+    - ``timeout_ms`` / ``retryable``：导航超时与可重试性。
+    不把 Playwright page/locator 句柄写入 IR：只保存通用 selector 与 Schema。
+    """
+
+    contract_version: str = Field(default="1", alias="contractVersion")
+    url_pattern: str = Field(alias="urlPattern")
+    body_selector: str = Field(default="body", alias="bodySelector")
+    fields: dict[str, str] = Field(default_factory=dict)
+    output_schema: dict[str, Any] | None = Field(default=None, alias="outputSchema")
+    timeout_ms: int = Field(default=15000, alias="timeoutMs")
+    retryable: bool = True
+
+    model_config = {"populate_by_name": True}
 
 
 class ObservedPage(BaseModel):

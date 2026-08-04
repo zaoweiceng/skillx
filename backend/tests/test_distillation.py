@@ -72,6 +72,7 @@ def _lookup_action(message: str = "q1") -> dict:
 
 def test_lookup_action_with_evidence_becomes_deterministic_node() -> None:
     first, analysis = compile_agent_trajectory(_base_trajectory([_lookup_action()]))
+
     second, _ = compile_agent_trajectory(_base_trajectory([_lookup_action()]))
     assert digest_json(first) == digest_json(second)
     assert analysis["publishable"] is True
@@ -157,6 +158,40 @@ def test_missing_call_id_analysis_fails() -> None:
     action = {"kind": "tool", "capability": "x", "arguments": {}, "result": {}}
     with pytest.raises(DistillationError):
         compile_agent_trajectory(_base_trajectory([action]))
+
+
+def test_valid_proposal_participates_in_adjudication() -> None:
+    from app.application.distillation_ir import DistillationProposal
+
+    # Agent 建议把 lookup 动作保留为 Agent 节点（proposed_strategy=agent）：
+    # Compiler 尊重该判断，即使动作本可确定化为 transform。
+    proposal = DistillationProposal.model_validate(
+        {"nodes": [{"nodeId": "n1", "actionIds": ["call-1"], "strategy": "agent"}]}
+    )
+    definition, analysis = compile_agent_trajectory(
+        _base_trajectory([_lookup_action()]), proposal
+    )
+    assert definition["spec"]["nodes"][1]["type"] == "agent"
+    assert analysis["agentNodes"] == 1
+
+
+def test_proposal_not_covering_every_action_is_rejected() -> None:
+    from app.application.distillation_ir import DistillationProposal
+
+    lookup = _lookup_action()
+    second = {
+        "callId": "call-2",
+        "kind": "tool",
+        "capability": "summarize.text",
+        "arguments": {"text": "x"},
+        "result": {"summary": "y"},
+    }
+    # proposal 只覆盖 call-1，遗漏 call-2 → Compiler 拒绝，不静默换成错误图。
+    proposal = DistillationProposal.model_validate(
+        {"nodes": [{"nodeId": "n1", "actionIds": ["call-1"], "strategy": "deterministic"}]}
+    )
+    with pytest.raises(DistillationError):
+        compile_agent_trajectory(_base_trajectory([lookup, second]), proposal)
 
 
 async def test_distillation_rejects_imported_trajectory() -> None:

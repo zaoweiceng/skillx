@@ -151,6 +151,26 @@ async def seed() -> str:
                 definition=playwright_browser,
                 validation={"diagnostics": [], "executionClass": "zero_llm"},
             )
+        # 动态网页总结组件：Browser Read/Extract → TraeX 总结的混合图；仅当同时提供
+        # 站点 URL 与 TraeX 时 seed，供 F-01 验证“页面改变后重新读取并交给 TraeX”。
+        article_url = os.environ.get("SKILLX_DEMO_ARTICLE_URL")
+        if (
+            article_url
+            and os.environ.get("SKILLX_TRAEX_COMMAND")
+            and await session.scalar(
+                select(Component).where(Component.name == "动态网页总结")
+            )
+            is None
+        ):
+            web_summary = _web_summary_workflow(article_url)
+            await _create_component(
+                session,
+                name="动态网页总结",
+                description="确定读取网页正文（Browser Read）后交给受限 Agent 总结。",
+                workflow_name="动态网页总结工作流",
+                definition=web_summary,
+                validation={"diagnostics": [], "executionClass": "agent"},
+            )
         await session.commit()
         return component.id
 
@@ -568,6 +588,98 @@ def _playwright_browser_workflow(form_url: str) -> dict:
             "edges": [
                 {"source": "input", "target": "submit"},
                 {"source": "submit", "target": "output"},
+            ],
+        },
+    }
+
+
+def _web_summary_workflow(article_url: str) -> dict:
+    """动态网页总结：input(url) → read(Browser Read/Extract) → summarize(受限 Agent) → output。
+
+    read 节点用 BrowserReadContract 抽取 #main 正文；summarize 的输入引用 read 节点的
+    content 输出（真实数据依赖），因此页面正文改变后第二次运行会读取新正文并交给 TraeX。
+    """
+
+    read_output_schema = {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string"},
+            "title": {"type": "string"},
+            "content": {"type": "string"},
+            "fields": {"type": "object"},
+        },
+        "required": ["content"],
+    }
+    summary_schema = {
+        "type": "object",
+        "properties": {"reply": {"type": "string"}},
+        "required": ["reply"],
+        "additionalProperties": False,
+    }
+    from urllib.parse import urlparse
+
+    parsed = urlparse(article_url)
+    url_pattern = f"{parsed.scheme}://{parsed.netloc}/*"
+    return {
+        "apiVersion": "workflow.platform/v1",
+        "kind": "Workflow",
+        "metadata": {"name": "web-summary"},
+        "spec": {
+            "inputSchema": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "title": "文章 URL"}},
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+            "outputSchema": summary_schema,
+            "nodes": [
+                {"id": "input", "type": "input", "displayName": "输入"},
+                {
+                    "id": "read",
+                    "type": "browser",
+                    "displayName": "读取网页正文",
+                    "input": {"url": "${input.url}"},
+                    "config": {
+                        "runtime": "playwright",
+                        "action": "read",
+                        "pageContract": {
+                            "contractVersion": "1",
+                            "urlPattern": url_pattern,
+                            "bodySelector": "#main",
+                            "fields": {"headline": "#headline"},
+                            "outputSchema": read_output_schema,
+                        },
+                    },
+                    "timeoutSeconds": 30,
+                },
+                {
+                    "id": "summarize",
+                    "type": "agent",
+                    "displayName": "受限 Agent 总结",
+                    # 真实数据依赖：总结输入引用 read 节点抽取的正文，而非常量。
+                    "input": {"message": "${read.output.content}"},
+                    "config": {
+                        "agentProfile": "fake",
+                        "outputSchema": summary_schema,
+                        "maxSteps": 2,
+                        "maxTotalTokens": 500,
+                        "allowedCapabilities": [],
+                        # fake Agent 直接回显正文摘要，使输出依赖新正文（页面变化即变化）。
+                        "echoInputField": "message",
+                    },
+                    "timeoutSeconds": 30,
+                },
+                {
+                    "id": "output",
+                    "type": "output",
+                    "displayName": "输出",
+                    "input": {"reply": "${summarize.output.reply}"},
+                },
+            ],
+            "edges": [
+                {"source": "input", "target": "read"},
+                {"source": "read", "target": "summarize"},
+                {"source": "summarize", "target": "output"},
             ],
         },
     }

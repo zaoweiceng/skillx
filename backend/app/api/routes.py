@@ -44,6 +44,7 @@ from app.application.mcp import (
     validate_mcp_nodes,
 )
 from app.application.orchestrator import Orchestrator, append_event
+from app.application.replay import run_isolated_replay
 from app.application.retries import auto_retry_allowed
 from app.application.secrets import (
     SecretResolutionError,
@@ -54,6 +55,7 @@ from app.application.workflow_patch import (
     WorkflowPatch,
     WorkflowPatchViolation,
     apply_workflow_patch,
+    observation_eligibility,
 )
 from app.config import get_settings
 from app.infrastructure.database import (
@@ -66,6 +68,7 @@ from app.infrastructure.database import (
     ConversationRunEvent,
     Distillation,
     ExecutionCheckpoint,
+    FailureObservation,
     MCPServer,
     MCPToolSnapshot,
     Message,
@@ -459,18 +462,53 @@ async def apply_version_workflow_patch(
     body: dict[str, Any],
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    """把受控 WorkflowPatch 应用到某已发布版本，生成**新草稿**（不改旧版本）。
+    """把受控 WorkflowPatch 应用到某已发布版本，真实 replay 通过后生成**新草稿**。
 
-    这是通用 WorkflowPatch 审核闭环：应用总是创建 draft，展示 source→draft diff、
-    Compiler diagnostics 与锁变化；人工在编辑器校验并显式发布后才成为新不可变版本。
-    ContractPatch 是它的 Browser 子类型，共用同一发布治理。
+    治理闭环（006-D）：
+    1. 必须提供 ``sourceRunId``（或 ``failureFingerprint``）指向真实失败；资格由后端
+       FailureObservation 事实计算，不接受前端自报 reproducible；
+    2. 补丁不得扩权（能力锁/权限/模型/Secret 由 DSL 白名单封死）；
+    3. 用 source run 的安全输入在隔离环境**真实 replay** patched 图到原失败点；
+    4. replay 通过后才创建 draft，旧版本不变，仍需人工发布。
     """
 
     version = await session.get(WorkflowVersion, version_id)
     if version is None:
         raise HTTPException(404, "工作流版本不存在")
+
+    # 1) 资格：从后端 FailureObservation 计算，前端不能自报。
+    source_run_id = body.get("sourceRunId")
+    fingerprint = body.get("failureFingerprint")
+    observation = None
+    if fingerprint:
+        observation = await session.scalar(
+            select(FailureObservation).where(FailureObservation.fingerprint == fingerprint)
+        )
+    elif source_run_id:
+        observation = await session.scalar(
+            select(FailureObservation)
+            .where(FailureObservation.last_run_id == source_run_id)
+            .order_by(FailureObservation.updated_at.desc())
+        )
+    if observation is None:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "PATCH_NOT_ELIGIBLE",
+                "message": "缺少可归因的失败观测；补丁必须由真实可复现失败驱动",
+            },
+        )
+    eligibility = observation_eligibility(observation)
+    if not eligibility["eligible"]:
+        raise HTTPException(
+            422,
+            detail={"code": "PATCH_NOT_ELIGIBLE", "message": eligibility["reason"], **eligibility},
+        )
+
+    # 2) 应用受控补丁（扩权/敏感字段被 DSL 拒绝）。
+    patch_body = body.get("patch", body)
     try:
-        patch = WorkflowPatch.model_validate({**body, "baseVersionId": version_id})
+        patch = WorkflowPatch.model_validate({**patch_body, "baseVersionId": version_id})
         patched = apply_workflow_patch(version.definition_json, patch)
     except WorkflowPatchViolation as exc:
         raise HTTPException(
@@ -482,13 +520,32 @@ async def apply_version_workflow_patch(
             422,
             detail={"code": "WORKFLOW_PATCH_INVALID", "message": str(exc)},
         ) from exc
-    # 用 Compiler 回放校验补丁后的草稿；diagnostics 供人工审核。
+
+    # 3) 真实 replay：用 source run 的安全输入在隔离环境跑到原失败点。
+    source_run = await session.get(Run, source_run_id) if source_run_id else None
+    safe_inputs = redact(source_run.input_json) if source_run else body.get("safeInputs", {})
+    replay = await run_isolated_replay(
+        patched, safe_inputs=safe_inputs or {}, fail_node_id=observation.node_id
+    )
+    if not replay["passed"]:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "REPLAY_FAILED",
+                "message": (
+                    "真实 replay 未通过（原失败点状态="
+                    f"{replay['failedNodeStatus']}），不生成草稿"
+                ),
+                "replay": replay,
+            },
+        )
+
+    # 4) replay 通过：创建新草稿（不触碰已发布版本）。
     try:
         compiled = compiler.compile(patched)
         diagnostics = [item.model_dump() for item in compiled.diagnostics]
     except WorkflowValidationError as exc:
         diagnostics = [item.model_dump() for item in exc.diagnostics]
-    # 应用总是创建新草稿 Workflow，不触碰任何已发布版本。
     draft = Workflow(
         id=str(uuid4()),
         name=f"patch-of-{version.workflow_id[:8]}",
@@ -503,6 +560,13 @@ async def apply_version_workflow_patch(
         "baseVersionId": version_id,
         "definition": patched,
         "diagnostics": diagnostics,
+        "eligibility": eligibility,
+        "replay": {
+            "replayRunId": replay["replayRunId"],
+            "passed": replay["passed"],
+            "failedNodeStatus": replay["failedNodeStatus"],
+            "sideEffectsSimulated": replay["sideEffectsSimulated"],
+        },
         "publishable": not any(item["level"] == "error" for item in diagnostics),
     }
 
@@ -744,13 +808,15 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
         {
             "id": item.id,
             "status": item.status,
+            "approvalStatus": item.approval_status,
             "failedNode": item.failed_node_id,
             "attempt": item.attempt,
             "digest": item.digest,
             "completedNodes": sorted((item.snapshot_json or {}).get("completedOutputs", {})),
             "remainingSubgraph": (item.snapshot_json or {}).get("remainingSubgraph", []),
             "committedSideEffects": (item.snapshot_json or {}).get("committedSideEffects", []),
-            "fallbackTarget": (item.snapshot_json or {}).get("failedNode", {}),
+            "fallbackTarget": (item.snapshot_json or {}).get("fallbackConfig", {}).get("target"),
+            "recoveryNodeRunId": item.recovery_node_run_id,
             "decision": redact(item.decision_json) if item.decision_json else None,
         }
         for item in checkpoints
@@ -767,6 +833,32 @@ async def cancel_run(run_id: str, session: AsyncSession = Depends(get_session)) 
         await orchestrator.request_cancellation(session, run.id)
         await session.commit()
     return run_view(run)
+
+
+async def _approve_recovery(session: AsyncSession, approval: Approval) -> dict[str, Any]:
+    """批准恢复：checkpoint→approved 且 Run→recovering，交给同一 Recovery claim。"""
+
+    checkpoint_id = approval.snapshot_json.get("checkpointId")
+    checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+    if checkpoint is None or checkpoint.status != "pending":
+        raise HTTPException(409, "恢复检查点不可用或已处理")
+    run = await session.get(Run, approval.run_id)
+    if run is None or run.status != "waiting_approval":
+        raise HTTPException(409, "运行不在等待恢复审批状态")
+    approval.status = "approved"
+    approval.decided_by = "local-user"
+    approval.decided_at = utcnow()
+    checkpoint.approval_status = "approved"
+    run.status = "recovering"
+    await append_event(
+        session,
+        approval.run_id,
+        "run.recovery_requested",
+        {"runId": run.id, "checkpointId": checkpoint.id, "failedNode": approval.node_id},
+        approval.node_run_id,
+    )
+    await session.commit()
+    return {"id": approval.id, "status": approval.status}
 
 
 @router.post("/approvals/{approval_id}/approve")
@@ -790,13 +882,17 @@ async def approve(
             409,
             detail={"code": "APPROVAL_SNAPSHOT_CHANGED", "message": "服务端审批快照已变化"},
         )
+    effect = approval.snapshot_json.get("effect")
+    # 恢复审批：批准后 checkpoint→approved 且 Run→recovering，由同一 Recovery claim 处理；
+    # 关联的失败 NodeRun 保持 failed（不可变）。
+    if effect == "recovery.approval":
+        return await _approve_recovery(session, approval)
     node_run = await session.get(NodeRun, approval.node_run_id)
     if node_run is None or node_run.status != "waiting_user":
         raise HTTPException(409, "关联节点不在等待状态")
     approval.status = "approved"
     approval.decided_by = "local-user"
     approval.decided_at = utcnow()
-    effect = approval.snapshot_json.get("effect")
     if node_run.node_type == "browser" and effect == "form.submit":
         authorization_digest_value = approval.snapshot_json.get("authorizationDigest")
         if not authorization_digest_value:
@@ -853,6 +949,34 @@ async def reject(approval_id: str, session: AsyncSession = Depends(get_session))
         raise HTTPException(404, "审批不存在")
     if approval.status != "pending":
         raise HTTPException(409, "审批已处理")
+    # 恢复审批被拒绝：checkpoint→rejected，Run 保持原失败终态，失败历史不变。
+    if approval.snapshot_json.get("effect") == "recovery.approval":
+        checkpoint_id = approval.snapshot_json.get("checkpointId")
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        approval.status = "rejected"
+        approval.decided_by = "local-user"
+        approval.decided_at = utcnow()
+        run = await session.get(Run, approval.run_id)
+        failed_node = await session.get(NodeRun, approval.node_run_id)
+        if checkpoint is not None:
+            checkpoint.approval_status = "rejected"
+            checkpoint.status = "rejected"
+        if run is not None:
+            run.status = "failed"
+            run.finished_at = utcnow()
+            run.error_json = failed_node.error_json if failed_node else {
+                "code": "RECOVERY_REJECTED",
+                "message": "恢复审批被拒绝",
+            }
+        await append_event(
+            session,
+            approval.run_id,
+            "run.recovery_rejected",
+            {"approvalId": approval.id, "checkpointId": checkpoint_id},
+            approval.node_run_id,
+        )
+        await session.commit()
+        return {"id": approval.id, "status": approval.status}
     node_run = await session.get(NodeRun, approval.node_run_id)
     approval.status = "rejected"
     approval.decided_by = "local-user"

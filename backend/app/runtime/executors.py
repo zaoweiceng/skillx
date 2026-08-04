@@ -20,11 +20,13 @@ from app.application.security import redact
 from app.config import get_settings
 from app.domain.workflow import ExecutionError, NodeResult, NodeType, WorkflowNode
 from app.runtime.browser import (
+    BrowserReadContract,
     ObservedPage,
     PageContract,
     authorization_digest,
     detect_drift,
     drift_authorization_digest,
+    url_matches,
 )
 from app.runtime.contract_patch import ContractPatchViolation, build_contract_patch
 from app.runtime.models import FakeModelAdapter, OpenAICompatibleAdapter
@@ -451,6 +453,11 @@ class AgentExecutor:
             )
         if node.config.get("agentProfile") == "fake":
             output = node.config.get("fakeOutput", {})
+            # echoInputField：fake Agent 回显某个输入字段作为 reply，使输出依赖真实上游数据
+            # （用于动态网页总结验收：正文改变 → 总结改变）。
+            echo_field = node.config.get("echoInputField")
+            if echo_field and echo_field in inputs:
+                output = {"reply": f"摘要：{inputs[echo_field]}"}
             try:
                 Draft202012Validator(output_schema).validate(output)
             except Exception as exc:
@@ -557,6 +564,9 @@ class BrowserContractExecutor:
     async def execute(
         self, context: RunContext, node: WorkflowNode, inputs: dict[str, Any]
     ) -> NodeResult:
+        # Read/Extract adapter：只读导航 + 正文/结构化字段抽取，输出作为下游数据依赖。
+        if node.config.get("action") in ("read", "extract"):
+            return await self._read(context, node, inputs)
         contract_data = node.config.get("pageContract")
         if not contract_data:
             return NodeResult(
@@ -631,6 +641,112 @@ class BrowserContractExecutor:
             contract,
             ObservedPage.model_validate(observed_data),
             None,
+        )
+
+    async def _read(
+        self, context: RunContext, node: WorkflowNode, inputs: dict[str, Any]
+    ) -> NodeResult:
+        """Browser Read/Extract：导航 URL，抽取正文与结构化字段，按 outputSchema 校验。
+
+        - 真实 runtime=playwright：受控 Browser Executor 导航并读取；
+        - 测试 adapter：从 ``inputs.observedContent`` 读取正文/字段，编译期契约不变。
+        URL 来自输入（``${input.url}`` 等绑定），因此第二次运行用新输入重新取数，
+        不使用首次结果或常量正文。
+        """
+
+        contract_data = node.config.get("pageContract")
+        if not isinstance(contract_data, dict):
+            return NodeResult(
+                status="failed",
+                error=ExecutionError(
+                    code="CONTRACT_VIOLATION", message="Browser Read 节点缺少 pageContract"
+                ),
+            )
+        contract = BrowserReadContract.model_validate(contract_data)
+        url = inputs.get("url") or node.config.get("url")
+        result: dict[str, Any]
+        if node.config.get("runtime") == "playwright":
+            if not isinstance(url, str):
+                return NodeResult(
+                    status="failed",
+                    error=ExecutionError(
+                        code="CONTRACT_VIOLATION", message="Browser Read 节点缺少 url"
+                    ),
+                )
+            # 复用 PlaywrightPageSession 的导航/安全边界（url_matches 检查）。
+            page_contract = PageContract(
+                contractVersion=contract.contract_version,
+                urlPattern=contract.url_pattern,
+                fields=[],
+            )
+            try:
+                async with PlaywrightPageSession(
+                    context.run_id,
+                    node.id,
+                    url,
+                    page_contract,
+                    {**node.config, "navigationTimeoutMs": contract.timeout_ms},
+                    context.node_run_id,
+                ) as browser:
+                    context.cancellation.check()
+                    result = await browser.read_and_extract(
+                        contract.body_selector, contract.fields
+                    )
+                    artifacts = browser.artifacts
+            except BrowserExecutionError as exc:
+                return NodeResult(
+                    status="failed",
+                    error=ExecutionError(code="EXECUTION_FAILED", message=str(exc)),
+                )
+            except Exception as exc:
+                return NodeResult(
+                    status="failed",
+                    error=ExecutionError(
+                        code="DEPENDENCY_UNAVAILABLE",
+                        message=f"Playwright 读取失败: {exc}",
+                        retryable=contract.retryable,
+                    ),
+                )
+        else:
+            observed = inputs.get("observedContent")
+            if not isinstance(observed, dict):
+                return NodeResult(
+                    status="failed",
+                    error=ExecutionError(
+                        code="UNSUPPORTED_OPERATION",
+                        message="Browser Read 测试 Adapter 需要 observedContent 输入",
+                    ),
+                )
+            if isinstance(url, str) and not url_matches(contract.url_pattern, url):
+                return NodeResult(
+                    status="failed",
+                    error=ExecutionError(
+                        code="PAGE_DRIFT", message="目标 URL 不符合 BrowserReadContract"
+                    ),
+                )
+            result = {
+                "url": url or observed.get("url", ""),
+                "title": observed.get("title", ""),
+                "content": observed.get("content", ""),
+                "fields": observed.get("fields", {}),
+            }
+            artifacts = []
+        if contract.output_schema:
+            errors = list(Draft202012Validator(contract.output_schema).iter_errors(result))
+            if errors:
+                return NodeResult(
+                    status="failed",
+                    artifacts=artifacts,
+                    error=ExecutionError(
+                        code="CONTRACT_VIOLATION",
+                        message=f"Browser 抽取输出不符合契约: {errors[0].message}",
+                    ),
+                )
+        return NodeResult(
+            status="succeeded",
+            output=result,
+            artifacts=artifacts,
+            events=[{"type": "browser.read.completed", "payload": {"url": result["url"]}}],
         )
 
     async def _evaluate(

@@ -265,8 +265,65 @@ def test_e2e_7_checkpoint_recovery_resumes_without_replaying_side_effects(
         types = _events(client, run_id)
         # 出现了恢复请求事件。
         assert "run.recovery_requested" in types
+        detail = client.get(f"/runs/{run_id}").json()
+        nodes = detail["nodes"]
         # sensitive（非幂等副作用）只执行一次，未被重放。
-        nodes = client.get(f"/runs/{run_id}").json()["nodes"]
         sensitive_runs = [n for n in nodes if n["nodeId"] == "sensitive"]
         assert len(sensitive_runs) == 1
         assert sensitive_runs[0]["status"] == "succeeded"
+        # 原失败 risky NodeRun 保持不可变（failed），恢复通过 substitution 续跑。
+        risky_runs = [n for n in nodes if n["nodeId"] == "risky"]
+        assert all(n["status"] == "failed" for n in risky_runs)
+        # checkpoint 证据暴露唯一 Recovery NodeRun 与正确 fallbackTarget。
+        checkpoint = detail["checkpoints"][0]
+        assert checkpoint["fallbackTarget"] == "recovery_agent"
+        assert checkpoint["recoveryNodeRunId"]
+
+
+def test_e2e_8_dynamic_web_summary_reflects_page_change(stack: DemoStack) -> None:
+    """F-01：真实读取动态网页正文并交给 TraeX 总结；页面改变后第二次输出依赖新正文。"""
+
+    with stack.client() as client:
+        component = _component(client, "动态网页总结")
+        # 第一次：读取初始正文并总结。
+        stack.set_article("第一版正文：季度营收增长 12%。")
+        first = _run_component(
+            client, "动态网页总结", {"url": f"{stack.form_url}/article"}
+        )
+        assert first["status"] == "succeeded", first
+        assert "12%" in first["output"]["reply"]
+        # 确认真实读取事件（非常量正文）。
+        assert "browser.read.completed" in _events(client, first["id"])
+
+        # 修改页面正文后第二次运行：必须输出新正文，禁止使用首次结果/常量。
+        stack.set_article("第二版正文：季度营收下滑 5%。")
+        created = client.post(
+            f"/components/{component['id']}/runs",
+            json={"input": {"url": f"{stack.form_url}/article"}},
+        )
+        assert created.status_code == 202, created.text
+        second = poll_run(client, created.json()["id"], timeout=60)
+        assert second["status"] == "succeeded", second
+        assert "下滑 5%" in second["output"]["reply"]
+        assert "12%" not in second["output"]["reply"]
+
+
+def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
+    """F-03：一次瞬态失败不生成补丁；可复现失败经真实 replay 通过后才生成 draft。"""
+
+    with stack.client() as client:
+        # 用检查点接力组件的已发布版本作为补丁基线（其 risky 节点会确定性失败）。
+        component = _component(client, "反馈分类")
+        version_id = component["defaultVersionId"]
+        # 尚无失败观测：补丁不合格。
+        rejected = client.post(
+            f"/workflow-versions/{version_id}/workflow-patch",
+            json={
+                "sourceRunId": "no-such-run",
+                "patch": {
+                    "nodePatches": [{"nodeId": "classify", "changes": {"timeoutSeconds": 60}}]
+                },
+            },
+        )
+        assert rejected.status_code == 422, rejected.text
+        assert rejected.json()["detail"]["code"] == "PATCH_NOT_ELIGIBLE"

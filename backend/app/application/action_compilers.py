@@ -35,6 +35,8 @@ class CompileContext:
     message: str  # 去除指令后的用户输入语义
     output_schema: dict[str, Any]
     proposed_strategy: str = "deterministic"
+    # actionId → 已编译节点 id 的映射：把 prior_output/artifact 绑定翻译为 ${nodeId.path}。
+    action_node_ids: dict[str, str] = field(default_factory=dict)
 
 
 class ActionCompiler(Protocol):
@@ -43,19 +45,40 @@ class ActionCompiler(Protocol):
     def compile(self, action: NormalizedAction, ctx: CompileContext) -> CompileResult: ...
 
 
-def _input_mapping_from_bindings(action: NormalizedAction) -> dict[str, Any]:
-    """把 IR 绑定转成节点 input mapping（user_input→${input.message}，constant→原值）。"""
+def _input_mapping_from_bindings(
+    action: NormalizedAction, ctx: CompileContext
+) -> dict[str, Any]:
+    """把 IR 绑定转成节点 input mapping。
+
+    - user_input → ``${input.<inputKey>}``；
+    - prior_output → ``${<上游节点 id>.output.<path>}``（数据依赖真实传值）；
+    - artifact → ``${<上游节点 id>.output.<path>}``（Artifact 引用路径）；
+    - constant → 原值。
+    未知 fromAction 回退为常量，避免生成悬空引用。
+    """
 
     mapping: dict[str, Any] = {}
     for binding in action.input_bindings:
         if binding.source == "user_input":
-            mapping[binding.field] = "${input.message}"
-        elif binding.source == "prior_output" and binding.from_action:
+            mapping[binding.field] = f"${{input.{binding.input_key or 'message'}}}"
+        elif binding.source in ("prior_output", "artifact") and binding.from_action:
+            upstream = ctx.action_node_ids.get(binding.from_action)
             path = binding.from_path or "output"
-            mapping[binding.field] = f"${{{binding.from_action}.{path}}}"
+            if upstream:
+                mapping[binding.field] = f"${{{upstream}.output.{path}}}"
+            else:
+                mapping[binding.field] = binding.constant
         else:
             mapping[binding.field] = binding.constant
     return mapping
+
+
+def _agent_input(action: NormalizedAction, ctx: CompileContext) -> dict[str, Any]:
+    """Agent/LLM 节点的输入映射：优先使用显式 bindings（含 prior_output 数据依赖），
+    没有任何绑定时回退到 ``{message: ${input.message}}``，保证向后兼容。"""
+
+    mapping = _input_mapping_from_bindings(action, ctx)
+    return mapping or {"message": "${input.message}"}
 
 
 def _agent_node(action: NormalizedAction, ctx: CompileContext, reason: str) -> CompileResult:
@@ -65,7 +88,7 @@ def _agent_node(action: NormalizedAction, ctx: CompileContext, reason: str) -> C
         "id": ctx.node_id,
         "type": "agent",
         "displayName": f"受限 Agent（{action.kind}）",
-        "input": {"message": "${input.message}"},
+        "input": _agent_input(action, ctx),
         "config": {
             "outputSchema": ctx.output_schema,
             "maxSteps": 4,
@@ -73,7 +96,7 @@ def _agent_node(action: NormalizedAction, ctx: CompileContext, reason: str) -> C
             "allowedCapabilities": (
                 [action.capability_ref.name] if action.capability_ref else []
             ),
-            "prompt": f"复现动作 {action.action_id}",
+            "prompt": action.observations.get("prompt", f"复现动作 {action.action_id}"),
         },
     }
     return CompileResult(decision="agent", node=node, reason=reason)
@@ -103,7 +126,7 @@ class LockedCapabilityCompiler:
             "id": ctx.node_id,
             "type": node_type,
             "displayName": f"锁定 {ref.name}",
-            "input": _input_mapping_from_bindings(action),
+            "input": _input_mapping_from_bindings(action, ctx),
             "config": config,
             "sideEffect": action.effect not in ("none", "unknown"),
             "idempotent": action.idempotent,
@@ -112,7 +135,9 @@ class LockedCapabilityCompiler:
 
 
 class BrowserActionCompiler:
-    """Browser：固化为抽象 browser 能力 + Page/Action Contract，不暴露 Playwright 私有对象。"""
+    """Browser Read/Extract 只是一个 Adapter：固化为抽象 browser 能力 + BrowserReadContract，
+    不暴露 Playwright 私有对象。读取/抽取的正文与结构化字段作为节点输出，供后续 TraeX
+    总结引用（真实数据依赖，而非常量“正文”）。"""
 
     kind = "browser"
 
@@ -122,16 +147,24 @@ class BrowserActionCompiler:
             # 没有抽象 Page/Action Contract 证据：保留 Agent 节点复现读取/抽取。
             return _agent_node(action, ctx, "缺少抽象 Page/Action Contract，保留 Agent 读取")
         cap_name = action.capability_ref.name if action.capability_ref else ""
+        input_mapping = _input_mapping_from_bindings(action, ctx)
+        action_kind = action.observations.get("action", "read")
+        config: dict[str, Any] = {
+            "runtime": action.observations.get("runtime", "contract"),
+            "pageContract": contract,
+            "action": action_kind,
+        }
+        # Read/Extract 契约：正文 selector 与结构化字段 selector，输出 Schema、可重试性。
+        for key in ("extract", "outputSchema", "navigation", "timeoutMs"):
+            if key in action.observations:
+                config[key] = action.observations[key]
         node = {
             "id": ctx.node_id,
             "type": "browser",
             "displayName": f"浏览器动作 {cap_name}",
-            "input": _input_mapping_from_bindings(action),
-            "config": {
-                "runtime": action.observations.get("runtime", "contract"),
-                "pageContract": contract,
-                "action": action.observations.get("action", "read"),
-            },
+            "input": input_mapping,
+            "config": config,
+            # read/extract 是只读语义，不是副作用。
             "sideEffect": action.effect not in ("none", "unknown"),
             "idempotent": action.idempotent,
         }
@@ -148,7 +181,12 @@ class TransformCompiler:
         if operation == "lookup":
             table = action.observations.get("table")
             key_binding = next(
-                (b for b in action.input_bindings if b.source == "user_input"), None
+                (
+                    b
+                    for b in action.input_bindings
+                    if b.source in ("user_input", "prior_output")
+                ),
+                None,
             )
             if not isinstance(table, dict) or key_binding is None:
                 return CompileResult(
@@ -158,16 +196,23 @@ class TransformCompiler:
                             "level": "error",
                             "code": "UNPROVEN_TRANSFORM",
                             "path": ctx.node_id,
-                            "message": "lookup 需要显式全表与来自用户输入的 key",
+                            "message": "lookup 需要显式全表与来自用户输入/前序输出的 key",
                         }
                     ],
                     reason="lookup 缺少可证明的全表/参数来源",
                 )
+            # key 引用：user_input→${input.<key>}；prior_output→${上游节点.output.<path>}。
+            if key_binding.source == "user_input":
+                key_ref = f"${{input.{key_binding.input_key or 'message'}}}"
+            else:
+                upstream = ctx.action_node_ids.get(key_binding.from_action or "")
+                path = key_binding.from_path or "output"
+                key_ref = f"${{{upstream}.output.{path}}}" if upstream else "${input.message}"
             node = {
                 "id": ctx.node_id,
                 "type": "transform",
                 "displayName": "确定查表",
-                "input": {"key": "${input.message}"},
+                "input": {"key": key_ref},
                 "config": {
                     "operation": "lookup",
                     "table": table,
@@ -181,7 +226,7 @@ class TransformCompiler:
                 "id": ctx.node_id,
                 "type": "transform",
                 "displayName": "确定转换",
-                "input": _input_mapping_from_bindings(action),
+                "input": _input_mapping_from_bindings(action, ctx),
                 "config": action.observations.get("config", {"operation": operation}),
             }
             return CompileResult(decision="compiled", node=node, reason="纯函数转换")
@@ -199,7 +244,7 @@ class ModelCompiler:
             "id": ctx.node_id,
             "type": self.kind,
             "displayName": "受限 Agent" if self.kind == "agent" else "LLM",
-            "input": {"message": "${input.message}"},
+            "input": _agent_input(action, ctx),
             "config": {
                 "outputSchema": ctx.output_schema,
                 "maxSteps": action.observations.get("maxSteps", 4),

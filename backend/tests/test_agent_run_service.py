@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -267,3 +268,41 @@ async def test_run_not_configured_records_failure() -> None:
     run = await _drive(run_id)
     assert run.status == "failed"
     assert run.error_json["code"] == "MODEL_NOT_CONFIGURED"
+
+
+async def test_secret_never_appears_in_trajectory_or_disk(traex_stub: None) -> None:
+    """E-02：Secret 原值不得出现在 trajectory_json、事件 payload 或落盘轨迹字节中。"""
+
+    conversation_id = await _conversation()
+    run_id = await _enqueue(
+        conversation_id,
+        "查询 [[MODE:secret_result]][[REPLY:ok]]",
+        config=AgentRunConfig(
+            output_schema=AgentRunConfig.default().output_schema,
+            allowed_capabilities=("lookup.table",),
+        ),
+    )
+    run = await _drive(run_id)
+    assert run.status == "succeeded"
+    leaked = ("sk-should-not-leak", "p@ss-should-not-leak")
+    async with SessionLocal() as session:
+        row = await session.get(ConversationRun, run_id)
+        trajectory_text = json.dumps(row.trajectory_json, ensure_ascii=False)
+        events = list(
+            await session.scalars(
+                select(ConversationRunEvent.payload_json).where(
+                    ConversationRunEvent.conversation_run_id == run_id
+                )
+            )
+        )
+    events_text = json.dumps(events, ensure_ascii=False)
+    for secret in leaked:
+        assert secret not in trajectory_text
+        assert secret not in events_text
+    # 扫描落盘轨迹字节。
+    directory = get_settings().artifact_root / "conversation-agents" / run_id
+    for path in directory.rglob("*"):
+        if path.is_file():
+            content = path.read_bytes()
+            for secret in leaked:
+                assert secret.encode() not in content

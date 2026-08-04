@@ -61,10 +61,16 @@ export default function RunDetailPage() {
       const currentTimeout =
         typeof failed?.input?.timeoutSeconds === 'number' ? failed.input.timeoutSeconds : 30
       const result = await api.applyWorkflowPatch(run.workflowVersionId, {
-        nodePatches: [
-          { nodeId: failedNode, changes: { timeoutSeconds: Math.min(currentTimeout * 2, 86400) } },
-        ],
-        reason: `对失败节点 ${failedNode} 提出受控超时补丁`,
+        sourceRunId: run.id,
+        patch: {
+          nodePatches: [
+            {
+              nodeId: failedNode,
+              changes: { timeoutSeconds: Math.min(currentTimeout * 2, 86400) },
+            },
+          ],
+          reason: `对失败节点 ${failedNode} 提出受控超时补丁`,
+        },
       })
       setPatchDraft(result)
     } catch (reason) {
@@ -300,6 +306,10 @@ export default function RunDetailPage() {
                     <small>
                       attempt {checkpoint.attempt} · 剩余子图 {checkpoint.remainingSubgraph.length}{' '}
                       个节点
+                      {checkpoint.fallbackTarget ? ` · fallback → ${checkpoint.fallbackTarget}` : ''}
+                      {checkpoint.approvalStatus && checkpoint.approvalStatus !== 'none'
+                        ? ` · 审批 ${checkpoint.approvalStatus}`
+                        : ''}
                     </small>
                   </div>
                   <StatusBadge status={checkpoint.status} />

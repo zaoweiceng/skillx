@@ -334,7 +334,15 @@ class ExecutionCheckpoint(Base, TimestampMixin):
     """
 
     __tablename__ = "execution_checkpoints"
-    __table_args__ = (Index("ix_execution_checkpoints_run_id", "run_id"),)
+    __table_args__ = (
+        Index("ix_execution_checkpoints_run_id", "run_id"),
+        Index(
+            "uq_checkpoint_failed_attempt",
+            "failed_node_run_id",
+            "attempt",
+            unique=True,
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
@@ -346,6 +354,64 @@ class ExecutionCheckpoint(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(24), default="pending")
     snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     decision_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # 原子领取租约：单条 CAS 把 pending→running 并写入 owner/expiry/heartbeat，未领取成功
+    # 的 Worker 不得调用 Agent。
+    lease_owner: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 该次恢复实际执行的 Recovery NodeRun（唯一）。
+    recovery_node_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # 审批型 fallback：none|pending|approved|rejected。
+    approval_status: Mapped[str] = mapped_column(String(20), default="none")
+
+
+class OutputSubstitution(Base, TimestampMixin):
+    """恢复提供的替代输出（不覆盖失败 NodeRun）。
+
+    原失败 attempt 永远不可变；恢复从 checkpoint 剩余子图续跑时，下游节点显式从这里读取
+    被替代节点的输出。每个 (run_id, node_id) 至多一条替代。
+    """
+
+    __tablename__ = "output_substitutions"
+    __table_args__ = (
+        Index("uq_output_substitution_node", "run_id", "node_id", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    checkpoint_id: Mapped[str] = mapped_column(String(36))
+    node_id: Mapped[str] = mapped_column(String(64))
+    failed_node_run_id: Mapped[str] = mapped_column(String(36))
+    output_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    source: Mapped[str] = mapped_column(String(40), default="recovery")
+
+
+class FailureObservation(Base, TimestampMixin):
+    """按稳定 fingerprint 聚合的失败观测（受控 WorkflowPatch 的资格依据）。
+
+    瞬态错误默认只记录并累加 occurrence；只有可复现的非瞬态 fingerprint 才允许生成 Patch
+    proposal。资格由后端事实（occurrence + classification）计算，不接受前端自报。
+    """
+
+    __tablename__ = "failure_observations"
+    __table_args__ = (
+        Index("uq_failure_observation_fingerprint", "fingerprint", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    fingerprint: Mapped[str] = mapped_column(String(80))
+    workflow_version_id: Mapped[str] = mapped_column(String(36))
+    node_id: Mapped[str] = mapped_column(String(64))
+    node_type: Mapped[str] = mapped_column(String(32))
+    error_code: Mapped[str] = mapped_column(String(64))
+    classification: Mapped[str] = mapped_column(String(32))
+    occurrence: Mapped[int] = mapped_column(Integer, default=1)
+    recovered: Mapped[bool] = mapped_column(default=False)
+    last_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    last_checkpoint_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    contract_summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
 
 
 settings = get_settings()

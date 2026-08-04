@@ -1,25 +1,30 @@
-"""005-D：通用 ExecutionCheckpoint 接力测试。
+"""006-A/B：可执行 ExecutionCheckpoint、原子领取、不可变恢复历史与真实上下文接力。
 
-节点重试耗尽且命中显式 fallback → 冻结 checkpoint → Recovery Agent 从剩余子图继续；
-已完成节点不重放，已完成非幂等副作用调用次数不增加，未知结果需人工确认。
+节点重试耗尽且命中显式 fallback → 冻结可执行 checkpoint → Recovery Agent 从剩余子图继续；
+原失败 NodeRun 永不改写（新增 OutputSubstitution），已完成非幂等副作用调用次数不增加，
+双 Worker 竞争只产生一次 Agent 调用，未知结果需人工确认。
 """
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import func, select
 
 from app.application.compiler import WorkflowCompiler
 from app.application.orchestrator import WorkerService
 from app.application.recovery import (
     RecoveryDriver,
+    RecoveryError,
     apply_recovery_decision,
     build_checkpoint,
     is_recoverable,
+    parse_recovery_decision,
     verify_checkpoint,
 )
 from app.config import get_settings
@@ -27,6 +32,7 @@ from app.domain.workflow import WorkflowDefinition
 from app.infrastructure.database import (
     ExecutionCheckpoint,
     NodeRun,
+    OutputSubstitution,
     Run,
     SessionLocal,
     Workflow,
@@ -53,7 +59,7 @@ def traex_stub(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _recovery_workflow() -> dict[str, Any]:
-    # input → sensitive(side effect, 幂等) → risky(可重试失败, fallback→recovery) → output
+    # input → sensitive(side effect, 非幂等) → risky(可重试失败, fallback→recovery) → output
     return {
         "apiVersion": "workflow.platform/v1",
         "kind": "Workflow",
@@ -112,17 +118,225 @@ def _recovery_workflow() -> dict[str, Any]:
 
 def test_is_recoverable_rejects_unsafe_codes() -> None:
     assert is_recoverable("DEPENDENCY_UNAVAILABLE", ["DEPENDENCY_UNAVAILABLE"]) is True
-    # 声明外错误码不恢复。
     assert is_recoverable("TIMEOUT", ["DEPENDENCY_UNAVAILABLE"]) is False
-    # 安全/契约/未知类默认不自动恢复。
     assert is_recoverable("PERMISSION_DENIED", ["PERMISSION_DENIED"]) is False
     assert is_recoverable("UNKNOWN_OUTCOME", ["UNKNOWN_OUTCOME"]) is False
 
 
-async def _seed_failed_run() -> tuple[str, str]:
-    """构造一个 sensitive 成功、risky 失败（可重试耗尽）的 Run，返回 (run_id, checkpoint_id)。"""
+def test_parse_recovery_decision_discriminated_union() -> None:
+    # provide_substitution 必须带 substitution。
+    parsed = parse_recovery_decision(
+        {"action": "provide_substitution", "substitution": {"value": "x"}}
+    )
+    assert parsed["substitution"] == {"value": "x"}
+    with pytest.raises(RecoveryError):
+        parse_recovery_decision({"action": "provide_substitution"})
+    # 其它 action 不得带 substitution。
+    with pytest.raises(RecoveryError):
+        parse_recovery_decision({"action": "abort", "substitution": {"value": "x"}})
+    with pytest.raises(RecoveryError):
+        parse_recovery_decision({"action": "unknown"})
+
+
+async def _seed_failed_run(*, seed: str = "s1") -> tuple[str, str]:
+    """构造 sensitive 成功、risky 失败（可重试耗尽）的 Run，返回 (run_id, checkpoint_id)。"""
 
     definition = _recovery_workflow()
+    compiled = WorkflowCompiler().compile(definition)
+    async with SessionLocal() as session, session.begin():
+        workflow = Workflow(id=str(uuid4()), name="rec", draft_revision=1, draft_json=definition)
+        session.add(workflow)
+        await session.flush()
+        version = WorkflowVersion(
+            id=str(uuid4()),
+            workflow_id=workflow.id,
+            version=1,
+            definition_json=definition,
+            digest=compiled.digest,
+            validation_json={},
+        )
+        session.add(version)
+        await session.flush()
+        run = Run(
+            id=str(uuid4()),
+            workflow_version_id=version.id,
+            status="running",
+            input_json={"seed": seed},
+            started_at=utcnow(),
+        )
+        session.add(run)
+        await session.flush()
+        session.add(
+            NodeRun(
+                id=str(uuid4()),
+                run_id=run.id,
+                node_id="sensitive",
+                node_type="transform",
+                attempt=1,
+                status="succeeded",
+                input_json={"value": seed},
+                output_json={"value": seed},
+                finished_at=utcnow(),
+            )
+        )
+        risky = NodeRun(
+            id=str(uuid4()),
+            run_id=run.id,
+            node_id="risky",
+            node_type="transform",
+            attempt=1,
+            status="failed",
+            input_json={"value": seed},
+            error_json={"code": "DEPENDENCY_UNAVAILABLE", "message": "网络波动", "retryable": True},
+            finished_at=utcnow(),
+        )
+        session.add(risky)
+        await session.flush()
+        definition_model = WorkflowDefinition.model_validate(definition)
+        checkpoint = await build_checkpoint(session, run, definition_model, risky)
+        run.status = "recovering"
+        return run.id, checkpoint.id
+
+
+async def test_checkpoint_freezes_completed_outputs_and_remaining() -> None:
+    _run_id, checkpoint_id = await _seed_failed_run()
+    async with SessionLocal() as session:
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        snapshot = checkpoint.snapshot_json
+        # 已完成 sensitive 输出值被冻结；已提交非幂等副作用被记录并带幂等键。
+        assert snapshot["completedOutputs"]["sensitive"] == {"value": "s1"}
+        effects = snapshot["committedSideEffects"]
+        assert effects[0]["nodeId"] == "sensitive"
+        assert effects[0]["idempotent"] is False
+        assert "idempotencyKey" in effects[0]
+        # remaining 含节点定义与边，且排除 fallback-only recovery_agent。
+        remaining_ids = {node["id"] for node in snapshot["remainingNodes"]}
+        assert "risky" in remaining_ids
+        assert "sensitive" not in remaining_ids
+        assert "recovery_agent" not in remaining_ids
+        assert snapshot["remainingEdges"]
+        # 失败节点输入与完整错误被冻结。
+        assert snapshot["failedNode"]["input"] == {"value": "s1"}
+        assert snapshot["failedNode"]["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+        verify_checkpoint(checkpoint)
+
+
+async def test_recovery_prompt_contains_completed_values() -> None:
+    from app.application.recovery import build_recovery_prompt
+
+    _run_id, checkpoint_id = await _seed_failed_run(seed="RANDOM-XYZ")
+    async with SessionLocal() as session:
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        prompt = build_recovery_prompt(checkpoint)
+    # 真正把上下文交给 Agent：已完成值出现在 prompt 中，而不仅是节点 id。
+    assert "RANDOM-XYZ" in prompt
+    assert "completedOutputs" in prompt
+
+
+async def test_recovery_resumes_without_replaying_side_effects(traex_stub: None) -> None:
+    run_id, _ = await _seed_failed_run()
+    driver = RecoveryDriver()
+    assert await driver.poll_once() is True
+    worker = WorkerService("recovery-worker")
+    for _ in range(4):
+        if not await worker.run_once():
+            break
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        assert run.status == "succeeded", run.error_json
+        assert run.output_json["value"] is not None
+        # sensitive（非幂等副作用）仍只有一次成功 attempt，未被重放。
+        sensitive_count = await session.scalar(
+            select(func.count())
+            .select_from(NodeRun)
+            .where(NodeRun.run_id == run_id, NodeRun.node_id == "sensitive")
+        )
+        assert sensitive_count == 1
+        # 原失败 risky NodeRun 保持 failed（不可变），恢复通过 substitution 记录替代输出。
+        risky = await session.scalar(
+            select(NodeRun).where(NodeRun.run_id == run_id, NodeRun.node_id == "risky")
+        )
+        assert risky.status == "failed"
+        substitution = await session.scalar(
+            select(OutputSubstitution).where(
+                OutputSubstitution.run_id == run_id, OutputSubstitution.node_id == "risky"
+            )
+        )
+        assert substitution is not None
+
+
+async def test_recovery_output_depends_on_random_checkpoint_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """恢复 Agent 输出必须依赖 checkpoint 中随机前序值（否则测试失败）。"""
+
+    from app.application import recovery as recovery_module
+
+    run_id, _checkpoint_id = await _seed_failed_run(seed="TOKEN-4711")
+
+    async def fake_agent(checkpoint, fallback_config, *, host=None):  # noqa: ANN001, ARG001
+        # 恢复决定必须复用 checkpoint 中已完成的 sensitive 值。
+        completed = checkpoint.snapshot_json["completedOutputs"]["sensitive"]["value"]
+        return {"action": "provide_substitution", "substitution": {"value": completed}}
+
+    monkeypatch.setattr(recovery_module, "run_recovery_agent", fake_agent)
+    driver = RecoveryDriver()
+    assert await driver.poll_once() is True
+    worker = WorkerService("recovery-worker")
+    for _ in range(4):
+        if not await worker.run_once():
+            break
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        assert run.status == "succeeded", run.error_json
+        # 输出携带随机前序值，证明接力消费了 checkpoint 上下文。
+        assert run.output_json["value"] == "TOKEN-4711"
+
+
+async def test_concurrent_recovery_drivers_claim_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """双 Recovery Worker 竞争同一 checkpoint：只产生一个 Recovery NodeRun 与一次 Agent 调用。"""
+
+    from app.application import recovery as recovery_module
+
+    _run_id, _checkpoint_id = await _seed_failed_run()
+    calls: list[str] = []
+
+    async def counting_agent(checkpoint, fallback_config, *, host=None):  # noqa: ANN001, ARG001
+        calls.append(checkpoint.id)
+        await asyncio.sleep(0.05)
+        return {"action": "provide_substitution", "substitution": {"value": "recovered"}}
+
+    monkeypatch.setattr(recovery_module, "run_recovery_agent", counting_agent)
+    driver_a = RecoveryDriver(worker_id="rec-a")
+    driver_b = RecoveryDriver(worker_id="rec-b")
+    await asyncio.gather(driver_a.poll_once(), driver_b.poll_once())
+    # 只有一个 Worker 领取成功并调用 Agent。
+    assert len(calls) == 1
+    async with SessionLocal() as session:
+        recovery_runs = await session.scalar(
+            select(func.count())
+            .select_from(NodeRun)
+            .where(NodeRun.run_id == _run_id, NodeRun.node_id == "recovery_agent")
+        )
+        assert recovery_runs == 1
+
+
+async def test_recovery_request_user_transitions_to_waiting_approval() -> None:
+    run_id, checkpoint_id = await _seed_failed_run()
+    async with SessionLocal() as session, session.begin():
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        await apply_recovery_decision(session, checkpoint, {"action": "request_user"})
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        assert run.status == "waiting_approval"
+
+
+async def test_substitution_schema_mismatch_fails_closed() -> None:
+    """替代输出不符合失败节点 outputSchema 时 fail closed。"""
+
+    definition = _recovery_workflow()
+    # 给 risky 节点声明一个 outputSchema，校验替代输出。
+    definition["spec"]["nodes"][2]["config"]["outputSchema"] = OUTPUT_SCHEMA
     compiled = WorkflowCompiler().compile(definition)
     async with SessionLocal() as session, session.begin():
         workflow = Workflow(id=str(uuid4()), name="rec", draft_revision=1, draft_json=definition)
@@ -147,21 +361,6 @@ async def _seed_failed_run() -> tuple[str, str]:
         )
         session.add(run)
         await session.flush()
-        # sensitive 成功一次。
-        session.add(
-            NodeRun(
-                id=str(uuid4()),
-                run_id=run.id,
-                node_id="sensitive",
-                node_type="transform",
-                attempt=1,
-                status="succeeded",
-                input_json={"value": "s1"},
-                output_json={"value": "s1"},
-                finished_at=utcnow(),
-            )
-        )
-        # risky 失败（重试耗尽）。
         risky = NodeRun(
             id=str(uuid4()),
             run_id=run.id,
@@ -170,7 +369,7 @@ async def _seed_failed_run() -> tuple[str, str]:
             attempt=1,
             status="failed",
             input_json={"value": "s1"},
-            error_json={"code": "DEPENDENCY_UNAVAILABLE", "message": "网络波动", "retryable": True},
+            error_json={"code": "DEPENDENCY_UNAVAILABLE", "message": "x", "retryable": True},
             finished_at=utcnow(),
         )
         session.add(risky)
@@ -178,62 +377,19 @@ async def _seed_failed_run() -> tuple[str, str]:
         definition_model = WorkflowDefinition.model_validate(definition)
         checkpoint = await build_checkpoint(session, run, definition_model, risky)
         run.status = "recovering"
-        return run.id, checkpoint.id
-
-
-async def test_checkpoint_freezes_completed_outputs_and_remaining() -> None:
-    _run_id, checkpoint_id = await _seed_failed_run()
-    async with SessionLocal() as session:
-        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
-        snapshot = checkpoint.snapshot_json
-        # 已完成 sensitive 输出被冻结；已提交非幂等副作用被记录。
-        assert snapshot["completedOutputs"]["sensitive"] == {"value": "s1"}
-        assert snapshot["committedSideEffects"] == [{"nodeId": "sensitive", "idempotent": False}]
-        # remaining 子图含失败节点，不含已完成节点。
-        assert "risky" in snapshot["remainingSubgraph"]
-        assert "sensitive" not in snapshot["remainingSubgraph"]
-        # digest 固定内容可核验。
-        verify_checkpoint(checkpoint)
-
-
-async def test_recovery_resumes_remaining_without_replaying_side_effects(traex_stub: None) -> None:
-    run_id, _ = await _seed_failed_run()
-    driver = RecoveryDriver()
-    assert await driver.poll_once() is True
-    # 驱动工作流从剩余子图继续。
-    worker = WorkerService("recovery-worker")
-    for _ in range(4):
-        if not await worker.run_once():
-            break
-    async with SessionLocal() as session:
-        run = await session.get(Run, run_id)
-        assert run.status == "succeeded", run.error_json
-        # 输出来自恢复 Agent 提供的 failedOutput。
-        assert run.output_json["value"] is not None
-        # sensitive（非幂等副作用）仍只有一次成功 attempt，未被重放。
-        from sqlalchemy import func, select
-
-        sensitive_count = await session.scalar(
-            select(func.count())
-            .select_from(NodeRun)
-            .where(NodeRun.run_id == run_id, NodeRun.node_id == "sensitive")
-        )
-        assert sensitive_count == 1
-
-
-async def test_recovery_request_user_transitions_to_waiting_approval() -> None:
-    run_id, checkpoint_id = await _seed_failed_run()
+        checkpoint_id = checkpoint.id
     async with SessionLocal() as session, session.begin():
         checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
-        await apply_recovery_decision(session, checkpoint, {"action": "request_user"})
-    async with SessionLocal() as session:
-        run = await session.get(Run, run_id)
-        assert run.status == "waiting_approval"
+        with pytest.raises(RecoveryError):
+            # 缺 required value 字段，类型不匹配 fail closed。
+            await apply_recovery_decision(
+                session,
+                checkpoint,
+                {"action": "provide_substitution", "substitution": {"wrong": 1}},
+            )
 
 
 async def test_cancel_recovering_run_marks_checkpoint_cancelled() -> None:
-    """取消处于 recovering 状态的 Run：checkpoint 置 cancelled，恢复驱动不再复活它。"""
-
     run_id, checkpoint_id = await _seed_failed_run()
     from app.application.orchestrator import Orchestrator
 
@@ -242,12 +398,9 @@ async def test_cancel_recovering_run_marks_checkpoint_cancelled() -> None:
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
-        # recovering 无运行中节点：取消后直接进入 cancelled 终态。
         assert run.status == "cancelled"
-        # pending checkpoint 一并被取消，避免驱动 TOCTOU 复活。
         assert checkpoint.status == "cancelled"
 
-    # 恢复驱动此时不应再领取该 checkpoint（已取消），也不会改变 Run 终态。
     driver = RecoveryDriver()
     assert await driver.poll_once() is False
     async with SessionLocal() as session:
@@ -256,17 +409,11 @@ async def test_cancel_recovering_run_marks_checkpoint_cancelled() -> None:
 
 
 async def test_build_checkpoint_is_idempotent_per_failed_attempt() -> None:
-    """同一失败 attempt 只产生一个 checkpoint：致命处理重入不会重复恢复。"""
-
-    from sqlalchemy import func, select
-
     from app.application.orchestrator import Orchestrator
 
     run_id, _ = await _seed_failed_run()
-    # 再次对同一失败节点触发致命处理：不应新建第二个 checkpoint。
     async with SessionLocal() as session, session.begin():
         run = await session.get(Run, run_id)
-        # 复位为 running 以便 _handle_fatal 重新评估（模拟重入）。
         run.status = "running"
         version = await session.get(WorkflowVersion, run.workflow_version_id)
         definition = WorkflowDefinition.model_validate(version.definition_json)
@@ -280,16 +427,12 @@ async def test_build_checkpoint_is_idempotent_per_failed_attempt() -> None:
             .select_from(ExecutionCheckpoint)
             .where(ExecutionCheckpoint.run_id == run_id)
         )
-        # 幂等：仍只有最初的一个 checkpoint。
         assert count == 1
         run = await session.get(Run, run_id)
-        # 已存在 checkpoint → 不再重复进入恢复，按原语义 fail run。
         assert run.status == "failed"
 
 
 async def test_reapplying_decision_after_terminal_fails_closed() -> None:
-    """恢复决定已应用后再次应用：digest 仍一致但状态已迁移，二次应用不复活已终态 Run。"""
-
     run_id, checkpoint_id = await _seed_failed_run()
     async with SessionLocal() as session, session.begin():
         checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
@@ -299,7 +442,6 @@ async def test_reapplying_decision_after_terminal_fails_closed() -> None:
         assert run.status == "failed"
         checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
         assert checkpoint.status == "aborted"
-    # 驱动再次轮询：run 已非 recovering，不得复活。
     driver = RecoveryDriver()
     assert await driver.poll_once() is False
     async with SessionLocal() as session:
@@ -311,11 +453,180 @@ async def test_tampered_checkpoint_fails_closed() -> None:
     _run_id, checkpoint_id = await _seed_failed_run()
     async with SessionLocal() as session, session.begin():
         checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
-        # 篡改快照内容而不更新 digest。
         checkpoint.snapshot_json = {**checkpoint.snapshot_json, "tampered": True}
-    from app.application.recovery import RecoveryError
-
     async with SessionLocal() as session, session.begin():
         checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
         with pytest.raises(RecoveryError):
-            await apply_recovery_decision(session, checkpoint, {"action": "resume_remaining"})
+            await apply_recovery_decision(session, checkpoint, {"action": "retry_replanned"})
+
+
+def _approval_recovery_workflow() -> dict[str, Any]:
+    definition = _recovery_workflow()
+    # 危险错误码 + requireUserApproval：命中后先建 checkpoint 并等待人工审批。
+    definition["spec"]["nodes"][2]["fallback"] = {
+        "on": ["CONTRACT_VIOLATION"],
+        "target": "recovery_agent",
+        "requireUserApproval": True,
+    }
+    return definition
+
+
+async def test_approval_gated_fallback_waits_then_recovers() -> None:
+    """A-03：危险错误先 checkpoint + waiting_approval；批准后走同一 Recovery claim。"""
+
+    from app.api.routes import Decision, approve
+    from app.application.orchestrator import Orchestrator
+    from app.infrastructure.database import Approval
+
+    definition = _approval_recovery_workflow()
+    compiled = WorkflowCompiler().compile(definition)
+    async with SessionLocal() as session, session.begin():
+        workflow = Workflow(id=str(uuid4()), name="rec", draft_revision=1, draft_json=definition)
+        session.add(workflow)
+        await session.flush()
+        version = WorkflowVersion(
+            id=str(uuid4()),
+            workflow_id=workflow.id,
+            version=1,
+            definition_json=definition,
+            digest=compiled.digest,
+            validation_json={},
+        )
+        session.add(version)
+        await session.flush()
+        run = Run(
+            id=str(uuid4()),
+            workflow_version_id=version.id,
+            status="running",
+            input_json={"seed": "s1"},
+            started_at=utcnow(),
+        )
+        session.add(run)
+        await session.flush()
+        session.add(
+            NodeRun(
+                id=str(uuid4()),
+                run_id=run.id,
+                node_id="sensitive",
+                node_type="transform",
+                attempt=1,
+                status="succeeded",
+                input_json={"value": "s1"},
+                output_json={"value": "s1"},
+                finished_at=utcnow(),
+            )
+        )
+        risky = NodeRun(
+            id=str(uuid4()),
+            run_id=run.id,
+            node_id="risky",
+            node_type="transform",
+            attempt=1,
+            status="failed",
+            input_json={"value": "s1"},
+            error_json={"code": "CONTRACT_VIOLATION", "message": "契约违规", "retryable": False},
+            finished_at=utcnow(),
+        )
+        session.add(risky)
+        run_id = run.id
+
+    # 触发致命处理：应先建 checkpoint 并进入 waiting_approval（不直接失败）。
+    async with SessionLocal() as session, session.begin():
+        run = await session.get(Run, run_id)
+        version = await session.get(WorkflowVersion, run.workflow_version_id)
+        definition_model = WorkflowDefinition.model_validate(version.definition_json)
+        failed = await session.scalar(
+            select(NodeRun).where(NodeRun.run_id == run_id, NodeRun.node_id == "risky")
+        )
+        await Orchestrator()._handle_fatal(session, run, definition_model, failed)
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        assert run.status == "waiting_approval"
+        checkpoint = await session.scalar(
+            select(ExecutionCheckpoint).where(ExecutionCheckpoint.run_id == run_id)
+        )
+        assert checkpoint.approval_status == "pending"
+        approval = await session.scalar(
+            select(Approval).where(Approval.run_id == run_id)
+        )
+        assert approval is not None
+        approval_id = approval.id
+        snapshot_digest = approval.snapshot_digest
+
+    # 批准：checkpoint→approved 且 run→recovering。
+    async with SessionLocal() as session:
+        await approve(approval_id, Decision(snapshotDigest=snapshot_digest), session)
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        assert run.status == "recovering"
+        checkpoint = await session.scalar(
+            select(ExecutionCheckpoint).where(ExecutionCheckpoint.run_id == run_id)
+        )
+        assert checkpoint.approval_status == "approved"
+
+
+async def test_rejected_recovery_keeps_failure_terminal() -> None:
+    """拒绝恢复审批：Run 保持失败终态，checkpoint→rejected。"""
+
+    from app.api.routes import reject
+    from app.application.orchestrator import Orchestrator
+    from app.infrastructure.database import Approval
+
+    definition = _approval_recovery_workflow()
+    compiled = WorkflowCompiler().compile(definition)
+    async with SessionLocal() as session, session.begin():
+        workflow = Workflow(id=str(uuid4()), name="rec", draft_revision=1, draft_json=definition)
+        session.add(workflow)
+        await session.flush()
+        version = WorkflowVersion(
+            id=str(uuid4()),
+            workflow_id=workflow.id,
+            version=1,
+            definition_json=definition,
+            digest=compiled.digest,
+            validation_json={},
+        )
+        session.add(version)
+        await session.flush()
+        run = Run(
+            id=str(uuid4()),
+            workflow_version_id=version.id,
+            status="running",
+            input_json={"seed": "s1"},
+            started_at=utcnow(),
+        )
+        session.add(run)
+        await session.flush()
+        risky = NodeRun(
+            id=str(uuid4()),
+            run_id=run.id,
+            node_id="risky",
+            node_type="transform",
+            attempt=1,
+            status="failed",
+            input_json={"value": "s1"},
+            error_json={"code": "CONTRACT_VIOLATION", "message": "契约违规", "retryable": False},
+            finished_at=utcnow(),
+        )
+        session.add(risky)
+        run_id = run.id
+    async with SessionLocal() as session, session.begin():
+        run = await session.get(Run, run_id)
+        version = await session.get(WorkflowVersion, run.workflow_version_id)
+        definition_model = WorkflowDefinition.model_validate(version.definition_json)
+        failed = await session.scalar(
+            select(NodeRun).where(NodeRun.run_id == run_id, NodeRun.node_id == "risky")
+        )
+        await Orchestrator()._handle_fatal(session, run, definition_model, failed)
+    async with SessionLocal() as session:
+        approval = await session.scalar(select(Approval).where(Approval.run_id == run_id))
+        approval_id = approval.id
+    async with SessionLocal() as session:
+        await reject(approval_id, session)
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        assert run.status == "failed"
+        checkpoint = await session.scalar(
+            select(ExecutionCheckpoint).where(ExecutionCheckpoint.run_id == run_id)
+        )
+        assert checkpoint.approval_status == "rejected"

@@ -535,11 +535,17 @@ class AgentRunWorker:
     def _stage_trajectory(
         cls, run_id: str, raw_events: list[dict[str, Any]], output: dict[str, Any]
     ) -> dict[str, Any]:
+        from app.application.security import redact
+
         directory = cls._trajectory_dir(run_id)
         staging = directory / ".staging"
         staging.mkdir(parents=True, exist_ok=True)
+        # 默认 Local Demo 也不把 Secret 原值复制到磁盘：落盘的 runtime 事件与输出均脱敏。
+        # 若确需原始轨迹调试价值，应经显式开关/分类/保留期限（本版本默认脱敏）。
         content = json.dumps(
-            {"events": raw_events, "output": output}, ensure_ascii=False, indent=2
+            {"events": redact(raw_events), "output": redact(output)},
+            ensure_ascii=False,
+            indent=2,
         ).encode()
         (staging / "trajectory.json").write_bytes(content)
         return {
@@ -557,6 +563,23 @@ class AgentRunWorker:
             source.replace(target)
 
 
+def _desensitize_action(action: dict[str, Any]) -> dict[str, Any]:
+    """对单个 action 脱敏：对 arguments/result 递归遮蔽敏感键，保留固化所需结构。
+
+    保留 callId/kind/capability/argumentBindings/observations/outputSchema 等编译证据；
+    只遮蔽 Secret 原值（password/token/apiKey 等），不整体丢弃可确定化的表数据。
+    """
+
+    from app.application.security import redact
+
+    cleaned = dict(action)
+    if isinstance(action.get("arguments"), dict):
+        cleaned["arguments"] = redact(action["arguments"])
+    if isinstance(action.get("result"), dict):
+        cleaned["result"] = redact(action["result"])
+    return cleaned
+
+
 def build_trajectory(
     config: AgentRunConfig,
     prompt: str,
@@ -565,11 +588,13 @@ def build_trajectory(
     step_count: int,
     artifact_uri: str | None = None,
 ) -> dict[str, Any]:
-    """把一次成功的 Agent 运行归一化为可提炼的规范化轨迹。
+    """把一次成功的 Agent 运行归一化为可提炼的规范化轨迹（脱敏后入库）。
 
-    保存成功 action 序列（callId/tool/参数/结果），供 Distillation 消费并尝试参数化为
-    确定节点，而不是简单地把原 prompt 再交给 Agent。
+    保存脱敏后的 action 序列（callId/tool/结构化证据），Secret 原值不入库；供 Distillation
+    消费并尝试参数化为确定节点，而不是简单地把原 prompt 再交给 Agent。
     """
+
+    from app.application.security import redact
 
     return {
         "runType": "agent_run",
@@ -582,8 +607,8 @@ def build_trajectory(
             "additionalProperties": False,
         },
         "outputSchema": config.output_schema,
-        "actions": actions,
-        "output": output,
+        "actions": [_desensitize_action(item) for item in actions],
+        "output": redact(output),
         "config": {
             "maxSteps": config.max_steps,
             "maxTotalTokens": config.max_total_tokens,

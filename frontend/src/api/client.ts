@@ -108,7 +108,10 @@ export type Run = {
   checkpoints?: Array<{
     id: string
     status: string
+    approvalStatus?: string
     failedNode: string
+    fallbackTarget?: string | null
+    recoveryNodeRunId?: string | null
     attempt: number
     digest: string
     completedNodes: string[]
@@ -237,11 +240,15 @@ export const api = {
     ),
   applyWorkflowPatch: (
     versionId: string,
-    patch: {
-      nodePatches?: Array<{ nodeId: string; changes: Record<string, unknown> }>
-      addEdges?: Array<{ source: string; target: string }>
-      removeEdges?: Array<{ source: string; target: string }>
-      reason?: string
+    body: {
+      sourceRunId?: string
+      failureFingerprint?: string
+      patch: {
+        nodePatches?: Array<{ nodeId: string; changes: Record<string, unknown> }>
+        addEdges?: Array<{ source: string; target: string }>
+        removeEdges?: Array<{ source: string; target: string }>
+        reason?: string
+      }
     },
   ) =>
     request<{
@@ -249,10 +256,12 @@ export const api = {
       baseVersionId: string
       definition: WorkflowDefinition
       diagnostics: Array<{ level: string; code: string; path: string; message: string }>
+      eligibility?: { eligible: boolean; reason: string; occurrence: number }
+      replay?: { replayRunId: string; passed: boolean; failedNodeStatus: string }
       publishable: boolean
     }>(`/workflow-versions/${versionId}/workflow-patch`, {
       method: 'POST',
-      body: JSON.stringify(patch),
+      body: JSON.stringify(body),
     }),
   createComponent: (
     name: string,

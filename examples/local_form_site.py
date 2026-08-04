@@ -17,7 +17,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 _LOCK = threading.Lock()
-_STATE: dict[str, object] = {"submitCount": 0, "lastSubmission": None, "mutated": False}
+_STATE: dict[str, object] = {
+    "submitCount": 0,
+    "lastSubmission": None,
+    "mutated": False,
+    "articleBody": "第一版正文：季度营收增长 12%。",
+}
 
 
 def _form_page(business_id: str, mutated: bool) -> str:
@@ -63,6 +68,19 @@ def _result_page(business_id: str, amount: str) -> str:
 """
 
 
+def _article_page(body: str) -> str:
+    # 供 Browser Read/Extract 读取的动态文章页；正文放在 #main，供 bodySelector 抽取。
+    return f"""<!doctype html>
+<html lang="zh">
+<head><meta charset="utf-8"><title>季度文章</title></head>
+<body>
+<h1 id="headline">季度复盘</h1>
+<article id="main">{body}</article>
+</body>
+</html>
+"""
+
+
 class _Handler(BaseHTTPRequestHandler):
     business_id = "EXP-DEMO-001"
 
@@ -91,6 +109,10 @@ class _Handler(BaseHTTPRequestHandler):
             with _LOCK:
                 mutated = bool(_STATE["mutated"])
             self._send_html(200, _form_page(self.business_id, mutated))
+        elif path == "/article":
+            with _LOCK:
+                body = str(_STATE["articleBody"])
+            self._send_html(200, _article_page(body))
         elif path == "/__stats":
             with _LOCK:
                 self._send_json(200, dict(_STATE))
@@ -98,6 +120,12 @@ class _Handler(BaseHTTPRequestHandler):
             with _LOCK:
                 _STATE["mutated"] = True
             self._send_json(200, {"mutated": True})
+        elif path == "/__set-article":
+            # 修改文章正文，模拟“发布后页面内容改变”，第二次读取应得到新正文。
+            new_body = parse_qs(urlparse(self.path).query).get("body", ["新正文"])[0]
+            with _LOCK:
+                _STATE["articleBody"] = new_body
+            self._send_json(200, {"articleBody": new_body})
         else:
             self._send_html(404, "<h1>not found</h1>")
 

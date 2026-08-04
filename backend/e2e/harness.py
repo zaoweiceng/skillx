@@ -48,6 +48,12 @@ class DemoStack:
         response.raise_for_status()
         return response.json()
 
+    def set_article(self, body: str) -> None:
+        """修改动态文章页正文（模拟发布后页面内容改变）。"""
+
+        response = httpx.get(f"{self.form_url}/__set-article", params={"body": body}, timeout=5)
+        response.raise_for_status()
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -111,6 +117,8 @@ def start_stack(
         "SKILLX_AGENT_HOST_CAPABILITIES": '["search.web", "lookup.table"]',
         # 本地表单站点 URL：seed 据此创建真实 Playwright 提交组件（E2E-6）。
         "SKILLX_DEMO_FORM_URL": f"http://127.0.0.1:{form_port}/apply",
+        # 动态文章页 URL：seed 据此创建动态网页总结组件（F-01）。
+        "SKILLX_DEMO_ARTICLE_URL": f"http://127.0.0.1:{form_port}/article",
         **(model_env or {}),
     }
 

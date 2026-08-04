@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -132,10 +133,32 @@ class AgentHost:
 
         try:
             async with asyncio.timeout(request.max_duration_seconds):
-                async for raw in adapter.events(request.run_id, run_request):
-                    if cancellation is not None and await cancellation():
+                event_iter = adapter.events(request.run_id, run_request).__aiter__()
+                while True:
+                    # 事件流与取消检查并发竞争：即便子进程挂住不再产出事件，取消一到
+                    # 也能立即终止 subprocess，而不必等待下一条事件（P2-2 / E-01）。
+                    next_task = asyncio.ensure_future(event_iter.__anext__())
+                    cancel_task: asyncio.Task[bool] | None = None
+                    if cancellation is not None:
+                        cancel_task = asyncio.ensure_future(self._await_cancel(cancellation))
+                    wait_set = {next_task, *( [cancel_task] if cancel_task else [] )}
+                    done, _pending = await asyncio.wait(
+                        wait_set, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if cancel_task is not None and cancel_task in done and cancel_task.result():
+                        next_task.cancel()
+                        with suppress(asyncio.CancelledError, StopAsyncIteration):
+                            await next_task
                         await self._cancel(adapter, request.run_id)
                         raise asyncio.CancelledError
+                    if cancel_task is not None and cancel_task not in done:
+                        cancel_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await cancel_task
+                    try:
+                        raw = await next_task
+                    except StopAsyncIteration:
+                        break
                     try:
                         runtime_event, audit_event = validator.validate_pair(raw)
                     except PermissionError as exc:
@@ -181,8 +204,30 @@ class AgentHost:
                             )
                     elif event_type == "agent.completed":
                         output = payload.get("output")
-                        if payload.get("totalTokens") is not None:
-                            result.total_tokens = payload["totalTokens"]
+                        final_tokens = payload.get("totalTokens")
+                        if final_tokens is not None:
+                            # 终态 Token 一致性校验：必须非负、不得小于可信步骤累计值，
+                            # 并再次执行 Host 上限（只在终态报大数或报更小数都不能绕过）。
+                            if not isinstance(final_tokens, int) or final_tokens < 0:
+                                await self._cancel(adapter, request.run_id)
+                                raise AgentHostError(
+                                    "AGENT_EVENT_INVALID",
+                                    f"agent.completed.totalTokens 非法: {final_tokens}",
+                                )
+                            if final_tokens < result.total_tokens:
+                                await self._cancel(adapter, request.run_id)
+                                raise AgentHostError(
+                                    "AGENT_EVENT_INVALID",
+                                    "agent.completed.totalTokens 小于步骤累计值，审计不一致",
+                                )
+                            if final_tokens > request.max_total_tokens:
+                                await self._cancel(adapter, request.run_id)
+                                raise AgentHostError(
+                                    "TOKEN_BUDGET_EXCEEDED",
+                                    f"终态 Token {final_tokens} 超过 Host 上限 "
+                                    f"{request.max_total_tokens}",
+                                )
+                            result.total_tokens = final_tokens
         except TimeoutError as exc:
             await self._cancel(adapter, request.run_id)
             raise AgentHostError("TIMEOUT", "Agent 运行超时，已取消") from exc
@@ -233,10 +278,25 @@ class AgentHost:
                 action[key] = completed[key]
             elif key in started:
                 action[key] = started[key]
+        # 显式 per-argument provenance：Runtime 为每个参数声明来源
+        # （user_input / prior_output(actionId,path) / artifact(id,path) / constant），
+        # 不再靠“值是否等于 prompt”猜测。见 build_action_ir。
+        bindings = completed.get("argumentBindings") or started.get("argumentBindings")
+        if isinstance(bindings, dict):
+            action["argumentBindings"] = bindings
         observations = completed.get("observations") or started.get("observations")
         if isinstance(observations, dict):
             action["observations"] = observations
         return action
+
+    @staticmethod
+    async def _await_cancel(cancellation: CancellationCheck) -> bool:
+        """轮询取消信号；置位即返回 True（与事件流竞争，及时终止挂起子进程）。"""
+
+        while True:
+            if await cancellation():
+                return True
+            await asyncio.sleep(0.1)
 
     @staticmethod
     async def _cancel(adapter: TraeXSubprocessAdapter, run_id: str) -> None:

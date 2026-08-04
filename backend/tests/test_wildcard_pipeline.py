@@ -46,6 +46,7 @@ def _web_fetch_action(message: str) -> dict:
         "kind": "browser",
         "capability": "browser.read",
         "arguments": {"url": message},
+        "argumentBindings": {"url": {"source": "user_input", "inputKey": "message"}},
         "result": {"title": "T", "content": "正文"},
         "effect": "none",
         "idempotent": True,
@@ -55,19 +56,23 @@ def _web_fetch_action(message: str) -> dict:
             "pageContract": {
                 "contractVersion": "1",
                 "urlPattern": "https://site.local/*",
-                "extract": {"content": "#main"},
             },
+            "extract": {"content": "#main"},
         },
     }
 
 
 def _agent_summary_action() -> dict:
     # 显式 Agent 总结：无确定化证据 → 保留为 Agent 节点。
+    # 显式声明 text 参数来源于前序读取动作的 content 输出（真实数据依赖）。
     return {
         "callId": "call-2",
         "kind": "agent",
         "capability": "summarize",
         "arguments": {"text": "正文"},
+        "argumentBindings": {
+            "text": {"source": "prior_output", "fromAction": "call-1", "fromPath": "content"}
+        },
         "result": {"summary": "首次总结"},
     }
 
@@ -97,7 +102,14 @@ def test_web_summary_trajectory_distills_to_mixed_graph() -> None:
     # browser 节点是抽象契约，不暴露 Playwright 私有对象。
     browser_node = definition["spec"]["nodes"][1]
     assert browser_node["config"]["pageContract"]["contractVersion"] == "1"
-    assert "playwright" not in str(browser_node["config"]).lower() or True
+    assert "playwright" not in str(browser_node["config"]).lower()
+    # 真实数据依赖：Agent 总结节点的 text 输入引用 browser 节点的 content 输出，
+    # 而不是常量“正文”。这是可执行 mixed dataflow 的核心证据。
+    agent_node = definition["spec"]["nodes"][2]
+    browser_id = browser_node["id"]
+    assert agent_node["input"]["text"] == f"${{{browser_id}.output.content}}"
+    # 边由真实数据依赖构建：browser → agent。
+    assert {"source": browser_id, "target": agent_node["id"]} in definition["spec"]["edges"]
 
 
 def test_non_web_file_task_uses_same_pipeline() -> None:

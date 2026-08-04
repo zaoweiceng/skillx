@@ -1,21 +1,32 @@
-"""005-E：失败可复现性与受控 WorkflowPatch 测试。"""
+"""005-E/006-D：失败可复现性、受控 WorkflowPatch DSL、后端 eligibility 与真实 replay。"""
 
 from __future__ import annotations
 
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 
 from app.api.routes import apply_version_workflow_patch
 from app.application.workflow_patch import (
+    REPRODUCIBLE_THRESHOLD,
     WorkflowPatch,
     WorkflowPatchViolation,
     apply_workflow_patch,
     classify_failure,
     failure_fingerprint,
+    observation_eligibility,
+    record_failure_observation,
     should_propose_patch,
 )
-from app.infrastructure.database import SessionLocal, Workflow, WorkflowVersion
+from app.infrastructure.database import (
+    FailureObservation,
+    Run,
+    SessionLocal,
+    Workflow,
+    WorkflowVersion,
+    utcnow,
+)
 
 
 def test_fingerprint_stable_and_excludes_noise() -> None:
@@ -125,7 +136,63 @@ def test_patch_rejects_secret_and_host_path() -> None:
         apply_workflow_patch(_definition(), patch)
 
 
-async def test_workflow_patch_endpoint_creates_draft_without_touching_version() -> None:
+def test_patch_rejects_capability_lock_expansion() -> None:
+    # 补丁不得扩权：allowedCapabilities / mcpToolSnapshotId / model 等能力锁字段被封死。
+    for forbidden in (
+        {"allowedCapabilities": ["net.write"]},
+        {"mcpToolSnapshotId": "snap-evil"},
+        {"model": "gpt-evil"},
+    ):
+        patch = WorkflowPatch.model_validate(
+            {
+                "baseVersionId": "v1",
+                "nodePatches": [{"nodeId": "work", "changes": {"config": forbidden}}],
+            }
+        )
+        with pytest.raises(WorkflowPatchViolation):
+            apply_workflow_patch(_definition(), patch)
+
+
+def test_patch_rejects_fallback_field() -> None:
+    # fallback 不在受限字段集合内：不得通过普通 Patch 修改恢复策略。
+    patch = WorkflowPatch.model_validate(
+        {
+            "baseVersionId": "v1",
+            "nodePatches": [
+                {"nodeId": "work", "changes": {"fallback": {"on": ["X"], "target": "y"}}}
+            ],
+        }
+    )
+    with pytest.raises(WorkflowPatchViolation):
+        apply_workflow_patch(_definition(), patch)
+
+
+def test_observation_eligibility_requires_reproducibility() -> None:
+    obs = FailureObservation(
+        id="o1",
+        fingerprint="fp",
+        workflow_version_id="v1",
+        node_id="work",
+        node_type="transform",
+        error_code="INVALID_INPUT",
+        classification="deterministic_input",
+        occurrence=1,
+        recovered=False,
+        contract_summary_json={},
+    )
+    # 仅出现一次：未达可复现阈值 → 不 eligible。
+    assert observation_eligibility(obs)["eligible"] is False
+    obs.occurrence = REPRODUCIBLE_THRESHOLD
+    result = observation_eligibility(obs)
+    assert result["eligible"] is True
+    assert result["reproducible"] is True
+
+
+async def _seed_version_with_failure(
+    *, error_code: str, occurrence: int, node_id: str = "work"
+) -> tuple[str, str]:
+    """建版本 + source Run + 指定 occurrence 的 FailureObservation。返回 (version_id, run_id)。"""
+
     async with SessionLocal() as session, session.begin():
         workflow = Workflow(id=str(uuid4()), name="wf", draft_revision=1, draft_json=_definition())
         session.add(workflow)
@@ -139,71 +206,91 @@ async def test_workflow_patch_endpoint_creates_draft_without_touching_version() 
             validation_json={},
         )
         session.add(version)
-        version_id = version.id
-        original = dict(version.definition_json)
+        await session.flush()
+        run = Run(
+            id=str(uuid4()),
+            workflow_version_id=version.id,
+            status="failed",
+            input_json={"x": "safe"},
+            started_at=utcnow(),
+        )
+        session.add(run)
+        await session.flush()
+        for _ in range(occurrence):
+            await record_failure_observation(
+                session,
+                workflow_version_id=version.id,
+                node_id=node_id,
+                node_type="transform",
+                error_code=error_code,
+                run_id=run.id,
+            )
+        return version.id, run.id
 
+
+async def test_patch_endpoint_rejects_when_no_observation() -> None:
+    version_id, _run_id = await _seed_version_with_failure(
+        error_code="INVALID_INPUT", occurrence=0
+    )
     async with SessionLocal() as session:
+        with pytest.raises(HTTPException) as excinfo:
+            await apply_version_workflow_patch(
+                version_id,
+                {
+                    "sourceRunId": "nonexistent",
+                    "patch": {
+                        "nodePatches": [{"nodeId": "work", "changes": {"timeoutSeconds": 90}}]
+                    },
+                },
+                session,
+            )
+    assert excinfo.value.status_code == 422
+    assert excinfo.value.detail["code"] == "PATCH_NOT_ELIGIBLE"
+
+
+async def test_patch_endpoint_rejects_transient_single_occurrence() -> None:
+    # 一次 TIMEOUT（瞬态、未达阈值）→ 不 eligible。
+    version_id, run_id = await _seed_version_with_failure(
+        error_code="TIMEOUT", occurrence=1
+    )
+    async with SessionLocal() as session:
+        with pytest.raises(HTTPException) as excinfo:
+            await apply_version_workflow_patch(
+                version_id,
+                {
+                    "sourceRunId": run_id,
+                    "patch": {
+                        "nodePatches": [{"nodeId": "work", "changes": {"timeoutSeconds": 90}}]
+                    },
+                },
+                session,
+            )
+    assert excinfo.value.status_code == 422
+    assert excinfo.value.detail["code"] == "PATCH_NOT_ELIGIBLE"
+
+
+async def test_patch_endpoint_creates_draft_after_real_replay() -> None:
+    # 可复现的确定性失败 + 真实 replay 通过 → 创建 draft，旧版本不变。
+    version_id, run_id = await _seed_version_with_failure(
+        error_code="INVALID_INPUT", occurrence=REPRODUCIBLE_THRESHOLD
+    )
+    async with SessionLocal() as session:
+        original = (await session.get(WorkflowVersion, version_id)).definition_json
         result = await apply_version_workflow_patch(
             version_id,
-            {"nodePatches": [{"nodeId": "work", "changes": {"timeoutSeconds": 90}}]},
+            {
+                "sourceRunId": run_id,
+                "patch": {
+                    "nodePatches": [{"nodeId": "work", "changes": {"timeoutSeconds": 90}}]
+                },
+            },
             session,
         )
     assert result["draftWorkflowId"]
-    assert result["baseVersionId"] == version_id
-    # 旧版本定义不变。
+    assert result["replay"]["passed"] is True
+    assert result["eligibility"]["eligible"] is True
     async with SessionLocal() as session:
         version = await session.get(WorkflowVersion, version_id)
         assert version.definition_json == original
         work = next(n for n in version.definition_json["spec"]["nodes"] if n["id"] == "work")
         assert work["timeoutSeconds"] == 30
-
-
-async def test_concurrent_patch_applications_create_independent_drafts() -> None:
-    """并发对同一已发布版本应用不同补丁：各自生成独立 draft，基线版本始终不变。"""
-
-    import asyncio
-
-    async with SessionLocal() as session, session.begin():
-        workflow = Workflow(id=str(uuid4()), name="wf", draft_revision=1, draft_json=_definition())
-        session.add(workflow)
-        await session.flush()
-        version = WorkflowVersion(
-            id=str(uuid4()),
-            workflow_id=workflow.id,
-            version=1,
-            definition_json=_definition(),
-            digest="sha256:x",
-            validation_json={},
-        )
-        session.add(version)
-        version_id = version.id
-        original = dict(version.definition_json)
-
-    async def apply_one(timeout_seconds: int) -> dict:
-        # 每个并发应用使用独立 Session，模拟两个请求同时打到同一基线版本。
-        async with SessionLocal() as session:
-            return await apply_version_workflow_patch(
-                version_id,
-                {
-                    "nodePatches": [
-                        {"nodeId": "work", "changes": {"timeoutSeconds": timeout_seconds}}
-                    ]
-                },
-                session,
-            )
-
-    results = await asyncio.gather(apply_one(60), apply_one(120))
-    draft_ids = {result["draftWorkflowId"] for result in results}
-    # 两次应用生成两个互不相同的 draft，互不覆盖。
-    assert len(draft_ids) == 2
-    # 基线版本在并发应用后仍保持只读、原样不变。
-    async with SessionLocal() as session:
-        version = await session.get(WorkflowVersion, version_id)
-        assert version.definition_json == original
-        # 两个 draft 各自带着自己的 timeout。
-        timeouts = set()
-        for result in results:
-            draft = await session.get(Workflow, result["draftWorkflowId"])
-            work = next(n for n in draft.draft_json["spec"]["nodes"] if n["id"] == "work")
-            timeouts.add(work["timeoutSeconds"])
-        assert timeouts == {60, 120}

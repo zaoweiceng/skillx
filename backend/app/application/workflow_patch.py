@@ -4,26 +4,78 @@ import hashlib
 import json
 from copy import deepcopy
 from typing import Any, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-# 005-E：失败可复现性与受控 WorkflowPatch。
+from app.infrastructure.database import FailureObservation, utcnow
+
+# 006-D/005-E：失败可复现性与受控 WorkflowPatch。
 #
 # 一次瞬态波动不提版本修改；同版本、同 failureFingerprint 可重复复现且修复回放成功时，
-# 才允许生成 WorkflowPatch 草稿。通用 WorkflowPatch 只表达节点/边/配置/契约的受限变更，
-# 不能携带宿主机路径、Secret 或扩大能力权限。应用补丁总是创建 draft，人工发布后才生效。
+# 才允许生成 WorkflowPatch 草稿。资格由后端事实（持久 FailureObservation 的 occurrence +
+# classification）计算，不接受前端自报 reproducible。通用 WorkflowPatch 只表达节点/边/配置/
+# 契约的受限变更，不能携带宿主机路径、Secret 或扩大能力/锁/模型/权限。应用补丁总是创建
+# draft，真实 replay 通过后才可发布。
 
 FailureClass = Literal[
     "transient", "contract_drift", "deterministic_input", "platform_bug", "unknown"
 ]
 
-# 补丁绝不允许出现的敏感/越权字段。
+# 可复现阈值：同一非瞬态 fingerprint 至少出现这么多次才有资格生成 proposal。
+REPRODUCIBLE_THRESHOLD = 2
+
+# 补丁绝不允许出现的敏感/越权字段（键名规范化后递归匹配，防大小写/嵌套绕过）。
 _FORBIDDEN_CONFIG_KEYS = frozenset(
-    {"package", "packagePath", "command", "secretRef", "secret", "apiKey", "token"}
+    {
+        "package",
+        "packagepath",
+        "command",
+        "secretref",
+        "secret",
+        "apikey",
+        "token",
+        # 能力锁 / 权限 / 模型 / 副作用 / 幂等 / 风险：不得通过普通 Patch 修改。
+        "allowedcapabilities",
+        "mcptoolsnapshotid",
+        "capabilityversionid",
+        "capabilityref",
+        "model",
+        "modelprofile",
+        "permissions",
+        "sideeffect",
+        "idempotent",
+        "risk",
+        "risklevel",
+    }
 )
-# 只允许补丁修改的节点字段（受限变更集）。
+# 只允许补丁修改的节点字段（受限变更集）。config 走字段级白名单，不做任意浅合并。
 _ALLOWED_NODE_FIELDS = frozenset(
-    {"config", "input", "timeoutSeconds", "retry", "fallback", "displayName"}
+    {"config", "input", "timeoutSeconds", "retry", "displayName"}
+)
+# config 内允许调整的键（不含任何能力/锁/权限/模型）。
+_ALLOWED_CONFIG_KEYS = frozenset(
+    {
+        "operation",
+        "table",
+        "keyField",
+        "default",
+        "template",
+        "fields",
+        "mapping",
+        "maxSteps",
+        "maxTotalTokens",
+        "maxOutputTokens",
+        "prompt",
+        "outputSchema",
+        "navigation",
+        "timeoutMs",
+        "extract",
+        "successAssertions",
+        "resultSelectors",
+    }
 )
 
 
@@ -110,12 +162,14 @@ class WorkflowPatch(BaseModel):
 
 
 def _reject_forbidden(value: Any, path: str = "") -> None:
-    """递归拒绝宿主机路径/Secret 等敏感键。"""
+    """递归拒绝宿主机路径/Secret/能力锁等敏感键；键名规范化（小写去分隔符）后匹配，
+    避免大小写/嵌套绕过。"""
 
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in _FORBIDDEN_CONFIG_KEYS:
-                raise WorkflowPatchViolation(f"补丁不得携带敏感字段 {path}{key}")
+            normalized = str(key).lower().replace("_", "").replace("-", "")
+            if normalized in _FORBIDDEN_CONFIG_KEYS:
+                raise WorkflowPatchViolation(f"补丁不得携带敏感/能力字段 {path}{key}")
             _reject_forbidden(item, f"{path}{key}.")
     elif isinstance(value, list):
         for item in value:
@@ -128,9 +182,10 @@ def apply_workflow_patch(
 ) -> dict[str, Any]:
     """把受控 WorkflowPatch 应用到草稿 definition，返回新的 definition。
 
-    安全边界：只改允许的节点字段；禁止修改 type/sideEffect/idempotent/permissions；
-    禁止携带宿主机路径/Secret；不得新增未在原图中的能力权限。应用产生 draft，人工发布
-    后才生效。
+    安全边界：只改允许的节点字段；config 只允许字段级白名单键（不含能力锁/权限/模型/
+    副作用/幂等）；禁止修改 type/sideEffect/idempotent/permissions/fallback；禁止携带
+    宿主机路径/Secret；不得新增/替换能力锁。边变更后须重做 reachability/数据依赖检查
+    （由调用方 Compiler 回放完成）。应用产生 draft，真实 replay 通过后才可发布。
     """
 
     next_definition = deepcopy(definition)
@@ -143,14 +198,15 @@ def apply_workflow_patch(
             if field not in _ALLOWED_NODE_FIELDS:
                 raise WorkflowPatchViolation(f"补丁不得修改节点字段 {field}")
             _reject_forbidden({field: value})
-            # config 做浅合并，其余字段整体替换。
-            merge_config = (
-                field == "config"
-                and isinstance(value, dict)
-                and isinstance(node.get("config"), dict)
-            )
-            if merge_config:
-                node["config"] = {**node["config"], **value}
+            if field == "config" and isinstance(value, dict):
+                # config 字段级白名单合并：只允许安全键，不做任意浅合并。
+                for config_key in value:
+                    if config_key not in _ALLOWED_CONFIG_KEYS:
+                        raise WorkflowPatchViolation(
+                            f"补丁不得修改 config 键 {config_key}（不在受限白名单内）"
+                        )
+                base = node.get("config") if isinstance(node.get("config"), dict) else {}
+                node["config"] = {**base, **value}
             else:
                 node[field] = value
     edges = next_definition.setdefault("spec", {}).setdefault("edges", [])
@@ -168,3 +224,108 @@ def apply_workflow_patch(
             raise WorkflowPatchViolation("补丁新增边的端点必须是已有节点")
         edges.append({"source": edge["source"], "target": edge["target"]})
     return next_definition
+
+
+async def record_failure_observation(
+    session: AsyncSession,
+    *,
+    workflow_version_id: str,
+    node_id: str,
+    node_type: str,
+    error_code: str,
+    contract_summary: dict[str, Any] | None = None,
+    recovered: bool = False,
+    run_id: str | None = None,
+    checkpoint_id: str | None = None,
+) -> FailureObservation:
+    """按稳定 fingerprint 聚合失败观测；重复失败累加 occurrence（后端事实来源）。"""
+
+    fingerprint = failure_fingerprint(
+        workflow_version_id=workflow_version_id,
+        node_id=node_id,
+        node_type=node_type,
+        error_code=error_code,
+        contract_summary=contract_summary,
+    )
+    existing = await session.scalar(
+        select(FailureObservation).where(FailureObservation.fingerprint == fingerprint)
+    )
+    classification = classify_failure(
+        error_code, recovered=recovered, reproducible=False
+    )
+    if existing is not None:
+        existing.occurrence += 1
+        existing.recovered = existing.recovered or recovered
+        existing.last_run_id = run_id
+        existing.last_checkpoint_id = checkpoint_id
+        existing.updated_at = utcnow()
+        # 复现后按可复现重新分类（occurrence 决定资格，见 observation_eligibility）。
+        reproducible = existing.occurrence >= REPRODUCIBLE_THRESHOLD
+        existing.classification = classify_failure(
+            error_code, recovered=existing.recovered, reproducible=reproducible
+        )
+        await session.flush()
+        return existing
+    observation = FailureObservation(
+        id=str(uuid4()),
+        fingerprint=fingerprint,
+        workflow_version_id=workflow_version_id,
+        node_id=node_id,
+        node_type=node_type,
+        error_code=error_code,
+        classification=classification,
+        occurrence=1,
+        recovered=recovered,
+        last_run_id=run_id,
+        last_checkpoint_id=checkpoint_id,
+        contract_summary_json=contract_summary or {},
+    )
+    session.add(observation)
+    await session.flush()
+    return observation
+
+
+def observation_eligibility(observation: FailureObservation) -> dict[str, Any]:
+    """由后端事实计算 Patch 资格：只有可复现（occurrence≥阈值）的非瞬态故障才 eligible。
+
+    返回 {eligible, reason, reproducible, occurrence, classification}，前端不能自报。
+    """
+
+    reproducible = observation.occurrence >= REPRODUCIBLE_THRESHOLD
+    classification = classify_failure(
+        observation.error_code, recovered=observation.recovered, reproducible=reproducible
+    )
+    eligible = should_propose_patch(classification, reproducible=reproducible)
+    if not reproducible:
+        reason = f"故障仅出现 {observation.occurrence} 次，未达可复现阈值 {REPRODUCIBLE_THRESHOLD}"
+    elif not eligible:
+        reason = f"分类 {classification} 不适合生成补丁（瞬态或未知）"
+    else:
+        reason = "可复现的非瞬态故障，允许生成受控补丁 proposal"
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "reproducible": reproducible,
+        "occurrence": observation.occurrence,
+        "classification": classification,
+    }
+
+
+async def replay_patched_definition(
+    patched_definition: dict[str, Any],
+    *,
+    safe_inputs: dict[str, Any],
+    fail_node_id: str,
+) -> dict[str, Any]:
+    """在隔离受限环境用安全输入真实回放 patched 图，验证原失败点不再复现。
+
+    这不是静态编译校验：它用内存执行器实际跑到失败节点及必要下游，比较结果。返回
+    {replayRunId, passed, failedNodeStatus, outputs, diagnostics}。副作用节点在 replay
+    中以幂等/模拟语义执行；替代输入取自 source checkpoint 的安全值。
+    """
+
+    from app.application.replay import run_isolated_replay
+
+    return await run_isolated_replay(
+        patched_definition, safe_inputs=safe_inputs, fail_node_id=fail_node_id
+    )

@@ -170,6 +170,37 @@ class PlaywrightPageSession:
             await self._screenshot("browser-filled.png", "browser-filled")
         return observed
 
+    async def read_and_extract(
+        self,
+        body_selector: str,
+        field_selectors: dict[str, str],
+    ) -> dict[str, Any]:
+        """只读导航后抽取正文与结构化字段（Read/Extract adapter 运行路径）。
+
+        输出通用 provenance（正文文本 + 字段文本），不暴露 Playwright page/locator 句柄。
+        """
+
+        page = self._page()
+        body_locator = page.locator(body_selector)
+        content = ""
+        if await body_locator.count() >= 1:
+            content = (await body_locator.first.inner_text()).strip()
+        fields: dict[str, str] = {}
+        for field_id, selector in field_selectors.items():
+            locator = page.locator(selector)
+            if await locator.count() >= 1:
+                fields[field_id] = (await locator.first.inner_text()).strip()
+        result = {
+            "url": page.url,
+            "title": await page.title(),
+            "content": content,
+            "fields": fields,
+        }
+        await self._write_json_artifact(
+            "browser-read-summary.json", result, "browser-read-summary"
+        )
+        return result
+
     async def submit(self) -> dict[str, Any]:
         if not self.contract.submit:
             raise BrowserExecutionError("PageContract 未声明 submit")

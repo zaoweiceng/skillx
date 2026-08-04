@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -51,6 +52,8 @@ TERMINAL_NODE_STATES = {
     "cancelled",
     "lease_expired",
 }
+
+logger = logging.getLogger(__name__)
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -135,7 +138,7 @@ class Orchestrator:
                     update(ExecutionCheckpoint)
                     .where(
                         ExecutionCheckpoint.run_id == run.id,
-                        ExecutionCheckpoint.status == "pending",
+                        ExecutionCheckpoint.status.in_(["pending", "running"]),
                     )
                     .values(status="cancelled")
                 )
@@ -157,6 +160,22 @@ class Orchestrator:
             raise LookupError("workflow version not found")
         definition = WorkflowDefinition.model_validate(version.definition_json)
         nodes = {node.id: node for node in definition.spec.nodes}
+        # fallback-only target 只在恢复时激活：正常调度绝不为其创建 NodeRun。
+        from app.application.recovery import _fallback_only_targets, load_substitutions
+
+        fallback_only = _fallback_only_targets(definition)
+        # 恢复替代输出（不可变历史）：下游据此读取被替代节点的输出，失败 NodeRun 不改写。
+        substitutions = await load_substitutions(session, run.id)
+        # 处于活跃恢复中的失败 attempt：不得被再次判为 fatal（正在等待审批或恢复中）。
+        active_checkpoints = (
+            await session.scalars(
+                select(ExecutionCheckpoint).where(
+                    ExecutionCheckpoint.run_id == run.id,
+                    ExecutionCheckpoint.status.in_(["pending", "running", "awaiting_user"]),
+                )
+            )
+        ).all()
+        under_recovery = {item.failed_node_run_id for item in active_checkpoints}
 
         if self._duration_exceeded(run, definition):
             if run.status != "cancelling":
@@ -228,7 +247,10 @@ class Orchestrator:
         fatal = [
             item
             for node_id, item in latest.items()
-            if item.status == "failed" and nodes[node_id].on_error == "fail_run"
+            if item.status == "failed"
+            and nodes[node_id].on_error == "fail_run"
+            and node_id not in substitutions
+            and item.id not in under_recovery
         ]
         if fatal:
             await self._handle_fatal(session, run, definition, fatal[0])
@@ -236,6 +258,10 @@ class Orchestrator:
 
         waiting = [item for item in latest.values() if item.status == "waiting_user"]
         if waiting:
+            run.status = "waiting_approval"
+            return run
+        # 等待恢复审批：保持 waiting_approval，直到人工批准（→recovering）或拒绝（→failed）。
+        if any(item.approval_status == "pending" for item in active_checkpoints):
             run.status = "waiting_approval"
             return run
         if run.status == "waiting_approval":
@@ -250,18 +276,26 @@ class Orchestrator:
                 values[node_id] = item.output_json
             elif item.status == "failed" and nodes[node_id].on_error == "continue":
                 values[node_id] = {"error": item.error_json or {}}
+        # 恢复替代输出：被替代的失败节点以其替代值参与下游解析（原失败 NodeRun 不改写）。
+        for node_id, output in substitutions.items():
+            if output:
+                values[node_id] = output
 
         for node in definition.spec.nodes:
+            # fallback-only target 只在恢复时由 RecoveryDriver 创建，正常调度跳过。
+            if node.id in fallback_only:
+                continue
             if node.id in latest:
                 continue
             edges = incoming[node.id]
             if edges and not all(
-                edge.source in latest and latest[edge.source].status in TERMINAL_NODE_STATES
-                for edge in edges
+                self._edge_ready(edge.source, latest, substitutions) for edge in edges
             ):
                 continue
             selected = [
-                edge for edge in edges if self._edge_selected(edge.source, edge.when, latest, nodes)
+                edge
+                for edge in edges
+                if self._edge_selected(edge.source, edge.when, latest, nodes, substitutions)
             ]
             if edges and not selected:
                 await self._insert_node_run(
@@ -295,7 +329,10 @@ class Orchestrator:
         fatal = [
             item
             for node_id, item in latest.items()
-            if item.status == "failed" and nodes[node_id].on_error == "fail_run"
+            if item.status == "failed"
+            and nodes[node_id].on_error == "fail_run"
+            and node_id not in substitutions
+            and item.id not in under_recovery
         ]
         if fatal:
             await self._handle_fatal(session, run, definition, fatal[0])
@@ -341,21 +378,41 @@ class Orchestrator:
         )
 
     @staticmethod
+    def _edge_ready(
+        source: str,
+        latest: dict[str, NodeRun],
+        substitutions: dict[str, Any],
+    ) -> bool:
+        """上游节点是否处于终态（可解析下游）：正常终态，或被恢复替代的失败节点。"""
+
+        if source not in latest:
+            return False
+        if source in substitutions and latest[source].status == "failed":
+            return True
+        return latest[source].status in TERMINAL_NODE_STATES
+
+    @staticmethod
     def _edge_selected(
         source: str,
         when: bool | None,
         latest: dict[str, NodeRun],
         nodes: dict[str, WorkflowNode],
+        substitutions: dict[str, Any] | None = None,
     ) -> bool:
         source_run = latest[source]
-        allowed = source_run.status == "succeeded" or (
-            source_run.status == "failed" and nodes[source].on_error == "continue"
+        substitutions = substitutions or {}
+        substituted = source in substitutions and source_run.status == "failed"
+        allowed = (
+            source_run.status == "succeeded"
+            or substituted
+            or (source_run.status == "failed" and nodes[source].on_error == "continue")
         )
         if not allowed:
             return False
         if when is None:
             return True
-        return bool((source_run.output_json or {}).get("result")) == when
+        output = substitutions[source] if substituted else (source_run.output_json or {})
+        return bool((output or {}).get("result")) == when
 
     @staticmethod
     async def _latest_node_runs(session: AsyncSession, run_id: str) -> dict[str, NodeRun]:
@@ -436,8 +493,13 @@ class Orchestrator:
         definition: WorkflowDefinition,
         failed_node_run: NodeRun,
     ) -> None:
-        """致命失败处理：命中显式 fallback 且错误码可自动恢复时冻结 checkpoint 进入
-        ``recovering``；否则按原语义 fail run。Direct/MCP/Browser 失败不隐式升级为 Agent。"""
+        """致命失败处理：命中显式 fallback 时冻结 checkpoint。
+
+        - 可自动恢复（错误码在 fallback.on 且非危险类）且无需审批 → ``recovering``；
+        - ``requireUserApproval=true`` → 先建 checkpoint 并进入 ``waiting_approval``，
+          等待人工批准/拒绝，不直接失败（A-03 / P2-3）；
+        - 否则按原语义 fail run。Direct/MCP/Browser 失败不隐式升级为 Agent。
+        """
 
         from app.application.recovery import build_checkpoint, is_recoverable
 
@@ -454,12 +516,34 @@ class Orchestrator:
                 ExecutionCheckpoint.failed_node_run_id == failed_node_run.id,
             )
         )
-        if (
+        hits_fallback = (
             fallback is not None
             and existing is None
-            and is_recoverable(error_code, fallback.on)
-            and not fallback.require_user_approval
-        ):
+            and error_code is not None
+            and error_code in fallback.on
+        )
+        if hits_fallback and fallback.require_user_approval:
+            # 危险错误先建立 checkpoint，进入待审批；批准后走同一 Recovery claim。
+            checkpoint = await build_checkpoint(session, run, definition, failed_node_run)
+            checkpoint.approval_status = "pending"
+            run.status = "waiting_approval"
+            await self._create_recovery_approval(
+                session, run, failed_node_run, node, checkpoint, error_code
+            )
+            await append_event(
+                session,
+                run.id,
+                "run.recovery_approval_requested",
+                {
+                    "runId": run.id,
+                    "checkpointId": checkpoint.id,
+                    "failedNode": failed_node_run.node_id,
+                    "errorCode": error_code,
+                    "fallbackTarget": fallback.target,
+                },
+            )
+            return
+        if hits_fallback and is_recoverable(error_code, fallback.on):
             checkpoint = await build_checkpoint(session, run, definition, failed_node_run)
             run.status = "recovering"
             await append_event(
@@ -475,7 +559,67 @@ class Orchestrator:
                 },
             )
             return
+        # 记录失败观测（受控 WorkflowPatch 的后端事实来源）：不进入恢复的致命失败按
+        # fingerprint 聚合，供 eligibility 计算是否可复现。
+        await self._record_observation(session, run, failed_node_run)
         await self._finish_failed(session, run, failed_node_run.error_json)
+
+    @staticmethod
+    async def _record_observation(
+        session: AsyncSession, run: Run, failed_node_run: NodeRun
+    ) -> None:
+        from app.application.workflow_patch import record_failure_observation
+
+        error = failed_node_run.error_json or {}
+        with suppress(Exception):
+            await record_failure_observation(
+                session,
+                workflow_version_id=run.workflow_version_id,
+                node_id=failed_node_run.node_id,
+                node_type=failed_node_run.node_type,
+                error_code=error.get("code", "EXECUTION_FAILED"),
+                run_id=run.id,
+            )
+
+    @staticmethod
+    async def _create_recovery_approval(
+        session: AsyncSession,
+        run: Run,
+        failed_node_run: NodeRun,
+        node: WorkflowNode | None,
+        checkpoint: ExecutionCheckpoint,
+        error_code: str | None,
+    ) -> None:
+        """为审批型 fallback 创建审批：展示错误码、能力集合、已提交副作用与上下文摘要。"""
+
+        snapshot = {
+            "runId": run.id,
+            "nodeId": failed_node_run.node_id,
+            "title": f"恢复审批：{node.display_name if node else failed_node_run.node_id}",
+            "description": f"节点失败（{error_code}），是否批准交给受限恢复 Agent？",
+            "payload": {
+                "checkpointId": checkpoint.id,
+                "errorCode": error_code,
+                "allowedCapabilities": checkpoint.snapshot_json.get("fallbackConfig", {}).get(
+                    "allowedCapabilities", []
+                ),
+                "committedSideEffects": checkpoint.snapshot_json.get("committedSideEffects", []),
+            },
+            "effect": "recovery.approval",
+            "checkpointId": checkpoint.id,
+        }
+        session.add(
+            Approval(
+                id=str(uuid4()),
+                run_id=run.id,
+                node_run_id=failed_node_run.id,
+                node_id=failed_node_run.node_id,
+                snapshot_digest=digest_json(snapshot),
+                snapshot_json=snapshot,
+                status="pending",
+            )
+        )
+        await session.flush()
 
 
 @dataclass(frozen=True)
@@ -768,6 +912,15 @@ class WorkerService:
                 result = self._interrupted_result(claimed.node, "TIMEOUT", "节点执行超时")
         except (ExecutionCancelledError, asyncio.CancelledError):
             result = self._interrupted_result(claimed.node, "CANCELLED", "节点执行已取消")
+        except Exception:  # noqa: BLE001
+            # Executor 抛出的非约定异常（Pydantic/KeyError 等）不得击穿 Worker 循环：
+            # 转换为结构化 EXECUTOR_INTERNAL_ERROR，记录 traceback，走标准失败/重试状态机。
+            logger.exception(
+                "executor raised for node %s (run %s)", claimed.node_id, claimed.run_id
+            )
+            result = self._interrupted_result(
+                claimed.node, "EXECUTOR_INTERNAL_ERROR", "节点执行器内部错误"
+            )
         finally:
             cancellation_waiter.cancel()
             stop_heartbeat.set()

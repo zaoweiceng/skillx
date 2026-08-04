@@ -169,8 +169,11 @@ describe('RunDetailPage 可观测性与审批', () => {
     fireEvent.click(screen.getByRole('button', { name: /提出补丁草稿/ }))
     await waitFor(() =>
       expect(applyWorkflowPatch).toHaveBeenCalledWith('v1', {
-        nodePatches: [{ nodeId: 'work', changes: { timeoutSeconds: 60 } }],
-        reason: '对失败节点 work 提出受控超时补丁',
+        sourceRunId: baseRun.id,
+        patch: {
+          nodePatches: [{ nodeId: 'work', changes: { timeoutSeconds: 60 } }],
+          reason: '对失败节点 work 提出受控超时补丁',
+        },
       }),
     )
     await waitFor(() => expect(screen.getByText(/打开草稿审核 diff 并发布/)).toBeInTheDocument())

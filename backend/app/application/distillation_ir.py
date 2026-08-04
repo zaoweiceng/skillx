@@ -102,16 +102,61 @@ class TrajectoryAnalysisError(ValueError):
 def _classify_bindings(
     arguments: dict[str, Any],
     message: str,
+    explicit: dict[str, Any] | None,
+    known_actions: set[str],
 ) -> list[InputBinding]:
-    """根据参数值与用户输入的关系推断 provenance。
+    """根据显式 provenance 声明推断每个参数的来源；缺声明时回退到用户输入/常量。
 
-    - 值等于用户输入 → user_input（绑定 ${input.message}）；
-    - 其余 → constant（保留原值）。
-    prior_output/artifact 由带 provenance 的事件显式声明时才标注（此处保守处理）。
+    显式 ``argumentBindings`` 为每个字段声明：
+    - ``{"source": "user_input", "inputKey": "message"}``
+    - ``{"source": "prior_output", "fromAction": "call-1", "fromPath": "content"}``
+    - ``{"source": "artifact", "fromAction": "call-1", "fromPath": "uri"}``
+    - ``{"source": "constant", "value": ...}``
+    没有显式声明时才回退：值等于用户输入 → user_input；其余 → constant。绝不把未声明的
+    prior_output 猜成 constant 而丢失数据依赖——若显式声明了 prior_output 但引用未知
+    action，则抛 :class:`TrajectoryAnalysisError`（分析失败而非猜测）。
     """
 
+    explicit = explicit or {}
     bindings: list[InputBinding] = []
     for field, value in arguments.items():
+        declared = explicit.get(field)
+        if isinstance(declared, dict):
+            source = declared.get("source")
+            if source == "user_input":
+                bindings.append(
+                    InputBinding(
+                        field=field,
+                        source="user_input",
+                        input_key=declared.get("inputKey", "message"),
+                    )
+                )
+                continue
+            if source in ("prior_output", "artifact"):
+                from_action = declared.get("fromAction")
+                if not from_action or from_action not in known_actions:
+                    raise TrajectoryAnalysisError(
+                        f"参数 {field} 声明 {source} 但引用未知动作 {from_action}"
+                    )
+                bindings.append(
+                    InputBinding(
+                        field=field,
+                        source=source,
+                        from_action=from_action,
+                        from_path=declared.get("fromPath", "output"),
+                    )
+                )
+                continue
+            if source == "constant":
+                bindings.append(
+                    InputBinding(
+                        field=field,
+                        source="constant",
+                        constant=declared.get("value", value),
+                    )
+                )
+                continue
+        # 无显式声明：回退到保守推断。
         if message and value == message:
             bindings.append(
                 InputBinding(field=field, source="user_input", input_key="message")
@@ -130,12 +175,16 @@ def build_action_ir(trajectory: dict[str, Any]) -> list[NormalizedAction]:
 
     message = str(trajectory.get("prompt", ""))
     raw_actions = trajectory.get("actions") or []
-    ir: list[NormalizedAction] = []
-    previous_id: str | None = None
+    # 先收集所有 callId：显式 prior_output 绑定必须引用序列中已出现的动作。
+    known_actions: set[str] = set()
     for index, raw in enumerate(raw_actions):
         call_id = raw.get("callId")
         if not call_id:
             raise TrajectoryAnalysisError(f"动作 {index} 缺少 callId，无法关联")
+    ir: list[NormalizedAction] = []
+    previous_id: str | None = None
+    for raw in raw_actions:
+        call_id = raw["callId"]
         kind = raw.get("kind") or "tool"
         capability_name = raw.get("capability") or raw.get("tool")
         if not capability_name:
@@ -157,20 +206,29 @@ def build_action_ir(trajectory: dict[str, Any]) -> list[NormalizedAction]:
             "resultKeys", sorted(result) if isinstance(result, dict) else None
         )
         observations.setdefault("resultType", type(result).__name__)
+        bindings = _classify_bindings(
+            arguments, message, raw.get("argumentBindings"), known_actions
+        )
+        # 真实数据依赖：从 prior_output/artifact 绑定推导 dependsOn，而非强制单链。
+        data_deps = sorted(
+            {b.from_action for b in bindings if b.from_action}
+        )
+        depends_on = data_deps or ([previous_id] if previous_id else [])
         ir.append(
             NormalizedAction(
                 actionId=call_id,
                 kind=normalized_kind,
                 capabilityRef=capability_ref,
-                inputBindings=_classify_bindings(arguments, message),
+                inputBindings=bindings,
                 outputSchema=raw.get("outputSchema"),
                 effect=raw.get("effect", "unknown"),
                 idempotent=bool(raw.get("idempotent", False)),
                 replayability=raw.get("replayability", "unsupported"),
                 observations=observations,
-                dependsOn=[previous_id] if previous_id else [],
+                dependsOn=depends_on,
             )
         )
+        known_actions.add(call_id)
         previous_id = call_id
     return ir
 
