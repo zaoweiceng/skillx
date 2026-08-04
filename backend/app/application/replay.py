@@ -58,7 +58,9 @@ async def run_isolated_replay(
     registry = ExecutorRegistry()
     outputs: dict[str, Any] = {}
     side_effects_simulated: list[str] = []
+    statuses: dict[str, str] = {}
     failed_status = "not_reached"
+    failed_code: str | None = None
     passed = False
 
     input_node = next(
@@ -70,6 +72,13 @@ async def run_isolated_replay(
     for node_id in order:
         node = nodes[node_id]
         if node.type in (NodeType.INPUT,):
+            statuses[node_id] = "succeeded"
+            continue
+        if any(
+            statuses.get(dep) not in {"succeeded", "skipped"}
+            for dep in compiled.dependencies[node_id]
+        ):
+            statuses[node_id] = "skipped"
             continue
         try:
             resolved = resolve_mapping(node.input, safe_inputs, outputs)
@@ -77,28 +86,111 @@ async def run_isolated_replay(
             if node_id == fail_node_id:
                 failed_status = "failed"
             outputs[node_id] = {"error": {"code": "INVALID_INPUT", "message": str(exc)}}
+            statuses[node_id] = "failed"
             continue
-        # 非幂等副作用节点：replay 中不执行真实副作用，用模拟成功输出代替。
-        if node.side_effect and not node.idempotent:
+        # 所有外部写一律模拟，不因“幂等”而触发真实副作用。
+        if node.side_effect:
             side_effects_simulated.append(node_id)
             outputs[node_id] = {"simulated": True, **resolved}
+            statuses[node_id] = "succeeded"
             if node_id == fail_node_id:
                 failed_status = "succeeded"
             continue
-        result = await _execute_node(registry, replay_run_id, node, resolved, safe_inputs)
+        external_types = {
+            NodeType.MCP,
+            NodeType.SKILLX,
+            NodeType.BROWSER,
+            NodeType.LLM,
+            NodeType.AGENT,
+        }
+        if node.type in external_types:
+            fixtures = safe_inputs.get("_replayFixtures", {})
+            fixture = fixtures.get(node_id) if isinstance(fixtures, dict) else None
+            if not isinstance(fixture, dict):
+                from app.domain.workflow import ExecutionError, NodeResult
+
+                result = NodeResult(
+                    status="failed",
+                    error=ExecutionError(
+                        code="REPLAY_UNSUPPORTED",
+                        message=f"外部读取节点 {node_id} 缺少捕获 fixture",
+                    ),
+                )
+            else:
+                from app.domain.workflow import NodeResult
+
+                result = NodeResult(status="succeeded", output=fixture)
+        else:
+            result = await _execute_node(
+                registry, replay_run_id, node, resolved, safe_inputs
+            )
         error_output = result.error.model_dump() if result.error else {}
         outputs[node_id] = result.output or {"error": error_output}
+        statuses[node_id] = result.status
         if node_id == fail_node_id:
             failed_status = result.status
-    # 原失败点在 replay 中不再失败即视为修复通过。
-    passed = failed_status in ("succeeded",)
+            failed_code = result.error.code if result.error else None
+    output_node = next(
+        (node for node in definition.spec.nodes if node.type == NodeType.OUTPUT), None
+    )
+    final_status = statuses.get(output_node.id, "not_reached") if output_node else "not_reached"
+    passed = failed_status == "succeeded" and final_status == "succeeded"
     return {
         "replayRunId": replay_run_id,
         "passed": passed,
         "failedNodeStatus": failed_status,
+        "failedNodeErrorCode": failed_code,
+        "finalOutputStatus": final_status,
         "outputs": outputs,
         "sideEffectsSimulated": side_effects_simulated,
         "diagnostics": [item.model_dump() for item in compiled.diagnostics],
+    }
+
+
+async def run_replay_proof(
+    base_definition: dict[str, Any],
+    patched_definition: dict[str, Any],
+    *,
+    safe_inputs: dict[str, Any],
+    fail_node_id: str,
+    expected_error_code: str,
+) -> dict[str, Any]:
+    baseline = await run_isolated_replay(
+        base_definition,
+        safe_inputs=safe_inputs,
+        fail_node_id=fail_node_id,
+    )
+    reproduced = (
+        baseline["failedNodeStatus"] == "failed"
+        and baseline["failedNodeErrorCode"] == expected_error_code
+    )
+    if not reproduced:
+        return {
+            "passed": False,
+            "baselineReproduced": False,
+            "baseline": baseline,
+            "patched": None,
+            "diff": {
+                "expectedErrorCode": expected_error_code,
+                "actualErrorCode": baseline["failedNodeErrorCode"],
+            },
+        }
+    patched = await run_isolated_replay(
+        patched_definition,
+        safe_inputs=safe_inputs,
+        fail_node_id=fail_node_id,
+    )
+    return {
+        "passed": patched["passed"],
+        "baselineReproduced": True,
+        "baseline": baseline,
+        "patched": patched,
+        "diff": {
+            "failedNode": fail_node_id,
+            "before": baseline["failedNodeStatus"],
+            "after": patched["failedNodeStatus"],
+            "finalOutputStatus": patched["finalOutputStatus"],
+        },
     }
 
 

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
 from app.application.agent_run import (
     AgentRunConfig,
     enqueue_agent_run,
@@ -44,13 +45,30 @@ from app.application.mcp import (
     validate_mcp_nodes,
 )
 from app.application.orchestrator import Orchestrator, append_event
-from app.application.replay import run_isolated_replay
+from app.application.plans import (
+    PlanCompileError,
+    WorkflowSelection,
+    create_plan_snapshot,
+)
+from app.application.replay import run_replay_proof
 from app.application.retries import auto_retry_allowed
 from app.application.secrets import (
     SecretResolutionError,
     register_secret_reference,
 )
 from app.application.security import redact
+from app.application.workflow_catalog import (
+    CatalogError,
+    build_manifest,
+    create_private_fragment_snapshot,
+    describe_fragment,
+    describe_workflow,
+    disclose_refs,
+    enforce_session_limit,
+    require_disclosed_ref,
+    require_plan_refs_disclosed,
+    search_manifests,
+)
 from app.application.workflow_patch import (
     WorkflowPatch,
     WorkflowPatchViolation,
@@ -73,10 +91,14 @@ from app.infrastructure.database import (
     MCPToolSnapshot,
     Message,
     NodeRun,
+    PlanSnapshot,
+    ReplayEvidence,
     Run,
     RunEvent,
     SecretReference,
     Workflow,
+    WorkflowCapabilityManifest,
+    WorkflowFragmentManifest,
     WorkflowVersion,
     get_session,
     utcnow,
@@ -113,6 +135,11 @@ class RunCreate(BaseModel):
 
 class Decision(BaseModel):
     snapshot_digest: str = Field(alias="snapshotDigest")
+
+
+class RecoveryAnswer(BaseModel):
+    snapshot_digest: str = Field(alias="snapshotDigest")
+    answer: Any
 
 
 class CapabilityCreate(BaseModel):
@@ -177,6 +204,41 @@ class AgentRunCreate(BaseModel):
     max_steps: int | None = Field(default=None, alias="maxSteps", ge=1, le=32)
 
 
+class WorkflowSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=1000)
+    constraints: dict[str, Any] = Field(default_factory=dict)
+    limit: int = Field(default=5, ge=1, le=8)
+    session_id: str = Field(default="local", alias="sessionId", min_length=1)
+
+
+class WorkflowDescribeRequest(BaseModel):
+    ref: str = Field(min_length=1, max_length=300)
+    session_id: str = Field(default="local", alias="sessionId", min_length=1)
+
+
+class WorkflowSliceRequest(BaseModel):
+    workflow_ref: str = Field(alias="workflowRef", min_length=1, max_length=300)
+    candidate_node_ids: list[str] = Field(alias="candidateNodeIds", min_length=1)
+    session_id: str = Field(default="local", alias="sessionId", min_length=1)
+
+
+class PlanCreate(BaseModel):
+    plan: dict[str, Any]
+    created_by_conversation_run_id: str | None = Field(
+        default=None, alias="createdByConversationRunId"
+    )
+    ttl_hours: int = Field(default=168, alias="ttlHours", ge=1, le=8760)
+    session_id: str = Field(default="local", alias="sessionId", min_length=1)
+
+
+class PlanRunCreate(BaseModel):
+    input: dict[str, Any]
+
+
+class PlanSolidifyRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
 def workflow_view(item: Workflow) -> dict[str, Any]:
     return {
         "id": item.id,
@@ -198,6 +260,7 @@ def run_view(
     payload = {
         "id": run.id,
         "workflowVersionId": run.workflow_version_id,
+        "planSnapshotId": run.plan_snapshot_id,
         "componentId": run.component_id,
         "status": run.status,
         "input": redact(run.input_json, input_schema),
@@ -413,6 +476,15 @@ async def publish_workflow(
         },
     )
     session.add(version)
+    await session.flush()
+    try:
+        manifest = await build_manifest(session, item, version)
+    except CatalogError as exc:
+        await session.rollback()
+        raise HTTPException(
+            422,
+            detail={"code": "CAPABILITY_MANIFEST_INVALID", "message": str(exc)},
+        ) from exc
     await session.commit()
     await session.refresh(version)
     return {
@@ -421,6 +493,8 @@ async def publish_workflow(
         "version": version.version,
         "digest": version.digest,
         "definition": version.definition_json,
+        "workflowRef": manifest.manifest_json["workflowRef"],
+        "manifestDigest": manifest.digest,
     }
 
 
@@ -498,12 +572,15 @@ async def apply_version_workflow_patch(
                 "message": "缺少可归因的失败观测；补丁必须由真实可复现失败驱动",
             },
         )
-    eligibility = observation_eligibility(observation)
-    if not eligibility["eligible"]:
+    if observation.workflow_version_id != version_id:
         raise HTTPException(
             422,
-            detail={"code": "PATCH_NOT_ELIGIBLE", "message": eligibility["reason"], **eligibility},
+            detail={
+                "code": "PATCH_SOURCE_MISMATCH",
+                "message": "失败观测与目标 WorkflowVersion 不一致",
+            },
         )
+    eligibility = observation_eligibility(observation)
 
     # 2) 应用受控补丁（扩权/敏感字段被 DSL 拒绝）。
     patch_body = body.get("patch", body)
@@ -522,19 +599,61 @@ async def apply_version_workflow_patch(
         ) from exc
 
     # 3) 真实 replay：用 source run 的安全输入在隔离环境跑到原失败点。
-    source_run = await session.get(Run, source_run_id) if source_run_id else None
-    safe_inputs = redact(source_run.input_json) if source_run else body.get("safeInputs", {})
-    replay = await run_isolated_replay(
-        patched, safe_inputs=safe_inputs or {}, fail_node_id=observation.node_id
+    if not source_run_id or source_run_id != observation.last_run_id:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "PATCH_SOURCE_MISMATCH",
+                "message": "必须使用 observation 绑定的 sourceRunId",
+            },
+        )
+    source_run = await session.get(Run, source_run_id)
+    if source_run is None or source_run.workflow_version_id != version_id:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "PATCH_SOURCE_MISMATCH",
+                "message": "source Run 与目标 WorkflowVersion 不一致",
+            },
+        )
+    replay = await run_replay_proof(
+        version.definition_json,
+        patched,
+        safe_inputs=redact(source_run.input_json) or {},
+        fail_node_id=observation.node_id,
+        expected_error_code=observation.error_code,
     )
+    observation.baseline_reproduced = replay["baselineReproduced"]
+    eligibility = observation_eligibility(observation)
+    evidence = ReplayEvidence(
+        id=str(uuid4()),
+        observation_id=observation.id,
+        baseline_snapshot_json=replay["baseline"],
+        patched_snapshot_json=replay["patched"] or {},
+        diff_json=replay["diff"],
+        passed=replay["passed"],
+    )
+    session.add(evidence)
+    if not eligibility["eligible"]:
+        await session.commit()
+        raise HTTPException(
+            422,
+            detail={
+                "code": "PATCH_NOT_ELIGIBLE",
+                "message": eligibility["reason"],
+                **eligibility,
+                "replayEvidenceId": evidence.id,
+            },
+        )
     if not replay["passed"]:
+        await session.commit()
         raise HTTPException(
             422,
             detail={
                 "code": "REPLAY_FAILED",
                 "message": (
                     "真实 replay 未通过（原失败点状态="
-                    f"{replay['failedNodeStatus']}），不生成草稿"
+                    f"{replay['baseline']['failedNodeStatus']}），不生成草稿"
                 ),
                 "replay": replay,
             },
@@ -562,10 +681,11 @@ async def apply_version_workflow_patch(
         "diagnostics": diagnostics,
         "eligibility": eligibility,
         "replay": {
-            "replayRunId": replay["replayRunId"],
+            "replayEvidenceId": evidence.id,
             "passed": replay["passed"],
-            "failedNodeStatus": replay["failedNodeStatus"],
-            "sideEffectsSimulated": replay["sideEffectsSimulated"],
+            "baselineReproduced": replay["baselineReproduced"],
+            "failedNodeStatus": replay["patched"]["failedNodeStatus"],
+            "sideEffectsSimulated": replay["patched"]["sideEffectsSimulated"],
         },
         "publishable": not any(item["level"] == "error" for item in diagnostics),
     }
@@ -586,6 +706,313 @@ async def list_components(session: AsyncSession = Depends(get_session)) -> list[
         }
         for item in rows
     ]
+
+
+@router.post("/workflow-tools/search")
+async def workflow_search(
+    body: WorkflowSearchRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """L0：有界 top-k 能力卡片，不返回完整 Schema 或 DAG。"""
+
+    try:
+        enforce_session_limit(body.session_id, "search")
+        items = await search_manifests(
+            session, body.query, constraints=body.constraints, limit=body.limit
+        )
+        disclose_refs(
+            body.session_id, [str(item["workflowRef"]) for item in items]
+        )
+    except CatalogError as exc:
+        raise HTTPException(
+            429, detail={"code": "WORKFLOW_TOOL_LIMIT", "message": str(exc)}
+        ) from exc
+    return {"level": "L0", "count": len(items), "items": items}
+
+
+@router.post("/workflow-tools/describe")
+async def workflow_describe(
+    body: WorkflowDescribeRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """L1：按 Registry 返回的精确 workflowRef 披露契约，不返回技术 DAG。"""
+
+    try:
+        enforce_session_limit(body.session_id, "describe")
+        require_disclosed_ref(body.session_id, body.ref)
+        result = await describe_workflow(session, body.ref)
+        disclose_refs(
+            body.session_id,
+            [
+                item["fragmentRef"]
+                for item in result.get("fragments", [])
+                if item.get("fragmentRef")
+            ],
+        )
+        return {"level": "L1", "workflow": result}
+    except CatalogError as exc:
+        raise HTTPException(
+            404,
+            detail={"code": "WORKFLOW_REF_NOT_FOUND", "message": str(exc)},
+        ) from exc
+
+
+@router.post("/workflow-tools/describe-fragment")
+async def workflow_describe_fragment(
+    body: WorkflowDescribeRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """L2：仅按已选择的精确 fragmentRef 披露边界与锁。"""
+
+    try:
+        enforce_session_limit(body.session_id, "describe")
+        require_disclosed_ref(body.session_id, body.ref)
+        return {"level": "L2", "fragment": await describe_fragment(session, body.ref)}
+    except CatalogError as exc:
+        raise HTTPException(
+            404,
+            detail={"code": "FRAGMENT_REF_NOT_FOUND", "message": str(exc)},
+        ) from exc
+
+
+@router.post("/workflow-tools/slice", status_code=201)
+async def workflow_slice(
+    body: WorkflowSliceRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    try:
+        enforce_session_limit(body.session_id, "slice")
+        require_disclosed_ref(body.session_id, body.workflow_ref)
+        snapshot = await create_private_fragment_snapshot(
+            session, body.workflow_ref, body.candidate_node_ids
+        )
+        disclose_refs(body.session_id, [snapshot.fragment_ref])
+    except CatalogError as exc:
+        raise HTTPException(
+            422, detail={"code": "FRAGMENT_SLICE_REJECTED", "message": str(exc)}
+        ) from exc
+    await session.commit()
+    return {
+        "level": "L2",
+        "fragment": {**snapshot.manifest_json, "manifestDigest": snapshot.digest},
+    }
+
+
+@router.post("/workflow-tools/validate-selection")
+async def validate_workflow_selection(
+    body: WorkflowSelection,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """校验 Agent 的结构化选择；ref 必须能由已发布 Registry 精确解析。"""
+
+    try:
+        for ref in body.refs:
+            require_disclosed_ref(body.session_id, ref)
+            if ref.startswith("workflow:"):
+                await describe_workflow(session, ref)
+            elif ref.startswith(("fragment:", "fragment-snapshot:")):
+                await describe_fragment(session, ref)
+            else:
+                raise CatalogError("选择包含 Registry 未返回的 ref 类型")
+    except CatalogError as exc:
+        raise HTTPException(
+            422, detail={"code": "WORKFLOW_SELECTION_REJECTED", "message": str(exc)}
+        ) from exc
+    return {"valid": True, "selection": body.model_dump(by_alias=True)}
+
+
+def _plan_view(item: PlanSnapshot) -> dict[str, Any]:
+    definition = item.definition_json.get("spec", {})
+    nodes = definition.get("nodes", [])
+    return {
+        "id": item.id,
+        "digest": item.digest,
+        "status": item.status,
+        "expiresAt": item.expires_at,
+        "sourceRefs": item.source_refs_json,
+        "locks": item.locks_json,
+        "planSignature": item.plan_signature,
+        "preview": {
+            "inputSchema": definition.get("inputSchema"),
+            "outputSchema": definition.get("outputSchema"),
+            "steps": [
+                {
+                    "id": node["id"],
+                    "name": node.get("displayName"),
+                    "type": node["type"],
+                    "sideEffect": bool(node.get("sideEffect")),
+                }
+                for node in nodes
+                if node["type"] not in {"input", "output"}
+                and "__" not in node["id"]
+            ],
+            "hasSideEffects": any(node.get("sideEffect") for node in nodes),
+            "callsAgent": any(node["type"] in {"agent", "llm"} for node in nodes),
+        },
+    }
+
+
+@router.post("/plans", status_code=201)
+async def create_plan(
+    body: PlanCreate,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    if body.created_by_conversation_run_id and await session.get(
+        ConversationRun, body.created_by_conversation_run_id
+    ) is None:
+        raise HTTPException(404, "ConversationRun 不存在")
+    try:
+        enforce_session_limit(body.session_id, "plan")
+        require_plan_refs_disclosed(body.session_id, body.plan)
+        snapshot = await create_plan_snapshot(
+            session,
+            body.plan,
+            created_by_conversation_run_id=body.created_by_conversation_run_id,
+            ttl_hours=body.ttl_hours,
+        )
+    except (PlanCompileError, CatalogError, WorkflowValidationError) as exc:
+        await session.rollback()
+        raise HTTPException(
+            422, detail={"code": "PLAN_COMPILATION_FAILED", "message": str(exc)}
+        ) from exc
+    await session.commit()
+    return _plan_view(snapshot)
+
+
+@router.get("/plans/{plan_id}")
+async def get_plan(
+    plan_id: str, session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    snapshot = await session.get(PlanSnapshot, plan_id)
+    if snapshot is None:
+        raise HTTPException(404, "PlanSnapshot 不存在")
+    return _plan_view(snapshot)
+
+
+@router.post("/plans/{plan_id}/runs", status_code=202)
+async def create_plan_run(
+    plan_id: str,
+    body: PlanRunCreate,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    snapshot = await session.get(PlanSnapshot, plan_id)
+    if snapshot is None:
+        raise HTTPException(404, "PlanSnapshot 不存在")
+    try:
+        run = await orchestrator.create_plan_run(session, snapshot, body.input)
+    except (ValueError, CatalogError) as exc:
+        raise HTTPException(422, detail={"code": "INVALID_PLAN_RUN", "message": str(exc)}) from exc
+    await session.commit()
+    return run_view(run)
+
+
+@router.get("/plan-suggestions")
+async def list_plan_suggestions(
+    threshold: int = Query(default=3, ge=2, le=100),
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    rows = (await session.scalars(select(PlanSnapshot))).all()
+    suggestions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for snapshot in rows:
+        if snapshot.plan_signature in seen:
+            continue
+        matching = [
+            item for item in rows if item.plan_signature == snapshot.plan_signature
+        ]
+        plan_ids = [item.id for item in matching]
+        plan_runs = (
+            await session.scalars(
+                select(Run).where(Run.plan_snapshot_id.in_(plan_ids))
+            )
+        ).all()
+        terminal = [
+            run
+            for run in plan_runs
+            if run.status in {"succeeded", "failed", "cancelled"}
+        ]
+        success_count = sum(run.status == "succeeded" for run in terminal)
+        failure_count = sum(run.status != "succeeded" for run in terminal)
+        failure_rate = (
+            round(failure_count / len(terminal), 3) if terminal else None
+        )
+        input_variants = len(
+            {
+                digest_json(redact(run.input_json))
+                for run in terminal
+                if run.status == "succeeded"
+            }
+        )
+        run_ids = [run.id for run in terminal]
+        metric_events = (
+            (
+                await session.scalars(
+                    select(RunEvent).where(
+                        RunEvent.run_id.in_(run_ids),
+                        RunEvent.type == "node.completed",
+                    )
+                )
+            ).all()
+            if run_ids
+            else []
+        )
+        total_tokens = sum(
+            int((event.payload_json.get("metrics") or {}).get("totalTokens", 0))
+            for event in metric_events
+        )
+        average_tokens = (
+            round(total_tokens / success_count, 2) if success_count else None
+        )
+        manual_adjustments = max(0, len(matching) - 1)
+        if success_count >= threshold and failure_count == 0 and input_variants >= 2:
+            suggestions.append(
+                {
+                    "planSignature": snapshot.plan_signature,
+                    "successCount": success_count,
+                    "failureRate": failure_rate,
+                    "inputVariantCount": input_variants,
+                    "manualAdjustmentCount": manual_adjustments,
+                    "averageTotalTokens": average_tokens,
+                    "planSnapshotId": snapshot.id,
+                    "action": "suggest_draft",
+                }
+            )
+            seen.add(snapshot.plan_signature)
+    return suggestions
+
+
+@router.post("/plans/{plan_id}/solidify", status_code=201)
+async def solidify_plan(
+    plan_id: str,
+    body: PlanSolidifyRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    snapshot = await session.get(PlanSnapshot, plan_id)
+    if snapshot is None:
+        raise HTTPException(404, "PlanSnapshot 不存在")
+    definition = {
+        **snapshot.definition_json,
+        "metadata": {
+            **snapshot.definition_json.get("metadata", {}),
+            "name": body.name,
+            "sourcePlanSnapshotId": snapshot.id,
+            "sourceRefs": snapshot.source_refs_json,
+        },
+    }
+    workflow = Workflow(
+        id=str(uuid4()),
+        name=body.name,
+        draft_revision=1,
+        draft_json=definition,
+    )
+    session.add(workflow)
+    await session.commit()
+    return {
+        "workflowId": workflow.id,
+        "draftRevision": workflow.draft_revision,
+        "published": False,
+        "sourcePlanSnapshotId": snapshot.id,
+    }
 
 
 @router.post("/components", status_code=201)
@@ -650,6 +1077,27 @@ async def get_component(
         if node["type"] in {"approval", "browser"} or node.get("sideEffect")
     ]
     validation = version.validation_json if version else {}
+    manifest = (
+        await session.scalar(
+            select(WorkflowCapabilityManifest).where(
+                WorkflowCapabilityManifest.workflow_version_id == version.id
+            )
+        )
+        if version
+        else None
+    )
+    fragments = (
+        (
+            await session.scalars(
+                select(WorkflowFragmentManifest).where(
+                    WorkflowFragmentManifest.workflow_version_id == version.id,
+                    WorkflowFragmentManifest.status == "published",
+                )
+            )
+        ).all()
+        if version
+        else []
+    )
     # 最近成功率（最多取该组件最近 20 次运行）。
     recent = (
         await session.scalars(
@@ -670,6 +1118,21 @@ async def get_component(
         "defaultVersionId": item.default_version_id,
         "visibility": item.visibility,
         "executionClass": item.execution_class,
+        "capabilityManifest": (
+            {
+                **manifest.manifest_json,
+                "manifestDigest": manifest.digest,
+                "fragments": [
+                    {
+                        **fragment.manifest_json,
+                        "manifestDigest": fragment.digest,
+                    }
+                    for fragment in fragments
+                ],
+            }
+            if manifest
+            else None
+        ),
         "definition": version.definition_json if version else None,
         "businessView": {
             "sideEffectNodes": side_effect_nodes,
@@ -744,8 +1207,22 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             .order_by(ExecutionCheckpoint.created_at)
         )
     ).all()
-    version = await session.get(WorkflowVersion, run.workflow_version_id)
-    definition = version.definition_json.get("spec", {}) if version else {}
+    version = (
+        await session.get(WorkflowVersion, run.workflow_version_id)
+        if run.workflow_version_id
+        else None
+    )
+    plan_snapshot = (
+        await session.get(PlanSnapshot, run.plan_snapshot_id)
+        if run.plan_snapshot_id
+        else None
+    )
+    source_definition = (
+        version.definition_json if version else plan_snapshot.definition_json
+        if plan_snapshot
+        else {}
+    )
+    definition = source_definition.get("spec", {})
     result = run_view(
         run,
         list(nodes),
@@ -794,10 +1271,18 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
     for node in result.get("nodes", []):
         node["metrics"] = node_metrics.get(node["nodeId"], {})
     # 依赖版本：暴露 WorkflowVersion 锁定的 Capability/MCP digest 摘要。
-    validation = version.validation_json if version else {}
+    validation = (
+        version.validation_json
+        if version
+        else {"capabilityLocks": plan_snapshot.locks_json}
+        if plan_snapshot
+        else {}
+    )
     result["dependencyVersions"] = {
         "workflowVersionId": run.workflow_version_id,
         "workflowDigest": version.digest if version else None,
+        "planSnapshotId": run.plan_snapshot_id,
+        "planDigest": plan_snapshot.digest if plan_snapshot else None,
         "executionClass": validation.get("executionClass"),
         "capabilityLocks": validation.get("capabilityLocks", []),
         "mcpLocks": validation.get("mcpLocks", []),
@@ -940,6 +1425,54 @@ async def approve(
     await orchestrator.advance_run(session, approval.run_id)
     await session.commit()
     return {"id": approval.id, "status": approval.status}
+
+
+@router.post("/approvals/{approval_id}/answer")
+async def answer_recovery_question(
+    approval_id: str,
+    body: RecoveryAnswer,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    approval = await session.get(Approval, approval_id)
+    if approval is None:
+        raise HTTPException(404, "审批不存在")
+    if (
+        approval.status != "pending"
+        or approval.snapshot_json.get("effect") != "recovery.question"
+    ):
+        raise HTTPException(409, "恢复问题不可回答或已处理")
+    if approval.snapshot_digest != body.snapshot_digest:
+        raise HTTPException(409, "恢复问题快照已变化")
+    checkpoint = await session.get(
+        ExecutionCheckpoint, approval.snapshot_json.get("checkpointId")
+    )
+    run = await session.get(Run, approval.run_id)
+    if checkpoint is None or run is None or checkpoint.status != "awaiting_user":
+        raise HTTPException(409, "恢复检查点不可继续")
+    checkpoint.snapshot_json = {
+        **checkpoint.snapshot_json,
+        "userAnswer": redact(body.answer),
+    }
+    checkpoint.digest = digest_json(checkpoint.snapshot_json)
+    checkpoint.status = "pending"
+    checkpoint.decision_json = {
+        **(checkpoint.decision_json or {}),
+        "userAnswer": redact(body.answer),
+    }
+    checkpoint.lease_owner = None
+    checkpoint.lease_expires_at = None
+    run.status = "recovering"
+    approval.status = "approved"
+    approval.decided_by = "local-user"
+    approval.decided_at = utcnow()
+    await append_event(
+        session,
+        run.id,
+        "recovery.user_answered",
+        {"checkpointId": checkpoint.id, "approvalId": approval.id},
+    )
+    await session.commit()
+    return {"id": approval.id, "status": approval.status, "checkpointId": checkpoint.id}
 
 
 @router.post("/approvals/{approval_id}/reject")
@@ -1415,10 +1948,81 @@ async def create_message(
             session, component_id, body.content, body.inputs
         )
     else:
-        candidate = await match_component(session, body.content)
-        if candidate is not None:
-            assistant_content = candidate_message(candidate)
+        selection_session_id = f"conversation:{conversation.id}"
+        enforce_session_limit(selection_session_id, "search")
+        workflow_cards = await search_manifests(session, body.content, limit=5)
+        disclose_refs(
+            selection_session_id,
+            [str(card["workflowRef"]) for card in workflow_cards],
+        )
+        if workflow_cards:
+            selection = await _select_workflow_candidate(
+                body.content, workflow_cards, selection_session_id
+            )
+            selected_ref = (
+                selection.refs[0]
+                if selection.action == "run_full" and selection.refs
+                else workflow_cards[0]["workflowRef"]
+            )
+            if selected_ref not in {
+                str(card["workflowRef"]) for card in workflow_cards
+            }:
+                raise HTTPException(
+                    422,
+                    detail={
+                        "code": "WORKFLOW_SELECTION_REJECTED",
+                        "message": "TraeX 选择了本次 L0 未披露的 ref",
+                    },
+                )
+            top = next(
+                card for card in workflow_cards if card["workflowRef"] == selected_ref
+            )
+            manifest = await describe_workflow(session, top["workflowRef"])
+            component = await session.scalar(
+                select(Component).where(
+                    Component.default_version_id
+                    == manifest["versionLock"]["versionId"]
+                )
+            )
+            if component is not None:
+                version = await session.get(
+                    WorkflowVersion, component.default_version_id
+                )
+                spec = version.definition_json["spec"]
+                candidate = ComponentCandidate(
+                    component_id=component.id,
+                    component_name=component.name,
+                    workflow_version_id=version.id,
+                    input_schema=spec["inputSchema"],
+                    ui_schema=spec.get("uiSchema", {}),
+                    execution_class=component.execution_class,
+                    confidence=top["matchReason"]["score"],
+                    reason=selection.reason,
+                )
+                assistant_content = {
+                    **candidate_message(candidate),
+                    "workflowRef": top["workflowRef"],
+                    "manifestDigest": top["manifestDigest"],
+                    "disclosureLevel": "L0",
+                    "selectionSource": (
+                        "traex" if get_settings().traex_command else "ui_fallback"
+                    ),
+                    "workflowCandidates": workflow_cards,
+                }
+            else:
+                assistant_content = {
+                    "type": "workflow_candidates",
+                    "state": "workflow_candidates",
+                    "level": "L0",
+                    "items": workflow_cards,
+                    "text": "已返回有界 Workflow 候选；选择后再按需读取契约。",
+                }
         else:
+            # 无发布 Manifest 时仅作为 UI 降级推荐，不代表 TraeX 已作语义选择。
+            candidate = await match_component(session, body.content)
+        if not workflow_cards and candidate is not None:
+            assistant_content = candidate_message(candidate)
+        elif not workflow_cards:
             assistant_content, conversation_run = await _general_agent_message(
                 conversation, body.content
             )
@@ -1440,6 +2044,53 @@ async def create_message(
         "userMessageId": user_message.id,
         "assistant": assistant_message.content_json,
     }
+
+
+async def _select_workflow_candidate(
+    user_text: str,
+    cards: list[dict[str, Any]],
+    session_id: str,
+) -> WorkflowSelection:
+    if not get_settings().traex_command:
+        return WorkflowSelection(
+            action="run_full",
+            reason="无 TraeX Runtime，按 Registry 排序提供 UI 降级候选",
+            refs=[str(cards[0]["workflowRef"])],
+            sessionId=session_id,
+        )
+    request = AgentHostRequest(
+        run_id=f"workflow-selection-{uuid4()}",
+        prompt=(
+            "你负责从有界 L0 Workflow 卡片中做语义选择。不得选择列表外 ref，"
+            "不得假设未披露的 Schema/DAG。输出 WorkflowSelection；信息不足时 ask_user，"
+            "无合适候选时 continue_agent。\n"
+            f"user={body_text(user_text)}\n"
+            f"candidates={cards}"
+        ),
+        output_schema=WorkflowSelection.model_json_schema(by_alias=True),
+        working_directory=get_settings().artifact_root / "workflow-selections",
+        requested_capabilities=(),
+        max_steps=1,
+        max_total_tokens=8000,
+        max_duration_seconds=60,
+    )
+    try:
+        result = await AgentHost().execute(request)
+        selection = WorkflowSelection.model_validate(
+            {**result.output, "sessionId": session_id}
+        )
+    except (AgentHostError, ValueError) as exc:
+        raise HTTPException(
+            502,
+            detail={"code": "WORKFLOW_SELECTION_FAILED", "message": str(exc)},
+        ) from exc
+    return selection
+
+
+def body_text(value: str) -> str:
+    """限制进入选择 prompt 的用户文本长度。"""
+
+    return value[:2000]
 
 
 async def _bound_component_message(

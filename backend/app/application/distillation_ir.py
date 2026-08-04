@@ -105,16 +105,15 @@ def _classify_bindings(
     explicit: dict[str, Any] | None,
     known_actions: set[str],
 ) -> list[InputBinding]:
-    """根据显式 provenance 声明推断每个参数的来源；缺声明时回退到用户输入/常量。
+    """根据显式 provenance 声明推断每个参数的来源。
 
     显式 ``argumentBindings`` 为每个字段声明：
     - ``{"source": "user_input", "inputKey": "message"}``
     - ``{"source": "prior_output", "fromAction": "call-1", "fromPath": "content"}``
     - ``{"source": "artifact", "fromAction": "call-1", "fromPath": "uri"}``
     - ``{"source": "constant", "value": ...}``
-    没有显式声明时才回退：值等于用户输入 → user_input；其余 → constant。绝不把未声明的
-    prior_output 猜成 constant 而丢失数据依赖——若显式声明了 prior_output 但引用未知
-    action，则抛 :class:`TrajectoryAnalysisError`（分析失败而非猜测）。
+    没有显式声明时只允许证明“值等于用户输入”；其它动态值标为 unknown，禁止把潜在
+    prior_output 猜成 constant 并生成可发布图。真正的常量必须由 Runtime 显式声明。
     """
 
     explicit = explicit or {}
@@ -162,7 +161,7 @@ def _classify_bindings(
                 InputBinding(field=field, source="user_input", input_key="message")
             )
         else:
-            bindings.append(InputBinding(field=field, source="constant", constant=value))
+            bindings.append(InputBinding(field=field, source="unknown"))
     return bindings
 
 

@@ -239,6 +239,37 @@ export default function ChatPage() {
     )
   }
 
+  function renderWorkflowCandidates(message: Message) {
+    return (
+      <div className="candidate-card">
+        <div className="candidate-meta">
+          <strong>Workflow 候选</strong>
+          <span className="effect-label">已加载 {message.content.level ?? 'L0'}</span>
+        </div>
+        <div className="node-table">
+          {(message.content.items ?? []).map((item) => (
+            <div className="node-row" key={item.workflowRef}>
+              <div>
+                <strong>{item.name}</strong>
+                <small>{item.summary}</small>
+                <div className="current-mapping">
+                  <span className="metric-chip">
+                    匹配 {(item.matchReason.score * 100).toFixed(0)}%
+                  </span>
+                  <span className="metric-chip">必填 {item.inputSynopsis.required.join(', ') || '无'}</span>
+                  <span className="metric-chip">副作用 {item.sideEffects}</span>
+                  <span className="metric-chip">LLM {item.estimatedCost.llmCalls}</span>
+                  {item.approvalRequired && <span className="effect-label">需要审批</span>}
+                </div>
+                <code className="digest-line">{item.workflowRef}</code>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
   // Agent 运行动作：只有 succeeded 才展示“固化为组件”，其它状态显式提示不可固化。
   function renderAgentRunActions(conversationRunId: string) {
     const status = runStatuses[conversationRunId]
@@ -342,6 +373,8 @@ export default function ChatPage() {
                   <span className="error-code">{message.content.code}</span>
                 )}
                 {message.content.type === 'component_candidate' && renderCandidate(message)}
+                {message.content.type === 'workflow_candidates' &&
+                  renderWorkflowCandidates(message)}
                 {message.content.offerAgentRun && (
                   <button
                     className="button ghost"

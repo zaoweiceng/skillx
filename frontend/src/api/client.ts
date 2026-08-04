@@ -33,6 +33,22 @@ export type ComponentSummary = {
   defaultVersionId: string
   visibility: string
   executionClass: 'zero_llm' | 'hybrid' | 'agent'
+  capabilityManifest?: {
+    workflowRef: string
+    name: string
+    summary: string
+    useWhen: string[]
+    doNotUseWhen: string[]
+    tags: string[]
+    entrypoints: string[]
+    manifestDigest: string
+    fragments?: Array<{
+      fragmentRef: string
+      name: string
+      summary: string
+      manifestDigest: string
+    }>
+  } | null
   definition?: WorkflowDefinition
   businessView?: {
     sideEffectNodes: Array<{ nodeId: string; type: string; displayName?: string }>
@@ -78,7 +94,8 @@ export type Approval = {
 
 export type Run = {
   id: string
-  workflowVersionId: string
+  workflowVersionId: string | null
+  planSnapshotId?: string | null
   componentId: string | null
   status: string
   input: Record<string, unknown>
@@ -99,8 +116,10 @@ export type Run = {
     downloadUrl: string
   }>
   dependencyVersions?: {
-    workflowVersionId: string
+    workflowVersionId: string | null
     workflowDigest: string | null
+    planSnapshotId?: string | null
+    planDigest?: string | null
     executionClass?: string | null
     capabilityLocks?: unknown[]
     mcpLocks?: unknown[]
@@ -149,6 +168,28 @@ export type ChatMessageContent = {
   inputSchema?: Record<string, unknown>
   uiSchema?: Record<string, unknown>
   executionClass?: string
+  level?: string
+  items?: WorkflowCapabilityCard[]
+}
+
+export type WorkflowCapabilityCard = {
+  workflowRef: string
+  name: string
+  summary: string
+  tags: string[]
+  inputSynopsis: {
+    required: string[]
+    properties: Record<string, string>
+  }
+  outputSynopsis: {
+    properties: Record<string, string>
+  }
+  executionClass: string
+  sideEffects: string
+  approvalRequired: boolean
+  estimatedCost: { llmCalls: number }
+  manifestDigest: string
+  matchReason: { score: number; query: string }
 }
 
 export type ConversationRunEvent = {
@@ -196,6 +237,24 @@ export const api = {
     }),
   listRuns: () => request<Run[]>('/runs'),
   getRun: (id: string) => request<Run>(`/runs/${id}`),
+  searchWorkflows: (query: string, constraints: Record<string, unknown> = {}) =>
+    request<{ level: string; count: number; items: WorkflowCapabilityCard[] }>(
+      '/workflow-tools/search',
+      {
+        method: 'POST',
+        body: JSON.stringify({ query, constraints, limit: 8 }),
+      },
+    ),
+  describeWorkflow: (ref: string) =>
+    request<Record<string, unknown>>('/workflow-tools/describe', {
+      method: 'POST',
+      body: JSON.stringify({ ref }),
+    }),
+  describeFragment: (ref: string) =>
+    request<Record<string, unknown>>('/workflow-tools/describe-fragment', {
+      method: 'POST',
+      body: JSON.stringify({ ref }),
+    }),
   cancelRun: (id: string) => request<Run>(`/runs/${id}/cancel`, { method: 'POST' }),
   approve: (id: string, snapshotDigest: string) =>
     request<{ id: string; status: string }>(`/approvals/${id}/approve`, {

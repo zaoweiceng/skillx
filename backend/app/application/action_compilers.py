@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from app.application.distillation_ir import NormalizedAction
+from app.runtime.browser import BrowserReadContract
 
 # 005-C：可扩展的 Action Compiler Registry。
 #
@@ -149,15 +150,60 @@ class BrowserActionCompiler:
         cap_name = action.capability_ref.name if action.capability_ref else ""
         input_mapping = _input_mapping_from_bindings(action, ctx)
         action_kind = action.observations.get("action", "read")
+        extract = action.observations.get("extract")
+        extract_contract = (
+            {
+                "bodySelector": extract.get(
+                    "bodySelector", extract.get("content", "body")
+                ),
+                "fields": extract.get(
+                    "fields",
+                    {
+                        key: value
+                        for key, value in extract.items()
+                        if key not in {"bodySelector", "content", "fields"}
+                    },
+                ),
+            }
+            if isinstance(extract, dict)
+            else {}
+        )
+        contract = {
+            **contract,
+            **extract_contract,
+            **(
+                {"outputSchema": action.observations["outputSchema"]}
+                if isinstance(action.observations.get("outputSchema"), dict)
+                else {}
+            ),
+            **(
+                {"timeoutMs": action.observations["timeoutMs"]}
+                if action.observations.get("timeoutMs") is not None
+                else {}
+            ),
+        }
+        try:
+            contract = BrowserReadContract.model_validate(contract).model_dump(
+                by_alias=True, exclude_none=True
+            )
+        except Exception as exc:  # noqa: BLE001 - 编译诊断必须保留模型校验原因。
+            return CompileResult(
+                decision="rejected",
+                diagnostics=[
+                    {
+                        "level": "error",
+                        "code": "INVALID_BROWSER_READ_CONTRACT",
+                        "path": ctx.node_id,
+                        "message": str(exc),
+                    }
+                ],
+                reason="BrowserReadContract 不合法",
+            )
         config: dict[str, Any] = {
-            "runtime": action.observations.get("runtime", "contract"),
+            "runtime": action.observations.get("runtime", "playwright"),
             "pageContract": contract,
             "action": action_kind,
         }
-        # Read/Extract 契约：正文 selector 与结构化字段 selector，输出 Schema、可重试性。
-        for key in ("extract", "outputSchema", "navigation", "timeoutMs"):
-            if key in action.observations:
-                config[key] = action.observations[key]
         node = {
             "id": ctx.node_id,
             "type": "browser",
@@ -273,3 +319,12 @@ class ActionCompilerRegistry:
             # 未注册 kind（含 api/file 未注册为受控能力）：绝不丢弃，保留为 Agent 节点。
             return _agent_node(action, ctx, f"未注册的 action kind {action.kind}，保留 Agent")
         return compiler.compile(action, ctx)
+
+    def compile_as(
+        self, strategy: str, action: NormalizedAction, ctx: CompileContext
+    ) -> CompileResult:
+        """按 Proposal 的概率性策略编译，不暴露 registry 私有成员。"""
+
+        if strategy not in {"agent", "llm"}:
+            return self.compile(action, ctx)
+        return ModelCompiler(strategy).compile(action, ctx)

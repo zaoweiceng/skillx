@@ -81,7 +81,7 @@ class WorkflowCompiler:
 
         order = self._topological_order(nodes, incoming, outgoing, diagnostics)
         self._validate_node_types(definition, diagnostics)
-        self._validate_fallbacks(definition, nodes, diagnostics)
+        self._validate_fallbacks(definition, nodes, incoming, outgoing, diagnostics)
         if len(order) == len(nodes):
             self._validate_references(definition, nodes, incoming, diagnostics)
             self._validate_reachability(nodes, outgoing, diagnostics)
@@ -230,11 +230,26 @@ class WorkflowCompiler:
                             message="Agent 节点必须声明 maxSteps 和 allowedCapabilities",
                         )
                     )
+            if (
+                node.type == NodeType.BROWSER
+                and node.config.get("action") in {"read", "extract"}
+                and node.config.get("runtime") != "playwright"
+            ):
+                diagnostics.append(
+                    Diagnostic(
+                        level="error",
+                        code="BROWSER_TEST_ADAPTER_FORBIDDEN",
+                        path=f"spec.nodes.{index}.config.runtime",
+                        message="可发布 Browser Read/Extract 必须使用受控 playwright runtime",
+                    )
+                )
 
     @staticmethod
     def _validate_fallbacks(
         definition: WorkflowDefinition,
         nodes: dict[str, Any],
+        incoming: dict[str, list[str]],
+        outgoing: dict[str, list[str]],
         diagnostics: list[Diagnostic],
     ) -> None:
         """校验 fallback：target 存在且为 agent、只处理声明错误码、无 fallback 环、
@@ -265,6 +280,15 @@ class WorkflowCompiler:
                         code="FALLBACK_TARGET_NOT_AGENT",
                         path=path,
                         message="fallback target 必须是受限 Agent 节点",
+                    )
+                )
+            if incoming.get(fallback.target) or outgoing.get(fallback.target):
+                diagnostics.append(
+                    Diagnostic(
+                        level="error",
+                        code="FALLBACK_TARGET_NOT_DEDICATED",
+                        path=path,
+                        message="fallback target 必须是专用恢复节点，禁止连接普通边",
                     )
                 )
             if fallback.target == node.id:
@@ -379,12 +403,12 @@ class WorkflowCompiler:
         if first and first not in properties:
             diagnostics.append(
                 Diagnostic(
-                    level="warning",
+                    level="error",
                     code="OUTPUT_FIELD_NOT_IN_SCHEMA",
                     path=f"spec.nodes.{index}.input",
                     message=(
                         f"引用字段 {first} 不在上游节点 {source_node.id} 的 outputSchema 中，"
-                        "运行时可能解析失败"
+                        "发布已阻止"
                     ),
                 )
             )

@@ -50,6 +50,13 @@ def _base_trajectory(actions: list[dict], *, message: str = "q1") -> dict:
         "outputSchema": OUTPUT_SCHEMA,
         "actions": actions,
         "output": {"reply": LOOKUP_TABLE.get(message, "")},
+        "outputProvenance": {
+            "reply": {
+                "source": "action_output",
+                "actionId": actions[-1].get("callId", "missing"),
+                "path": "value",
+            }
+        },
         "config": {"maxSteps": 6, "maxTotalTokens": 30000, "allowedCapabilities": []},
         "originalModelCalls": 1,
     }
@@ -172,6 +179,54 @@ def test_valid_proposal_participates_in_adjudication() -> None:
         _base_trajectory([_lookup_action()]), proposal
     )
     assert definition["spec"]["nodes"][1]["type"] == "agent"
+    assert analysis["agentNodes"] == 1
+
+
+def test_proposal_groups_multiple_actions_into_one_agent_node() -> None:
+    from app.application.distillation_ir import DistillationProposal
+
+    first = _lookup_action()
+    second = {
+        "callId": "call-2",
+        "kind": "agent",
+        "capability": "summarize.text",
+        "arguments": {"text": "dynamic"},
+        "argumentBindings": {
+            "text": {
+                "source": "prior_output",
+                "fromAction": "call-1",
+                "fromPath": "value",
+            }
+        },
+        "result": {"reply": "summary"},
+        "outputSchema": OUTPUT_SCHEMA,
+    }
+    trajectory = _base_trajectory([first, second])
+    trajectory["outputProvenance"]["reply"] = {
+        "source": "action_output",
+        "actionId": "call-2",
+        "path": "reply",
+    }
+    proposal = DistillationProposal.model_validate(
+        {
+            "nodes": [
+                {
+                    "nodeId": "combined",
+                    "actionIds": ["call-1", "call-2"],
+                    "strategy": "agent",
+                }
+            ]
+        }
+    )
+    definition, analysis = compile_agent_trajectory(trajectory, proposal)
+    business_nodes = definition["spec"]["nodes"][1:-1]
+    assert len(business_nodes) == 1
+    assert business_nodes[0]["id"] == "combined"
+    assert business_nodes[0]["type"] == "agent"
+    assert business_nodes[0]["config"]["allowedCapabilities"] == [
+        "lookup.table",
+        "summarize.text",
+    ]
     assert analysis["agentNodes"] == 1
 
 

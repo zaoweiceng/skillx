@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.database import FailureObservation, utcnow
@@ -24,7 +25,7 @@ FailureClass = Literal[
     "transient", "contract_drift", "deterministic_input", "platform_bug", "unknown"
 ]
 
-# 可复现阈值：同一非瞬态 fingerprint 至少出现这么多次才有资格生成 proposal。
+# 出现次数只用于聚合热度，不作为 baseline reproduction 证据。
 REPRODUCIBLE_THRESHOLD = 2
 
 # 补丁绝不允许出现的敏感/越权字段（键名规范化后递归匹配，防大小写/嵌套绕过）。
@@ -247,26 +248,11 @@ async def record_failure_observation(
         error_code=error_code,
         contract_summary=contract_summary,
     )
-    existing = await session.scalar(
-        select(FailureObservation).where(FailureObservation.fingerprint == fingerprint)
-    )
     classification = classify_failure(
         error_code, recovered=recovered, reproducible=False
     )
-    if existing is not None:
-        existing.occurrence += 1
-        existing.recovered = existing.recovered or recovered
-        existing.last_run_id = run_id
-        existing.last_checkpoint_id = checkpoint_id
-        existing.updated_at = utcnow()
-        # 复现后按可复现重新分类（occurrence 决定资格，见 observation_eligibility）。
-        reproducible = existing.occurrence >= REPRODUCIBLE_THRESHOLD
-        existing.classification = classify_failure(
-            error_code, recovered=existing.recovered, reproducible=reproducible
-        )
-        await session.flush()
-        return existing
-    observation = FailureObservation(
+    now = utcnow()
+    statement = sqlite_insert(FailureObservation).values(
         id=str(uuid4()),
         fingerprint=fingerprint,
         workflow_version_id=workflow_version_id,
@@ -279,8 +265,29 @@ async def record_failure_observation(
         last_run_id=run_id,
         last_checkpoint_id=checkpoint_id,
         contract_summary_json=contract_summary or {},
+        created_at=now,
+        updated_at=now,
     )
-    session.add(observation)
+    await session.execute(
+        statement.on_conflict_do_update(
+            index_elements=[FailureObservation.fingerprint],
+            set_={
+                "occurrence": FailureObservation.occurrence + 1,
+                "recovered": FailureObservation.recovered | recovered,
+                "last_run_id": run_id,
+                "last_checkpoint_id": checkpoint_id,
+                "updated_at": now,
+            },
+        )
+    )
+    observation = await session.scalar(
+        select(FailureObservation).where(FailureObservation.fingerprint == fingerprint)
+    )
+    assert observation is not None
+    reproducible = bool(observation.baseline_reproduced)
+    observation.classification = classify_failure(
+        error_code, recovered=observation.recovered, reproducible=reproducible
+    )
     await session.flush()
     return observation
 
@@ -291,13 +298,13 @@ def observation_eligibility(observation: FailureObservation) -> dict[str, Any]:
     返回 {eligible, reason, reproducible, occurrence, classification}，前端不能自报。
     """
 
-    reproducible = observation.occurrence >= REPRODUCIBLE_THRESHOLD
+    reproducible = bool(observation.baseline_reproduced)
     classification = classify_failure(
         observation.error_code, recovered=observation.recovered, reproducible=reproducible
     )
     eligible = should_propose_patch(classification, reproducible=reproducible)
     if not reproducible:
-        reason = f"故障仅出现 {observation.occurrence} 次，未达可复现阈值 {REPRODUCIBLE_THRESHOLD}"
+        reason = "尚未通过隔离 baseline reproduction"
     elif not eligible:
         reason = f"分类 {classification} 不适合生成补丁（瞬态或未知）"
     else:

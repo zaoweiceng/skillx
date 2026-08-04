@@ -39,6 +39,7 @@ class DemoStack:
     _logs: dict[str, Path] = field(default_factory=dict)
     # 父进程持有的日志文件句柄，停止时显式关闭，避免泄漏描述符。
     _log_handles: list[Any] = field(default_factory=list)
+    _env: dict[str, str] = field(default_factory=dict)
 
     def client(self) -> httpx.Client:
         return httpx.Client(base_url=self.base_url, timeout=30)
@@ -78,14 +79,19 @@ def _wait_http(url: str, timeout: float, proc: subprocess.Popen) -> None:
     raise TimeoutError(f"等待 {url} 就绪超时：{last_error}")
 
 
-def _wait_worker_polling(worker: subprocess.Popen, log_path: Path, timeout: float) -> None:
+def _wait_worker_polling(
+    worker: subprocess.Popen,
+    log_path: Path,
+    timeout: float,
+    marker: str = "worker polling",
+) -> None:
     """确认 Worker 已进入领取循环，而不只是进程尚未退出。"""
 
     deadline = time.time() + timeout
     while time.time() < deadline:
         if worker.poll() is not None:
             raise RuntimeError(f"Worker 在就绪前退出，返回码 {worker.returncode}")
-        if log_path.exists() and "worker polling" in log_path.read_text(encoding="utf-8"):
+        if log_path.exists() and marker in log_path.read_text(encoding="utf-8"):
             return
         time.sleep(0.2)
     raise TimeoutError("Worker 未在超时内进入轮询状态")
@@ -114,7 +120,10 @@ def start_stack(
         "SKILLX_TRAEX_COMMAND": f'["{sys.executable}", "{TRAEX_STUB}"]',
         "SKILLX_TRAEX_ALLOWED_EXECUTABLES": f'["{Path(sys.executable).name}"]',
         # Host policy 授予的 Agent Tool 集合：请求方能力只能取交集缩小，不能扩大。
-        "SKILLX_AGENT_HOST_CAPABILITIES": '["search.web", "lookup.table"]',
+        "SKILLX_AGENT_HOST_CAPABILITIES": (
+            '["search.web", "lookup.table", "browser.read", "summarize.text"]'
+        ),
+        "SKILLX_AGENT_LEASE_SECONDS": "2",
         # 本地表单站点 URL：seed 据此创建真实 Playwright 提交组件（E2E-6）。
         "SKILLX_DEMO_FORM_URL": f"http://127.0.0.1:{form_port}/apply",
         # 动态文章页 URL：seed 据此创建动态网页总结组件（F-01）。
@@ -197,6 +206,7 @@ def start_stack(
         form,
         logs,
         [api_log, worker_log, form_log],
+        env,
     )
     try:
         _wait_http(f"{base_url}/health/ready", timeout=30, proc=api)
@@ -206,6 +216,31 @@ def start_stack(
         stop_stack(stack, failed=True)
         raise
     return stack
+
+
+def restart_worker(stack: DemoStack, *, crash: bool = False) -> None:
+    if stack._worker.poll() is None:
+        if crash:
+            stack._worker.kill()
+        else:
+            stack._worker.send_signal(signal.SIGTERM)
+        stack._worker.wait(timeout=10)
+    worker_log_path = stack._logs["worker"]
+    worker_log = open(worker_log_path, "a", encoding="utf-8")  # noqa: SIM115
+    stack._log_handles.append(worker_log)
+    stack._worker = subprocess.Popen(
+        [sys.executable, "-m", "app.worker", "--worker-id", "demo-worker-restarted"],
+        cwd=BACKEND_DIR,
+        env=stack._env,
+        stdout=worker_log,
+        stderr=subprocess.STDOUT,
+    )
+    _wait_worker_polling(
+        stack._worker,
+        worker_log_path,
+        timeout=30,
+        marker="worker polling worker_id=demo-worker-restarted",
+    )
 
 
 def stop_stack(stack: DemoStack, *, failed: bool = False) -> None:

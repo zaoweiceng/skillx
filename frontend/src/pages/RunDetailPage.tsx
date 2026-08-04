@@ -53,7 +53,10 @@ export default function RunDetailPage() {
   // 对失败节点提出受控补丁：把超时上调，作为可复现故障的最小修复示例。
   // 补丁只创建 draft（旧版本不变），并回放展示 diagnostics，人工发布后才生效。
   async function proposePatch(failedNode: string) {
-    if (!run) return
+    if (!run?.workflowVersionId) {
+      setError('临时计划不能直接修改源版本，请先人工固化为 Workflow draft。')
+      return
+    }
     setPatching(true)
     setError('')
     try {
@@ -92,6 +95,11 @@ export default function RunDetailPage() {
         <div>
           <span className="eyebrow">RUN / {run.id.slice(0, 8)}</span>
           <h1>运行详情</h1>
+          {run.planSnapshotId && (
+            <p className="run-notes">
+              临时 PlanSnapshot · {run.planSnapshotId.slice(0, 8)} · 冻结版本不随源默认版本变化
+            </p>
+          )}
         </div>
         <div className="run-header-actions">
           <StatusBadge status={run.status} />

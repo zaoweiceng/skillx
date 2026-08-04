@@ -23,6 +23,7 @@ from app.application.recovery import (
     RecoveryError,
     apply_recovery_decision,
     build_checkpoint,
+    build_recovery_prompt,
     is_recoverable,
     parse_recovery_decision,
     verify_checkpoint,
@@ -325,10 +326,71 @@ async def test_recovery_request_user_transitions_to_waiting_approval() -> None:
     run_id, checkpoint_id = await _seed_failed_run()
     async with SessionLocal() as session, session.begin():
         checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
-        await apply_recovery_decision(session, checkpoint, {"action": "request_user"})
+        await apply_recovery_decision(
+            session,
+            checkpoint,
+            {"action": "request_user", "question": "请确认是否继续？"},
+        )
     async with SessionLocal() as session:
         run = await session.get(Run, run_id)
         assert run.status == "waiting_approval"
+
+
+async def test_recovery_prompt_summarizes_large_checkpoint_outputs() -> None:
+    _run_id, checkpoint_id = await _seed_failed_run(seed="x" * 20_000)
+    async with SessionLocal() as session:
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        stored = checkpoint.snapshot_json["completedOutputs"]["sensitive"]
+        assert stored["summary"]["bytes"] > 16_384
+        assert stored["nodeRunRef"]
+        prompt = build_recovery_prompt(checkpoint)
+        assert len(prompt.encode()) < 24_500
+        assert "contextTruncated" not in prompt or '"contextTruncated": true' in prompt
+
+
+async def test_typed_replan_executes_new_recovery_attempt() -> None:
+    run_id, checkpoint_id = await _seed_failed_run()
+    async with SessionLocal() as session, session.begin():
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        remaining_nodes = checkpoint.snapshot_json["remainingNodes"]
+        patched_nodes = [
+            {
+                **node,
+                "config": (
+                    {"operation": "passthrough"}
+                    if node["id"] == "risky"
+                    else node.get("config", {})
+                ),
+            }
+            for node in remaining_nodes
+        ]
+        await apply_recovery_decision(
+            session,
+            checkpoint,
+            {
+                "action": "retry_replanned",
+                "planPatch": {
+                    "remainingNodes": patched_nodes,
+                    "remainingEdges": checkpoint.snapshot_json["remainingEdges"],
+                    "inputMappings": {},
+                    "locks": checkpoint.snapshot_json["capabilityLocks"],
+                },
+            },
+        )
+    worker = WorkerService("replan-worker")
+    for _ in range(8):
+        await worker.run_once()
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        attempts = (
+            await session.scalars(
+                select(NodeRun)
+                .where(NodeRun.run_id == run_id, NodeRun.node_id == "risky")
+                .order_by(NodeRun.attempt)
+            )
+        ).all()
+        assert run is not None and run.status == "succeeded"
+        assert [item.status for item in attempts] == ["failed", "succeeded"]
 
 
 async def test_substitution_schema_mismatch_fails_closed() -> None:

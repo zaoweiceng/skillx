@@ -1,24 +1,32 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
 from app.application.compiler import digest_json
+from app.application.expressions import ExpressionError, resolve_mapping
 from app.application.security import redact
 from app.config import get_settings
 from app.domain.workflow import NON_RECOVERABLE_ERROR_CODES, NodeType, WorkflowDefinition
 from app.infrastructure.database import (
+    Approval,
+    Artifact,
     ExecutionCheckpoint,
     NodeRun,
     OutputSubstitution,
+    RecoveryAttempt,
     Run,
     utcnow,
 )
@@ -40,11 +48,32 @@ RECOVERY_DECISION_SCHEMA: dict[str, Any] = {
     "properties": {
         "action": {"type": "string", "enum": list(RECOVERY_ACTIONS)},
         "substitution": {"type": "object"},
+        "planPatch": {
+            "type": "object",
+            "properties": {
+                "remainingNodes": {"type": "array", "items": {"type": "object"}},
+                "remainingEdges": {"type": "array", "items": {"type": "object"}},
+                "inputMappings": {"type": "object"},
+                "locks": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["remainingNodes", "remainingEdges", "inputMappings", "locks"],
+            "additionalProperties": False,
+        },
+        "question": {"type": "string"},
         "reason": {"type": "string"},
     },
     "required": ["action"],
-    "additionalProperties": True,
+    "additionalProperties": False,
 }
+
+
+class RecoveryPlanPatch(BaseModel):
+    remaining_nodes: list[dict[str, Any]] = Field(alias="remainingNodes")
+    remaining_edges: list[dict[str, Any]] = Field(alias="remainingEdges")
+    input_mappings: dict[str, Any] = Field(alias="inputMappings")
+    locks: list[dict[str, Any]]
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
 class RecoveryError(Exception):
@@ -94,12 +123,30 @@ async def build_checkpoint(
             }
 
     latest = await _latest_node_runs(session, run.id)
+    artifact_rows = (
+        await session.scalars(select(Artifact).where(Artifact.run_id == run.id))
+    ).all()
+    artifacts_by_node: dict[str, list[dict[str, Any]]] = {}
+    for artifact in artifact_rows:
+        node_id = (artifact.metadata_json or {}).get("nodeId")
+        if node_id:
+            artifacts_by_node.setdefault(str(node_id), []).append(
+                {
+                    "artifactId": artifact.id,
+                    "uri": artifact.uri,
+                    "sha256": artifact.sha256,
+                    "size": artifact.size,
+                    "mediaType": artifact.media_type,
+                }
+            )
     substitutions = await load_substitutions(session, run.id)
     completed_outputs: dict[str, Any] = {}
     committed_side_effects: list[dict[str, Any]] = []
     for node_id, node_run in latest.items():
         if node_run.status == "succeeded":
-            completed_outputs[node_id] = node_run.output_json
+            completed_outputs[node_id] = _checkpoint_output(
+                node_run, artifacts_by_node.get(node_id, [])
+            )
             node = nodes.get(node_id)
             if node is not None and node.side_effect:
                 committed_side_effects.append(
@@ -135,8 +182,12 @@ async def build_checkpoint(
         for item in await _node_attempts(session, run.id, failed_node_run.node_id)
     ]
     error = failed_node_run.error_json or {}
+    from app.application.orchestrator import load_execution_source
+
+    source = await load_execution_source(session, run)
     snapshot = {
         "workflowVersionId": run.workflow_version_id,
+        "planSnapshotId": run.plan_snapshot_id,
         "completedOutputs": completed_outputs,
         "committedSideEffects": committed_side_effects,
         "failedNode": {
@@ -156,7 +207,9 @@ async def build_checkpoint(
         "remainingEdges": remaining_edges,
         "remainingSubgraph": sorted(node["id"] for node in remaining_nodes),
         "outputContract": definition.spec.output_schema,
-        "capabilityLocks": _capability_locks(run),
+        "capabilityLocks": (
+            source.validation_json.get("capabilityLocks", []) if source else []
+        ),
         "fallbackConfig": fallback_config,
         "runInput": run.input_json,
     }
@@ -164,7 +217,9 @@ async def build_checkpoint(
     checkpoint = ExecutionCheckpoint(
         id=str(uuid4()),
         run_id=run.id,
-        workflow_version_id=run.workflow_version_id,
+        workflow_version_id=(
+            run.workflow_version_id or f"plan:{run.plan_snapshot_id}"
+        ),
         failed_node_id=failed_node_run.node_id,
         failed_node_run_id=failed_node_run.id,
         attempt=failed_node_run.attempt,
@@ -176,14 +231,6 @@ async def build_checkpoint(
     session.add(checkpoint)
     await session.flush()
     return checkpoint
-
-
-def _capability_locks(run: Run) -> list[dict[str, Any]]:
-    """从 Run 关联的锁摘要中提取能力锁（若已附加），否则空列表。"""
-
-    locks = getattr(run, "_capability_locks", None)
-    return list(locks) if isinstance(locks, list) else []
-
 
 def build_recovery_prompt(checkpoint: ExecutionCheckpoint) -> str:
     """由平台模板 + checkpoint 摘要生成 Recovery Agent prompt。
@@ -206,8 +253,14 @@ def build_recovery_prompt(checkpoint: ExecutionCheckpoint) -> str:
         # 已完成节点的实际输出值（脱敏）：Agent 可据此计算替代输出。
         "completedOutputs": redact(snapshot.get("completedOutputs", {})),
         "remainingSubgraph": snapshot.get("remainingSubgraph", []),
+        "remainingNodes": snapshot.get("remainingNodes", []),
+        "remainingEdges": snapshot.get("remainingEdges", []),
+        "capabilityLocks": snapshot.get("capabilityLocks", []),
         "outputContract": snapshot.get("outputContract"),
+        "userAnswer": redact(snapshot.get("userAnswer")),
+        "runInput": redact(snapshot.get("runInput", {})),
     }
+    context = _bounded_recovery_context(context)
     return (
         "你是受限恢复 Agent。已发布工作流的某节点重试耗尽，请基于以下 checkpoint 上下文"
         "决定如何恢复。只能返回 RecoveryDecision，action ∈ "
@@ -217,6 +270,74 @@ def build_recovery_prompt(checkpoint: ExecutionCheckpoint) -> str:
         "outcomeCertainty 为 unknown 时选择 request_user。\n"
         f"context: {json.dumps(context, ensure_ascii=False)}"
     )
+
+
+def _checkpoint_output(
+    node_run: NodeRun, artifact_refs: list[dict[str, Any]]
+) -> Any:
+    value = node_run.output_json
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True).encode()
+    if len(encoded) <= 16_384:
+        return value
+    return {
+        "summary": {
+            "type": type(value).__name__,
+            "bytes": len(encoded),
+            "digest": digest_json(value),
+        },
+        "nodeRunRef": node_run.id,
+        "artifactRefs": artifact_refs,
+    }
+
+
+def _bounded_recovery_context(context: dict[str, Any]) -> dict[str, Any]:
+    encoded = json.dumps(context, ensure_ascii=False, sort_keys=True).encode()
+    if len(encoded) <= 24_000:
+        return context
+    output_contract = context.get("outputContract", {})
+    properties = (
+        output_contract.get("properties", {})
+        if isinstance(output_contract, dict)
+        else {}
+    )
+    return {
+        **context,
+        "failedNode": {
+            **context.get("failedNode", {}),
+            "input": _prompt_summary(context.get("failedNode", {}).get("input")),
+        },
+        "completedOutputs": {
+            node_id: (
+                value
+                if isinstance(value, dict) and "summary" in value
+                else {"summary": {"digest": digest_json(value)}}
+            )
+            for node_id, value in context.get("completedOutputs", {}).items()
+        },
+        "outputContract": {
+            "required": output_contract.get("required", [])
+            if isinstance(output_contract, dict)
+            else [],
+            "properties": {
+                key: {"type": item.get("type", "unknown")}
+                for key, item in properties.items()
+                if isinstance(item, dict)
+            },
+        },
+        "runInput": _prompt_summary(context.get("runInput")),
+        "contextTruncated": True,
+    }
+
+
+def _prompt_summary(value: Any) -> Any:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True).encode()
+    if len(encoded) <= 4_096:
+        return value
+    return {
+        "type": type(value).__name__,
+        "bytes": len(encoded),
+        "digest": digest_json(value),
+    }
 
 
 def parse_recovery_decision(raw: dict[str, Any]) -> dict[str, Any]:
@@ -230,16 +351,42 @@ def parse_recovery_decision(raw: dict[str, Any]) -> dict[str, Any]:
     if action not in RECOVERY_ACTIONS:
         raise RecoveryError("CONTRACT_VIOLATION", f"非法 RecoveryDecision action: {action}")
     substitution = raw.get("substitution")
+    plan_patch = raw.get("planPatch")
+    question = raw.get("question")
     if action == "provide_substitution":
         if not isinstance(substitution, dict):
             raise RecoveryError(
                 "CONTRACT_VIOLATION", "provide_substitution 需要 substitution 对象"
             )
-    elif substitution is not None:
+        if plan_patch is not None or question is not None:
+            raise RecoveryError("CONTRACT_VIOLATION", "substitution 分支含非法字段")
+    elif action == "retry_replanned":
+        if substitution is not None or not isinstance(plan_patch, dict):
+            raise RecoveryError(
+                "CONTRACT_VIOLATION", "retry_replanned 需要 typed planPatch"
+            )
+        try:
+            plan_patch = RecoveryPlanPatch.model_validate(plan_patch).model_dump(
+                by_alias=True
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise RecoveryError("CONTRACT_VIOLATION", f"非法 planPatch: {exc}") from exc
+    elif action == "request_user":
+        if substitution is not None or plan_patch is not None or not question:
+            raise RecoveryError(
+                "CONTRACT_VIOLATION", "request_user 需要非空 question"
+            )
+    elif substitution is not None or plan_patch is not None or question is not None:
         raise RecoveryError(
-            "CONTRACT_VIOLATION", f"{action} 不得携带 substitution 字段"
+            "CONTRACT_VIOLATION", f"{action} 携带了不允许的字段"
         )
-    return {"action": action, "substitution": substitution, "reason": raw.get("reason", "")}
+    return {
+        "action": action,
+        "substitution": substitution,
+        "planPatch": plan_patch,
+        "question": question,
+        "reason": raw.get("reason", ""),
+    }
 
 
 async def run_recovery_agent(
@@ -247,6 +394,7 @@ async def run_recovery_agent(
     fallback_config: dict[str, Any],
     *,
     host: AgentHost | None = None,
+    cancellation: Callable[[], Awaitable[bool]] | None = None,
 ) -> dict[str, Any]:
     """运行受限 Recovery Agent，返回校验过的 RecoveryDecision。
 
@@ -267,7 +415,7 @@ async def run_recovery_agent(
         max_duration_seconds=int(fallback_config.get("maxDurationSeconds", 60)),
     )
     try:
-        result = await host.execute(request)
+        result = await host.execute(request, cancellation=cancellation)
     except AgentHostError as exc:
         raise RecoveryError(exc.code, exc.message) from exc
     return parse_recovery_decision(result.output)
@@ -380,6 +528,27 @@ async def apply_recovery_decision(
         await session.flush()
         return "failed"
     if action == "request_user":
+        question = decision["question"]
+        approval_snapshot = {
+            "runId": run.id,
+            "nodeId": checkpoint.failed_node_id,
+            "title": "恢复需要用户输入",
+            "description": question,
+            "payload": {"checkpointId": checkpoint.id, "question": question},
+            "effect": "recovery.question",
+            "checkpointId": checkpoint.id,
+        }
+        session.add(
+            Approval(
+                id=str(uuid4()),
+                run_id=run.id,
+                node_run_id=checkpoint.failed_node_run_id,
+                node_id=checkpoint.failed_node_id,
+                snapshot_digest=digest_json(approval_snapshot),
+                snapshot_json=approval_snapshot,
+                status="pending",
+            )
+        )
         run.status = "waiting_approval"
         checkpoint.status = "awaiting_user"
         await session.flush()
@@ -389,7 +558,80 @@ async def apply_recovery_decision(
         _validate_substitution(checkpoint, output)
         await _record_substitution(session, checkpoint, output, source="recovery")
     else:  # retry_replanned
-        await _record_substitution(session, checkpoint, {}, source="skip")
+        plan_patch = RecoveryPlanPatch.model_validate(decision["planPatch"])
+        _validate_recovery_plan_patch(checkpoint, plan_patch)
+        existing = await session.scalar(
+            select(RecoveryAttempt)
+            .where(RecoveryAttempt.checkpoint_id == checkpoint.id)
+            .order_by(RecoveryAttempt.attempt.desc())
+        )
+        attempt = (existing.attempt if existing else 0) + 1
+        payload = plan_patch.model_dump(by_alias=True)
+        session.add(
+            RecoveryAttempt(
+                id=str(uuid4()),
+                checkpoint_id=checkpoint.id,
+                attempt=attempt,
+                plan_patch_json=payload,
+                digest=digest_json(payload),
+                status="active",
+            )
+        )
+        checkpoint.snapshot_json = {
+            **checkpoint.snapshot_json,
+            "remainingNodes": payload["remainingNodes"],
+            "remainingEdges": payload["remainingEdges"],
+            "recoveryInputMappings": payload["inputMappings"],
+        }
+        checkpoint.digest = digest_json(checkpoint.snapshot_json)
+        latest_runs = await _latest_node_runs(session, run.id)
+        completed_values = {
+            node_id: item.output_json
+            for node_id, item in latest_runs.items()
+            if item.status == "succeeded" and item.output_json is not None
+        }
+        failed_mapping = payload["inputMappings"].get(checkpoint.failed_node_id)
+        try:
+            retry_input = (
+                resolve_mapping(failed_mapping, run.input_json, completed_values)
+                if isinstance(failed_mapping, dict)
+                else checkpoint.snapshot_json["failedNode"]["input"]
+            )
+        except ExpressionError as exc:
+            raise RecoveryError(
+                "RECOVERY_PLAN_INVALID", f"失败节点 input mapping 无法解析: {exc}"
+            ) from exc
+        latest_failed_attempt = max(
+            (
+                item.attempt
+                for item in latest_runs.values()
+                if item.node_id == checkpoint.failed_node_id
+            ),
+            default=checkpoint.attempt,
+        )
+        failed_definition = next(
+            node
+            for node in payload["remainingNodes"]
+            if node["id"] == checkpoint.failed_node_id
+        )
+        await session.execute(
+            sqlite_insert(NodeRun)
+            .values(
+                id=str(uuid4()),
+                run_id=run.id,
+                node_id=checkpoint.failed_node_id,
+                node_type=failed_definition["type"],
+                attempt=latest_failed_attempt + 1,
+                status="ready",
+                input_json=retry_input,
+                available_at=utcnow(),
+                created_at=utcnow(),
+                updated_at=utcnow(),
+            )
+            .on_conflict_do_nothing(
+                index_elements=[NodeRun.run_id, NodeRun.node_id, NodeRun.attempt]
+            )
+        )
     # 让 Run 回到 running，由 Orchestrator 从剩余子图继续调度。
     run.status = "running"
     run.error_json = None
@@ -404,7 +646,38 @@ def _redacted_decision(decision: dict[str, Any]) -> dict[str, Any]:
         "substitution": redact(decision.get("substitution"))
         if decision.get("substitution") is not None
         else None,
+        "planPatch": redact(decision.get("planPatch")),
+        "question": decision.get("question"),
     }
+
+
+def _validate_recovery_plan_patch(
+    checkpoint: ExecutionCheckpoint, patch: RecoveryPlanPatch
+) -> None:
+    snapshot = checkpoint.snapshot_json
+    allowed_nodes = {
+        node["id"] for node in snapshot.get("remainingNodes", []) if "id" in node
+    }
+    completed_nodes = set(snapshot.get("completedOutputs", {}))
+    proposed_nodes = {node.get("id") for node in patch.remaining_nodes}
+    if None in proposed_nodes or proposed_nodes != allowed_nodes:
+        raise RecoveryError(
+            "RECOVERY_PLAN_INVALID", "replan 必须完整覆盖且不得扩大 remaining nodes"
+        )
+    for edge in patch.remaining_edges:
+        if edge.get("source") not in proposed_nodes | completed_nodes | {"input"} or edge.get(
+            "target"
+        ) not in proposed_nodes | {"output"}:
+            raise RecoveryError("RECOVERY_PLAN_INVALID", "replan edge 越过剩余子图边界")
+    if not any(edge.get("target") == "output" for edge in patch.remaining_edges):
+        raise RecoveryError("RECOVERY_PLAN_INVALID", "replan 必须保留最终 output 边界")
+    if not set(patch.input_mappings) <= proposed_nodes:
+        raise RecoveryError("RECOVERY_PLAN_INVALID", "inputMappings 含剩余子图外节点")
+    allowed_locks = {
+        digest_json(lock) for lock in snapshot.get("capabilityLocks", [])
+    }
+    if any(digest_json(lock) not in allowed_locks for lock in patch.locks):
+        raise RecoveryError("RECOVERY_PLAN_INVALID", "replan 不得扩大能力锁")
 
 
 async def _record_substitution(
@@ -454,6 +727,7 @@ class RecoveryDriver:
         from app.infrastructure.database import SessionLocal
 
         now = utcnow()
+        await self._reclaim_expired(now)
         # 1) 选候选并原子领取：只领取 run 仍 recovering、审批已通过（或无需审批）的 pending。
         async with SessionLocal() as session, session.begin():
             candidate = await session.scalar(
@@ -493,6 +767,15 @@ class RecoveryDriver:
             recovery_node_run_id = str(uuid4())
             target = fallback_config.get("target")
             if target:
+                latest_attempt = await session.scalar(
+                    select(NodeRun.attempt)
+                    .where(
+                        NodeRun.run_id == candidate.run_id,
+                        NodeRun.node_id == target,
+                    )
+                    .order_by(NodeRun.attempt.desc())
+                    .limit(1)
+                )
                 inserted = await session.execute(
                     sqlite_insert(NodeRun)
                     .values(
@@ -500,7 +783,7 @@ class RecoveryDriver:
                         run_id=candidate.run_id,
                         node_id=target,
                         node_type="agent",
-                        attempt=1,
+                        attempt=(latest_attempt or 0) + 1,
                         status="running",
                         input_json={"checkpointId": checkpoint_id},
                         worker_id=self.worker_id,
@@ -525,11 +808,54 @@ class RecoveryDriver:
 
         # 2) 运行 Recovery Agent（Host 边界内），不持有事务。
         try:
+            async def cancelled() -> bool:
+                async with SessionLocal() as heartbeat_session, heartbeat_session.begin():
+                    current = await heartbeat_session.get(
+                        ExecutionCheckpoint, checkpoint_id
+                    )
+                    if current is None:
+                        return True
+                    current_run = await heartbeat_session.get(Run, current.run_id)
+                    if (
+                        current.status != "running"
+                        or current.lease_owner != self.worker_id
+                        or current_run is None
+                        or current_run.cancellation_requested_at is not None
+                        or current_run.status == "cancelling"
+                    ):
+                        return True
+                    current.heartbeat_at = utcnow()
+                    current.lease_expires_at = utcnow() + timedelta(
+                        seconds=self.lease_seconds
+                    )
+                    if current.recovery_node_run_id:
+                        await heartbeat_session.execute(
+                            update(NodeRun)
+                            .where(NodeRun.id == current.recovery_node_run_id)
+                            .values(
+                                heartbeat_at=utcnow(),
+                                lease_expires_at=current.lease_expires_at,
+                            )
+                        )
+                    return False
+
             async with SessionLocal() as session:
                 checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+                kwargs: dict[str, Any] = {"host": self._host}
+                if "cancellation" in inspect.signature(
+                    run_recovery_agent
+                ).parameters:
+                    kwargs["cancellation"] = cancelled
                 decision = await run_recovery_agent(
-                    checkpoint, fallback_config, host=self._host
+                    checkpoint, fallback_config, **kwargs
                 )
+        except asyncio.CancelledError:
+            async with SessionLocal() as session, session.begin():
+                checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+                if checkpoint is not None:
+                    checkpoint.status = "cancelled"
+                    await self._finish_recovery_node(session, checkpoint, "cancelled")
+            return True
         except RecoveryError as exc:
             async with SessionLocal() as session, session.begin():
                 checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
@@ -557,6 +883,77 @@ class RecoveryDriver:
             async with SessionLocal() as session, session.begin():
                 await Orchestrator().advance_run(session, run_id)
         return True
+
+    async def _reclaim_expired(self, now: Any) -> None:
+        """回收崩溃 Worker 遗留租约；未知结果必须再次人工确认。"""
+
+        from app.infrastructure.database import SessionLocal
+
+        async with SessionLocal() as session, session.begin():
+            expired = (
+                await session.scalars(
+                    select(ExecutionCheckpoint).where(
+                        ExecutionCheckpoint.status == "running",
+                        ExecutionCheckpoint.lease_expires_at < now,
+                    )
+                )
+            ).all()
+            for checkpoint in expired:
+                run = await session.get(Run, checkpoint.run_id)
+                if checkpoint.recovery_node_run_id:
+                    await session.execute(
+                        update(NodeRun)
+                        .where(
+                            NodeRun.id == checkpoint.recovery_node_run_id,
+                            NodeRun.status == "running",
+                        )
+                        .values(
+                            status="lease_expired",
+                            worker_id=None,
+                            lease_expires_at=None,
+                            finished_at=now,
+                        )
+                    )
+                checkpoint.recovery_node_run_id = None
+                checkpoint.lease_owner = None
+                checkpoint.lease_expires_at = None
+                certainty = (
+                    checkpoint.snapshot_json.get("failedNode", {}).get(
+                        "outcomeCertainty"
+                    )
+                )
+                if certainty == "unknown":
+                    checkpoint.status = "pending"
+                    checkpoint.approval_status = "pending"
+                    if run is not None:
+                        run.status = "waiting_approval"
+                    snapshot = {
+                        "runId": checkpoint.run_id,
+                        "nodeId": checkpoint.failed_node_id,
+                        "title": "恢复结果未知，需要人工确认",
+                        "description": "Recovery Worker 租约过期，无法确认外部结果。",
+                        "payload": {"checkpointId": checkpoint.id},
+                        "effect": "recovery.approval",
+                        "checkpointId": checkpoint.id,
+                    }
+                    session.add(
+                        Approval(
+                            id=str(uuid4()),
+                            run_id=checkpoint.run_id,
+                            node_run_id=checkpoint.failed_node_run_id,
+                            node_id=checkpoint.failed_node_id,
+                            snapshot_digest=digest_json(snapshot),
+                            snapshot_json=snapshot,
+                            status="pending",
+                        )
+                    )
+                else:
+                    checkpoint.status = "pending"
+                    if run is not None and run.status not in {
+                        "cancelling",
+                        "cancelled",
+                    }:
+                        run.status = "recovering"
 
     @staticmethod
     async def _finish_recovery_node(

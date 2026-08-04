@@ -28,6 +28,8 @@ from app.infrastructure.database import (
     ConversationRun,
     ExecutionCheckpoint,
     NodeRun,
+    PlanSnapshot,
+    RecoveryAttempt,
     Run,
     RunEvent,
     SessionLocal,
@@ -54,6 +56,109 @@ TERMINAL_NODE_STATES = {
 }
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ExecutionSource:
+    id: str
+    definition_json: dict[str, Any]
+    validation_json: dict[str, Any]
+    digest: str
+
+
+async def load_execution_source(
+    session: AsyncSession, run: Run
+) -> ExecutionSource | None:
+    source: ExecutionSource | None = None
+    if run.workflow_version_id:
+        version = await session.get(WorkflowVersion, run.workflow_version_id)
+        if version is None:
+            return None
+        source = ExecutionSource(
+            version.id,
+            version.definition_json,
+            version.validation_json or {},
+            version.digest,
+        )
+    elif run.plan_snapshot_id:
+        from app.application.plans import verify_plan_snapshot
+
+        snapshot = await session.get(PlanSnapshot, run.plan_snapshot_id)
+        if snapshot is None:
+            return None
+        verify_plan_snapshot(snapshot)
+        source = ExecutionSource(
+            snapshot.id,
+            snapshot.definition_json,
+            {"capabilityLocks": snapshot.locks_json, "mcpLocks": snapshot.locks_json},
+            snapshot.digest,
+        )
+    if source is None:
+        return None
+    recovery_attempt = await session.scalar(
+        select(RecoveryAttempt)
+        .join(
+            ExecutionCheckpoint,
+            ExecutionCheckpoint.id == RecoveryAttempt.checkpoint_id,
+        )
+        .where(
+            ExecutionCheckpoint.run_id == run.id,
+            RecoveryAttempt.status == "active",
+        )
+        .order_by(RecoveryAttempt.created_at.desc())
+        .limit(1)
+    )
+    if recovery_attempt is None or not recovery_attempt.plan_patch_json:
+        return source
+    patched_definition = _merge_recovery_plan(
+        source.definition_json, recovery_attempt.plan_patch_json
+    )
+    from app.application.compiler import WorkflowCompiler
+
+    compiled = WorkflowCompiler().compile(patched_definition)
+    return ExecutionSource(
+        recovery_attempt.id,
+        compiled.definition.model_dump(by_alias=True, mode="json"),
+        source.validation_json,
+        recovery_attempt.digest,
+    )
+
+
+def _merge_recovery_plan(
+    base_definition: dict[str, Any], patch: dict[str, Any]
+) -> dict[str, Any]:
+    """把已校验 RecoveryPlanPatch 合并到冻结定义，不修改原版本。"""
+
+    definition = {
+        **base_definition,
+        "spec": {
+            **base_definition["spec"],
+            "nodes": [dict(node) for node in base_definition["spec"]["nodes"]],
+            "edges": [dict(edge) for edge in base_definition["spec"]["edges"]],
+        },
+    }
+    replacements = {
+        node["id"]: dict(node) for node in patch.get("remainingNodes", [])
+    }
+    input_mappings = patch.get("inputMappings", {})
+    nodes = []
+    for node in definition["spec"]["nodes"]:
+        replacement = replacements.get(node["id"], node)
+        if node["id"] in input_mappings:
+            replacement = {**replacement, "input": input_mappings[node["id"]]}
+        nodes.append(replacement)
+    remaining_ids = set(replacements)
+    preserved_edges = [
+        edge
+        for edge in definition["spec"]["edges"]
+        if edge["source"] not in remaining_ids and edge["target"] not in remaining_ids
+    ]
+    definition["spec"]["nodes"] = nodes
+    definition["spec"]["edges"] = [
+        *preserved_edges,
+        *patch.get("remainingEdges", []),
+    ]
+    return definition
 
 
 def _aware(value: datetime | None) -> datetime | None:
@@ -122,6 +227,43 @@ class Orchestrator:
         await self.advance_run(session, run.id)
         return run
 
+    async def create_plan_run(
+        self,
+        session: AsyncSession,
+        snapshot: PlanSnapshot,
+        inputs: dict[str, Any],
+        owner_id: str = "local-user",
+    ) -> Run:
+        from app.application.plans import verify_plan_snapshot
+
+        verify_plan_snapshot(snapshot)
+        definition = WorkflowDefinition.model_validate(snapshot.definition_json)
+        errors = list(Draft202012Validator(definition.spec.input_schema).iter_errors(inputs))
+        if errors:
+            raise ValueError(errors[0].message)
+        run = Run(
+            id=str(uuid4()),
+            workflow_version_id=None,
+            plan_snapshot_id=snapshot.id,
+            owner_id=owner_id,
+            status="queued",
+            input_json=inputs,
+        )
+        session.add(run)
+        await session.flush()
+        await append_event(
+            session,
+            run.id,
+            "run.created",
+            {
+                "runId": run.id,
+                "planSnapshotId": snapshot.id,
+                "planDigest": snapshot.digest,
+            },
+        )
+        await self.advance_run(session, run.id)
+        return run
+
     async def request_cancellation(self, session: AsyncSession, run_id: str) -> Run:
         run = await session.get(Run, run_id)
         if run is None:
@@ -155,10 +297,10 @@ class Orchestrator:
         # 误判为 fatal 后 fail run。
         if run.status == "recovering":
             return run
-        version = await session.get(WorkflowVersion, run.workflow_version_id)
-        if version is None:
-            raise LookupError("workflow version not found")
-        definition = WorkflowDefinition.model_validate(version.definition_json)
+        source = await load_execution_source(session, run)
+        if source is None:
+            raise LookupError("execution source not found")
+        definition = WorkflowDefinition.model_validate(source.definition_json)
         nodes = {node.id: node for node in definition.spec.nodes}
         # fallback-only target 只在恢复时激活：正常调度绝不为其创建 NodeRun。
         from app.application.recovery import _fallback_only_targets, load_substitutions
@@ -574,7 +716,9 @@ class Orchestrator:
         with suppress(Exception):
             await record_failure_observation(
                 session,
-                workflow_version_id=run.workflow_version_id,
+                workflow_version_id=(
+                    run.workflow_version_id or f"plan:{run.plan_snapshot_id}"
+                ),
                 node_id=failed_node_run.node_id,
                 node_type=failed_node_run.node_type,
                 error_code=error.get("code", "EXECUTION_FAILED"),
@@ -652,13 +796,23 @@ class WorkerService:
         ).all()
         recovered = 0
         for node_run in expired:
+            recovery_checkpoint = await session.scalar(
+                select(ExecutionCheckpoint).where(
+                    ExecutionCheckpoint.recovery_node_run_id == node_run.id,
+                    ExecutionCheckpoint.status == "running",
+                )
+            )
+            if recovery_checkpoint is not None:
+                # RecoveryDriver 与 checkpoint 共用该租约并负责 outcome certainty；
+                # 标准节点接管不得抢先把 Recovery NodeRun 改成普通 failed。
+                continue
             run = await session.get(Run, node_run.run_id)
             if not run:
                 continue
-            version = await session.get(WorkflowVersion, run.workflow_version_id)
-            if not version:
+            source = await load_execution_source(session, run)
+            if not source:
                 continue
-            definition = WorkflowDefinition.model_validate(version.definition_json)
+            definition = WorkflowDefinition.model_validate(source.definition_json)
             node = next(item for item in definition.spec.nodes if item.id == node_run.node_id)
             if node.side_effect and not node.idempotent:
                 error = {
@@ -762,10 +916,10 @@ class WorkerService:
             run = await session.get(Run, candidate.run_id)
             if run is None or run.status != "running":
                 continue
-            version = await session.get(WorkflowVersion, run.workflow_version_id)
-            if version is None:
+            source = await load_execution_source(session, run)
+            if source is None:
                 continue
-            definition = WorkflowDefinition.model_validate(version.definition_json)
+            definition = WorkflowDefinition.model_validate(source.definition_json)
             max_parallel = definition.spec.policies.max_parallel_nodes
             # 将并发配额检查折叠进领取 UPDATE：running 计数与所有权 CAS 是同一条
             # 原子语句。SQLite 串行化写入，两个 Worker 不会同时越过 Run 级上限。
@@ -798,7 +952,7 @@ class WorkerService:
             mcp_lock = next(
                 (
                     lock
-                    for lock in (version.validation_json or {}).get("mcpLocks", [])
+                    for lock in source.validation_json.get("mcpLocks", [])
                     if lock.get("nodeId") == node.id
                 ),
                 None,

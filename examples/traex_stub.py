@@ -21,6 +21,7 @@ import json
 import re
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 # deterministic 模式下 Tool 的确定性查表：输出取决于输入，而非固定 reply 指令。
@@ -78,10 +79,101 @@ def main() -> int:
     reply = _directive(args.prompt, "REPLY", "已完成任务")
     allowed = json.loads(args.allowed_tools) if args.allowed_tools else []
 
+    if "WorkflowSelection" in args.prompt:
+        refs = re.findall(r"workflow:[^'\"\s,}\]]+", args.prompt)
+        selected = refs[0] if refs else ""
+        emit({"type": "agent.plan", "payload": {"summary": "比较 L0 Workflow 卡片"}})
+        emit(
+            {
+                "type": "agent.step.completed",
+                "payload": {"step": 1, "inputTokens": 15, "outputTokens": 8},
+            }
+        )
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {
+                    "steps": 1,
+                    "totalTokens": 23,
+                    "output": {
+                        "action": "run_full" if selected else "continue_agent",
+                        "reason": "TraeX 根据用户语义选择最高匹配 L0 卡片",
+                        "refs": [selected] if selected else [],
+                        "bindings": {},
+                        "missingInputs": [],
+                    },
+                },
+            }
+        )
+        return 0
+
+    if "Distillation Agent" in args.prompt:
+        action_ids = re.findall(r"'actionId': '([^']+)'", args.prompt)
+        kinds = re.findall(r"'kind': '([^']+)'", args.prompt)
+        nodes = [
+            {
+                "nodeId": f"proposed-{index + 1}",
+                "actionIds": [action_id],
+                "strategy": (
+                    "agent" if index < len(kinds) and kinds[index] == "agent"
+                    else "llm" if index < len(kinds) and kinds[index] == "llm"
+                    else "deterministic"
+                ),
+                "reason": "按动作能力边界分组",
+            }
+            for index, action_id in enumerate(action_ids)
+        ]
+        emit({"type": "agent.plan", "payload": {"summary": "生成固化分组建议"}})
+        emit(
+            {
+                "type": "agent.step.completed",
+                "payload": {"step": 1, "inputTokens": 12, "outputTokens": 8},
+            }
+        )
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {
+                    "steps": 1,
+                    "totalTokens": 20,
+                    "output": {
+                        "nodes": nodes,
+                        "variableCandidates": {},
+                        "estimatedCost": {"llmCalls": sum(
+                            node["strategy"] in {"agent", "llm"} for node in nodes
+                        )},
+                    },
+                },
+            }
+        )
+        return 0
+
     if "RecoveryDecision" in args.prompt:
         # 恢复 Agent：平台模板 prompt 含 RecoveryDecision。默认提供替代输出以从剩余
         # 子图继续（provide_substitution）。可用 [[RECOVERY:action]] 覆盖。
+        context: dict[str, Any] = {}
+        if "context: " in args.prompt:
+            try:
+                context = json.loads(args.prompt.split("context: ", 1)[1])
+            except json.JSONDecodeError:
+                context = {}
+        run_input = context.get("runInput", {})
+        seed = run_input.get("seed") if isinstance(run_input, dict) else None
         action = _directive(args.prompt, "RECOVERY", "provide_substitution")
+        if seed == "request-user":
+            marker = Path(".recovery-user-answered")
+            if marker.exists() or context.get("userAnswer") is not None:
+                action = "provide_substitution"
+            else:
+                marker.write_text("asked", encoding="utf-8")
+                action = "request_user"
+        elif seed == "retry-replanned":
+            action = "retry_replanned"
+        if "crash-recovery" in args.prompt:
+            marker = Path(".recovery-crash-observed")
+            if not marker.exists():
+                marker.write_text("claimed", encoding="utf-8")
+                time.sleep(30)
         emit({"type": "agent.plan", "payload": {"summary": "评估 checkpoint 决定恢复策略"}})
         emit(
             {
@@ -93,6 +185,26 @@ def main() -> int:
         if action == "provide_substitution":
             recovered_value = _directive(args.prompt, "REPLY", "恢复值")
             decision["substitution"] = {"recovered": True, "value": recovered_value}
+        elif action == "request_user":
+            decision["question"] = "请确认是否按 checkpoint 继续恢复？"
+        elif action == "retry_replanned":
+            remaining_nodes = context.get("remainingNodes", [])
+            decision["planPatch"] = {
+                "remainingNodes": [
+                    {
+                        **node,
+                        "config": (
+                            {"operation": "passthrough"}
+                            if node.get("id") == "risky"
+                            else node.get("config", {})
+                        ),
+                    }
+                    for node in remaining_nodes
+                ],
+                "remainingEdges": context.get("remainingEdges", []),
+                "inputMappings": {},
+                "locks": context.get("capabilityLocks", []),
+            }
         emit(
             {
                 "type": "agent.completed",
@@ -144,6 +256,136 @@ def main() -> int:
                     "steps": 1,
                     "totalTokens": 16,
                     "output": {"reply": LOOKUP_TABLE.get(key, "未知季度")},
+                },
+            }
+        )
+        return 0
+
+    if mode == "browser_summary":
+        url = _clean_message(args.prompt)
+        browser_capability = "browser.read"
+        summary_capability = "summarize.text"
+        emit(
+            {
+                "type": "browser.action.started",
+                "payload": {
+                    "callId": "call-browser",
+                    "capability": browser_capability,
+                    "action": "read",
+                    "arguments": {"url": url},
+                    "argumentBindings": {
+                        "url": {"source": "user_input", "inputKey": "message"}
+                    },
+                },
+            }
+        )
+        emit(
+            {
+                "type": "browser.action.completed",
+                "payload": {
+                    "callId": "call-browser",
+                    "capability": browser_capability,
+                    "action": "read",
+                    "result": {"content": "首次探索正文"},
+                    "effect": "none",
+                    "idempotent": True,
+                    "replayability": "parameterizable",
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                        "required": ["content"],
+                    },
+                    "observations": {
+                        "runtime": "playwright",
+                        "action": "read",
+                        "pageContract": {
+                            "contractVersion": "1",
+                            "urlPattern": url,
+                            "bodySelector": "#main",
+                            "fields": {},
+                        },
+                    },
+                },
+            }
+        )
+        emit(
+            {
+                "type": "tool.call.started",
+                "payload": {
+                    "callId": "call-summary",
+                    "tool": summary_capability,
+                    "arguments": {"text": "首次探索正文"},
+                    "argumentBindings": {
+                        "text": {
+                            "source": "prior_output",
+                            "fromAction": "call-browser",
+                            "fromPath": "content",
+                        }
+                    },
+                },
+            }
+        )
+        emit(
+            {
+                "type": "tool.call.completed",
+                "payload": {
+                    "callId": "call-summary",
+                    "tool": summary_capability,
+                    "actionKind": "agent",
+                    "result": {"reply": "首次探索正文"},
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {"reply": {"type": "string"}},
+                        "required": ["reply"],
+                        "additionalProperties": False,
+                    },
+                    "observations": {
+                        "prompt": "[[MODE:echo_input]] 根据 text 生成 reply",
+                        "allowedCapabilities": [],
+                        "maxSteps": 2,
+                    },
+                },
+            }
+        )
+        emit(
+            {
+                "type": "agent.step.completed",
+                "payload": {"step": 1, "inputTokens": 20, "outputTokens": 10},
+            }
+        )
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {
+                    "steps": 1,
+                    "totalTokens": 30,
+                    "output": {"reply": "首次探索正文"},
+                },
+            }
+        )
+        return 0
+
+    if mode == "echo_input":
+        marker = "\n输入："
+        raw_input = args.prompt.rsplit(marker, 1)[-1] if marker in args.prompt else "{}"
+        try:
+            input_data = json.loads(raw_input)
+        except json.JSONDecodeError:
+            input_data = {}
+        echoed = input_data.get("text") or input_data.get("content") or str(input_data)
+        emit(
+            {
+                "type": "agent.step.completed",
+                "payload": {"step": 1, "inputTokens": 10, "outputTokens": 10},
+            }
+        )
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {
+                    "steps": 1,
+                    "totalTokens": 20,
+                    "output": {"reply": str(echoed)},
                 },
             }
         )

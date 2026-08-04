@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from app.application.compiler import WorkflowCompiler
 from app.application.mcp import classify_snapshot, discover_tools, register_server
+from app.application.workflow_catalog import build_manifest
 from app.infrastructure.database import (
     Component,
     SessionLocal,
@@ -204,6 +205,7 @@ async def _create_component(
     )
     session.add(version)
     await session.flush()
+    await build_manifest(session, workflow, version)
     component = Component(
         id=str(uuid4()),
         name=name,

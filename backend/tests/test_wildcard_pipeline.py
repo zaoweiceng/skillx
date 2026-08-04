@@ -34,6 +34,13 @@ def _trajectory(actions: list[dict], *, message: str = "https://site.local/a") -
         "outputSchema": OUTPUT_SCHEMA,
         "actions": actions,
         "output": {"summary": "首次总结"},
+        "outputProvenance": {
+            "summary": {
+                "source": "action_output",
+                "actionId": actions[-1]["callId"],
+                "path": "summary" if actions[-1].get("kind") == "agent" else "content",
+            }
+        },
         "config": {"maxSteps": 6, "maxTotalTokens": 30000, "allowedCapabilities": []},
         "originalModelCalls": 2,
     }
@@ -52,7 +59,7 @@ def _web_fetch_action(message: str) -> dict:
         "idempotent": True,
         "observations": {
             "action": "read",
-            "runtime": "contract",
+            "runtime": "playwright",
             "pageContract": {
                 "contractVersion": "1",
                 "urlPattern": "https://site.local/*",
@@ -99,10 +106,11 @@ def test_web_summary_trajectory_distills_to_mixed_graph() -> None:
     assert node_types == ["input", "browser", "agent", "output"]
     assert analysis["directNodes"] == 1
     assert analysis["agentNodes"] == 1
-    # browser 节点是抽象契约，不暴露 Playwright 私有对象。
+    # browser 节点选择受控 Playwright runtime，但不暴露 page/locator 私有对象。
     browser_node = definition["spec"]["nodes"][1]
     assert browser_node["config"]["pageContract"]["contractVersion"] == "1"
-    assert "playwright" not in str(browser_node["config"]).lower()
+    assert browser_node["config"]["runtime"] == "playwright"
+    assert "locator" not in str(browser_node["config"]).lower()
     # 真实数据依赖：Agent 总结节点的 text 输入引用 browser 节点的 content 输出，
     # 而不是常量“正文”。这是可执行 mixed dataflow 的核心证据。
     agent_node = definition["spec"]["nodes"][2]

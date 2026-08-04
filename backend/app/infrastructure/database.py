@@ -4,7 +4,17 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, Text, event
+from sqlalchemy import (
+    JSON,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    event,
+)
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -67,11 +77,76 @@ class Component(Base, TimestampMixin):
     execution_class: Mapped[str] = mapped_column(String(20), default="zero_llm")
 
 
-class Run(Base, TimestampMixin):
-    __tablename__ = "runs"
+class WorkflowCapabilityManifest(Base, TimestampMixin):
+    __tablename__ = "workflow_capability_manifests"
+    __table_args__ = (
+        Index("uq_workflow_capability_version", "workflow_version_id", unique=True),
+        Index("ix_workflow_capability_status", "status"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    workflow_version_id: Mapped[str] = mapped_column(ForeignKey("workflow_versions.id"))
+    workflow_version_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_versions.id", ondelete="CASCADE")
+    )
+    workflow_digest: Mapped[str] = mapped_column(String(80))
+    manifest_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    digest: Mapped[str] = mapped_column(String(80), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published")
+    search_text: Mapped[str] = mapped_column(Text)
+
+
+class WorkflowFragmentManifest(Base, TimestampMixin):
+    __tablename__ = "workflow_fragment_manifests"
+    __table_args__ = (
+        Index("uq_workflow_fragment_ref", "fragment_ref", unique=True),
+        Index("ix_workflow_fragment_version", "workflow_version_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workflow_version_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_versions.id", ondelete="CASCADE")
+    )
+    fragment_ref: Mapped[str] = mapped_column(String(240))
+    source_workflow_digest: Mapped[str] = mapped_column(String(80))
+    closure_digest: Mapped[str] = mapped_column(String(80))
+    manifest_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    digest: Mapped[str] = mapped_column(String(80), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="published")
+
+
+class PlanSnapshot(Base, TimestampMixin):
+    __tablename__ = "plan_snapshots"
+    __table_args__ = (Index("ix_plan_signature", "plan_signature"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    definition_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    digest: Mapped[str] = mapped_column(String(80), index=True)
+    source_refs_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    locks_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    created_by_conversation_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversation_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(20), default="active")
+    plan_signature: Mapped[str] = mapped_column(String(80))
+
+
+class Run(Base, TimestampMixin):
+    __tablename__ = "runs"
+    __table_args__ = (
+        CheckConstraint(
+            "(workflow_version_id IS NOT NULL) != (plan_snapshot_id IS NOT NULL)",
+            name="ck_run_execution_source",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    workflow_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("workflow_versions.id"), nullable=True
+    )
+    plan_snapshot_id: Mapped[str | None] = mapped_column(
+        ForeignKey("plan_snapshots.id"), nullable=True
+    )
     component_id: Mapped[str | None] = mapped_column(ForeignKey("components.id"), nullable=True)
     owner_id: Mapped[str] = mapped_column(String(120), default="local-user")
     status: Mapped[str] = mapped_column(String(32), index=True, default="queued")
@@ -409,9 +484,39 @@ class FailureObservation(Base, TimestampMixin):
     classification: Mapped[str] = mapped_column(String(32))
     occurrence: Mapped[int] = mapped_column(Integer, default=1)
     recovered: Mapped[bool] = mapped_column(default=False)
+    baseline_reproduced: Mapped[bool] = mapped_column(default=False)
     last_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     last_checkpoint_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     contract_summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class RecoveryAttempt(Base, TimestampMixin):
+    __tablename__ = "recovery_attempts"
+    __table_args__ = (
+        Index("uq_recovery_attempt", "checkpoint_id", "attempt", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    checkpoint_id: Mapped[str] = mapped_column(
+        ForeignKey("execution_checkpoints.id", ondelete="CASCADE")
+    )
+    attempt: Mapped[int] = mapped_column(Integer)
+    plan_patch_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    digest: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(24))
+
+
+class ReplayEvidence(Base, TimestampMixin):
+    __tablename__ = "replay_evidence"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    observation_id: Mapped[str] = mapped_column(
+        ForeignKey("failure_observations.id", ondelete="CASCADE"), index=True
+    )
+    baseline_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    patched_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    diff_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    passed: Mapped[bool] = mapped_column(default=False)
 
 
 settings = get_settings()

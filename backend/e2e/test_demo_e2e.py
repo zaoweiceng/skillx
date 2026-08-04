@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 
 import httpx
@@ -16,6 +17,7 @@ from e2e.harness import (
     DemoStack,
     poll_conversation_run,
     poll_run,
+    restart_worker,
     start_stack,
     stop_stack,
 )
@@ -92,6 +94,9 @@ def test_e2e_4_conversation_component(stack: DemoStack) -> None:
         candidate = message["assistant"]
         assert candidate["type"] == "component_candidate"
         assert candidate.get("candidateSnapshotDigest")
+        assert candidate["selectionSource"] == "traex"
+        assert candidate["disclosureLevel"] == "L0"
+        assert candidate["workflowRef"].startswith("workflow:")
         # 补参并显式确认，启动锁定版本的 Workflow。
         confirmed = client.post(
             f"/conversations/{conversation['id']}/confirm-component",
@@ -280,6 +285,56 @@ def test_e2e_7_checkpoint_recovery_resumes_without_replaying_side_effects(
         assert checkpoint["recoveryNodeRunId"]
 
 
+def test_e2e_7c_recovery_request_user_answers_same_checkpoint(
+    stack: DemoStack,
+) -> None:
+    with stack.client() as client:
+        component = _component(client, "检查点接力演示")
+        created = client.post(
+            f"/components/{component['id']}/runs",
+            json={"input": {"seed": "request-user"}},
+        )
+        waiting = poll_run(client, created.json()["id"], timeout=60)
+        assert waiting["status"] == "waiting_approval", waiting
+        approval = next(
+            item
+            for item in waiting["approvals"]
+            if item["snapshot"].get("effect") == "recovery.question"
+        )
+        answered = client.post(
+            f"/approvals/{approval['id']}/answer",
+            json={
+                "snapshotDigest": approval["snapshotDigest"],
+                "answer": {"confirmed": True},
+            },
+        )
+        assert answered.status_code == 200, answered.text
+        completed = poll_run(client, waiting["id"], timeout=60)
+        assert completed["status"] == "succeeded", completed
+        checkpoints = client.get(f"/runs/{waiting['id']}").json()["checkpoints"]
+        assert len(checkpoints) == 1
+        assert checkpoints[0]["status"] == "applied"
+
+
+def test_e2e_7d_recovery_typed_replan_executes_new_attempt(
+    stack: DemoStack,
+) -> None:
+    with stack.client() as client:
+        component = _component(client, "检查点接力演示")
+        created = client.post(
+            f"/components/{component['id']}/runs",
+            json={"input": {"seed": "retry-replanned"}},
+        )
+        completed = poll_run(client, created.json()["id"], timeout=60)
+        assert completed["status"] == "succeeded", completed
+        detail = client.get(f"/runs/{completed['id']}").json()
+        risky = [node for node in detail["nodes"] if node["nodeId"] == "risky"]
+        assert len(risky) >= 2
+        assert all(node["status"] == "failed" for node in risky[:-1])
+        assert risky[-1]["status"] == "succeeded"
+        assert detail["checkpoints"][0]["decision"]["action"] == "retry_replanned"
+
+
 def test_e2e_8_dynamic_web_summary_reflects_page_change(stack: DemoStack) -> None:
     """F-01：真实读取动态网页正文并交给 TraeX 总结；页面改变后第二次输出依赖新正文。"""
 
@@ -327,3 +382,477 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
         )
         assert rejected.status_code == 422, rejected.text
         assert rejected.json()["detail"]["code"] == "PATCH_NOT_ELIGIBLE"
+
+        definition = {
+            "apiVersion": "workflow.platform/v1",
+            "kind": "Workflow",
+            "metadata": {"name": "replay-proof"},
+            "spec": {
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["x"],
+                    "properties": {"x": {"type": "string"}},
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "required": ["y"],
+                    "properties": {"y": {"type": "string"}},
+                },
+                "nodes": [
+                    {"id": "input", "type": "input", "displayName": "输入"},
+                    {
+                        "id": "work",
+                        "type": "transform",
+                        "displayName": "确定失败",
+                        "input": {"value": "${input.x}"},
+                        "config": {"operation": "fail_dependency"},
+                    },
+                    {
+                        "id": "output",
+                        "type": "output",
+                        "displayName": "输出",
+                        "input": {"y": "${work.output.value}"},
+                    },
+                ],
+                "edges": [
+                    {"source": "input", "target": "work"},
+                    {"source": "work", "target": "output"},
+                ],
+            },
+        }
+        workflow = client.post(
+            "/workflows", json={"name": "Replay Proof", "definition": definition}
+        )
+        published = client.post(
+            f"/workflows/{workflow.json()['id']}/publish"
+        ).json()
+        replay_component = client.post(
+            "/components",
+            json={
+                "name": "Replay Proof",
+                "workflowVersionId": published["id"],
+            },
+        ).json()
+        source_run_id = ""
+        for _ in range(2):
+            created = client.post(
+                f"/components/{replay_component['id']}/runs",
+                json={"input": {"x": "safe"}},
+            )
+            failed = poll_run(client, created.json()["id"])
+            assert failed["status"] == "failed", failed
+            source_run_id = failed["id"]
+
+        patched = client.post(
+            f"/workflow-versions/{published['id']}/workflow-patch",
+            json={
+                "sourceRunId": source_run_id,
+                "patch": {
+                    "nodePatches": [
+                        {
+                            "nodeId": "work",
+                            "changes": {"config": {"operation": "passthrough"}},
+                        }
+                    ]
+                },
+            },
+        )
+        assert patched.status_code == 201, patched.text
+        proof = patched.json()
+        assert proof["replay"]["baselineReproduced"] is True
+        assert proof["replay"]["passed"] is True
+        assert proof["replay"]["replayEvidenceId"]
+        assert proof["draftWorkflowId"]
+
+
+def test_e2e_10_progressive_catalog_composition_and_version_pinning(
+    stack: DemoStack,
+) -> None:
+    with stack.client() as client:
+        searched = client.post(
+            "/workflow-tools/search",
+            json={"query": "问候", "constraints": {"sideEffects": "none"}, "limit": 8},
+        )
+        assert searched.status_code == 200, searched.text
+        cards = searched.json()["items"]
+        assert 1 <= len(cards) <= 8
+        card = next(item for item in cards if item["name"] == "问候工作流")
+        assert "inputSchema" not in card
+        assert "definition" not in card
+
+        described = client.post(
+            "/workflow-tools/describe", json={"ref": card["workflowRef"]}
+        )
+        assert described.status_code == 200, described.text
+        detail = described.json()["workflow"]
+        assert detail["versionLock"]["digest"] in card["workflowRef"]
+        assert "inputSchema" in detail
+        assert "definition" not in detail
+
+        plan = client.post(
+            "/plans",
+            json={
+                "plan": {
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {"name": {"type": "string"}},
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["message"],
+                        "properties": {"message": {"type": "string"}},
+                    },
+                    "steps": [
+                        {
+                            "id": "first",
+                            "kind": "workflow",
+                            "ref": card["workflowRef"],
+                            "input": {"name": "${input.name}"},
+                        },
+                        {
+                            "id": "second",
+                            "kind": "workflow",
+                            "ref": card["workflowRef"],
+                            "input": {"name": "${first.message}"},
+                        },
+                        {
+                            "id": "summary",
+                            "kind": "agent",
+                            "input": {"text": "${second.message}"},
+                            "config": {
+                                "prompt": "[[MODE:echo_input]] 输出 reply",
+                                "outputSchema": {
+                                    "type": "object",
+                                    "required": ["reply"],
+                                    "properties": {"reply": {"type": "string"}},
+                                    "additionalProperties": False,
+                                },
+                                "allowedCapabilities": [],
+                            },
+                        },
+                    ],
+                    "edges": [
+                        {"source": "first", "target": "second"},
+                        {"source": "second", "target": "summary"},
+                    ],
+                    "output": {"message": "${summary.reply}"},
+                }
+            },
+        )
+        assert plan.status_code == 201, plan.text
+        snapshot = plan.json()
+        assert snapshot["preview"]["hasSideEffects"] is False
+        assert snapshot["preview"]["callsAgent"] is True
+        assert len(snapshot["sourceRefs"]) == 2
+
+        # 更新源组件默认版本；已创建 PlanSnapshot 仍引用旧 digest。
+        component = _component(client, "确定性问候")
+        workflow = client.get(f"/workflows/{component['workflowId']}").json()
+        definition = workflow["definition"]
+        format_node = next(
+            node for node in definition["spec"]["nodes"] if node["id"] == "format"
+        )
+        format_node["config"]["template"] = "新版你好，{name}"
+        updated = client.put(
+            f"/workflows/{component['workflowId']}/draft",
+            json={"revision": workflow["draftRevision"], "definition": definition},
+        )
+        assert updated.status_code == 200, updated.text
+        published = client.post(f"/workflows/{component['workflowId']}/publish")
+        assert published.status_code == 201, published.text
+        changed_default = client.post(
+            "/components",
+            json={
+                "name": "确定性问候",
+                "description": component["description"],
+                "workflowVersionId": published.json()["id"],
+            },
+        )
+        assert changed_default.status_code == 201, changed_default.text
+
+        plan_run = client.post(
+            f"/plans/{snapshot['id']}/runs", json={"input": {"name": "Alice"}}
+        )
+        assert plan_run.status_code == 202, plan_run.text
+        completed = poll_run(client, plan_run.json()["id"])
+        assert completed["status"] == "succeeded", completed
+        assert completed["output"] == {"message": "你好，你好，Alice"}
+        assert completed["workflowVersionId"] is None
+        assert completed["planSnapshotId"] == snapshot["id"]
+
+
+def test_e2e_11_fragment_disclosure_and_slice_safety(stack: DemoStack) -> None:
+    with stack.client() as client:
+        source = _component(client, "确定性问候")
+        source_definition = client.get(f"/components/{source['id']}").json()[
+            "definition"
+        ]
+        source_definition["metadata"] = {
+            "name": "fragment-demo",
+            "capability": {
+                "summary": "可组合的问候片段",
+                "useWhen": ["需要问候片段"],
+                "tags": ["fragment"],
+            },
+            "callableFragments": [
+                {
+                    "name": "format-only",
+                    "nodeIds": ["format"],
+                    "summary": "只执行格式化",
+                    "outputMapping": {"message": "${format.output.text}"},
+                }
+            ],
+        }
+        created = client.post(
+            "/workflows",
+            json={"name": "片段问候工作流", "definition": source_definition},
+        )
+        assert created.status_code == 201, created.text
+        published = client.post(f"/workflows/{created.json()['id']}/publish")
+        assert published.status_code == 201, published.text
+        workflow_ref = next(
+            item["workflowRef"]
+            for item in client.post(
+                "/workflow-tools/search",
+                json={"query": "可组合的问候片段", "limit": 8},
+            ).json()["items"]
+            if item["workflowRef"] == published.json()["workflowRef"]
+        )
+
+        described = client.post(
+            "/workflow-tools/describe", json={"ref": workflow_ref}
+        ).json()["workflow"]
+        fragment_ref = described["fragments"][0]["fragmentRef"]
+        fragment = client.post(
+            "/workflow-tools/describe-fragment", json={"ref": fragment_ref}
+        )
+        assert fragment.status_code == 200, fragment.text
+        assert fragment.json()["fragment"]["nodeIds"] == ["format"]
+
+        plan = client.post(
+            "/plans",
+            json={
+                "plan": {
+                    "inputSchema": source_definition["spec"]["inputSchema"],
+                    "outputSchema": source_definition["spec"]["outputSchema"],
+                    "steps": [
+                        {
+                            "id": "fragment",
+                            "kind": "fragment",
+                            "ref": fragment_ref,
+                            "input": {"name": "${input.name}"},
+                        }
+                    ],
+                    "output": {"message": "${fragment.message}"},
+                }
+            },
+        )
+        assert plan.status_code == 201, plan.text
+        run = client.post(
+            f"/plans/{plan.json()['id']}/runs", json={"input": {"name": "片段"}}
+        )
+        completed = poll_run(client, run.json()["id"])
+        assert completed["status"] == "succeeded", completed
+        source_template = next(
+            node
+            for node in source_definition["spec"]["nodes"]
+            if node["id"] == "format"
+        )["config"]["template"]
+        assert completed["output"] == {
+            "message": source_template.format(name="片段")
+        }
+
+        browser = _component(client, "费用提交（真实浏览器）")
+        browser_definition = client.get(f"/components/{browser['id']}").json()[
+            "definition"
+        ]
+        side_effect_node = next(
+            node for node in browser_definition["spec"]["nodes"] if node.get("sideEffect")
+        )
+        browser_card = next(
+            item
+            for item in client.post(
+                "/workflow-tools/search",
+                json={"query": "费用提交", "limit": 8},
+            ).json()["items"]
+            if "费用提交" in item["name"]
+        )
+        rejected = client.post(
+            "/workflow-tools/slice",
+            json={
+                "workflowRef": browser_card["workflowRef"],
+                "candidateNodeIds": [side_effect_node["id"]],
+            },
+        )
+        assert rejected.status_code == 422, rejected.text
+        assert rejected.json()["detail"]["code"] == "FRAGMENT_SLICE_REJECTED"
+
+
+def test_e2e_8b_real_browser_distillation_to_non_fake_agent(
+    stack: DemoStack,
+) -> None:
+    with stack.client() as client:
+        article_url = f"{stack.form_url}/article"
+        stack.set_article("探索阶段正文")
+        conversation = client.post(
+            "/conversations", json={"title": "真实 Browser 固化"}
+        ).json()
+        started = client.post(
+            f"/conversations/{conversation['id']}/agent-runs",
+            json={
+                "content": f"{article_url} [[MODE:browser_summary]]",
+                "allowedCapabilities": ["browser.read", "summarize.text"],
+            },
+        )
+        assert started.status_code == 202, started.text
+        conversation_run_id = started.json()["conversationRunId"]
+        summary = poll_conversation_run(client, conversation_run_id)
+        assert summary["status"] == "succeeded", summary
+        events = client.get(
+            f"/conversation-runs/{conversation_run_id}/events"
+        ).json()
+        assert "browser.action.started" in {event["type"] for event in events}
+
+        distilled = client.post(f"/conversation-runs/{conversation_run_id}/distill")
+        assert distilled.status_code == 201, distilled.text
+        analysis = distilled.json()["analysis"]
+        assert analysis["proposalSource"] == "distillation_agent"
+        assert analysis["proposalDigest"].startswith("sha256:")
+        assert analysis["sourceTrajectoryDigest"].startswith("sha256:")
+        assert analysis["directNodes"] == 1
+        assert analysis["agentNodes"] == 1
+        assert analysis["publishable"] is True
+
+        published = client.post(
+            f"/workflows/{distilled.json()['draftWorkflowId']}/publish"
+        )
+        assert published.status_code == 201, published.text
+        component = client.post(
+            "/components",
+            json={
+                "name": "Browser 固化总结",
+                "description": "真实 Browser 轨迹固化",
+                "workflowVersionId": published.json()["id"],
+            },
+        )
+        assert component.status_code == 201, component.text
+
+        stack.set_article("第二次运行的新正文：利润增长 21%。")
+        created = client.post(
+            f"/components/{component.json()['id']}/runs",
+            json={"input": {"message": article_url}},
+        )
+        completed = poll_run(client, created.json()["id"], timeout=60)
+        assert completed["status"] == "succeeded", completed
+        assert "利润增长 21%" in completed["output"]["reply"]
+        node_types = {
+            node["nodeId"]: node["type"] for node in completed.get("nodes", [])
+        }
+        assert "browser" in node_types.values()
+        assert "agent" in node_types.values()
+        assert "agent.completed" in _events(client, completed["id"])
+
+
+def test_e2e_12_successful_plan_only_suggests_human_draft(
+    stack: DemoStack,
+) -> None:
+    with stack.client() as client:
+        card = client.post(
+            "/workflow-tools/search", json={"query": "问候", "limit": 8}
+        ).json()["items"][0]
+        plan = client.post(
+            "/plans",
+            json={
+                "plan": {
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["name"],
+                        "properties": {"name": {"type": "string"}},
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["message"],
+                        "properties": {"message": {"type": "string"}},
+                    },
+                    "steps": [
+                        {
+                            "id": "greet",
+                            "kind": "workflow",
+                            "ref": card["workflowRef"],
+                            "input": {"name": "${input.name}"},
+                        }
+                    ],
+                    "output": {"message": "${greet.message}"},
+                }
+            },
+        )
+        assert plan.status_code == 201, plan.text
+        snapshot = plan.json()
+        for name in ("A", "B", "C"):
+            created = client.post(
+                f"/plans/{snapshot['id']}/runs", json={"input": {"name": name}}
+            )
+            completed = poll_run(client, created.json()["id"])
+            assert completed["status"] == "succeeded", completed
+
+        suggestions = client.get("/plan-suggestions", params={"threshold": 3})
+        assert suggestions.status_code == 200, suggestions.text
+        suggestion = next(
+            item
+            for item in suggestions.json()
+            if item["planSignature"] == snapshot["planSignature"]
+        )
+        assert suggestion["action"] == "suggest_draft"
+        solidified = client.post(
+            f"/plans/{snapshot['id']}/solidify", json={"name": "人工固化问候"}
+        )
+        assert solidified.status_code == 201, solidified.text
+        assert solidified.json()["published"] is False
+        draft = client.get(
+            f"/workflows/{solidified.json()['workflowId']}"
+        )
+        assert draft.status_code == 200, draft.text
+        assert (
+            draft.json()["definition"]["metadata"]["sourcePlanSnapshotId"]
+            == snapshot["id"]
+        )
+
+
+def test_e2e_7b_recovery_worker_crash_is_reclaimed(stack: DemoStack) -> None:
+    with stack.client() as client:
+        component = _component(client, "检查点接力演示")
+        created = client.post(
+            f"/components/{component['id']}/runs",
+            json={"input": {"seed": "crash-recovery"}},
+        )
+        assert created.status_code == 202, created.text
+        run_id = created.json()["id"]
+        deadline = time.time() + 30
+        claimed = False
+        while time.time() < deadline:
+            detail = client.get(f"/runs/{run_id}").json()
+            claimed = any(
+                checkpoint["status"] == "running"
+                for checkpoint in detail.get("checkpoints", [])
+            )
+            if claimed:
+                break
+            time.sleep(0.1)
+        assert claimed, "Recovery checkpoint 未被 Worker 领取"
+
+        restart_worker(stack, crash=True)
+        completed = poll_run(client, run_id, timeout=30)
+        assert completed["status"] == "succeeded", completed
+        detail = client.get(f"/runs/{run_id}").json()
+        recovery_attempts = [
+            node for node in detail["nodes"] if node["nodeId"] == "recovery_agent"
+        ]
+        assert [node["status"] for node in recovery_attempts] == [
+            "lease_expired",
+            "succeeded",
+        ]
+        risky_attempts = [
+            node for node in detail["nodes"] if node["nodeId"] == "risky"
+        ]
+        assert all(node["status"] == "failed" for node in risky_attempts)

@@ -1,6 +1,6 @@
 .PHONY: demo-check quality-check backend-check browser-install frontend-check migration-check e2e-check
 
-# 完整验收：质量门禁 + 六条真实黑盒 E2E。
+# 完整验收：质量门禁 + docs/demo-acceptance.md 定义的真实黑盒 E2E。
 demo-check: quality-check e2e-check
 
 # 较快的静态/单元/进程内集成检查，不含黑盒子进程 E2E。
@@ -17,7 +17,7 @@ migration-check:
 	cd backend && DB_PATH=$$(mktemp -u /tmp/skillx-migration.XXXXXX) && \
 		SKILLX_DATABASE_URL=sqlite+aiosqlite:///$$DB_PATH uv run alembic upgrade head
 
-# 六条真实 API + 独立 Worker 子进程黑盒 E2E。浏览器安装独立执行，避免每次门禁重复下载。
+# 真实 API + 独立 Worker 子进程黑盒 E2E。浏览器安装独立执行，避免每次门禁重复下载。
 e2e-check: browser-install
 	cd backend && uv run pytest e2e -q -p no:cacheprovider
 

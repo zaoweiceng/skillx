@@ -32,7 +32,7 @@ def test_compiler_rejects_unsafe_side_effect_retry() -> None:
     assert "UNSAFE_SIDE_EFFECT_RETRY" in {item.code for item in error.value.diagnostics}
 
 
-def test_compiler_warns_on_output_field_not_in_upstream_schema() -> None:
+def test_compiler_rejects_output_field_not_in_upstream_schema() -> None:
     # 上游 LLM 节点声明 outputSchema 只有 category，下游引用不存在的 missing 字段。
     definition = deterministic_workflow()
     definition["spec"]["nodes"].insert(
@@ -62,9 +62,11 @@ def test_compiler_warns_on_output_field_not_in_upstream_schema() -> None:
     output = next(node for node in definition["spec"]["nodes"] if node["id"] == "output")
     output["input"] = {"message": "${classify.output.missing}"}
 
-    compiled = WorkflowCompiler().compile(definition)
-    codes = {item.code for item in compiled.diagnostics}
-    assert "OUTPUT_FIELD_NOT_IN_SCHEMA" in codes
+    with pytest.raises(WorkflowValidationError) as error:
+        WorkflowCompiler().compile(definition)
+    assert "OUTPUT_FIELD_NOT_IN_SCHEMA" in {
+        item.code for item in error.value.diagnostics
+    }
 
 
 def test_compiler_allows_indexed_array_reference() -> None:

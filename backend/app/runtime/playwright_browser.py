@@ -72,6 +72,8 @@ class PlaywrightPageSession:
             wait_until="domcontentloaded",
             timeout=int(self.config.get("navigationTimeoutMs", 15000)),
         )
+        if not url_matches(self.contract.url_pattern, self.page.url):
+            raise BrowserExecutionError("重定向后的最终 URL 不符合 PageContract")
         return self
 
     async def __aexit__(self, *_: Any) -> None:

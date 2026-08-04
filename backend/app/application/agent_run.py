@@ -596,6 +596,31 @@ def build_trajectory(
 
     from app.application.security import redact
 
+    cleaned_actions = [_desensitize_action(item) for item in actions]
+    last_action_id = cleaned_actions[-1].get("callId") if cleaned_actions else None
+    last_result = cleaned_actions[-1].get("result", {}) if cleaned_actions else {}
+    last_observations = (
+        cleaned_actions[-1].get("observations", {}) if cleaned_actions else {}
+    )
+    output_provenance: dict[str, Any] = {}
+    for field, value in output.items():
+        path = field
+        if last_observations.get("operation") == "lookup":
+            path = "value"
+        elif isinstance(last_result, dict):
+            if field in last_result:
+                path = field
+            else:
+                matching = [
+                    key for key, result_value in last_result.items() if result_value == value
+                ]
+                if len(matching) == 1:
+                    path = matching[0]
+        output_provenance[field] = {
+            "source": "action_output",
+            **({"actionId": last_action_id} if last_action_id else {}),
+            "path": path,
+        }
     return {
         "runType": "agent_run",
         "name": "conversation-agent-draft",
@@ -607,8 +632,9 @@ def build_trajectory(
             "additionalProperties": False,
         },
         "outputSchema": config.output_schema,
-        "actions": [_desensitize_action(item) for item in actions],
+        "actions": cleaned_actions,
         "output": redact(output),
+        "outputProvenance": output_provenance,
         "config": {
             "maxSteps": config.max_steps,
             "maxTotalTokens": config.max_total_tokens,

@@ -96,6 +96,47 @@ export default function ComponentDetailPage() {
         </section>
       )}
 
+      {component.capabilityManifest && (
+        <section className="panel result-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">TRAE X DISCLOSURE PREVIEW</span>
+              <h2>L0 / L1 / L2 能力清单</h2>
+            </div>
+            <span className="effect-label">
+              {component.capabilityManifest.entrypoints.join(' · ')}
+            </span>
+          </div>
+          <p>{component.capabilityManifest.summary}</p>
+          <div className="current-mapping">
+            {component.capabilityManifest.tags.map((tag) => (
+              <span className="metric-chip" key={tag}>{tag}</span>
+            ))}
+          </div>
+          <ul className="dual-view-list">
+            <li>适用：{component.capabilityManifest.useWhen.join('；') || '未补充'}</li>
+            <li>不适用：{component.capabilityManifest.doNotUseWhen.join('；') || '未补充'}</li>
+            <li className="digest-line">ref：{component.capabilityManifest.workflowRef}</li>
+            <li className="digest-line">
+              manifest：{component.capabilityManifest.manifestDigest}
+            </li>
+          </ul>
+          {(component.capabilityManifest.fragments?.length ?? 0) > 0 && (
+            <div className="node-table">
+              {component.capabilityManifest.fragments?.map((fragment) => (
+                <div className="node-row" key={fragment.fragmentRef}>
+                  <div>
+                    <strong>{fragment.name}</strong>
+                    <small>{fragment.summary}</small>
+                    <code className="digest-line">{fragment.fragmentRef}</code>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      )}
+
       <section className="detail-grid">
         <div className="graph-panel panel">
           <div className="panel-heading">

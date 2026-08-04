@@ -180,28 +180,39 @@ def test_observation_eligibility_requires_reproducibility() -> None:
         recovered=False,
         contract_summary_json={},
     )
-    # 仅出现一次：未达可复现阈值 → 不 eligible。
+    # occurrence 只表示热度，不能替代 baseline reproduction。
     assert observation_eligibility(obs)["eligible"] is False
     obs.occurrence = REPRODUCIBLE_THRESHOLD
+    assert observation_eligibility(obs)["eligible"] is False
+    obs.baseline_reproduced = True
     result = observation_eligibility(obs)
     assert result["eligible"] is True
     assert result["reproducible"] is True
 
 
 async def _seed_version_with_failure(
-    *, error_code: str, occurrence: int, node_id: str = "work"
+    *,
+    error_code: str,
+    occurrence: int,
+    node_id: str = "work",
+    real_failure: bool = False,
 ) -> tuple[str, str]:
     """建版本 + source Run + 指定 occurrence 的 FailureObservation。返回 (version_id, run_id)。"""
 
     async with SessionLocal() as session, session.begin():
-        workflow = Workflow(id=str(uuid4()), name="wf", draft_revision=1, draft_json=_definition())
+        definition = _definition()
+        if real_failure:
+            definition["spec"]["nodes"][1]["config"]["operation"] = "fail_dependency"
+        workflow = Workflow(
+            id=str(uuid4()), name="wf", draft_revision=1, draft_json=definition
+        )
         session.add(workflow)
         await session.flush()
         version = WorkflowVersion(
             id=str(uuid4()),
             workflow_id=workflow.id,
             version=1,
-            definition_json=_definition(),
+            definition_json=definition,
             digest="sha256:x",
             validation_json={},
         )
@@ -272,7 +283,9 @@ async def test_patch_endpoint_rejects_transient_single_occurrence() -> None:
 async def test_patch_endpoint_creates_draft_after_real_replay() -> None:
     # 可复现的确定性失败 + 真实 replay 通过 → 创建 draft，旧版本不变。
     version_id, run_id = await _seed_version_with_failure(
-        error_code="INVALID_INPUT", occurrence=REPRODUCIBLE_THRESHOLD
+        error_code="DEPENDENCY_UNAVAILABLE",
+        occurrence=REPRODUCIBLE_THRESHOLD,
+        real_failure=True,
     )
     async with SessionLocal() as session:
         original = (await session.get(WorkflowVersion, version_id)).definition_json
@@ -281,7 +294,12 @@ async def test_patch_endpoint_creates_draft_after_real_replay() -> None:
             {
                 "sourceRunId": run_id,
                 "patch": {
-                    "nodePatches": [{"nodeId": "work", "changes": {"timeoutSeconds": 90}}]
+                    "nodePatches": [
+                        {
+                            "nodeId": "work",
+                            "changes": {"config": {"operation": "passthrough"}},
+                        }
+                    ]
                 },
             },
             session,
@@ -293,4 +311,4 @@ async def test_patch_endpoint_creates_draft_after_real_replay() -> None:
         version = await session.get(WorkflowVersion, version_id)
         assert version.definition_json == original
         work = next(n for n in version.definition_json["spec"]["nodes"] if n["id"] == "work")
-        assert work["timeoutSeconds"] == 30
+        assert work["config"]["operation"] == "fail_dependency"
