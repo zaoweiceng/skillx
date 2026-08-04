@@ -246,3 +246,27 @@ def test_e2e_6b_page_change_after_approval_invalidates_authorization(stack: Demo
         # 未产生任何提交（本用例的 amount=200 从未落库）。
         submissions = stack.form_stats()["lastSubmission"]
         assert submissions != {"amount": "200"}
+
+
+def test_e2e_7_checkpoint_recovery_resumes_without_replaying_side_effects(
+    stack: DemoStack,
+) -> None:
+    with stack.client() as client:
+        component = _component(client, "检查点接力演示")
+        created = client.post(
+            f"/components/{component['id']}/runs",
+            json={"input": {"seed": "abc"}},
+        )
+        assert created.status_code == 202, created.text
+        run_id = created.json()["id"]
+        # risky 节点重试耗尽 → checkpoint → 恢复 Agent 从剩余子图接力 → 成功。
+        run = poll_run(client, run_id, timeout=60)
+        assert run["status"] == "succeeded", run
+        types = _events(client, run_id)
+        # 出现了恢复请求事件。
+        assert "run.recovery_requested" in types
+        # sensitive（非幂等副作用）只执行一次，未被重放。
+        nodes = client.get(f"/runs/{run_id}").json()["nodes"]
+        sensitive_runs = [n for n in nodes if n["nodeId"] == "sensitive"]
+        assert len(sensitive_runs) == 1
+        assert sensitive_runs[0]["status"] == "succeeded"

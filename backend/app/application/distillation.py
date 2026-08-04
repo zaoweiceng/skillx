@@ -85,14 +85,11 @@ def compile_agent_trajectory(
             # 被拒绝的动作仍需保留位置：退回显式 Agent 节点，避免丢步骤，但草稿不可发布。
             fallback = registry._compilers["agent"].compile(action, ctx)  # noqa: SLF001
             node = fallback.node
-            agent_nodes += 1
-        elif result.decision == "agent":
-            node = result.node
-            agent_nodes += 1
         else:
             node = result.node
-            deterministic_nodes += 1
-            if action.capability_ref and action.capability_ref.digest:
+            if result.decision == "compiled" and action.capability_ref and (
+                action.capability_ref.digest
+            ):
                 capability_locks.append(
                     {
                         "nodeId": node_id,
@@ -104,6 +101,11 @@ def compile_agent_trajectory(
                     }
                 )
         assert node is not None
+        # 按结果节点类型统计：agent/llm 计入模型节点，其余确定节点计入 direct。
+        if node["type"] in ("agent", "llm"):
+            agent_nodes += 1
+        else:
+            deterministic_nodes += 1
         nodes.append(node)
         edges.append({"source": previous, "target": node_id})
         previous = node_id

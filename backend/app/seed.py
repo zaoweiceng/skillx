@@ -116,6 +116,23 @@ async def seed() -> str:
                 definition=browser,
                 validation={"diagnostics": [], "executionClass": "zero_llm"},
             )
+        # 检查点接力演示组件：仅当配置 TraeX 时 seed，供黑盒 E2E-7 验证 fallback 恢复。
+        if (
+            os.environ.get("SKILLX_TRAEX_COMMAND")
+            and await session.scalar(
+                select(Component).where(Component.name == "检查点接力演示")
+            )
+            is None
+        ):
+            recovery = _recovery_workflow()
+            await _create_component(
+                session,
+                name="检查点接力演示",
+                description="中间节点注入可重试失败，重试耗尽后按 fallback 从 checkpoint 接力。",
+                workflow_name="检查点接力工作流",
+                definition=recovery,
+                validation={"diagnostics": [], "executionClass": "agent"},
+            )
         # 真实 Playwright 提交组件：仅当提供本地表单站点 URL 时 seed，供黑盒 E2E-6 使用。
         form_url = os.environ.get("SKILLX_DEMO_FORM_URL")
         if (
@@ -324,6 +341,78 @@ def _agent_workflow() -> dict:
             "edges": [
                 {"source": "input", "target": "agent"},
                 {"source": "agent", "target": "output"},
+            ],
+        },
+    }
+
+
+def _recovery_workflow() -> dict:
+    """检查点接力演示：sensitive(副作用成功) → risky(注入可重试失败, fallback→agent)。"""
+
+    output_schema = {
+        "type": "object",
+        "properties": {"result": {"type": "string"}},
+        "required": ["result"],
+        "additionalProperties": False,
+    }
+    return {
+        "apiVersion": "workflow.platform/v1",
+        "kind": "Workflow",
+        "metadata": {"name": "checkpoint-recovery"},
+        "spec": {
+            "inputSchema": {
+                "type": "object",
+                "properties": {"seed": {"type": "string", "title": "输入"}},
+                "required": ["seed"],
+                "additionalProperties": False,
+            },
+            "outputSchema": output_schema,
+            "nodes": [
+                {"id": "input", "type": "input", "displayName": "输入"},
+                {
+                    "id": "sensitive",
+                    "type": "transform",
+                    "displayName": "副作用步骤",
+                    "input": {"value": "${input.seed}"},
+                    "config": {"operation": "passthrough"},
+                    "sideEffect": True,
+                    "idempotent": False,
+                },
+                {
+                    "id": "risky",
+                    "type": "transform",
+                    "displayName": "易失败步骤",
+                    "input": {"value": "${sensitive.output.value}"},
+                    "config": {"operation": "fail_dependency"},
+                    "retry": {"maxAttempts": 2, "backoffSeconds": 0},
+                    "fallback": {
+                        "on": ["DEPENDENCY_UNAVAILABLE"],
+                        "target": "recovery_agent",
+                    },
+                },
+                {
+                    "id": "recovery_agent",
+                    "type": "agent",
+                    "displayName": "恢复 Agent",
+                    "input": {"seed": "${input.seed}"},
+                    "config": {
+                        "outputSchema": {"type": "object"},
+                        "maxSteps": 4,
+                        "maxTotalTokens": 2000,
+                        "allowedCapabilities": [],
+                    },
+                },
+                {
+                    "id": "output",
+                    "type": "output",
+                    "displayName": "输出",
+                    "input": {"result": "${risky.output.value}"},
+                },
+            ],
+            "edges": [
+                {"source": "input", "target": "sensitive"},
+                {"source": "sensitive", "target": "risky"},
+                {"source": "risky", "target": "output"},
             ],
         },
     }

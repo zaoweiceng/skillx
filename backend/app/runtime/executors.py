@@ -174,6 +174,17 @@ class TransformExecutor:
         self, context: RunContext, node: WorkflowNode, inputs: dict[str, Any]
     ) -> NodeResult:
         operation = node.config.get("operation", "passthrough")
+        # 确定性可重试失败注入（仅用于恢复演示/测试）：返回 retryable DEPENDENCY_UNAVAILABLE，
+        # 供 fallback checkpoint 接力验收。真实生产工作流不应使用该 operation。
+        if operation == "fail_dependency":
+            return NodeResult(
+                status="failed",
+                error=ExecutionError(
+                    code="DEPENDENCY_UNAVAILABLE",
+                    message="注入的可重试依赖故障",
+                    retryable=True,
+                ),
+            )
         try:
             if operation == "passthrough":
                 output = inputs
