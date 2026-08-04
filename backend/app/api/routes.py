@@ -50,6 +50,11 @@ from app.application.secrets import (
     register_secret_reference,
 )
 from app.application.security import redact
+from app.application.workflow_patch import (
+    WorkflowPatch,
+    WorkflowPatchViolation,
+    apply_workflow_patch,
+)
 from app.config import get_settings
 from app.infrastructure.database import (
     Approval,
@@ -444,6 +449,60 @@ async def apply_workflow_contract_patch(
         "id": workflow.id,
         "draftRevision": workflow.draft_revision,
         "definition": patched,
+    }
+
+
+@router.post("/workflow-versions/{version_id}/workflow-patch", status_code=201)
+async def apply_version_workflow_patch(
+    version_id: str,
+    body: dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """把受控 WorkflowPatch 应用到某已发布版本，生成**新草稿**（不改旧版本）。
+
+    这是通用 WorkflowPatch 审核闭环：应用总是创建 draft，展示 source→draft diff、
+    Compiler diagnostics 与锁变化；人工在编辑器校验并显式发布后才成为新不可变版本。
+    ContractPatch 是它的 Browser 子类型，共用同一发布治理。
+    """
+
+    version = await session.get(WorkflowVersion, version_id)
+    if version is None:
+        raise HTTPException(404, "工作流版本不存在")
+    try:
+        patch = WorkflowPatch.model_validate({**body, "baseVersionId": version_id})
+        patched = apply_workflow_patch(version.definition_json, patch)
+    except WorkflowPatchViolation as exc:
+        raise HTTPException(
+            422,
+            detail={"code": "WORKFLOW_PATCH_REJECTED", "message": str(exc)},
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - Pydantic 校验失败也返回 422。
+        raise HTTPException(
+            422,
+            detail={"code": "WORKFLOW_PATCH_INVALID", "message": str(exc)},
+        ) from exc
+    # 用 Compiler 回放校验补丁后的草稿；diagnostics 供人工审核。
+    try:
+        compiled = compiler.compile(patched)
+        diagnostics = [item.model_dump() for item in compiled.diagnostics]
+    except WorkflowValidationError as exc:
+        diagnostics = [item.model_dump() for item in exc.diagnostics]
+    # 应用总是创建新草稿 Workflow，不触碰任何已发布版本。
+    draft = Workflow(
+        id=str(uuid4()),
+        name=f"patch-of-{version.workflow_id[:8]}",
+        owner_id="local-user",
+        draft_revision=1,
+        draft_json=patched,
+    )
+    session.add(draft)
+    await session.commit()
+    return {
+        "draftWorkflowId": draft.id,
+        "baseVersionId": version_id,
+        "definition": patched,
+        "diagnostics": diagnostics,
+        "publishable": not any(item["level"] == "error" for item in diagnostics),
     }
 
 
