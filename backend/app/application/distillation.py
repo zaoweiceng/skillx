@@ -65,6 +65,24 @@ def _validate_proposal(
         if proposed.node_id in node_ids:
             raise DistillationError(f"DistillationProposal 节点 id 重复: {proposed.node_id}")
         node_ids.add(proposed.node_id)
+        positions = sorted(
+            action_ids.index(action_id)
+            for action_id in proposed.action_ids
+            if action_id in action_ids
+        )
+        if positions and positions != list(range(positions[0], positions[-1] + 1)):
+            raise DistillationError("ProposedNode action group 必须在轨迹中连续")
+        group_ids = set(proposed.action_ids)
+        for action_id in proposed.action_ids:
+            action = next((item for item in actions if item.action_id == action_id), None)
+            if action is None:
+                continue
+            for dependency in action.depends_on:
+                if (
+                    dependency not in group_ids
+                    and action_ids.index(dependency) >= positions[0]
+                ):
+                    raise DistillationError("ProposedNode action group 不是拓扑闭合分组")
         if proposed.strategy == "deterministic" and len(proposed.action_ids) != 1:
             raise DistillationError("deterministic ProposedNode 必须恰好包含一个 action")
         for action_id in proposed.action_ids:
@@ -107,6 +125,16 @@ def _grouped_action(
             if action.capability_ref is not None
         }
     )
+    capability_locks = [
+        {
+            "registryId": action.capability_ref.registry_id,
+            "name": action.capability_ref.name,
+            "version": action.capability_ref.version,
+            "digest": action.capability_ref.digest,
+        }
+        for action in group
+        if action.capability_ref is not None
+    ]
     external_dependencies = sorted(
         {
             dependency
@@ -125,6 +153,7 @@ def _grouped_action(
             "observations": {
                 **last.observations,
                 "allowedCapabilities": capabilities,
+                "capabilityLocks": capability_locks,
                 "prompt": (
                     f"按原顺序复现动作组 {[action.action_id for action in group]}，"
                     "保持边界输入输出契约。"
@@ -235,19 +264,20 @@ def compile_agent_trajectory(
             node = fallback.node
         else:
             node = result.node
-            if result.decision == "compiled" and compiled_action.capability_ref and (
-                compiled_action.capability_ref.digest
-            ):
-                capability_locks.append(
-                    {
-                        "nodeId": node_id,
-                        "kind": compiled_action.kind,
-                        "capability": compiled_action.capability_ref.name,
-                        "registryId": compiled_action.capability_ref.registry_id,
-                        "version": compiled_action.capability_ref.version,
-                        "digest": compiled_action.capability_ref.digest,
-                    }
-                )
+            if result.decision == "compiled":
+                for grouped_action in group:
+                    ref = grouped_action.capability_ref
+                    if ref and ref.digest:
+                        capability_locks.append(
+                            {
+                                "nodeId": node_id,
+                                "kind": grouped_action.kind,
+                                "capability": ref.name,
+                                "registryId": ref.registry_id,
+                                "version": ref.version,
+                                "digest": ref.digest,
+                            }
+                        )
         assert node is not None
         # 按结果节点类型统计：agent/llm 计入模型节点，其余确定节点计入 direct。
         if node["type"] in ("agent", "llm"):

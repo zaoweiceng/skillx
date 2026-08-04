@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import timedelta
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.compiler import WorkflowCompiler, digest_json
@@ -55,13 +56,44 @@ class WorkflowSelection(BaseModel):
     action: Literal[
         "run_full", "run_fragment", "compose", "continue_agent", "ask_user"
     ]
-    reason: str
+    reason: str = ""
     refs: list[str] = Field(default_factory=list)
     bindings: dict[str, Any] = Field(default_factory=dict)
     missing_inputs: list[str] = Field(default_factory=list, alias="missingInputs")
-    session_id: str = Field(default="local", alias="sessionId")
+    question: str | None = None
+    plan: dict[str, Any] | None = None
+    session_id: str = Field(alias="sessionId")
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_action_contract(self) -> WorkflowSelection:
+        if self.action == "ask_user":
+            if not self.question or not self.missing_inputs:
+                raise ValueError("ask_user 需要 question 和 missingInputs")
+            if self.refs or self.plan is not None:
+                raise ValueError("ask_user 禁止 refs/plan")
+        elif self.action == "continue_agent":
+            if not self.reason:
+                raise ValueError("continue_agent 需要 reason")
+            if self.refs or self.plan is not None:
+                raise ValueError("continue_agent 禁止 refs/plan")
+        elif self.action == "run_full":
+            if len(self.refs) != 1 or not self.refs[0].startswith("workflow:"):
+                raise ValueError("run_full 需要恰好一个 workflowRef")
+            if self.plan is not None:
+                raise ValueError("run_full 禁止 plan")
+        elif self.action == "run_fragment":
+            if len(self.refs) != 1 or not self.refs[0].startswith(
+                ("fragment:", "fragment-snapshot:")
+            ):
+                raise ValueError("run_fragment 需要恰好一个 fragmentRef")
+            if self.plan is not None:
+                raise ValueError("run_fragment 禁止 plan")
+        elif self.action == "compose":
+            if self.plan is None:
+                raise ValueError("compose 需要 ExecutionPlan")
+        return self
 
 
 class PlanCompileError(ValueError):
@@ -169,14 +201,26 @@ def _expand_definition(
             "config": {"operation": "passthrough"},
         }
     )
-    leaves = internal_ids - {
-        edge.source
-        for edge in definition.spec.edges
-        if edge.source in internal_ids and edge.target in internal_ids
+    output_sources = {
+        match.group("root")
+        for match in _REF.finditer(json.dumps(result_input, ensure_ascii=False))
+        if match.group("root") != "input"
     }
-    for leaf in sorted(leaves):
-        edges.append({"source": f"{step.id}__{leaf}", "target": step.id})
+    fallback_only = {
+        node.fallback.target for node in internal if node.fallback is not None
+    }
+    for source in sorted(output_sources - {f"{step.id}__{item}" for item in fallback_only}):
+        edges.append({"source": source, "target": step.id})
+    if not output_sources:
+        edges.append({"source": "input", "target": step.id})
     return nodes, edges, step.id
+
+
+def _fragment_step_inputs(data: dict[str, Any], step: PlanStep) -> dict[str, Any]:
+    mapping = data.get("inputMapping")
+    if not isinstance(mapping, dict):
+        raise PlanCompileError(f"fragment 步骤 {step.id} 缺少冻结 inputMapping")
+    return _replace_refs(mapping, step.input, "")
 
 
 def _required_inputs(schema: dict[str, Any], mapping: dict[str, Any], step_id: str) -> None:
@@ -267,7 +311,13 @@ def _direct_step(step: PlanStep) -> dict[str, Any]:
 class PlanCompiler:
     async def compile(
         self, session: AsyncSession, raw_plan: dict[str, Any]
-    ) -> tuple[ExecutionPlan, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    ) -> tuple[
+        ExecutionPlan,
+        dict[str, Any],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        dict[str, Any],
+    ]:
         try:
             plan = ExecutionPlan.model_validate(raw_plan)
         except Exception as exc:  # noqa: BLE001
@@ -286,6 +336,10 @@ class PlanCompiler:
         edges: list[dict[str, Any]] = []
         source_refs: list[dict[str, Any]] = []
         locks: list[dict[str, Any]] = []
+        source_map: dict[str, Any] = {
+            "expandedToSource": {},
+            "sourceToExpanded": {},
+        }
         roots: dict[str, list[str]] = {}
         source_schemas: dict[str, dict[str, Any]] = {"input": plan.input_schema}
         for step in plan.steps:
@@ -320,6 +374,11 @@ class PlanCompiler:
                     ]
                 )
                 step_output_schema = definition.spec.output_schema
+                source_node_ids = {
+                    node.id
+                    for node in definition.spec.nodes
+                    if node.type not in {NodeType.INPUT, NodeType.OUTPUT}
+                }
             elif step.kind == "fragment":
                 if not step.ref:
                     raise PlanCompileError("fragment step 缺少 ref")
@@ -336,6 +395,7 @@ class PlanCompiler:
                     step.id,
                 )
                 definition = WorkflowDefinition.model_validate(version.definition_json)
+                fragment_inputs = _fragment_step_inputs(data, step)
                 output_mapping = data.get("outputMapping")
                 if not output_mapping:
                     output_node = next(
@@ -346,7 +406,7 @@ class PlanCompiler:
                     output_mapping = output_node.input
                 expanded, expanded_edges, _ = _expand_definition(
                     definition,
-                    step,
+                    step.model_copy(update={"input": fragment_inputs}),
                     included=set(data["nodeIds"]),
                     output_mapping=output_mapping,
                 )
@@ -370,12 +430,24 @@ class PlanCompiler:
                     ]
                 )
                 step_output_schema = data["boundaryOutputSchema"]
+                source_node_ids = set(data["nodeIds"])
             else:
                 expanded = [_direct_step(step)]
                 expanded_edges = [{"source": "input", "target": step.id}]
                 step_output_schema = step.config.get("outputSchema", {})
+                source_node_ids = set()
             nodes.extend(expanded)
             edges.extend(expanded_edges)
+            for source_node_id in sorted(source_node_ids):
+                expanded_id = f"{step.id}__{source_node_id}"
+                source_map["expandedToSource"][expanded_id] = {
+                    "stepId": step.id,
+                    "sourceNodeId": source_node_id,
+                    "sourceRef": step.ref,
+                }
+                source_map["sourceToExpanded"].setdefault(
+                    f"{step.id}:{source_node_id}", []
+                ).append(expanded_id)
             source_schemas[step.id] = step_output_schema
             roots[step.id] = [
                 edge["target"] for edge in expanded_edges if edge["source"] == "input"
@@ -403,9 +475,7 @@ class PlanCompiler:
         )
         referenced = {
             match.group("root")
-            for value in plan.output.values()
-            if isinstance(value, str)
-            for match in _REF.finditer(value)
+            for match in _REF.finditer(json.dumps(plan.output, ensure_ascii=False))
             if match.group("root") != "input"
         }
         for source in sorted(referenced):
@@ -428,6 +498,7 @@ class PlanCompiler:
             compiled.definition.model_dump(by_alias=True, mode="json"),
             source_refs,
             locks,
+            source_map,
         )
 
 
@@ -461,11 +532,14 @@ async def create_plan_snapshot(
     created_by_conversation_run_id: str | None = None,
     ttl_hours: int = 168,
 ) -> PlanSnapshot:
-    plan, definition, source_refs, locks = await PlanCompiler().compile(session, raw_plan)
+    plan, definition, source_refs, locks, source_map = await PlanCompiler().compile(
+        session, raw_plan
+    )
     snapshot_payload = {
         "definition": definition,
         "sourceRefs": source_refs,
         "locks": locks,
+        "sourceMap": source_map,
     }
     item = PlanSnapshot(
         id=str(uuid4()),
@@ -473,6 +547,7 @@ async def create_plan_snapshot(
         digest=digest_json(snapshot_payload),
         source_refs_json=source_refs,
         locks_json=locks,
+        source_map_json=source_map,
         created_by_conversation_run_id=created_by_conversation_run_id,
         expires_at=utcnow() + timedelta(hours=max(1, ttl_hours)),
         status="active",
@@ -483,13 +558,43 @@ async def create_plan_snapshot(
     return item
 
 
-def verify_plan_snapshot(snapshot: PlanSnapshot) -> None:
+def verify_plan_snapshot(snapshot: PlanSnapshot, *, for_new_run: bool = True) -> None:
+    if snapshot.status not in {"active", "expired", "retired"}:
+        raise CatalogError("PlanSnapshot 状态非法")
+    expires_at = snapshot.expires_at
+    if expires_at.tzinfo is None:
+        from datetime import UTC
+
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if for_new_run and (snapshot.status != "active" or expires_at <= utcnow()):
+        raise CatalogError("PlanSnapshot 已过期或停用，不能创建新 Run")
     expected = digest_json(
         {
             "definition": snapshot.definition_json,
             "sourceRefs": snapshot.source_refs_json,
             "locks": snapshot.locks_json,
+            "sourceMap": snapshot.source_map_json,
         }
     )
+    if not snapshot.source_map_json:
+        expected = digest_json(
+            {
+                "definition": snapshot.definition_json,
+                "sourceRefs": snapshot.source_refs_json,
+                "locks": snapshot.locks_json,
+            }
+        )
     if expected != snapshot.digest:
         raise CatalogError("PlanSnapshot digest 不一致")
+
+
+def expire_plan_snapshot(snapshot: PlanSnapshot) -> bool:
+    expires_at = snapshot.expires_at
+    if expires_at.tzinfo is None:
+        from datetime import UTC
+
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if snapshot.status == "active" and expires_at <= utcnow():
+        snapshot.status = "expired"
+        return True
+    return False

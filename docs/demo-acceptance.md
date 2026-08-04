@@ -23,10 +23,18 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
 | E2E-11 Fragment safety | describe_fragment → run/非法裁剪 | L2、Compiler diagnostics | 只读闭包可运行；绕过审批/副作用的裁剪被拒 |
 | E2E-12 固化建议 | 同 signature 多输入成功 → 接受建议 | suggestion、draft | 仅创建 draft，未经人工不发布 |
 | Scale-1 Catalog 1000 | 1000 个已发布 Manifest → search | Registry 单元/集成门禁 | top-k≤8、总字节≤24KB、L0 不含 Schema/DAG |
+| Fence-1 迟到 Recovery | A 超租约 → B 重领 → A 返回 | generation/token、两个 Recovery NodeRun | 仅 B 的决定、替代输出和终态可提交 |
+| Selection-5 | 五种 action → validate/execute | action 终态、diagnostics | 类型错配、未披露 ref 和超预算 fail closed |
+| Disclosure-1 | 创建 session → L0/L1/L2 → 重启读取 | disclosure call audit | refs、level、剩余预算持久且跨 session 隔离 |
+| Plan lifecycle | 过期前创建 Run → Plan 过期 → Worker 恢复 | plan status/source map | 禁止新 Run/固化，既有 Run 继续完成 |
+| Catalog active | 发布 v2 → search v2 → resolve v1 ref | Manifest status | v1 不占 top-k，但精确 ref 仍可运行 |
+| Real first browser | Agent browser.read → Browser Tool Broker | `browser.action.completed` | 正文等于真实页面内容，非 TraeX fixture 常量 |
 
 ## 通用失败判定
 
 - 重复执行同一副作用，或迟到 Worker 覆盖新 attempt。
+- 未携带有效 disclosure session 调用 Registry，或跨 session 使用 ref。
+- 过期 PlanSnapshot 创建新 Run、固化草稿或进入目录建议。
 - Run 已显示 `cancelled`，Executor 仍继续并提交成功。
 - WorkflowVersion 未锁定实际 Capability/MCP/接口版本。
 - Secret 出现在数据库、事件、日志、API 或 Artifact。

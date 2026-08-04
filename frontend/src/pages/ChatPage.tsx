@@ -372,6 +372,24 @@ export default function ChatPage() {
                 {message.content.code && (
                   <span className="error-code">{message.content.code}</span>
                 )}
+                {message.content.disclosureSessionId && (
+                  <div className="current-mapping">
+                    <span className="metric-chip">
+                      Disclosure {message.content.disclosureLevel ?? 'L0'}
+                    </span>
+                    {message.content.agentAction && (
+                      <span className="metric-chip">Action {message.content.agentAction}</span>
+                    )}
+                    {message.content.selectionReason && (
+                      <span className="candidate-reason">
+                        选择依据：{message.content.selectionReason}
+                      </span>
+                    )}
+                    <code className="digest-line">
+                      session {message.content.disclosureSessionId.slice(0, 8)}
+                    </code>
+                  </div>
+                )}
                 {message.content.type === 'component_candidate' && renderCandidate(message)}
                 {message.content.type === 'workflow_candidates' &&
                   renderWorkflowCandidates(message)}

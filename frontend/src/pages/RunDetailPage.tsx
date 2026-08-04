@@ -97,7 +97,11 @@ export default function RunDetailPage() {
           <h1>运行详情</h1>
           {run.planSnapshotId && (
             <p className="run-notes">
-              临时 PlanSnapshot · {run.planSnapshotId.slice(0, 8)} · 冻结版本不随源默认版本变化
+              临时 PlanSnapshot · {run.planSnapshotId.slice(0, 8)} ·{' '}
+              {run.dependencyVersions?.planStatus ?? 'active'} · 到期时间{' '}
+              {run.dependencyVersions?.planExpiresAt
+                ? new Date(run.dependencyVersions.planExpiresAt).toLocaleString()
+                : '未知'}
             </p>
           )}
         </div>
@@ -164,6 +168,11 @@ export default function RunDetailPage() {
                       {node.type} · attempt {node.attempt}
                       {typeof node.durationMs === 'number' && ` · ${node.durationMs}ms`}
                     </small>
+                    {node.source && (
+                      <small>
+                        source {node.source.stepId}/{node.source.sourceNodeId}
+                      </small>
+                    )}
                   </div>
                   <StatusBadge status={node.status} />
                 </summary>
@@ -227,6 +236,23 @@ export default function RunDetailPage() {
             <StatusBadge status={run.status} />
           </div>
           <JsonBlock value={run.error ?? run.output} />
+        </section>
+      )}
+
+      {(run.checkpoints ?? []).length > 0 && (
+        <section className="panel result-panel">
+          <div className="panel-heading">
+            <h2>Recovery fencing</h2>
+          </div>
+          {(run.checkpoints ?? []).map((checkpoint) => (
+            <div className="node-row" key={checkpoint.id}>
+              <strong>{checkpoint.failedNode}</strong>
+              <small>
+                generation {checkpoint.claimGeneration ?? 0} · {checkpoint.status}
+              </small>
+              <JsonBlock value={checkpoint.decision} />
+            </div>
+          ))}
         </section>
       )}
 

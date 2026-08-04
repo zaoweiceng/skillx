@@ -87,9 +87,6 @@ class DistillationProposal(BaseModel):
     """
 
     nodes: list[ProposedNode] = Field(default_factory=list)
-    variable_candidates: dict[str, str] = Field(
-        default_factory=dict, alias="variableCandidates"
-    )
     estimated_cost: dict[str, Any] = Field(default_factory=dict, alias="estimatedCost")
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")

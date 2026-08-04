@@ -59,7 +59,7 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
             row[1]
             for row in connection.execute("PRAGMA table_info(failure_observations)")
         }
-    assert revision == ("0013",)
+    assert revision == ("0014",)
     assert {
         "runs",
         "capability_versions",

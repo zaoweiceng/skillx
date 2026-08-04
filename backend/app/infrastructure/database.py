@@ -123,6 +123,7 @@ class PlanSnapshot(Base, TimestampMixin):
     digest: Mapped[str] = mapped_column(String(80), index=True)
     source_refs_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
     locks_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
+    source_map_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_by_conversation_run_id: Mapped[str | None] = mapped_column(
         ForeignKey("conversation_runs.id", ondelete="SET NULL"), nullable=True
     )
@@ -183,6 +184,8 @@ class NodeRun(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_generation: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(80), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -300,9 +303,22 @@ class MCPToolSnapshot(Base, TimestampMixin):
 
 class Artifact(Base, TimestampMixin):
     __tablename__ = "artifacts"
+    __table_args__ = (
+        CheckConstraint(
+            "(run_id IS NOT NULL) != (conversation_run_id IS NOT NULL)",
+            name="ck_artifact_source",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), index=True)
+    run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), index=True, nullable=True
+    )
+    conversation_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversation_runs.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
     kind: Mapped[str] = mapped_column(String(40))
     name: Mapped[str] = mapped_column(String(255))
     uri: Mapped[str] = mapped_column(Text)
@@ -436,6 +452,8 @@ class ExecutionCheckpoint(Base, TimestampMixin):
         DateTime(timezone=True), nullable=True
     )
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claim_generation: Mapped[int] = mapped_column(Integer, default=0)
+    claim_token: Mapped[str | None] = mapped_column(String(80), nullable=True)
     # 该次恢复实际执行的 Recovery NodeRun（唯一）。
     recovery_node_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     # 审批型 fallback：none|pending|approved|rejected。
@@ -477,7 +495,9 @@ class FailureObservation(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     fingerprint: Mapped[str] = mapped_column(String(80))
-    workflow_version_id: Mapped[str] = mapped_column(String(36))
+    workflow_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    plan_snapshot_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    source_node_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     node_id: Mapped[str] = mapped_column(String(64))
     node_type: Mapped[str] = mapped_column(String(32))
     error_code: Mapped[str] = mapped_column(String(64))
@@ -487,7 +507,37 @@ class FailureObservation(Base, TimestampMixin):
     baseline_reproduced: Mapped[bool] = mapped_column(default=False)
     last_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     last_checkpoint_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    locks_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
     contract_summary_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    recovered_outcome_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
+class WorkflowDisclosureSession(Base, TimestampMixin):
+    __tablename__ = "workflow_disclosure_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    agent_run_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    disclosed_json: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    call_budget_json: Mapped[dict[str, int]] = mapped_column(JSON, default=dict)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+
+
+class WorkflowDisclosureCall(Base, TimestampMixin):
+    __tablename__ = "workflow_disclosure_calls"
+    __table_args__ = (
+        Index("ix_disclosure_call_session", "session_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_disclosure_sessions.id", ondelete="CASCADE")
+    )
+    operation: Mapped[str] = mapped_column(String(32))
+    request_summary_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    response_digest: Mapped[str] = mapped_column(String(80))
+    disclosure_level: Mapped[str | None] = mapped_column(String(8), nullable=True)
 
 
 class RecoveryAttempt(Base, TimestampMixin):

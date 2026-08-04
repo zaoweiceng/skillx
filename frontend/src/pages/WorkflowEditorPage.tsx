@@ -224,6 +224,14 @@ export default function WorkflowEditorPage() {
         <div className={error ? 'error-panel' : 'notice-panel'}>{error || notice}</div>
       )}
 
+      {!showJson && (
+        <CapabilityMetadataEditor
+          definition={definition}
+          onChange={patchDefinition}
+          selectedNodeId={selectedNodeId}
+        />
+      )}
+
       {showJson ? (
         <section className="panel source-panel">
           <div className="panel-heading">
@@ -319,6 +327,131 @@ export default function WorkflowEditorPage() {
       {/* 只读小图便于总览 */}
       {!showJson && <WorkflowGraph definition={definition} compact />}
     </div>
+  )
+}
+
+function CapabilityMetadataEditor({
+  definition,
+  onChange,
+  selectedNodeId,
+}: {
+  definition: WorkflowDefinition
+  onChange: (definition: WorkflowDefinition) => void
+  selectedNodeId: string
+}) {
+  const capability =
+    typeof definition.metadata.capability === 'object' && definition.metadata.capability
+      ? (definition.metadata.capability as Record<string, unknown>)
+      : {}
+  const fragments = Array.isArray(definition.metadata.callableFragments)
+    ? (definition.metadata.callableFragments as Array<Record<string, unknown>>)
+    : []
+
+  function patchMetadata(nextCapability: Record<string, unknown>, nextFragments = fragments) {
+    onChange({
+      ...definition,
+      metadata: {
+        ...definition.metadata,
+        capability: nextCapability,
+        callableFragments: nextFragments,
+      },
+    })
+  }
+
+  function addFragment() {
+    if (!selectedNodeId) return
+    const sourceProperties = definition.spec.inputSchema.properties as
+      | Record<string, unknown>
+      | undefined
+    const sourceField = Object.keys(sourceProperties ?? {})[0] ?? 'input'
+    const next = [
+      ...fragments,
+      {
+        name: `fragment-${fragments.length + 1}`,
+        summary: '',
+        nodeIds: [selectedNodeId],
+        inputSchema: definition.spec.inputSchema,
+        outputSchema: {
+          type: 'object',
+          properties: { result: {} },
+          required: ['result'],
+        },
+        inputMapping: { [sourceField]: `\${input.${sourceField}}` },
+        outputMapping: { result: `\${${selectedNodeId}.output}` },
+      },
+    ]
+    patchMetadata(capability, next)
+  }
+
+  return (
+    <section className="panel source-panel">
+      <div className="panel-heading">
+        <div>
+          <span className="eyebrow">CAPABILITY CONTRACT</span>
+          <h2>目录元数据与 Fragment 端口</h2>
+        </div>
+        <button className="button ghost" type="button" onClick={addFragment} disabled={!selectedNodeId}>
+          <Plus size={13} /> 将选中节点声明为 Fragment
+        </button>
+      </div>
+      <div className="inspector-fields">
+        <label>
+          <span>能力摘要</span>
+          <input
+            value={String(capability.summary ?? '')}
+            onChange={(event) => patchMetadata({ ...capability, summary: event.target.value })}
+          />
+        </label>
+        <label>
+          <span>适用场景（逗号分隔）</span>
+          <input
+            value={Array.isArray(capability.useWhen) ? capability.useWhen.join(', ') : ''}
+            onChange={(event) =>
+              patchMetadata({
+                ...capability,
+                useWhen: event.target.value
+                  .split(',')
+                  .map((item) => item.trim())
+                  .filter(Boolean),
+              })
+            }
+          />
+        </label>
+        {fragments.map((fragment, index) => (
+          <div className="node-row" key={`${String(fragment.name)}-${index}`}>
+            <label>
+              <span>Fragment 名称</span>
+              <input
+                value={String(fragment.name ?? '')}
+                onChange={(event) => {
+                  const next = [...fragments]
+                  next[index] = { ...fragment, name: event.target.value }
+                  patchMetadata(capability, next)
+                }}
+              />
+            </label>
+            <label>
+              <span>闭包节点（逗号分隔）</span>
+              <input
+                value={Array.isArray(fragment.nodeIds) ? fragment.nodeIds.join(', ') : ''}
+                onChange={(event) => {
+                  const next = [...fragments]
+                  next[index] = {
+                    ...fragment,
+                    nodeIds: event.target.value
+                      .split(',')
+                      .map((item) => item.trim())
+                      .filter(Boolean),
+                  }
+                  patchMetadata(capability, next)
+                }}
+              />
+            </label>
+            <small>输入、输出 Schema 与 mapping 已结构化冻结；高级字段可在 JSON 视图调整。</small>
+          </div>
+        ))}
+      </div>
+    </section>
   )
 }
 

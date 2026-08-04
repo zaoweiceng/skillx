@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -322,6 +323,57 @@ async def test_concurrent_recovery_drivers_claim_once(monkeypatch: pytest.Monkey
         assert recovery_runs == 1
 
 
+async def test_late_recovery_worker_cannot_commit_after_reclaim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 租约过期、B 重领后，A 的迟到决定不得修改任何持久状态。"""
+
+    from app.application import recovery as recovery_module
+
+    run_id, checkpoint_id = await _seed_failed_run()
+    a_started = asyncio.Event()
+    release_a = asyncio.Event()
+
+    async def fenced_agent(checkpoint, fallback_config, *, host=None):  # noqa: ANN001, ARG001
+        if checkpoint.lease_owner == "rec-a":
+            a_started.set()
+            await release_a.wait()
+            return {"action": "provide_substitution", "substitution": {"value": "late-a"}}
+        return {"action": "provide_substitution", "substitution": {"value": "winner-b"}}
+
+    monkeypatch.setattr(recovery_module, "run_recovery_agent", fenced_agent)
+    driver_a = RecoveryDriver(worker_id="rec-a")
+    driver_b = RecoveryDriver(worker_id="rec-b")
+    task_a = asyncio.create_task(driver_a.poll_once())
+    await a_started.wait()
+    async with SessionLocal() as session, session.begin():
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        checkpoint.lease_expires_at = utcnow() - timedelta(seconds=1)
+    assert await driver_b.poll_once() is True
+    release_a.set()
+    await task_a
+
+    async with SessionLocal() as session:
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        substitution = await session.scalar(
+            select(OutputSubstitution).where(
+                OutputSubstitution.run_id == run_id,
+                OutputSubstitution.node_id == "risky",
+            )
+        )
+        recovery_runs = (
+            await session.scalars(
+                select(NodeRun)
+                .where(NodeRun.run_id == run_id, NodeRun.node_id == "recovery_agent")
+                .order_by(NodeRun.attempt)
+            )
+        ).all()
+        assert checkpoint.claim_generation >= 3
+        assert checkpoint.decision_json["substitution"] == {"value": "winner-b"}
+        assert substitution.output_json == {"value": "winner-b"}
+        assert [item.status for item in recovery_runs] == ["lease_expired", "succeeded"]
+
+
 async def test_recovery_request_user_transitions_to_waiting_approval() -> None:
     run_id, checkpoint_id = await _seed_failed_run()
     async with SessionLocal() as session, session.begin():
@@ -352,28 +404,20 @@ async def test_typed_replan_executes_new_recovery_attempt() -> None:
     run_id, checkpoint_id = await _seed_failed_run()
     async with SessionLocal() as session, session.begin():
         checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
-        remaining_nodes = checkpoint.snapshot_json["remainingNodes"]
-        patched_nodes = [
-            {
-                **node,
-                "config": (
-                    {"operation": "passthrough"}
-                    if node["id"] == "risky"
-                    else node.get("config", {})
-                ),
-            }
-            for node in remaining_nodes
-        ]
         await apply_recovery_decision(
             session,
             checkpoint,
             {
                 "action": "retry_replanned",
                 "planPatch": {
-                    "remainingNodes": patched_nodes,
-                    "remainingEdges": checkpoint.snapshot_json["remainingEdges"],
+                    "nodePatches": [
+                        {
+                            "nodeId": "risky",
+                            "changes": {"config": {"operation": "passthrough"}},
+                        }
+                    ],
                     "inputMappings": {},
-                    "locks": checkpoint.snapshot_json["capabilityLocks"],
+                    "edgePatches": [],
                 },
             },
         )

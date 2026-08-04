@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections.abc import Iterator
 
@@ -52,6 +53,12 @@ def _run_component(client: httpx.Client, name: str, payload: dict) -> dict:
 def _events(client: httpx.Client, run_id: str) -> set[str]:
     events = client.get(f"/runs/{run_id}/events").json()
     return {item["type"] for item in events}
+
+
+def _workflow_session(client: httpx.Client) -> str:
+    created = client.post("/workflow-tools/sessions", json={})
+    assert created.status_code == 201, created.text
+    return created.json()["id"]
 
 
 def test_e2e_1_deterministic_component(stack: DemoStack) -> None:
@@ -469,9 +476,15 @@ def test_e2e_10_progressive_catalog_composition_and_version_pinning(
     stack: DemoStack,
 ) -> None:
     with stack.client() as client:
+        session_id = _workflow_session(client)
         searched = client.post(
             "/workflow-tools/search",
-            json={"query": "问候", "constraints": {"sideEffects": "none"}, "limit": 8},
+            json={
+                "sessionId": session_id,
+                "query": "问候",
+                "constraints": {"sideEffects": "none"},
+                "limit": 8,
+            },
         )
         assert searched.status_code == 200, searched.text
         cards = searched.json()["items"]
@@ -481,7 +494,8 @@ def test_e2e_10_progressive_catalog_composition_and_version_pinning(
         assert "definition" not in card
 
         described = client.post(
-            "/workflow-tools/describe", json={"ref": card["workflowRef"]}
+            "/workflow-tools/describe",
+            json={"sessionId": session_id, "ref": card["workflowRef"]},
         )
         assert described.status_code == 200, described.text
         detail = described.json()["workflow"]
@@ -492,6 +506,7 @@ def test_e2e_10_progressive_catalog_composition_and_version_pinning(
         plan = client.post(
             "/plans",
             json={
+                "sessionId": session_id,
                 "plan": {
                     "inputSchema": {
                         "type": "object",
@@ -584,6 +599,7 @@ def test_e2e_10_progressive_catalog_composition_and_version_pinning(
 
 def test_e2e_11_fragment_disclosure_and_slice_safety(stack: DemoStack) -> None:
     with stack.client() as client:
+        session_id = _workflow_session(client)
         source = _component(client, "确定性问候")
         source_definition = client.get(f"/components/{source['id']}").json()[
             "definition"
@@ -615,17 +631,23 @@ def test_e2e_11_fragment_disclosure_and_slice_safety(stack: DemoStack) -> None:
             item["workflowRef"]
             for item in client.post(
                 "/workflow-tools/search",
-                json={"query": "可组合的问候片段", "limit": 8},
+                json={
+                    "sessionId": session_id,
+                    "query": "可组合的问候片段",
+                    "limit": 8,
+                },
             ).json()["items"]
             if item["workflowRef"] == published.json()["workflowRef"]
         )
 
         described = client.post(
-            "/workflow-tools/describe", json={"ref": workflow_ref}
+            "/workflow-tools/describe",
+            json={"sessionId": session_id, "ref": workflow_ref},
         ).json()["workflow"]
         fragment_ref = described["fragments"][0]["fragmentRef"]
         fragment = client.post(
-            "/workflow-tools/describe-fragment", json={"ref": fragment_ref}
+            "/workflow-tools/describe-fragment",
+            json={"sessionId": session_id, "ref": fragment_ref},
         )
         assert fragment.status_code == 200, fragment.text
         assert fragment.json()["fragment"]["nodeIds"] == ["format"]
@@ -633,6 +655,7 @@ def test_e2e_11_fragment_disclosure_and_slice_safety(stack: DemoStack) -> None:
         plan = client.post(
             "/plans",
             json={
+                "sessionId": session_id,
                 "plan": {
                     "inputSchema": source_definition["spec"]["inputSchema"],
                     "outputSchema": source_definition["spec"]["outputSchema"],
@@ -674,13 +697,18 @@ def test_e2e_11_fragment_disclosure_and_slice_safety(stack: DemoStack) -> None:
             item
             for item in client.post(
                 "/workflow-tools/search",
-                json={"query": "费用提交", "limit": 8},
+                json={
+                    "sessionId": session_id,
+                    "query": "费用提交",
+                    "limit": 8,
+                },
             ).json()["items"]
             if "费用提交" in item["name"]
         )
         rejected = client.post(
             "/workflow-tools/slice",
             json={
+                "sessionId": session_id,
                 "workflowRef": browser_card["workflowRef"],
                 "candidateNodeIds": [side_effect_node["id"]],
             },
@@ -713,6 +741,15 @@ def test_e2e_8b_real_browser_distillation_to_non_fake_agent(
             f"/conversation-runs/{conversation_run_id}/events"
         ).json()
         assert "browser.action.started" in {event["type"] for event in events}
+        browser_completed = next(
+            event for event in events if event["type"] == "browser.action.completed"
+        )
+        assert browser_completed["payload"]["result"]["digest"]
+        evidence = summary["browserEvidence"][0]
+        assert evidence["resultSource"] == "browser_tool_broker"
+        assert evidence["contentSha256"] == hashlib.sha256(
+            "探索阶段正文".encode()
+        ).hexdigest()
 
         distilled = client.post(f"/conversation-runs/{conversation_run_id}/distill")
         assert distilled.status_code == 201, distilled.text
@@ -758,12 +795,15 @@ def test_e2e_12_successful_plan_only_suggests_human_draft(
     stack: DemoStack,
 ) -> None:
     with stack.client() as client:
+        session_id = _workflow_session(client)
         card = client.post(
-            "/workflow-tools/search", json={"query": "问候", "limit": 8}
+            "/workflow-tools/search",
+            json={"sessionId": session_id, "query": "问候", "limit": 8},
         ).json()["items"][0]
         plan = client.post(
             "/plans",
             json={
+                "sessionId": session_id,
                 "plan": {
                     "inputSchema": {
                         "type": "object",

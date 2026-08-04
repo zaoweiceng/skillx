@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import socket
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from jsonschema import Draft202012Validator
 
@@ -159,6 +162,9 @@ class AgentHost:
                         raw = await next_task
                     except StopAsyncIteration:
                         break
+                    raw = await self._broker_runtime_tool(
+                        raw, open_calls, request, set(effective)
+                    )
                     try:
                         runtime_event, audit_event = validator.validate_pair(raw)
                     except PermissionError as exc:
@@ -244,6 +250,135 @@ class AgentHost:
             )
         result.output = output
         return result
+
+    @staticmethod
+    async def _broker_runtime_tool(
+        raw: dict[str, Any],
+        open_calls: dict[str, dict[str, Any]],
+        request: AgentHostRequest,
+        effective_capabilities: set[str],
+    ) -> dict[str, Any]:
+        """Execute browser.read through the host broker instead of trusting Agent fixtures."""
+
+        if raw.get("type") != "browser.action.completed":
+            return raw
+        from app.domain.workflow import NodeType, WorkflowNode
+        from app.runtime.executors import (
+            CancellationToken,
+            ExecutorRegistry,
+            RunContext,
+        )
+
+        payload = raw.get("payload") or {}
+        started = open_calls.get(payload.get("callId"), {})
+        observations = payload.get("observations") or started.get("observations") or {}
+        if (
+            payload.get("capability") != "browser.read"
+            or "browser.read" not in effective_capabilities
+            or payload.get("action") != "read"
+            or observations.get("runtime") != "playwright"
+        ):
+            return raw
+        arguments = started.get("arguments") or {}
+        url = arguments.get("url")
+        contract = observations.get("pageContract")
+        if not isinstance(url, str) or not isinstance(contract, dict):
+            raise AgentHostError(
+                "CONTRACT_VIOLATION", "browser.read 缺少 url/pageContract"
+            )
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+        if (
+            parsed.scheme not in {"http", "https"}
+            or parsed.username is not None
+            or parsed.password is not None
+            or not hostname
+        ):
+            raise AgentHostError("PERMISSION_DENIED", "browser.read URL 不安全")
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            address = None
+        if (
+            address is not None
+            and (address.is_private or address.is_loopback or address.is_link_local)
+            and hostname not in get_settings().browser_allowed_hosts
+        ):
+            raise AgentHostError(
+                "PERMISSION_DENIED", "browser.read 私网目标未在 Host allowlist"
+            )
+        if hostname == "localhost" and hostname not in get_settings().browser_allowed_hosts:
+            raise AgentHostError(
+                "PERMISSION_DENIED", "browser.read 本机目标未在 Host allowlist"
+            )
+        if address is None:
+            try:
+                resolved = await asyncio.to_thread(
+                    socket.getaddrinfo,
+                    hostname,
+                    parsed.port or (443 if parsed.scheme == "https" else 80),
+                    type=socket.SOCK_STREAM,
+                )
+            except socket.gaierror as exc:
+                raise AgentHostError(
+                    "DEPENDENCY_UNAVAILABLE", "browser.read 目标域名无法解析"
+                ) from exc
+            for item in resolved:
+                resolved_address = ipaddress.ip_address(item[4][0])
+                if (
+                    resolved_address.is_private
+                    or resolved_address.is_loopback
+                    or resolved_address.is_link_local
+                ) and hostname not in get_settings().browser_allowed_hosts:
+                    raise AgentHostError(
+                        "PERMISSION_DENIED",
+                        "browser.read 域名解析到未授权私网地址",
+                    )
+        output_schema = payload.get("outputSchema")
+        page_contract = {
+            **contract,
+            **(
+                {"outputSchema": output_schema}
+                if isinstance(output_schema, dict)
+                else {}
+            ),
+        }
+        node = WorkflowNode(
+            id="broker_browser_read",
+            type=NodeType.BROWSER,
+            displayName="Broker Browser Read",
+            input={"url": url},
+            config={
+                "action": "read",
+                "runtime": "playwright",
+                "pageContract": page_contract,
+            },
+        )
+        context = RunContext(
+            run_id=request.run_id,
+            run_input={"url": url},
+            node_run_id=f"{request.run_id}:browser:{payload['callId']}",
+            cancellation=CancellationToken(asyncio.Event()),
+        )
+        result = await ExecutorRegistry().get(NodeType.BROWSER).execute(
+            context, node, {"url": url}
+        )
+        if result.status != "succeeded" or result.output is None:
+            raise AgentHostError(
+                result.error.code if result.error else "EXECUTION_FAILED",
+                result.error.message if result.error else "browser.read 执行失败",
+            )
+        return {
+            **raw,
+            "payload": {
+                **payload,
+                "result": result.output,
+                "observations": {
+                    **observations,
+                    "resultSource": "browser_tool_broker",
+                },
+            },
+        }
 
     @staticmethod
     def _normalize_action(

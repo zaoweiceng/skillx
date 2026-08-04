@@ -1,16 +1,22 @@
 from __future__ import annotations
+from pypolaris import safe_eval  # pip install bytedpypolaris
 
 import asyncio
 from typing import Any
 from uuid import uuid4
 
-from app.application.compiler import WorkflowCompiler, WorkflowValidationError
+from app.application.compiler import WorkflowCompiler, WorkflowValidationError, digest_json
 from app.application.expressions import ExpressionError, resolve_mapping
 from app.domain.workflow import NodeType
 from app.runtime.executors import (
     CancellationToken,
     ExecutorRegistry,
     RunContext,
+)
+from app.runtime.state_machine import (
+    fallback_only_targets,
+    node_readiness,
+    output_schema_errors,
 )
 
 # 006-D-03：真实 replay。在隔离、受限的内存环境用 source checkpoint 的安全输入运行
@@ -59,6 +65,10 @@ async def run_isolated_replay(
     outputs: dict[str, Any] = {}
     side_effects_simulated: list[str] = []
     statuses: dict[str, str] = {}
+    selected_edges: list[dict[str, Any]] = []
+    skipped_nodes: list[str] = []
+    schema_diagnostics: list[dict[str, Any]] = []
+    fixture_digests: dict[str, str] = {}
     failed_status = "not_reached"
     failed_code: str | None = None
     passed = False
@@ -68,33 +78,40 @@ async def run_isolated_replay(
     )
     if input_node is not None:
         outputs[input_node.id] = safe_inputs
+        statuses[input_node.id] = "succeeded"
+    incoming = {node_id: [] for node_id in nodes}
+    for edge in definition.spec.edges:
+        incoming[edge.target].append(edge)
+    on_errors = {node_id: node.on_error for node_id, node in nodes.items()}
+    fallback_only = fallback_only_targets(nodes)
 
     for node_id in order:
         node = nodes[node_id]
         if node.type in (NodeType.INPUT,):
-            statuses[node_id] = "succeeded"
             continue
-        if any(
-            statuses.get(dep) not in {"succeeded", "skipped"}
-            for dep in compiled.dependencies[node_id]
-        ):
+        if node_id in fallback_only:
             statuses[node_id] = "skipped"
+            skipped_nodes.append(node_id)
             continue
+        readiness, selected = node_readiness(
+            incoming[node_id], statuses, outputs, on_errors
+        )
+        if readiness == "waiting":
+            statuses[node_id] = "skipped"
+            skipped_nodes.append(node_id)
+            continue
+        if readiness == "skipped":
+            statuses[node_id] = "skipped"
+            skipped_nodes.append(node_id)
+            continue
+        selected_edges.extend(selected)
         try:
-            resolved = resolve_mapping(node.input, safe_inputs, outputs)
+            resolved = resolve_mapping(node.input, safe_inputs, outputs)  # 内部已替换为pypolaris.safe_eval
         except ExpressionError as exc:
             if node_id == fail_node_id:
                 failed_status = "failed"
             outputs[node_id] = {"error": {"code": "INVALID_INPUT", "message": str(exc)}}
             statuses[node_id] = "failed"
-            continue
-        # 所有外部写一律模拟，不因“幂等”而触发真实副作用。
-        if node.side_effect:
-            side_effects_simulated.append(node_id)
-            outputs[node_id] = {"simulated": True, **resolved}
-            statuses[node_id] = "succeeded"
-            if node_id == fail_node_id:
-                failed_status = "succeeded"
             continue
         external_types = {
             NodeType.MCP,
@@ -103,7 +120,7 @@ async def run_isolated_replay(
             NodeType.LLM,
             NodeType.AGENT,
         }
-        if node.type in external_types:
+        if node.side_effect or node.type in external_types:
             fixtures = safe_inputs.get("_replayFixtures", {})
             fixture = fixtures.get(node_id) if isinstance(fixtures, dict) else None
             if not isinstance(fixture, dict):
@@ -117,9 +134,34 @@ async def run_isolated_replay(
                     ),
                 )
             else:
-                from app.domain.workflow import NodeResult
+                fixture_digests[node_id] = digest_json(fixture)
+                schema = node.config.get("outputSchema")
+                errors = (
+                    output_schema_errors(schema, fixture)
+                    if isinstance(schema, dict)
+                    else []
+                )
+                if node.side_effect and not isinstance(schema, dict):
+                    errors = ["副作用模拟缺少冻结 outputSchema"]
+                if errors:
+                    from app.domain.workflow import ExecutionError, NodeResult
 
-                result = NodeResult(status="succeeded", output=fixture)
+                    schema_diagnostics.append(
+                        {"nodeId": node_id, "errors": errors}
+                    )
+                    result = NodeResult(
+                        status="failed",
+                        error=ExecutionError(
+                            code="REPLAY_UNSUPPORTED",
+                            message=f"节点 {node_id} fixture 不满足输出契约",
+                        ),
+                    )
+                else:
+                    from app.domain.workflow import NodeResult
+
+                    result = NodeResult(status="succeeded", output=fixture)
+                    if node.side_effect:
+                        side_effects_simulated.append(node_id)
         else:
             result = await _execute_node(
                 registry, replay_run_id, node, resolved, safe_inputs
@@ -134,7 +176,19 @@ async def run_isolated_replay(
         (node for node in definition.spec.nodes if node.type == NodeType.OUTPUT), None
     )
     final_status = statuses.get(output_node.id, "not_reached") if output_node else "not_reached"
-    passed = failed_status == "succeeded" and final_status == "succeeded"
+    final_output = outputs.get(output_node.id, {}) if output_node else {}
+    final_schema_errors = output_schema_errors(
+        definition.spec.output_schema, final_output
+    )
+    if final_schema_errors:
+        schema_diagnostics.append(
+            {"nodeId": output_node.id if output_node else "output", "errors": final_schema_errors}
+        )
+    passed = (
+        failed_status == "succeeded"
+        and final_status == "succeeded"
+        and not final_schema_errors
+    )
     return {
         "replayRunId": replay_run_id,
         "passed": passed,
@@ -143,6 +197,10 @@ async def run_isolated_replay(
         "finalOutputStatus": final_status,
         "outputs": outputs,
         "sideEffectsSimulated": side_effects_simulated,
+        "selectedEdges": selected_edges,
+        "skippedNodes": skipped_nodes,
+        "schemaDiagnostics": schema_diagnostics,
+        "fixtureDigests": fixture_digests,
         "diagnostics": [item.model_dump() for item in compiled.diagnostics],
     }
 

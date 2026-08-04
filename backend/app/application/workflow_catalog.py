@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import re
-from collections import defaultdict
+from datetime import timedelta
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.compiler import digest_json
@@ -15,43 +15,169 @@ from app.infrastructure.database import (
     Run,
     Workflow,
     WorkflowCapabilityManifest,
+    WorkflowDisclosureCall,
+    WorkflowDisclosureSession,
     WorkflowFragmentManifest,
     WorkflowVersion,
+    utcnow,
 )
 
 MAX_SEARCH_LIMIT = 8
 MAX_SEARCH_BYTES = 24_000
 _SECRET_KEYS = re.compile(r"secret|token|password|prompt|artifact", re.I)
 _SESSION_LIMITS = {"search": 20, "describe": 40, "slice": 10, "plan": 20}
-_SESSION_CALLS: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-_SESSION_REFS: dict[str, set[str]] = defaultdict(set)
 
 
 class CatalogError(ValueError):
     pass
 
 
-def enforce_session_limit(session_id: str, operation: str) -> None:
-    limit = _SESSION_LIMITS[operation]
-    _SESSION_CALLS[session_id][operation] += 1
-    if _SESSION_CALLS[session_id][operation] > limit:
-        raise CatalogError(f"会话 {operation} 调用超过上限 {limit}")
+async def create_disclosure_session(
+    session: AsyncSession,
+    *,
+    conversation_id: str | None = None,
+    agent_run_id: str | None = None,
+    ttl_minutes: int = 60,
+) -> WorkflowDisclosureSession:
+    item = WorkflowDisclosureSession(
+        id=str(uuid4()),
+        conversation_id=conversation_id,
+        agent_run_id=agent_run_id,
+        disclosed_json={},
+        call_budget_json=dict(_SESSION_LIMITS),
+        expires_at=utcnow() + timedelta(minutes=max(1, ttl_minutes)),
+        status="active",
+    )
+    session.add(item)
+    await session.flush()
+    return item
 
 
-def disclose_refs(session_id: str, refs: list[str]) -> None:
-    _SESSION_REFS[session_id].update(refs)
+async def _active_disclosure_session(
+    session: AsyncSession, session_id: str
+) -> WorkflowDisclosureSession:
+    item = await session.get(WorkflowDisclosureSession, session_id)
+    if item is None:
+        raise CatalogError("disclosure session 不存在")
+    expires_at = item.expires_at
+    if expires_at.tzinfo is None:
+        from datetime import UTC
+
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if item.status != "active" or expires_at <= utcnow():
+        if item.status == "active":
+            item.status = "expired"
+        raise CatalogError("disclosure session 已过期或关闭")
+    return item
 
 
-def require_disclosed_ref(session_id: str, ref: str) -> None:
-    if ref not in _SESSION_REFS[session_id]:
+async def consume_session_call(
+    session: AsyncSession,
+    session_id: str,
+    operation: str,
+    request_summary: dict[str, Any],
+) -> WorkflowDisclosureSession:
+    await _active_disclosure_session(session, session_id)
+    json_path = f"$.{operation}"
+    consumed = await session.execute(
+        update(WorkflowDisclosureSession)
+        .where(
+            WorkflowDisclosureSession.id == session_id,
+            WorkflowDisclosureSession.status == "active",
+            WorkflowDisclosureSession.expires_at > utcnow(),
+            func.json_extract(
+                WorkflowDisclosureSession.call_budget_json, json_path
+            )
+            > 0,
+        )
+        .values(
+            call_budget_json=func.json_set(
+                WorkflowDisclosureSession.call_budget_json,
+                json_path,
+                func.json_extract(
+                    WorkflowDisclosureSession.call_budget_json, json_path
+                )
+                - 1,
+            )
+        )
+    )
+    if consumed.rowcount != 1:
+        raise CatalogError(f"会话 {operation} 调用超过上限")
+    item = await session.get(WorkflowDisclosureSession, session_id)
+    assert item is not None
+    await session.refresh(item)
+    session.add(
+        WorkflowDisclosureCall(
+            id=str(uuid4()),
+            session_id=item.id,
+            operation=operation,
+            request_summary_json=request_summary,
+            response_digest="pending",
+            disclosure_level=None,
+        )
+    )
+    await session.flush()
+    return item
+
+
+async def record_disclosure_response(
+    session: AsyncSession,
+    session_id: str,
+    operation: str,
+    response: Any,
+    *,
+    level: str | None,
+) -> None:
+    call = await session.scalar(
+        select(WorkflowDisclosureCall)
+        .where(
+            WorkflowDisclosureCall.session_id == session_id,
+            WorkflowDisclosureCall.operation == operation,
+            WorkflowDisclosureCall.response_digest == "pending",
+        )
+        .order_by(WorkflowDisclosureCall.created_at.desc())
+        .limit(1)
+    )
+    if call is None:
+        raise CatalogError("disclosure call 审计记录不存在")
+    call.response_digest = digest_json(response)
+    call.disclosure_level = level
+
+
+async def disclose_refs(
+    session: AsyncSession,
+    session_id: str,
+    refs: list[str],
+    level: str,
+) -> None:
+    item = await _active_disclosure_session(session, session_id)
+    disclosed = dict(item.disclosed_json or {})
+    rank = {"L0": 0, "L1": 1, "L2": 2}
+    for ref in refs:
+        previous = disclosed.get(ref)
+        if previous is None or rank[level] > rank.get(previous, -1):
+            disclosed[ref] = level
+    item.disclosed_json = disclosed
+    await session.flush()
+
+
+async def require_disclosed_ref(
+    session: AsyncSession, session_id: str, ref: str
+) -> str:
+    item = await _active_disclosure_session(session, session_id)
+    level = (item.disclosed_json or {}).get(ref)
+    if level is None:
         raise CatalogError("ref 未由当前会话的 Registry 渐进披露")
+    return level
 
 
-def require_plan_refs_disclosed(session_id: str, raw_plan: dict[str, Any]) -> None:
+async def require_plan_refs_disclosed(
+    session: AsyncSession, session_id: str, raw_plan: dict[str, Any]
+) -> None:
     for step in raw_plan.get("steps", []):
         ref = step.get("ref") if isinstance(step, dict) else None
         if ref:
-            require_disclosed_ref(session_id, str(ref))
+            await require_disclosed_ref(session, session_id, str(ref))
 
 
 def workflow_ref(version: WorkflowVersion) -> str:
@@ -74,11 +200,128 @@ def _semantic_metadata(definition: WorkflowDefinition) -> dict[str, Any]:
     raw = definition.metadata.get("capability", {})
     if not isinstance(raw, dict):
         return {}
+    result: dict[str, Any] = {}
+    for key, value in raw.items():
+        if key not in {"summary", "useWhen", "doNotUseWhen", "examples", "tags"}:
+            continue
+        encoded = json.dumps(value, ensure_ascii=False)
+        if (
+            _SECRET_KEYS.search(key)
+            or len(encoded.encode()) > 4096
+            or re.search(r"(?:api[_-]?key|token|password)\s*[:=]|https?://[^/\s]+@", encoded, re.I)
+        ):
+            raise CatalogError(f"capability metadata {key} 含敏感值或超过长度限制")
+        result[key] = value
+    return result
+
+
+_INPUT_REF = re.compile(r"\$\{input\.([^}.]+)(?:\.[^}]*)?}")
+_NODE_REF = re.compile(r"\$\{([a-zA-Z][\w-]*)\.(?:output\.)?[^}]+}")
+
+
+def _refs(value: Any, pattern: re.Pattern[str]) -> set[str]:
+    encoded = json.dumps(value, ensure_ascii=False)
+    return set(pattern.findall(encoded))
+
+
+def _fragment_closure(
+    definition: WorkflowDefinition, declared: set[str]
+) -> set[str]:
+    nodes = {node.id: node for node in definition.spec.nodes}
+    incoming: dict[str, set[str]] = {node_id: set() for node_id in nodes}
+    for edge in definition.spec.edges:
+        incoming[edge.target].add(edge.source)
+    closure = set(declared)
+    changed = True
+    while changed:
+        changed = False
+        for node_id in list(closure):
+            node = nodes[node_id]
+            dependencies = {
+                source
+                for source in incoming[node_id]
+                if nodes[source].type != NodeType.INPUT
+            }
+            dependencies.update(
+                ref
+                for ref in _refs(node.input, _NODE_REF)
+                if ref in nodes and nodes[ref].type not in {NodeType.INPUT, NodeType.OUTPUT}
+            )
+            if node.fallback is not None:
+                dependencies.add(node.fallback.target)
+            for dependency in dependencies:
+                if dependency not in closure:
+                    closure.add(dependency)
+                    changed = True
+    return closure
+
+
+def _fragment_ports(
+    definition: WorkflowDefinition,
+    node_ids: set[str],
+    raw: dict[str, Any],
+) -> dict[str, Any]:
+    nodes = {node.id: node for node in definition.spec.nodes}
+    boundary_input = raw.get("inputSchema", definition.spec.input_schema)
+    boundary_output = raw.get("outputSchema", definition.spec.output_schema)
+    input_mapping = dict(raw.get("inputMapping") or {})
+    required_source_inputs = {
+        ref
+        for node_id in node_ids
+        for ref in _refs(nodes[node_id].input, _INPUT_REF)
+    }
+    boundary_fields = set(boundary_input.get("properties", {}))
+    for source_field in required_source_inputs:
+        if source_field not in input_mapping and source_field in boundary_fields:
+            input_mapping[source_field] = f"${{input.{source_field}}}"
+    missing_sources = required_source_inputs - set(input_mapping)
+    if missing_sources:
+        raise CatalogError(
+            f"fragment 输入端口未映射源 Workflow 字段: {sorted(missing_sources)}"
+        )
+    mapped_boundary = {
+        ref for value in input_mapping.values() for ref in _refs(value, _INPUT_REF)
+    }
+    if not set(boundary_input.get("required", [])) <= mapped_boundary:
+        raise CatalogError("fragment required boundary input 未映射到闭包节点输入")
+
+    output_mapping = dict(raw.get("outputMapping") or {})
+    if not output_mapping:
+        output_node = next(
+            node for node in definition.spec.nodes if node.type == NodeType.OUTPUT
+        )
+        output_mapping = {
+            key: value
+            for key, value in output_node.input.items()
+            if _refs(value, _NODE_REF) <= node_ids
+        }
+    missing_outputs = set(boundary_output.get("required", [])) - set(output_mapping)
+    if missing_outputs:
+        raise CatalogError(
+            f"fragment 缺少 required output mapping: {sorted(missing_outputs)}"
+        )
+    output_sources = {
+        ref for value in output_mapping.values() for ref in _refs(value, _NODE_REF)
+    }
+    if not output_sources <= node_ids:
+        raise CatalogError("fragment output mapping 引用了闭包外节点")
+    entry_nodes = sorted(
+        node_id
+        for node_id in node_ids
+        if any(
+            edge.target == node_id and edge.source not in node_ids
+            for edge in definition.spec.edges
+        )
+        or _refs(nodes[node_id].input, _INPUT_REF)
+    )
+    exit_nodes = sorted(output_sources)
     return {
-        key: value
-        for key, value in raw.items()
-        if key in {"summary", "useWhen", "doNotUseWhen", "examples", "tags"}
-        and not _SECRET_KEYS.search(key)
+        "entryPorts": entry_nodes,
+        "exitPorts": exit_nodes,
+        "boundaryInputSchema": boundary_input,
+        "boundaryOutputSchema": boundary_output,
+        "inputMapping": input_mapping,
+        "outputMapping": output_mapping,
     }
 
 
@@ -87,6 +330,23 @@ async def build_manifest(
     workflow: Workflow,
     version: WorkflowVersion,
 ) -> WorkflowCapabilityManifest:
+    previous = (
+        await session.scalars(
+            select(WorkflowCapabilityManifest)
+            .join(
+                WorkflowVersion,
+                WorkflowVersion.id
+                == WorkflowCapabilityManifest.workflow_version_id,
+            )
+            .where(
+                WorkflowVersion.workflow_id == workflow.id,
+                WorkflowCapabilityManifest.status == "published",
+                WorkflowCapabilityManifest.workflow_version_id != version.id,
+            )
+        )
+    ).all()
+    for item in previous:
+        item.status = "resolvable"
     definition = WorkflowDefinition.model_validate(version.definition_json)
     semantic = _semantic_metadata(definition)
     nodes = [
@@ -179,32 +439,27 @@ async def _build_fragments(
     if not isinstance(declarations, list):
         raise CatalogError("metadata.callableFragments 必须是数组")
     nodes = {node.id: node for node in definition.spec.nodes}
-    incoming: dict[str, set[str]] = {node_id: set() for node_id in nodes}
-    for edge in definition.spec.edges:
-        incoming[edge.target].add(edge.source)
     results: list[WorkflowFragmentManifest] = []
     for raw in declarations:
         name = str(raw.get("name", ""))
         declared = set(raw.get("nodeIds", []))
         if not name or not declared or not declared <= nodes.keys():
             raise CatalogError("callable fragment 需要合法 name/nodeIds")
-        for node_id in declared:
-            hidden = {
-                source
-                for source in incoming[node_id]
-                if source not in declared and nodes[source].type != NodeType.INPUT
-            }
-            if hidden:
-                raise CatalogError(f"fragment {name} 存在隐含依赖: {sorted(hidden)}")
-        side_effects = [nodes[node_id] for node_id in declared if nodes[node_id].side_effect]
+        closure_set = _fragment_closure(definition, declared)
+        if closure_set != declared:
+            raise CatalogError(
+                f"fragment {name} 存在隐藏依赖，必须显式包含: {sorted(closure_set - declared)}"
+            )
+        side_effects = [nodes[node_id] for node_id in closure_set if nodes[node_id].side_effect]
         approvals = [
             nodes[node_id]
-            for node_id in declared
+            for node_id in closure_set
             if nodes[node_id].type == NodeType.APPROVAL
         ]
-        if side_effects and not approvals and not raw.get("allowSideEffects", False):
-            raise CatalogError(f"fragment {name} 的副作用缺少显式允许或审批")
-        closure = sorted(declared)
+        if side_effects and not approvals:
+            raise CatalogError(f"fragment {name} 的副作用必须保留源审批边界")
+        closure = sorted(closure_set)
+        ports = _fragment_ports(definition, closure_set, raw)
         closure_digest = digest_json(
             {
                 "workflowDigest": version.digest,
@@ -227,14 +482,8 @@ async def _build_fragments(
             "sourceWorkflowVersionId": version.id,
             "sourceWorkflowDigest": version.digest,
             "nodeIds": closure,
-            "boundaryInputSchema": raw.get(
-                "inputSchema", definition.spec.input_schema
-            ),
-            "boundaryOutputSchema": raw.get(
-                "outputSchema", definition.spec.output_schema
-            ),
-            "inputMapping": raw.get("inputMapping", {}),
-            "outputMapping": raw.get("outputMapping", {}),
+            **ports,
+            "portDigest": digest_json(ports),
             "sideEffects": "none" if not side_effects else "declared",
             "approvalRequired": bool(approvals),
             "capabilityLocks": [
@@ -301,13 +550,29 @@ async def search_manifests(
 ) -> list[dict[str, Any]]:
     limit = max(1, min(limit, MAX_SEARCH_LIMIT))
     constraints = constraints or {}
+    normalized_query = query.strip().lower()[:200]
+    prefilter = select(WorkflowCapabilityManifest).where(
+        WorkflowCapabilityManifest.status == "published"
+    )
+    terms = [term for term in re.split(r"\s+", normalized_query) if term]
+    if terms:
+        prefilter = prefilter.where(
+            WorkflowCapabilityManifest.search_text.contains(terms[0])
+        )
     rows = (
         await session.scalars(
-            select(WorkflowCapabilityManifest).where(
-                WorkflowCapabilityManifest.status == "published"
-            )
+            prefilter.order_by(WorkflowCapabilityManifest.updated_at.desc()).limit(256)
         )
     ).all()
+    if not rows and terms:
+        rows = (
+            await session.scalars(
+                select(WorkflowCapabilityManifest)
+                .where(WorkflowCapabilityManifest.status == "published")
+                .order_by(WorkflowCapabilityManifest.updated_at.desc())
+                .limit(256)
+            )
+        ).all()
     candidates: list[tuple[float, WorkflowCapabilityManifest]] = []
     for row in rows:
         if not _matches_constraints(row.manifest_json, constraints):
@@ -351,7 +616,7 @@ async def resolve_workflow_manifest(
     rows = (
         await session.scalars(
             select(WorkflowCapabilityManifest).where(
-                WorkflowCapabilityManifest.status == "published"
+                WorkflowCapabilityManifest.status.in_(["published", "resolvable"])
             )
         )
     ).all()
@@ -430,24 +695,7 @@ async def create_private_fragment_snapshot(
         raise CatalogError("裁剪目标节点不存在")
     if any(nodes[node_id].type in {NodeType.INPUT, NodeType.OUTPUT} for node_id in candidates):
         raise CatalogError("Input/Output 不是可裁剪业务节点")
-    incoming: dict[str, set[str]] = {node_id: set() for node_id in nodes}
-    for edge in definition.spec.edges:
-        incoming[edge.target].add(edge.source)
-    closure: set[str] = set()
-
-    def include_ancestors(node_id: str) -> None:
-        for source in incoming[node_id]:
-            if nodes[source].type == NodeType.INPUT or source in closure:
-                continue
-            closure.add(source)
-            include_ancestors(source)
-
-    closure.update(candidates)
-    for node_id in list(candidates):
-        include_ancestors(node_id)
-        fallback = nodes[node_id].fallback
-        if fallback is not None:
-            closure.add(fallback.target)
+    closure = _fragment_closure(definition, candidates)
     business_nodes = [nodes[node_id] for node_id in closure]
     if any(node.side_effect for node in business_nodes) and not any(
         node.type == NodeType.APPROVAL for node in business_nodes
@@ -490,6 +738,35 @@ async def create_private_fragment_snapshot(
                 if key in output_mapping
             ],
         }
+    source_input_fields = {
+        ref
+        for node_id in closure
+        for ref in _refs(nodes[node_id].input, _INPUT_REF)
+    }
+    source_properties = definition.spec.input_schema.get("properties", {})
+    input_schema = {
+        **definition.spec.input_schema,
+        "properties": {
+            key: source_properties.get(key, {}) for key in sorted(source_input_fields)
+        },
+        "required": [
+            key
+            for key in definition.spec.input_schema.get("required", [])
+            if key in source_input_fields
+        ],
+    }
+    ports = _fragment_ports(
+        definition,
+        closure,
+        {
+            "inputSchema": input_schema,
+            "outputSchema": output_schema,
+            "inputMapping": {
+                key: f"${{input.{key}}}" for key in sorted(source_input_fields)
+            },
+            "outputMapping": output_mapping,
+        },
+    )
     closure_digest = digest_json(
         {"workflowDigest": version.digest, "nodeIds": sorted(closure)}
     )
@@ -505,10 +782,8 @@ async def create_private_fragment_snapshot(
         "sourceWorkflowVersionId": version.id,
         "sourceWorkflowDigest": version.digest,
         "nodeIds": sorted(closure),
-        "boundaryInputSchema": definition.spec.input_schema,
-        "boundaryOutputSchema": output_schema,
-        "inputMapping": {},
-        "outputMapping": output_mapping,
+        **ports,
+        "portDigest": digest_json(ports),
         "sideEffects": (
             "declared" if any(node.side_effect for node in business_nodes) else "none"
         ),

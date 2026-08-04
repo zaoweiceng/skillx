@@ -19,6 +19,7 @@ from app.application.agent_host import (
 )
 from app.config import get_settings
 from app.infrastructure.database import (
+    Artifact,
     Conversation,
     ConversationRun,
     ConversationRunEvent,
@@ -516,6 +517,23 @@ class AgentRunWorker:
             run.lease_expires_at = None
             run.output_json = output
             run.trajectory_json = trajectory
+            session.add(
+                Artifact(
+                    id=str(uuid4()),
+                    run_id=None,
+                    conversation_run_id=run.id,
+                    kind="conversation_trajectory",
+                    name="trajectory.json",
+                    uri=staged["uri"],
+                    sha256=staged["sha256"],
+                    size=staged["bytes"],
+                    media_type="application/json",
+                    metadata_json={
+                        "conversationRunId": run.id,
+                        "retentionClass": "trajectory",
+                    },
+                )
+            )
             await _append_event(
                 session,
                 run_id,
@@ -648,6 +666,20 @@ def build_trajectory(
 def summarize_run(conversation_run: ConversationRun) -> dict[str, Any]:
     """对话运行的 API 摘要视图（包含可恢复的长任务 handle 状态）。"""
 
+    browser_evidence = []
+    for action in (conversation_run.trajectory_json or {}).get("actions", []):
+        observations = action.get("observations") or {}
+        result = action.get("result") or {}
+        if action.get("kind") == "browser" and isinstance(result.get("content"), str):
+            browser_evidence.append(
+                {
+                    "callId": action.get("callId"),
+                    "resultSource": observations.get("resultSource"),
+                    "contentSha256": hashlib.sha256(
+                        result["content"].encode()
+                    ).hexdigest(),
+                }
+            )
     return {
         "id": conversation_run.id,
         "conversationId": conversation_run.conversation_id,
@@ -658,4 +690,5 @@ def summarize_run(conversation_run: ConversationRun) -> dict[str, Any]:
         "error": conversation_run.error_json,
         "attempt": conversation_run.attempt,
         "cancellationRequested": conversation_run.cancellation_requested_at is not None,
+        "browserEvidence": browser_evidence,
     }

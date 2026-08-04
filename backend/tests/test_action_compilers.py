@@ -104,8 +104,7 @@ def test_build_ir_forms_dependency_chain() -> None:
 def test_distillation_proposal_schema_roundtrip() -> None:
     proposal = DistillationProposal(
         nodes=[ProposedNode(nodeId="n1", actionIds=["a"], strategy="deterministic")],
-        variableCandidates={"key": "${input.message}"},
     )
     dumped = proposal.model_dump(by_alias=True)
     assert dumped["nodes"][0]["nodeId"] == "n1"
-    assert dumped["variableCandidates"]["key"] == "${input.message}"
+    assert "variableCandidates" not in dumped

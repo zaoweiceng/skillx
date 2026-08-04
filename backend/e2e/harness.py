@@ -124,6 +124,7 @@ def start_stack(
             '["search.web", "lookup.table", "browser.read", "summarize.text"]'
         ),
         "SKILLX_AGENT_LEASE_SECONDS": "2",
+        "SKILLX_BROWSER_ALLOWED_HOSTS": '["127.0.0.1"]',
         # 本地表单站点 URL：seed 据此创建真实 Playwright 提交组件（E2E-6）。
         "SKILLX_DEMO_FORM_URL": f"http://127.0.0.1:{form_port}/apply",
         # 动态文章页 URL：seed 据此创建动态网页总结组件（F-01）。

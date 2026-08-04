@@ -138,7 +138,6 @@ def main() -> int:
                     "totalTokens": 20,
                     "output": {
                         "nodes": nodes,
-                        "variableCandidates": {},
                         "estimatedCost": {"llmCalls": sum(
                             node["strategy"] in {"agent", "llm"} for node in nodes
                         )},
@@ -188,22 +187,15 @@ def main() -> int:
         elif action == "request_user":
             decision["question"] = "请确认是否按 checkpoint 继续恢复？"
         elif action == "retry_replanned":
-            remaining_nodes = context.get("remainingNodes", [])
             decision["planPatch"] = {
-                "remainingNodes": [
+                "nodePatches": [
                     {
-                        **node,
-                        "config": (
-                            {"operation": "passthrough"}
-                            if node.get("id") == "risky"
-                            else node.get("config", {})
-                        ),
+                        "nodeId": "risky",
+                        "changes": {"config": {"operation": "passthrough"}},
                     }
-                    for node in remaining_nodes
                 ],
-                "remainingEdges": context.get("remainingEdges", []),
                 "inputMappings": {},
-                "locks": context.get("capabilityLocks", []),
+                "edgePatches": [],
             }
         emit(
             {

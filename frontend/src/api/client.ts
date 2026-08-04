@@ -77,6 +77,11 @@ export type NodeRun = {
   finishedAt?: string | null
   durationMs?: number | null
   metrics?: Record<string, unknown>
+  source?: {
+    stepId: string
+    sourceNodeId: string
+    sourceRef: string
+  } | null
 }
 
 export type Approval = {
@@ -120,6 +125,9 @@ export type Run = {
     workflowDigest: string | null
     planSnapshotId?: string | null
     planDigest?: string | null
+    planStatus?: string | null
+    planExpiresAt?: string | null
+    sourceMap?: Record<string, unknown>
     executionClass?: string | null
     capabilityLocks?: unknown[]
     mcpLocks?: unknown[]
@@ -131,6 +139,7 @@ export type Run = {
     failedNode: string
     fallbackTarget?: string | null
     recoveryNodeRunId?: string | null
+    claimGeneration?: number
     attempt: number
     digest: string
     completedNodes: string[]
@@ -170,6 +179,10 @@ export type ChatMessageContent = {
   executionClass?: string
   level?: string
   items?: WorkflowCapabilityCard[]
+  agentAction?: string
+  selectionReason?: string
+  disclosureSessionId?: string
+  disclosureLevel?: string
 }
 
 export type WorkflowCapabilityCard = {
@@ -237,23 +250,32 @@ export const api = {
     }),
   listRuns: () => request<Run[]>('/runs'),
   getRun: (id: string) => request<Run>(`/runs/${id}`),
-  searchWorkflows: (query: string, constraints: Record<string, unknown> = {}) =>
+  createWorkflowSession: (conversationId?: string) =>
+    request<{ id: string; status: string; expiresAt: string }>('/workflow-tools/sessions', {
+      method: 'POST',
+      body: JSON.stringify({ conversationId }),
+    }),
+  searchWorkflows: (
+    sessionId: string,
+    query: string,
+    constraints: Record<string, unknown> = {},
+  ) =>
     request<{ level: string; count: number; items: WorkflowCapabilityCard[] }>(
       '/workflow-tools/search',
       {
         method: 'POST',
-        body: JSON.stringify({ query, constraints, limit: 8 }),
+        body: JSON.stringify({ sessionId, query, constraints, limit: 8 }),
       },
     ),
-  describeWorkflow: (ref: string) =>
+  describeWorkflow: (sessionId: string, ref: string) =>
     request<Record<string, unknown>>('/workflow-tools/describe', {
       method: 'POST',
-      body: JSON.stringify({ ref }),
+      body: JSON.stringify({ sessionId, ref }),
     }),
-  describeFragment: (ref: string) =>
+  describeFragment: (sessionId: string, ref: string) =>
     request<Record<string, unknown>>('/workflow-tools/describe-fragment', {
       method: 'POST',
-      body: JSON.stringify({ ref }),
+      body: JSON.stringify({ sessionId, ref }),
     }),
   cancelRun: (id: string) => request<Run>(`/runs/${id}/cancel`, { method: 'POST' }),
   approve: (id: string, snapshotDigest: string) =>

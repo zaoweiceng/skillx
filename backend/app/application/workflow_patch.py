@@ -230,19 +230,26 @@ def apply_workflow_patch(
 async def record_failure_observation(
     session: AsyncSession,
     *,
-    workflow_version_id: str,
+    workflow_version_id: str | None = None,
+    plan_snapshot_id: str | None = None,
     node_id: str,
     node_type: str,
     error_code: str,
     contract_summary: dict[str, Any] | None = None,
+    locks: list[dict[str, Any]] | None = None,
     recovered: bool = False,
+    recovered_outcome: dict[str, Any] | None = None,
     run_id: str | None = None,
+    source_node_run_id: str | None = None,
     checkpoint_id: str | None = None,
 ) -> FailureObservation:
     """按稳定 fingerprint 聚合失败观测；重复失败累加 occurrence（后端事实来源）。"""
 
+    if (workflow_version_id is None) == (plan_snapshot_id is None):
+        raise ValueError("FailureObservation 必须且只能绑定一个执行源")
+    execution_source_id = workflow_version_id or f"plan:{plan_snapshot_id}"
     fingerprint = failure_fingerprint(
-        workflow_version_id=workflow_version_id,
+        workflow_version_id=execution_source_id,
         node_id=node_id,
         node_type=node_type,
         error_code=error_code,
@@ -256,6 +263,8 @@ async def record_failure_observation(
         id=str(uuid4()),
         fingerprint=fingerprint,
         workflow_version_id=workflow_version_id,
+        plan_snapshot_id=plan_snapshot_id,
+        source_node_run_id=source_node_run_id,
         node_id=node_id,
         node_type=node_type,
         error_code=error_code,
@@ -264,7 +273,9 @@ async def record_failure_observation(
         recovered=recovered,
         last_run_id=run_id,
         last_checkpoint_id=checkpoint_id,
+        locks_json=locks or [],
         contract_summary_json=contract_summary or {},
+        recovered_outcome_json=recovered_outcome,
         created_at=now,
         updated_at=now,
     )
@@ -276,6 +287,10 @@ async def record_failure_observation(
                 "recovered": FailureObservation.recovered | recovered,
                 "last_run_id": run_id,
                 "last_checkpoint_id": checkpoint_id,
+                "source_node_run_id": source_node_run_id,
+                "locks_json": locks or [],
+                "contract_summary_json": contract_summary or {},
+                "recovered_outcome_json": recovered_outcome,
                 "updated_at": now,
             },
         )

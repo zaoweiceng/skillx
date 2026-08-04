@@ -27,6 +27,7 @@ from app.infrastructure.database import (
     Artifact,
     ConversationRun,
     ExecutionCheckpoint,
+    FailureObservation,
     NodeRun,
     PlanSnapshot,
     RecoveryAttempt,
@@ -44,6 +45,12 @@ from app.runtime.executors import (
     clear_staging,
     list_final_files,
     promote_staged_artifact,
+)
+from app.runtime.state_machine import (
+    edge_ready,
+    edge_selected,
+    node_readiness,
+    output_schema_errors,
 )
 
 FINAL_RUN_STATES = {"succeeded", "failed", "cancelled"}
@@ -86,7 +93,7 @@ async def load_execution_source(
         snapshot = await session.get(PlanSnapshot, run.plan_snapshot_id)
         if snapshot is None:
             return None
-        verify_plan_snapshot(snapshot)
+        verify_plan_snapshot(snapshot, for_new_run=False)
         source = ExecutionSource(
             snapshot.id,
             snapshot.definition_json,
@@ -110,6 +117,19 @@ async def load_execution_source(
     )
     if recovery_attempt is None or not recovery_attempt.plan_patch_json:
         return source
+    frozen_definition = recovery_attempt.plan_patch_json.get("compiledDefinition")
+    if isinstance(frozen_definition, dict):
+        return ExecutionSource(
+            recovery_attempt.id,
+            frozen_definition,
+            {
+                "capabilityLocks": recovery_attempt.plan_patch_json.get(
+                    "generatedLocks", []
+                ),
+                "mcpLocks": recovery_attempt.plan_patch_json.get("generatedLocks", []),
+            },
+            recovery_attempt.plan_patch_json.get("afterDigest", recovery_attempt.digest),
+        )
     patched_definition = _merge_recovery_plan(
         source.definition_json, recovery_attempt.plan_patch_json
     )
@@ -137,9 +157,21 @@ def _merge_recovery_plan(
             "edges": [dict(edge) for edge in base_definition["spec"]["edges"]],
         },
     }
-    replacements = {
-        node["id"]: dict(node) for node in patch.get("remainingNodes", [])
-    }
+    replacements = {}
+    for item in patch.get("nodePatches", []):
+        node_id = item.get("nodeId")
+        source = next(
+            (node for node in definition["spec"]["nodes"] if node["id"] == node_id),
+            None,
+        )
+        if source is not None:
+            replacement = {**source, **item.get("changes", {})}
+            if isinstance(item.get("changes", {}).get("config"), dict):
+                replacement["config"] = {
+                    **source.get("config", {}),
+                    **item["changes"]["config"],
+                }
+            replacements[node_id] = replacement
     input_mappings = patch.get("inputMappings", {})
     nodes = []
     for node in definition["spec"]["nodes"]:
@@ -147,17 +179,30 @@ def _merge_recovery_plan(
         if node["id"] in input_mappings:
             replacement = {**replacement, "input": input_mappings[node["id"]]}
         nodes.append(replacement)
-    remaining_ids = set(replacements)
-    preserved_edges = [
-        edge
-        for edge in definition["spec"]["edges"]
-        if edge["source"] not in remaining_ids and edge["target"] not in remaining_ids
-    ]
     definition["spec"]["nodes"] = nodes
-    definition["spec"]["edges"] = [
-        *preserved_edges,
-        *patch.get("remainingEdges", []),
-    ]
+    edges = definition["spec"]["edges"]
+    for edge_patch in patch.get("edgePatches", []):
+        candidate = {
+            "source": edge_patch["source"],
+            "target": edge_patch["target"],
+            **(
+                {"when": edge_patch["when"]}
+                if edge_patch.get("when") is not None
+                else {}
+            ),
+        }
+        if edge_patch.get("action") == "remove":
+            edges[:] = [
+                edge
+                for edge in edges
+                if not (
+                    edge["source"] == candidate["source"]
+                    and edge["target"] == candidate["target"]
+                    and edge.get("when") == candidate.get("when")
+                )
+            ]
+        elif candidate not in edges:
+            edges.append(candidate)
     return definition
 
 
@@ -422,6 +467,11 @@ class Orchestrator:
         for node_id, output in substitutions.items():
             if output:
                 values[node_id] = output
+        statuses = {node_id: item.status for node_id, item in latest.items()}
+        on_errors = {node_id: node.on_error for node_id, node in nodes.items()}
+        raw_outputs = {
+            node_id: item.output_json or {} for node_id, item in latest.items()
+        }
 
         for node in definition.spec.nodes:
             # fallback-only target 只在恢复时由 RecoveryDriver 创建，正常调度跳过。
@@ -430,16 +480,12 @@ class Orchestrator:
             if node.id in latest:
                 continue
             edges = incoming[node.id]
-            if edges and not all(
-                self._edge_ready(edge.source, latest, substitutions) for edge in edges
-            ):
+            readiness, _selected = node_readiness(
+                edges, statuses, raw_outputs, on_errors, substitutions
+            )
+            if readiness == "waiting":
                 continue
-            selected = [
-                edge
-                for edge in edges
-                if self._edge_selected(edge.source, edge.when, latest, nodes, substitutions)
-            ]
-            if edges and not selected:
+            if readiness == "skipped":
                 await self._insert_node_run(
                     session,
                     run,
@@ -484,18 +530,17 @@ class Orchestrator:
         output_run = latest.get(output_node.id)
         if output_run and output_run.status == "succeeded":
             run.output_json = output_run.output_json or {}
-            errors = list(
-                Draft202012Validator(definition.spec.output_schema).iter_errors(run.output_json)
-            )
+            errors = output_schema_errors(definition.spec.output_schema, run.output_json)
             if errors:
                 await self._finish_failed(
                     session,
                     run,
-                    {"code": "CONTRACT_VIOLATION", "message": errors[0].message},
+                    {"code": "CONTRACT_VIOLATION", "message": errors[0]},
                 )
             else:
                 run.status = "succeeded"
                 run.finished_at = utcnow()
+                await self._finalize_recovery_state(session, run, "succeeded")
                 await append_event(
                     session,
                     run.id,
@@ -527,11 +572,11 @@ class Orchestrator:
     ) -> bool:
         """上游节点是否处于终态（可解析下游）：正常终态，或被恢复替代的失败节点。"""
 
-        if source not in latest:
-            return False
-        if source in substitutions and latest[source].status == "failed":
-            return True
-        return latest[source].status in TERMINAL_NODE_STATES
+        return edge_ready(
+            source,
+            {node_id: item.status for node_id, item in latest.items()},
+            substitutions,
+        )
 
     @staticmethod
     def _edge_selected(
@@ -541,20 +586,15 @@ class Orchestrator:
         nodes: dict[str, WorkflowNode],
         substitutions: dict[str, Any] | None = None,
     ) -> bool:
-        source_run = latest[source]
         substitutions = substitutions or {}
-        substituted = source in substitutions and source_run.status == "failed"
-        allowed = (
-            source_run.status == "succeeded"
-            or substituted
-            or (source_run.status == "failed" and nodes[source].on_error == "continue")
+        return edge_selected(
+            source,
+            when,
+            {node_id: item.status for node_id, item in latest.items()},
+            {node_id: item.output_json or {} for node_id, item in latest.items()},
+            {node_id: node.on_error for node_id, node in nodes.items()},
+            substitutions,
         )
-        if not allowed:
-            return False
-        if when is None:
-            return True
-        output = substitutions[source] if substituted else (source_run.output_json or {})
-        return bool((output or {}).get("result")) == when
 
     @staticmethod
     async def _latest_node_runs(session: AsyncSession, run_id: str) -> dict[str, NodeRun]:
@@ -621,6 +661,7 @@ class Orchestrator:
         run.status = "failed"
         run.finished_at = utcnow()
         run.error_json = error or {"code": "EXECUTION_FAILED", "message": "运行失败"}
+        await Orchestrator._finalize_recovery_state(session, run, "failed")
         await append_event(
             session,
             run.id,
@@ -667,6 +708,9 @@ class Orchestrator:
         if hits_fallback and fallback.require_user_approval:
             # 危险错误先建立 checkpoint，进入待审批；批准后走同一 Recovery claim。
             checkpoint = await build_checkpoint(session, run, definition, failed_node_run)
+            await self._record_observation(
+                session, run, failed_node_run, checkpoint_id=checkpoint.id
+            )
             checkpoint.approval_status = "pending"
             run.status = "waiting_approval"
             await self._create_recovery_approval(
@@ -687,6 +731,9 @@ class Orchestrator:
             return
         if hits_fallback and is_recoverable(error_code, fallback.on):
             checkpoint = await build_checkpoint(session, run, definition, failed_node_run)
+            await self._record_observation(
+                session, run, failed_node_run, checkpoint_id=checkpoint.id
+            )
             run.status = "recovering"
             await append_event(
                 session,
@@ -708,22 +755,67 @@ class Orchestrator:
 
     @staticmethod
     async def _record_observation(
-        session: AsyncSession, run: Run, failed_node_run: NodeRun
+        session: AsyncSession,
+        run: Run,
+        failed_node_run: NodeRun,
+        *,
+        checkpoint_id: str | None = None,
     ) -> None:
         from app.application.workflow_patch import record_failure_observation
 
         error = failed_node_run.error_json or {}
         with suppress(Exception):
+            source = await load_execution_source(session, run)
             await record_failure_observation(
                 session,
-                workflow_version_id=(
-                    run.workflow_version_id or f"plan:{run.plan_snapshot_id}"
-                ),
+                workflow_version_id=run.workflow_version_id,
+                plan_snapshot_id=run.plan_snapshot_id,
                 node_id=failed_node_run.node_id,
                 node_type=failed_node_run.node_type,
                 error_code=error.get("code", "EXECUTION_FAILED"),
                 run_id=run.id,
+                source_node_run_id=failed_node_run.id,
+                checkpoint_id=checkpoint_id,
+                locks=(source.validation_json.get("capabilityLocks", []) if source else []),
+                contract_summary={
+                    "executionSourceDigest": source.digest if source else None,
+                    "inputDigest": digest_json(run.input_json),
+                },
             )
+
+    @staticmethod
+    async def _finalize_recovery_state(
+        session: AsyncSession, run: Run, status: str
+    ) -> None:
+        checkpoint_ids = select(ExecutionCheckpoint.id).where(
+            ExecutionCheckpoint.run_id == run.id
+        )
+        await session.execute(
+            update(RecoveryAttempt)
+            .where(
+                RecoveryAttempt.checkpoint_id.in_(checkpoint_ids),
+                RecoveryAttempt.status == "active",
+            )
+            .values(status="succeeded" if status == "succeeded" else "failed")
+        )
+        observation = await session.scalar(
+            select(FailureObservation)
+            .where(
+                FailureObservation.last_run_id == run.id,
+                FailureObservation.last_checkpoint_id.is_not(None),
+            )
+            .order_by(FailureObservation.updated_at.desc())
+            .limit(1)
+        )
+        if observation is not None:
+            observation.recovered = status == "succeeded"
+            observation.recovered_outcome_json = {
+                "status": status,
+                "outputDigest": (
+                    digest_json(run.output_json) if run.output_json is not None else None
+                ),
+                "error": run.error_json,
+            }
 
     @staticmethod
     async def _create_recovery_approval(
