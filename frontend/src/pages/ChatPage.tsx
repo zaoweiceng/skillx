@@ -2,7 +2,7 @@ import Form from '@rjsf/core'
 import validator from '@rjsf/validator-ajv8'
 import { Bot, CornerDownLeft, Link2Off, MessageSquareText } from 'lucide-react'
 import { FormEvent, useCallback, useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import { api, ChatMessageContent, ConversationRunEvent } from '@/api/client'
 
@@ -13,7 +13,9 @@ type Message = {
 }
 
 export default function ChatPage() {
-  const [conversationId, setConversationId] = useState('')
+  const { id: routeConversationId } = useParams()
+  const navigate = useNavigate()
+  const [conversationId, setConversationId] = useState(routeConversationId ?? '')
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
@@ -23,31 +25,52 @@ export default function ChatPage() {
   const [candidateInputs, setCandidateInputs] = useState<Record<string, Record<string, unknown>>>({})
   const [confirming, setConfirming] = useState('')
   const [startingAgent, setStartingAgent] = useState(false)
-  // 最近一次用户输入，用于「继续/启动通用 Agent」时复用原始任务描述。
-  const [lastPrompt, setLastPrompt] = useState('')
   // 轨迹抽屉：追踪最近一次通用 Agent 运行及其规范化事件。
   const [activeRunId, setActiveRunId] = useState('')
   const [runStatus, setRunStatus] = useState('')
   const [traceEvents, setTraceEvents] = useState<ConversationRunEvent[]>([])
+  // 每个 ConversationRun 的实时终态，供展示层判断“只有 succeeded 可固化”。
+  const [runStatuses, setRunStatuses] = useState<Record<string, string>>({})
 
+  // conversationId 写入路由：新对话创建后导航到 /chat/:id，刷新可恢复同一会话。
   useEffect(() => {
+    if (routeConversationId) {
+      setConversationId(routeConversationId)
+      return
+    }
     api
       .createConversation('新对话')
-      .then((item) => setConversationId(item.id))
+      .then((item) => navigate(`/chat/${item.id}`, { replace: true }))
       .catch((reason: Error) => setError(reason.message))
-  }, [])
+  }, [routeConversationId, navigate])
 
   const refresh = useCallback(async () => {
+    if (!conversationId) return
     const conversation = await api.getConversation(conversationId)
     setMessages(conversation.messages)
-    // 从服务端消息恢复最近一次 Agent 运行，刷新后仍可展示轨迹，不依赖本地 state。
-    const latestAgent = [...conversation.messages]
-      .reverse()
-      .find((message) => message.content.conversationRunId && message.content.runType === 'agent_run')
-    if (latestAgent?.content.conversationRunId) {
-      setActiveRunId(latestAgent.content.conversationRunId)
+    // 拉取所有 Agent 运行消息的当前终态，展示层据此仅对 succeeded 开放固化。
+    const agentRunIds = conversation.messages
+      .filter((message) => message.content.conversationRunId && message.content.runType === 'agent_run')
+      .map((message) => message.content.conversationRunId as string)
+    if (agentRunIds.length > 0) {
+      const summaries = await Promise.all(
+        agentRunIds.map((runId) => api.getConversationRun(runId).catch(() => null)),
+      )
+      setRunStatuses((current) => {
+        const next = { ...current }
+        summaries.forEach((summary) => {
+          if (summary) next[summary.id] = summary.status
+        })
+        return next
+      })
+      // 从服务端消息恢复最近一次 Agent 运行，刷新后仍可展示轨迹，不依赖本地 state。
+      setActiveRunId(agentRunIds[agentRunIds.length - 1])
     }
   }, [conversationId])
+
+  useEffect(() => {
+    refresh().catch((reason: Error) => setError(reason.message))
+  }, [refresh])
 
   // 订阅活动 Agent 运行的规范化事件，直到进入终态。
   useEffect(() => {
@@ -61,6 +84,7 @@ export default function ChatPage() {
         ])
         if (cancelled) return
         setRunStatus(summary.status)
+        setRunStatuses((current) => ({ ...current, [summary.id]: summary.status }))
         setTraceEvents(events)
         // queued/running 均为非终态：长任务由独立 Worker 执行，持续轮询直到终态。
         if (summary.status === 'queued' || summary.status === 'running') {
@@ -81,7 +105,6 @@ export default function ChatPage() {
     if (!input.trim() || !conversationId) return
     const text = input.trim()
     setInput('')
-    setLastPrompt(text)
     setSending(true)
     const optimistic: Message = {
       id: `local-${Date.now()}`,
@@ -155,14 +178,21 @@ export default function ChatPage() {
     }
   }
 
-  function lastUserPrompt(): string {
-    if (lastPrompt) return lastPrompt
-    const lastUser = [...messages].reverse().find((message) => message.role === 'user')
-    return lastUser?.content.text ?? ''
+  // 候选卡片绑定产生它的用户消息：取该助手消息之前最近的一条用户消息文本，
+  // 而不是全局最近 prompt，避免继续 Agent 时误用无关的新输入。
+  function sourcePromptFor(message: Message): string {
+    const index = messages.findIndex((item) => item.id === message.id)
+    for (let cursor = index - 1; cursor >= 0; cursor -= 1) {
+      if (messages[cursor].role === 'user') {
+        return messages[cursor].content.text ?? ''
+      }
+    }
+    return ''
   }
 
   function renderCandidate(message: Message) {
     const content = message.content
+    const sourcePrompt = sourcePromptFor(message)
     return (
       <div className="candidate-card">
         <div className="candidate-meta">
@@ -197,8 +227,8 @@ export default function ChatPage() {
               <button
                 className="button ghost"
                 type="button"
-                disabled={startingAgent}
-                onClick={() => startAgent(lastUserPrompt())}
+                disabled={startingAgent || !sourcePrompt}
+                onClick={() => startAgent(sourcePrompt)}
               >
                 {startingAgent ? '正在启动 Agent...' : '继续通用 Agent'}
               </button>
@@ -206,6 +236,30 @@ export default function ChatPage() {
           </Form>
         )}
       </div>
+    )
+  }
+
+  // Agent 运行动作：只有 succeeded 才展示“固化为组件”，其它状态显式提示不可固化。
+  function renderAgentRunActions(conversationRunId: string) {
+    const status = runStatuses[conversationRunId]
+    if (drafts[conversationRunId]) {
+      return (
+        <Link className="button ghost" to={`/workflows/${drafts[conversationRunId]}/edit`}>
+          打开固化草稿
+        </Link>
+      )
+    }
+    if (status === 'succeeded') {
+      return (
+        <button className="button ghost" onClick={() => distill(conversationRunId)}>
+          固化为组件
+        </button>
+      )
+    }
+    return (
+      <span className="hint">
+        {status ? `运行状态 ${status}，仅 succeeded 可固化` : '运行未完成，暂不可固化'}
+      </span>
     )
   }
 
@@ -293,7 +347,7 @@ export default function ChatPage() {
                     className="button ghost"
                     type="button"
                     disabled={startingAgent}
-                    onClick={() => startAgent(lastUserPrompt())}
+                    onClick={() => startAgent(sourcePromptFor(message))}
                   >
                     {startingAgent ? '正在启动 Agent...' : '启动通用 Agent 探索'}
                   </button>
@@ -305,21 +359,7 @@ export default function ChatPage() {
                 )}
                 {message.content.conversationRunId &&
                   message.content.runType === 'agent_run' &&
-                  (drafts[message.content.conversationRunId] ? (
-                    <Link
-                      className="button ghost"
-                      to={`/workflows/${drafts[message.content.conversationRunId]}/edit`}
-                    >
-                      打开固化草稿
-                    </Link>
-                  ) : (
-                    <button
-                      className="button ghost"
-                      onClick={() => distill(message.content.conversationRunId!)}
-                    >
-                      固化为组件
-                    </button>
-                  ))}
+                  renderAgentRunActions(message.content.conversationRunId)}
               </div>
             </article>
           ))}

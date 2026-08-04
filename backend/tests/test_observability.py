@@ -72,3 +72,68 @@ async def test_component_detail_exposes_business_and_technical_views() -> None:
     assert "businessView" in detail and "technicalView" in detail
     assert detail["technicalView"]["nodeCount"] >= 2
     assert detail["businessView"]["recentRunCount"] >= 0
+
+
+async def test_run_detail_exposes_checkpoint_recovery_evidence() -> None:
+    """恢复运行的详情暴露 checkpoint：已完成节点、剩余子图与恢复决定（脱敏）。"""
+
+    from app.application.recovery import build_checkpoint
+    from app.domain.workflow import WorkflowDefinition
+    from app.infrastructure.database import ExecutionCheckpoint, NodeRun, Run, utcnow
+
+    definition = deterministic_workflow()
+    compiled = WorkflowCompiler().compile(definition)
+    async with SessionLocal() as session, session.begin():
+        workflow = Workflow(id=str(uuid4()), name="ck-wf", draft_revision=1, draft_json=definition)
+        session.add(workflow)
+        await session.flush()
+        version = WorkflowVersion(
+            id=str(uuid4()),
+            workflow_id=workflow.id,
+            version=1,
+            definition_json=definition,
+            digest=compiled.digest,
+            validation_json={"executionClass": "zero_llm", "capabilityLocks": [], "mcpLocks": []},
+        )
+        session.add(version)
+        await session.flush()
+        run = Run(
+            id=str(uuid4()),
+            workflow_version_id=version.id,
+            status="recovering",
+            input_json={"name": "Alice"},
+            started_at=utcnow(),
+        )
+        session.add(run)
+        await session.flush()
+        # format 节点视为失败，构造 checkpoint。
+        failed = NodeRun(
+            id=str(uuid4()),
+            run_id=run.id,
+            node_id="format",
+            node_type="transform",
+            attempt=1,
+            status="failed",
+            input_json={"name": "Alice"},
+            error_json={"code": "DEPENDENCY_UNAVAILABLE", "message": "x", "retryable": True},
+            finished_at=utcnow(),
+        )
+        session.add(failed)
+        await session.flush()
+        definition_model = WorkflowDefinition.model_validate(definition)
+        checkpoint = await build_checkpoint(session, run, definition_model, failed)
+        checkpoint.status = "applied"
+        checkpoint.decision_json = {"action": "resume_remaining", "reason": "ok"}
+        run_id = run.id
+
+    async with SessionLocal() as session:
+        detail: dict[str, Any] = await get_run(run_id, session)
+
+    assert isinstance(detail["checkpoints"], list) and len(detail["checkpoints"]) == 1
+    ck = detail["checkpoints"][0]
+    assert ck["failedNode"] == "format"
+    assert ck["status"] == "applied"
+    assert "remainingSubgraph" in ck
+    assert ck["decision"]["action"] == "resume_remaining"
+    # 用作断言 ExecutionCheckpoint 已被读取（防止导入未使用）。
+    assert ExecutionCheckpoint.__tablename__ == "execution_checkpoints"

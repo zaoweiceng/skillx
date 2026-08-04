@@ -330,6 +330,13 @@ class RecoveryDriver:
 
         async with SessionLocal() as session, session.begin():
             checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+            run = await session.get(Run, checkpoint.run_id)
+            # 运行 Recovery Agent 期间可能被取消：只有 checkpoint 仍 pending 且 run 仍
+            # recovering 时才应用决定，避免把已取消/已终态的 Run 拉回 running。
+            if checkpoint.status != "pending" or run is None or run.status != "recovering":
+                if checkpoint.status == "pending":
+                    checkpoint.status = "superseded"
+                return True
             next_status = await apply_recovery_decision(session, checkpoint, decision)
             run_id = checkpoint.run_id
         # 应用后从剩余子图继续调度。

@@ -156,3 +156,54 @@ async def test_workflow_patch_endpoint_creates_draft_without_touching_version() 
         assert version.definition_json == original
         work = next(n for n in version.definition_json["spec"]["nodes"] if n["id"] == "work")
         assert work["timeoutSeconds"] == 30
+
+
+async def test_concurrent_patch_applications_create_independent_drafts() -> None:
+    """并发对同一已发布版本应用不同补丁：各自生成独立 draft，基线版本始终不变。"""
+
+    import asyncio
+
+    async with SessionLocal() as session, session.begin():
+        workflow = Workflow(id=str(uuid4()), name="wf", draft_revision=1, draft_json=_definition())
+        session.add(workflow)
+        await session.flush()
+        version = WorkflowVersion(
+            id=str(uuid4()),
+            workflow_id=workflow.id,
+            version=1,
+            definition_json=_definition(),
+            digest="sha256:x",
+            validation_json={},
+        )
+        session.add(version)
+        version_id = version.id
+        original = dict(version.definition_json)
+
+    async def apply_one(timeout_seconds: int) -> dict:
+        # 每个并发应用使用独立 Session，模拟两个请求同时打到同一基线版本。
+        async with SessionLocal() as session:
+            return await apply_version_workflow_patch(
+                version_id,
+                {
+                    "nodePatches": [
+                        {"nodeId": "work", "changes": {"timeoutSeconds": timeout_seconds}}
+                    ]
+                },
+                session,
+            )
+
+    results = await asyncio.gather(apply_one(60), apply_one(120))
+    draft_ids = {result["draftWorkflowId"] for result in results}
+    # 两次应用生成两个互不相同的 draft，互不覆盖。
+    assert len(draft_ids) == 2
+    # 基线版本在并发应用后仍保持只读、原样不变。
+    async with SessionLocal() as session:
+        version = await session.get(WorkflowVersion, version_id)
+        assert version.definition_json == original
+        # 两个 draft 各自带着自己的 timeout。
+        timeouts = set()
+        for result in results:
+            draft = await session.get(Workflow, result["draftWorkflowId"])
+            work = next(n for n in draft.draft_json["spec"]["nodes"] if n["id"] == "work")
+            timeouts.add(work["timeoutSeconds"])
+        assert timeouts == {60, 120}

@@ -124,9 +124,21 @@ class Orchestrator:
         if run is None:
             raise LookupError("run not found")
         if run.status not in FINAL_RUN_STATES and run.status != "cancelling":
+            was_recovering = run.status == "recovering"
             run.status = "cancelling"
             run.cancellation_requested_at = utcnow()
             await append_event(session, run.id, "run.cancellation_requested", {"runId": run.id})
+            # recovering 状态被取消：把尚未消费的 pending checkpoint 一并置为 cancelled，
+            # 避免 RecoveryDriver 在 TOCTOU 窗口内继续把已取消的 Run 拉回 running。
+            if was_recovering:
+                await session.execute(
+                    update(ExecutionCheckpoint)
+                    .where(
+                        ExecutionCheckpoint.run_id == run.id,
+                        ExecutionCheckpoint.status == "pending",
+                    )
+                    .values(status="cancelled")
+                )
         await self.advance_run(session, run.id)
         return run
 

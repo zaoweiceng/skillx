@@ -24,6 +24,13 @@ export default function RunDetailPage() {
   const [run, setRun] = useState<Run>()
   const [error, setError] = useState('')
   const events = useRunEvents((state) => (id ? state.events[id] ?? [] : []))
+  // WorkflowPatch 治理：应用受控补丁 → 展示 replay diagnostics → 打开生成的 draft。
+  const [patchDraft, setPatchDraft] = useState<{
+    draftWorkflowId: string
+    diagnostics: Array<{ level: string; code: string; path: string; message: string }>
+    publishable: boolean
+  }>()
+  const [patching, setPatching] = useState(false)
 
   const refresh = useCallback(() => {
     if (!id) return
@@ -40,6 +47,30 @@ export default function RunDetailPage() {
       refresh()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '审批操作失败')
+    }
+  }
+
+  // 对失败节点提出受控补丁：把超时上调，作为可复现故障的最小修复示例。
+  // 补丁只创建 draft（旧版本不变），并回放展示 diagnostics，人工发布后才生效。
+  async function proposePatch(failedNode: string) {
+    if (!run) return
+    setPatching(true)
+    setError('')
+    try {
+      const failed = (run.nodes ?? []).find((node) => node.nodeId === failedNode)
+      const currentTimeout =
+        typeof failed?.input?.timeoutSeconds === 'number' ? failed.input.timeoutSeconds : 30
+      const result = await api.applyWorkflowPatch(run.workflowVersionId, {
+        nodePatches: [
+          { nodeId: failedNode, changes: { timeoutSeconds: Math.min(currentTimeout * 2, 86400) } },
+        ],
+        reason: `对失败节点 ${failedNode} 提出受控超时补丁`,
+      })
+      setPatchDraft(result)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '应用补丁失败')
+    } finally {
+      setPatching(false)
     }
   }
 
@@ -185,6 +216,57 @@ export default function RunDetailPage() {
         </section>
       )}
 
+      {run.status === 'failed' && (run.nodes ?? []).some((node) => node.status === 'failed') && (
+        <section className="panel result-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">PATCH GOVERNANCE</span>
+              <h2>受控版本修订</h2>
+            </div>
+          </div>
+          <p className="run-notes">
+            对可复现失败提出受控 WorkflowPatch：只创建 draft、回放校验并展示 diff，旧版本不变，
+            人工发布后才成为新版本。
+          </p>
+          {(run.nodes ?? [])
+            .filter((node) => node.status === 'failed')
+            .map((node) => (
+              <div className="mapping-row" key={node.id}>
+                <span className="metric-chip">失败节点 {node.nodeId}</span>
+                <button
+                  className="button ghost"
+                  type="button"
+                  disabled={patching}
+                  onClick={() => proposePatch(node.nodeId)}
+                >
+                  {patching ? '正在生成补丁草稿...' : '提出补丁草稿'}
+                </button>
+              </div>
+            ))}
+          {patchDraft && (
+            <div className="notice-panel">
+              <p>
+                已生成补丁草稿，回放{patchDraft.publishable ? '通过' : '存在阻断项'}。
+                <Link className="button ghost" to={`/workflows/${patchDraft.draftWorkflowId}/edit`}>
+                  打开草稿审核 diff 并发布
+                </Link>
+              </p>
+              {patchDraft.diagnostics.length > 0 && (
+                <div className="diagnostics">
+                  {patchDraft.diagnostics.map((item) => (
+                    <div className={`diagnostic ${item.level}`} key={`${item.code}-${item.path}`}>
+                      <strong>{item.code}</strong>
+                      <span>{item.message}</span>
+                      <small>{item.path}</small>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
       {run.dependencyVersions && (
         <section className="panel result-panel">
           <div className="panel-heading">
@@ -197,6 +279,60 @@ export default function RunDetailPage() {
             )}
           </div>
           <JsonBlock value={run.dependencyVersions} />
+        </section>
+      )}
+
+      {(run.checkpoints?.length ?? 0) > 0 && (
+        <section className="panel result-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">CHECKPOINT RECOVERY</span>
+              <h2>检查点接力</h2>
+            </div>
+          </div>
+          <div className="node-table">
+            {run.checkpoints?.map((checkpoint) => (
+              <details className="node-row" key={checkpoint.id}>
+                <summary>
+                  <span className={`node-state-dot ${checkpoint.status}`} />
+                  <div>
+                    <strong>失败节点 {checkpoint.failedNode}</strong>
+                    <small>
+                      attempt {checkpoint.attempt} · 剩余子图 {checkpoint.remainingSubgraph.length}{' '}
+                      个节点
+                    </small>
+                  </div>
+                  <StatusBadge status={checkpoint.status} />
+                </summary>
+                <div className="node-detail">
+                  <div>
+                    <small>已完成节点（冻结输出，不重放）</small>
+                    <div className="current-mapping">
+                      {checkpoint.completedNodes.map((nodeId) => (
+                        <code className="variable-chip" key={nodeId}>
+                          {nodeId}
+                        </code>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <small>已提交非幂等副作用（去重边界）</small>
+                    <JsonBlock value={checkpoint.committedSideEffects} />
+                  </div>
+                  <div>
+                    <small>剩余子图（交给受限 Agent 接力）</small>
+                    <JsonBlock value={checkpoint.remainingSubgraph} />
+                  </div>
+                  {checkpoint.decision && (
+                    <div>
+                      <small>恢复决定</small>
+                      <JsonBlock value={checkpoint.decision} />
+                    </div>
+                  )}
+                </div>
+              </details>
+            ))}
+          </div>
         </section>
       )}
 

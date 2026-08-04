@@ -231,6 +231,82 @@ async def test_recovery_request_user_transitions_to_waiting_approval() -> None:
         assert run.status == "waiting_approval"
 
 
+async def test_cancel_recovering_run_marks_checkpoint_cancelled() -> None:
+    """取消处于 recovering 状态的 Run：checkpoint 置 cancelled，恢复驱动不再复活它。"""
+
+    run_id, checkpoint_id = await _seed_failed_run()
+    from app.application.orchestrator import Orchestrator
+
+    async with SessionLocal() as session, session.begin():
+        await Orchestrator().request_cancellation(session, run_id)
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        # recovering 无运行中节点：取消后直接进入 cancelled 终态。
+        assert run.status == "cancelled"
+        # pending checkpoint 一并被取消，避免驱动 TOCTOU 复活。
+        assert checkpoint.status == "cancelled"
+
+    # 恢复驱动此时不应再领取该 checkpoint（已取消），也不会改变 Run 终态。
+    driver = RecoveryDriver()
+    assert await driver.poll_once() is False
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        assert run.status == "cancelled"
+
+
+async def test_build_checkpoint_is_idempotent_per_failed_attempt() -> None:
+    """同一失败 attempt 只产生一个 checkpoint：致命处理重入不会重复恢复。"""
+
+    from sqlalchemy import func, select
+
+    from app.application.orchestrator import Orchestrator
+
+    run_id, _ = await _seed_failed_run()
+    # 再次对同一失败节点触发致命处理：不应新建第二个 checkpoint。
+    async with SessionLocal() as session, session.begin():
+        run = await session.get(Run, run_id)
+        # 复位为 running 以便 _handle_fatal 重新评估（模拟重入）。
+        run.status = "running"
+        version = await session.get(WorkflowVersion, run.workflow_version_id)
+        definition = WorkflowDefinition.model_validate(version.definition_json)
+        failed = await session.scalar(
+            select(NodeRun).where(NodeRun.run_id == run_id, NodeRun.node_id == "risky")
+        )
+        await Orchestrator()._handle_fatal(session, run, definition, failed)
+    async with SessionLocal() as session:
+        count = await session.scalar(
+            select(func.count())
+            .select_from(ExecutionCheckpoint)
+            .where(ExecutionCheckpoint.run_id == run_id)
+        )
+        # 幂等：仍只有最初的一个 checkpoint。
+        assert count == 1
+        run = await session.get(Run, run_id)
+        # 已存在 checkpoint → 不再重复进入恢复，按原语义 fail run。
+        assert run.status == "failed"
+
+
+async def test_reapplying_decision_after_terminal_fails_closed() -> None:
+    """恢复决定已应用后再次应用：digest 仍一致但状态已迁移，二次应用不复活已终态 Run。"""
+
+    run_id, checkpoint_id = await _seed_failed_run()
+    async with SessionLocal() as session, session.begin():
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        await apply_recovery_decision(session, checkpoint, {"action": "abort"})
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        assert run.status == "failed"
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        assert checkpoint.status == "aborted"
+    # 驱动再次轮询：run 已非 recovering，不得复活。
+    driver = RecoveryDriver()
+    assert await driver.poll_once() is False
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        assert run.status == "failed"
+
+
 async def test_tampered_checkpoint_fails_closed() -> None:
     _run_id, checkpoint_id = await _seed_failed_run()
     async with SessionLocal() as session, session.begin():

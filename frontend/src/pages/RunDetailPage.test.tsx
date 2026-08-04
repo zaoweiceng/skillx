@@ -7,12 +7,14 @@ import RunDetailPage from '@/pages/RunDetailPage'
 const getRun = vi.fn()
 const approve = vi.fn()
 const reject = vi.fn()
+const applyWorkflowPatch = vi.fn()
 
 vi.mock('@/api/client', () => ({
   api: {
     getRun: (...args: unknown[]) => getRun(...args),
     approve: (...args: unknown[]) => approve(...args),
     reject: (...args: unknown[]) => reject(...args),
+    applyWorkflowPatch: (...args: unknown[]) => applyWorkflowPatch(...args),
     cancelRun: vi.fn(),
   },
   eventStreamUrl: () => 'http://localhost/stream',
@@ -76,6 +78,7 @@ describe('RunDetailPage 可观测性与审批', () => {
     getRun.mockReset()
     approve.mockReset()
     reject.mockReset()
+    applyWorkflowPatch.mockReset()
   })
 
   afterEach(() => cleanup())
@@ -108,5 +111,68 @@ describe('RunDetailPage 可观测性与审批', () => {
     await waitFor(() => expect(screen.getByText('确认提交')).toBeInTheDocument())
     fireEvent.click(screen.getByRole('button', { name: /确认继续/ }))
     await waitFor(() => expect(approve).toHaveBeenCalledWith('ap-1', 'sha256:d'))
+  })
+
+  it('恢复运行展示检查点接力视图（已完成节点/剩余子图）', async () => {
+    getRun.mockResolvedValue({
+      ...baseRun,
+      status: 'succeeded',
+      checkpoints: [
+        {
+          id: 'ck-1',
+          status: 'applied',
+          failedNode: 'risky',
+          attempt: 1,
+          digest: 'sha256:c',
+          completedNodes: ['sensitive'],
+          remainingSubgraph: ['risky'],
+          committedSideEffects: [{ nodeId: 'sensitive', idempotent: false }],
+          decision: { action: 'provide_failed_output' },
+        },
+      ],
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('检查点接力')).toBeInTheDocument())
+    expect(screen.getByText(/失败节点 risky/)).toBeInTheDocument()
+    expect(screen.getByText('sensitive')).toBeInTheDocument()
+  })
+
+  it('失败运行可对失败节点提出受控补丁并展示 replay 结果', async () => {
+    getRun.mockResolvedValue({
+      ...baseRun,
+      status: 'failed',
+      output: null,
+      error: { code: 'TIMEOUT', message: '超时' },
+      nodes: [
+        {
+          id: 'n1',
+          nodeId: 'work',
+          type: 'transform',
+          attempt: 1,
+          status: 'failed',
+          input: { timeoutSeconds: 30 },
+          output: null,
+          error: { code: 'TIMEOUT', message: '超时' },
+          durationMs: 100,
+          metrics: {},
+        },
+      ],
+    })
+    applyWorkflowPatch.mockResolvedValue({
+      draftWorkflowId: 'draft-9',
+      baseVersionId: 'v1',
+      diagnostics: [],
+      publishable: true,
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByText('受控版本修订')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: /提出补丁草稿/ }))
+    await waitFor(() =>
+      expect(applyWorkflowPatch).toHaveBeenCalledWith('v1', {
+        nodePatches: [{ nodeId: 'work', changes: { timeoutSeconds: 60 } }],
+        reason: '对失败节点 work 提出受控超时补丁',
+      }),
+    )
+    await waitFor(() => expect(screen.getByText(/打开草稿审核 diff 并发布/)).toBeInTheDocument())
   })
 })

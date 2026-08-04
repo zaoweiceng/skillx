@@ -5,6 +5,11 @@ export type NodeDefinition = {
   input?: Record<string, unknown>
   config?: Record<string, unknown>
   sideEffect?: boolean
+  fallback?: {
+    on: string[]
+    target: string
+    requireUserApproval?: boolean
+  } | null
 }
 
 export type WorkflowDefinition = {
@@ -100,6 +105,17 @@ export type Run = {
     capabilityLocks?: unknown[]
     mcpLocks?: unknown[]
   }
+  checkpoints?: Array<{
+    id: string
+    status: string
+    failedNode: string
+    attempt: number
+    digest: string
+    completedNodes: string[]
+    remainingSubgraph: string[]
+    committedSideEffects: Array<{ nodeId: string; idempotent: boolean }>
+    decision: Record<string, unknown> | null
+  }>
 }
 
 export type Workflow = {
@@ -219,6 +235,25 @@ export const api = {
       `/workflows/${id}/contract-patch`,
       { method: 'POST', body: JSON.stringify({ nodeId, patch }) },
     ),
+  applyWorkflowPatch: (
+    versionId: string,
+    patch: {
+      nodePatches?: Array<{ nodeId: string; changes: Record<string, unknown> }>
+      addEdges?: Array<{ source: string; target: string }>
+      removeEdges?: Array<{ source: string; target: string }>
+      reason?: string
+    },
+  ) =>
+    request<{
+      draftWorkflowId: string
+      baseVersionId: string
+      definition: WorkflowDefinition
+      diagnostics: Array<{ level: string; code: string; path: string; message: string }>
+      publishable: boolean
+    }>(`/workflow-versions/${versionId}/workflow-patch`, {
+      method: 'POST',
+      body: JSON.stringify(patch),
+    }),
   createComponent: (
     name: string,
     description: string,

@@ -112,4 +112,50 @@ describe('WorkflowEditorPage 可视化编辑', () => {
     fireEvent.click(screen.getByRole('button', { name: /应用 JSON/ }))
     await waitFor(() => expect(screen.getByTestId('canvas')).toBeInTheDocument())
   })
+
+  it('为执行节点配置显式 fallback（勾选错误码后写入 target=agent 节点）', async () => {
+    // 含 agent 节点的定义：transform 可选择 fallback 目标。
+    const withAgent: WorkflowDefinition = {
+      ...definition,
+      spec: {
+        ...definition.spec,
+        nodes: [
+          { id: 'input', type: 'input', displayName: '输入' },
+          { id: 'work', type: 'transform', displayName: '处理', config: {}, input: {} },
+          { id: 'recovery', type: 'agent', displayName: '恢复', config: {}, input: {} },
+          { id: 'output', type: 'output', displayName: '输出' },
+        ],
+      },
+    }
+    getWorkflow.mockResolvedValue({
+      id: 'wf-1',
+      name: 'greeting',
+      draftRevision: 1,
+      definition: withAgent,
+      createdAt: '',
+      updatedAt: '',
+    })
+    updateDraft.mockResolvedValue({
+      id: 'wf-1',
+      name: 'greeting',
+      draftRevision: 2,
+      definition: withAgent,
+      createdAt: '',
+      updatedAt: '',
+    })
+    renderPage()
+    await waitFor(() => expect(screen.getByTestId('canvas')).toBeInTheDocument())
+    // 选中 work 节点：调色板占位无法点选，直接通过 JSON 视图往返不便，改用 Inspector。
+    // EditableCanvas 被 mock，需借助 onSelectNode——此处通过点击调色板新增 transform 再选中。
+    // 简化：直接断言 fallback 勾选框存在需先选中节点。这里选择新增一个 transform 后选中它。
+    fireEvent.click(screen.getByRole('button', { name: /^.*transform.*$/ }))
+    // 新增后 selectedNodeId 指向新节点，Inspector 渲染 fallback 编辑区（有 agent 目标）。
+    await waitFor(() =>
+      expect(screen.getByText(/显式失败接力/)).toBeInTheDocument(),
+    )
+    fireEvent.click(screen.getByLabelText('DEPENDENCY_UNAVAILABLE'))
+    // 勾选后出现恢复目标下拉，且默认指向 agent 节点 recovery。
+    const targetSelect = screen.getByLabelText('fallback 目标') as HTMLSelectElement
+    expect(targetSelect.value).toBe('recovery')
+  })
 })

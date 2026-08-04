@@ -65,6 +65,7 @@ from app.infrastructure.database import (
     ConversationRun,
     ConversationRunEvent,
     Distillation,
+    ExecutionCheckpoint,
     MCPServer,
     MCPToolSnapshot,
     Message,
@@ -672,6 +673,13 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             select(Artifact).where(Artifact.run_id == run_id).order_by(Artifact.created_at)
         )
     ).all()
+    checkpoints = (
+        await session.scalars(
+            select(ExecutionCheckpoint)
+            .where(ExecutionCheckpoint.run_id == run_id)
+            .order_by(ExecutionCheckpoint.created_at)
+        )
+    ).all()
     version = await session.get(WorkflowVersion, run.workflow_version_id)
     definition = version.definition_json.get("spec", {}) if version else {}
     result = run_view(
@@ -730,6 +738,23 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
         "capabilityLocks": validation.get("capabilityLocks", []),
         "mcpLocks": validation.get("mcpLocks", []),
     }
+    # 检查点/恢复证据：暴露冻结的已完成输出、剩余子图、失败事实与恢复决定，
+    # 供运行详情展示“从检查点接力”的可观测视图（脱敏后）。
+    result["checkpoints"] = [
+        {
+            "id": item.id,
+            "status": item.status,
+            "failedNode": item.failed_node_id,
+            "attempt": item.attempt,
+            "digest": item.digest,
+            "completedNodes": sorted((item.snapshot_json or {}).get("completedOutputs", {})),
+            "remainingSubgraph": (item.snapshot_json or {}).get("remainingSubgraph", []),
+            "committedSideEffects": (item.snapshot_json or {}).get("committedSideEffects", []),
+            "fallbackTarget": (item.snapshot_json or {}).get("failedNode", {}),
+            "decision": redact(item.decision_json) if item.decision_json else None,
+        }
+        for item in checkpoints
+    ]
     return result
 
 

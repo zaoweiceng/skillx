@@ -17,6 +17,7 @@ export default function App() {
         <Route element={<AppShell />}>
           <Route path="/" element={<Navigate to="/components" replace />} />
           <Route path="/chat" element={<ChatPage />} />
+          <Route path="/chat/:id" element={<ChatPage />} />
           <Route path="/components" element={<ComponentsPage />} />
           <Route path="/components/:id" element={<ComponentDetailPage />} />
           <Route path="/runs/:id" element={<RunDetailPage />} />
