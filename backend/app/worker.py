@@ -7,6 +7,7 @@ import signal
 
 from app.application.agent_run import AgentRunWorker
 from app.application.orchestrator import WorkerService, reconcile_recent_runs
+from app.application.recovery import RecoveryDriver
 from app.config import get_settings
 from app.infrastructure.database import SessionLocal, init_database
 
@@ -21,6 +22,7 @@ async def run_worker(worker_id: str | None = None) -> None:
     # Agent 长任务与工作流节点共用同一 Worker 进程：先持久化后执行的 ConversationRun
     # 由 AgentRunWorker 领取租约执行，API 重启不影响已领取/待领取任务。
     agent_worker = AgentRunWorker(f"{service.worker_id}-agent")
+    recovery_driver = RecoveryDriver()
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     for event in (signal.SIGINT, signal.SIGTERM):
@@ -45,6 +47,11 @@ async def run_worker(worker_id: str | None = None) -> None:
         except Exception:  # noqa: BLE001 - 记录根因后继续工作流循环，不静默吞掉。
             logger.exception("agent worker poll_once failed on worker %s", service.worker_id)
             processed_agent = False
+        try:
+            processed_recovery = await recovery_driver.poll_once()
+        except Exception:  # noqa: BLE001 - 恢复失败记录根因后继续。
+            logger.exception("recovery driver poll_once failed on worker %s", service.worker_id)
+            processed_recovery = False
         # 周期性 reconcile（约每 60 次空闲轮询一次），限制批量，形成可观察 GC。
         ticks += 1
         if ticks % 60 == 0:
@@ -53,7 +60,7 @@ async def run_worker(worker_id: str | None = None) -> None:
                     await reconcile_recent_runs(session, limit=20)
             except Exception:  # noqa: BLE001
                 logger.exception("periodic reconcile failed")
-        if not processed and not processed_agent:
+        if not processed and not processed_agent and not processed_recovery:
             try:
                 await asyncio.wait_for(stopping.wait(), timeout=settings.worker_poll_seconds)
             except TimeoutError:

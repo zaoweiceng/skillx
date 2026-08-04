@@ -78,6 +78,29 @@ def main() -> int:
     reply = _directive(args.prompt, "REPLY", "已完成任务")
     allowed = json.loads(args.allowed_tools) if args.allowed_tools else []
 
+    if "RecoveryDecision" in args.prompt:
+        # 恢复 Agent：平台模板 prompt 含 RecoveryDecision。默认提供失败节点输出以从剩余
+        # 子图继续（provide_failed_output）。可用 [[RECOVERY:action]] 覆盖。
+        action = _directive(args.prompt, "RECOVERY", "provide_failed_output")
+        emit({"type": "agent.plan", "payload": {"summary": "评估 checkpoint 决定恢复策略"}})
+        emit(
+            {
+                "type": "agent.step.completed",
+                "payload": {"step": 1, "inputTokens": 8, "outputTokens": 4},
+            }
+        )
+        decision = {"action": action, "reason": "从 checkpoint 恢复"}
+        if action == "provide_failed_output":
+            recovered_value = _directive(args.prompt, "REPLY", "恢复值")
+            decision["failedOutput"] = {"recovered": True, "value": recovered_value}
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {"steps": 1, "totalTokens": 12, "output": decision},
+            }
+        )
+        return 0
+
     if mode == "hang":
         # 模拟长时间无进展，交给 Host 超时/取消。
         time.sleep(30)

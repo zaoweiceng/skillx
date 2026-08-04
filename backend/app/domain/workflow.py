@@ -27,6 +27,27 @@ class RetryPolicy(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
+# 默认不允许自动交给 Agent 恢复的 error code（安全/契约/结果未知类）。
+# 只有节点显式声明且带审批策略时才可进入恢复；见 compiler 的 fallback 校验。
+NON_RECOVERABLE_ERROR_CODES = frozenset(
+    {"PERMISSION_DENIED", "AUTHENTICATION_FAILED", "CONTRACT_VIOLATION", "UNKNOWN_OUTCOME"}
+)
+
+
+class FallbackPolicy(BaseModel):
+    """节点级显式 fallback：某些错误码触发时把 checkpoint 交给受限 Agent 恢复。
+
+    fallback 必须写进已发布版本；只处理声明的错误码，Direct/MCP/Browser 失败不得隐式
+    升级为 Agent。``requireUserApproval`` 为 True 时恢复前需人工确认。
+    """
+
+    on: list[str] = Field(min_length=1)
+    target: str
+    require_user_approval: bool = Field(default=False, alias="requireUserApproval")
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
 class WorkflowNode(BaseModel):
     id: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
     type: NodeType
@@ -36,6 +57,7 @@ class WorkflowNode(BaseModel):
     timeout_seconds: int = Field(default=30, alias="timeoutSeconds", ge=1, le=86400)
     retry: RetryPolicy = Field(default_factory=RetryPolicy)
     on_error: Literal["fail_run", "continue"] = Field(default="fail_run", alias="onError")
+    fallback: FallbackPolicy | None = None
     permissions: list[str] = Field(default_factory=list)
     side_effect: bool = Field(default=False, alias="sideEffect")
     idempotent: bool = True
@@ -114,4 +136,3 @@ class NodeResult(BaseModel):
     metrics: dict[str, int | float | str] = Field(default_factory=dict)
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     events: list[dict[str, Any]] = Field(default_factory=list)
-    resume_token: str | None = None

@@ -326,6 +326,28 @@ class Distillation(Base, TimestampMixin):
     analysis_json: Mapped[dict[str, Any]] = mapped_column(JSON)
 
 
+class ExecutionCheckpoint(Base, TimestampMixin):
+    """节点重试耗尽且命中 fallback 时冻结的恢复检查点。
+
+    保存已完成输出/Artifact 引用、失败输入/标准错误、capability locks、剩余子图与
+    已提交副作用；恢复只消费该持久化 checkpoint，不依赖原 Worker 内存。
+    """
+
+    __tablename__ = "execution_checkpoints"
+    __table_args__ = (Index("ix_execution_checkpoints_run_id", "run_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
+    workflow_version_id: Mapped[str] = mapped_column(String(36))
+    failed_node_id: Mapped[str] = mapped_column(String(64))
+    failed_node_run_id: Mapped[str] = mapped_column(String(36))
+    attempt: Mapped[int] = mapped_column(Integer)
+    digest: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(24), default="pending")
+    snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    decision_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
 settings = get_settings()
 engine: AsyncEngine = create_async_engine(settings.database_url, future=True)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)

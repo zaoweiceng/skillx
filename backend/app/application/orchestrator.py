@@ -25,6 +25,7 @@ from app.infrastructure.database import (
     Approval,
     Artifact,
     ConversationRun,
+    ExecutionCheckpoint,
     NodeRun,
     Run,
     RunEvent,
@@ -135,6 +136,10 @@ class Orchestrator:
             raise LookupError("run not found")
         if run.status in FINAL_RUN_STATES:
             return run
+        # recovering 状态由恢复驱动独占：advance_run 不再处理，避免把等待恢复的 run
+        # 误判为 fatal 后 fail run。
+        if run.status == "recovering":
+            return run
         version = await session.get(WorkflowVersion, run.workflow_version_id)
         if version is None:
             raise LookupError("workflow version not found")
@@ -214,7 +219,7 @@ class Orchestrator:
             if item.status == "failed" and nodes[node_id].on_error == "fail_run"
         ]
         if fatal:
-            await self._finish_failed(session, run, fatal[0].error_json)
+            await self._handle_fatal(session, run, definition, fatal[0])
             return run
 
         waiting = [item for item in latest.values() if item.status == "waiting_user"]
@@ -281,7 +286,7 @@ class Orchestrator:
             if item.status == "failed" and nodes[node_id].on_error == "fail_run"
         ]
         if fatal:
-            await self._finish_failed(session, run, fatal[0].error_json)
+            await self._handle_fatal(session, run, definition, fatal[0])
             return run
 
         output_node = next(node for node in nodes.values() if node.type == NodeType.OUTPUT)
@@ -411,6 +416,54 @@ class Orchestrator:
             "run.failed",
             {"runId": run.id, "error": run.error_json},
         )
+
+    async def _handle_fatal(
+        self,
+        session: AsyncSession,
+        run: Run,
+        definition: WorkflowDefinition,
+        failed_node_run: NodeRun,
+    ) -> None:
+        """致命失败处理：命中显式 fallback 且错误码可自动恢复时冻结 checkpoint 进入
+        ``recovering``；否则按原语义 fail run。Direct/MCP/Browser 失败不隐式升级为 Agent。"""
+
+        from app.application.recovery import build_checkpoint, is_recoverable
+
+        node = next(
+            (item for item in definition.spec.nodes if item.id == failed_node_run.node_id),
+            None,
+        )
+        error_code = (failed_node_run.error_json or {}).get("code")
+        fallback = node.fallback if node else None
+        # 已有该失败 attempt 的 checkpoint 则不重复创建（幂等）。
+        existing = await session.scalar(
+            select(ExecutionCheckpoint).where(
+                ExecutionCheckpoint.run_id == run.id,
+                ExecutionCheckpoint.failed_node_run_id == failed_node_run.id,
+            )
+        )
+        if (
+            fallback is not None
+            and existing is None
+            and is_recoverable(error_code, fallback.on)
+            and not fallback.require_user_approval
+        ):
+            checkpoint = await build_checkpoint(session, run, definition, failed_node_run)
+            run.status = "recovering"
+            await append_event(
+                session,
+                run.id,
+                "run.recovery_requested",
+                {
+                    "runId": run.id,
+                    "checkpointId": checkpoint.id,
+                    "failedNode": failed_node_run.node_id,
+                    "errorCode": error_code,
+                    "fallbackTarget": fallback.target,
+                },
+            )
+            return
+        await self._finish_failed(session, run, failed_node_run.error_json)
 
 
 @dataclass(frozen=True)

@@ -36,13 +36,14 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
             row[1]
             for row in connection.execute("PRAGMA table_info(mcp_tool_snapshots)")
         }
-    assert revision == ("0009",)
+    assert revision == ("0010",)
     assert {
         "runs",
         "capability_versions",
         "mcp_tool_snapshots",
         "distillations",
         "conversation_run_events",
+        "execution_checkpoints",
     } <= tables
     assert "run_type" in run_type_columns
     assert "error_json" in run_type_columns

@@ -78,3 +78,51 @@ def test_compiler_allows_indexed_array_reference() -> None:
     compiled = WorkflowCompiler().compile(definition)
     # transform 无 outputSchema，不触发字段告警；引用语法被接受。
     assert "UNKNOWN_REFERENCE" not in {item.code for item in compiled.diagnostics}
+
+
+def _fallback_workflow() -> dict:
+    definition = deterministic_workflow()
+    definition["spec"]["nodes"].append(
+        {
+            "id": "recovery_agent",
+            "type": "agent",
+            "displayName": "恢复 Agent",
+            "input": {"message": "${input.name}"},
+            "config": {
+                "outputSchema": {"type": "object"},
+                "maxSteps": 4,
+                "allowedCapabilities": [],
+            },
+        }
+    )
+    fmt = next(node for node in definition["spec"]["nodes"] if node["id"] == "format")
+    fmt["fallback"] = {"on": ["DEPENDENCY_UNAVAILABLE"], "target": "recovery_agent"}
+    return definition
+
+
+def test_compiler_accepts_valid_fallback() -> None:
+    compiled = WorkflowCompiler().compile(_fallback_workflow())
+    codes = {item.code for item in compiled.diagnostics}
+    assert not codes & {
+        "FALLBACK_TARGET_MISSING",
+        "FALLBACK_TARGET_NOT_AGENT",
+        "FALLBACK_UNSAFE_ERROR_CODE",
+    }
+
+
+def test_compiler_rejects_fallback_missing_target() -> None:
+    definition = _fallback_workflow()
+    fmt = next(node for node in definition["spec"]["nodes"] if node["id"] == "format")
+    fmt["fallback"]["target"] = "ghost"
+    with pytest.raises(WorkflowValidationError) as error:
+        WorkflowCompiler().compile(definition)
+    assert "FALLBACK_TARGET_MISSING" in {item.code for item in error.value.diagnostics}
+
+
+def test_compiler_rejects_unsafe_fallback_error_code() -> None:
+    definition = _fallback_workflow()
+    fmt = next(node for node in definition["spec"]["nodes"] if node["id"] == "format")
+    fmt["fallback"]["on"] = ["PERMISSION_DENIED"]
+    with pytest.raises(WorkflowValidationError) as error:
+        WorkflowCompiler().compile(definition)
+    assert "FALLBACK_UNSAFE_ERROR_CODE" in {item.code for item in error.value.diagnostics}

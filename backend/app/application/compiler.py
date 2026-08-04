@@ -81,6 +81,7 @@ class WorkflowCompiler:
 
         order = self._topological_order(nodes, incoming, outgoing, diagnostics)
         self._validate_node_types(definition, diagnostics)
+        self._validate_fallbacks(definition, nodes, diagnostics)
         if len(order) == len(nodes):
             self._validate_references(definition, nodes, incoming, diagnostics)
             self._validate_reachability(nodes, outgoing, diagnostics)
@@ -231,6 +232,78 @@ class WorkflowCompiler:
                     )
 
     @staticmethod
+    def _validate_fallbacks(
+        definition: WorkflowDefinition,
+        nodes: dict[str, Any],
+        diagnostics: list[Diagnostic],
+    ) -> None:
+        """校验 fallback：target 存在且为 agent、只处理声明错误码、无 fallback 环、
+        Agent target 有最小能力集合、默认不自动交给安全/契约/未知类错误。"""
+
+        from app.domain.workflow import NON_RECOVERABLE_ERROR_CODES, NodeType
+
+        for index, node in enumerate(definition.spec.nodes):
+            fallback = node.fallback
+            if fallback is None:
+                continue
+            path = f"spec.nodes.{index}.fallback"
+            target = nodes.get(fallback.target)
+            if target is None:
+                diagnostics.append(
+                    Diagnostic(
+                        level="error",
+                        code="FALLBACK_TARGET_MISSING",
+                        path=path,
+                        message=f"fallback target {fallback.target} 不存在",
+                    )
+                )
+                continue
+            if target.type != NodeType.AGENT:
+                diagnostics.append(
+                    Diagnostic(
+                        level="error",
+                        code="FALLBACK_TARGET_NOT_AGENT",
+                        path=path,
+                        message="fallback target 必须是受限 Agent 节点",
+                    )
+                )
+            if fallback.target == node.id:
+                diagnostics.append(
+                    Diagnostic(
+                        level="error",
+                        code="FALLBACK_SELF_LOOP",
+                        path=path,
+                        message="fallback 不得指向自身，避免恢复环",
+                    )
+                )
+            # Agent target 必须声明最小能力集合与预算。
+            if target.type == NodeType.AGENT and not isinstance(
+                target.config.get("allowedCapabilities"), list
+            ):
+                diagnostics.append(
+                    Diagnostic(
+                        level="error",
+                        code="FALLBACK_AGENT_LIMITS_REQUIRED",
+                        path=path,
+                        message="fallback Agent target 必须声明 allowedCapabilities",
+                    )
+                )
+            # 默认不允许自动把安全/契约/未知类错误交给 Agent。
+            dangerous = set(fallback.on) & NON_RECOVERABLE_ERROR_CODES
+            if dangerous and not fallback.require_user_approval:
+                diagnostics.append(
+                    Diagnostic(
+                        level="error",
+                        code="FALLBACK_UNSAFE_ERROR_CODE",
+                        path=path,
+                        message=(
+                            f"错误码 {sorted(dangerous)} 默认不得自动交给 Agent，"
+                            "需 requireUserApproval=true"
+                        ),
+                    )
+                )
+
+    @staticmethod
     def _validate_references(
         definition: WorkflowDefinition,
         nodes: dict[str, Any],
@@ -325,6 +398,11 @@ class WorkflowCompiler:
         input_ids = [node.id for node in nodes.values() if node.type == NodeType.INPUT]
         if len(input_ids) != 1:
             return
+        # fallback target 通过恢复边可达，不算孤立节点。
+        fallback_targets: dict[str, list[str]] = {}
+        for node in nodes.values():
+            if node.fallback is not None:
+                fallback_targets.setdefault(node.id, []).append(node.fallback.target)
         visited: set[str] = set()
         queue = deque(input_ids)
         while queue:
@@ -333,6 +411,7 @@ class WorkflowCompiler:
                 continue
             visited.add(node_id)
             queue.extend(outgoing[node_id])
+            queue.extend(fallback_targets.get(node_id, []))
         for node_id in nodes.keys() - visited:
             diagnostics.append(
                 Diagnostic(
