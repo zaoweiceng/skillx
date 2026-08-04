@@ -227,18 +227,19 @@ async def discover_tools(
     for descriptor in descriptors:
         effect, idempotent, effect_source = classify_effect(descriptor.annotations)
         timeout_seconds = version.config_json.get("timeoutSeconds", 30)
-        # 契约 digest 纳入副作用/幂等/超时：这些语义变化必须产生新快照或新
-        # ServerVersion，不能静默沿用旧的乐观默认。
-        contract = {
+        # contract_digest 只覆盖远端 descriptor：discovery 据此侦测真实远端漂移，
+        # 不受本地 effect/idempotent 审核影响（后者只改 digest，不改 contract_digest）。
+        remote_contract = {
             "name": descriptor.name,
             "description": descriptor.description,
             "inputSchema": descriptor.input_schema,
             "outputSchema": descriptor.output_schema,
-            "effect": effect,
-            "idempotent": idempotent,
             "timeoutSeconds": timeout_seconds,
         }
-        contract_digest = digest_json(contract)
+        contract_digest = digest_json(remote_contract)
+        # 完整契约 digest 纳入 effect/idempotent，作为发布 lock 的运行前核对键。
+        full_contract = {**remote_contract, "effect": effect, "idempotent": idempotent}
+        full_digest = digest_json(full_contract)
         existing = await session.scalar(
             select(MCPToolSnapshot).where(
                 MCPToolSnapshot.server_version_id == version.id,
@@ -246,9 +247,11 @@ async def discover_tools(
             )
         )
         if existing:
-            if existing.digest != contract_digest:
+            # 只比较远端契约 digest：本地审核过的 Tool（digest 已随 effect 变化）
+            # 不会被重复 discovery 误判为远端漂移。
+            if existing.contract_digest != contract_digest:
                 raise MCPContractDriftError(
-                    f"MCP Tool {descriptor.name} 的契约 digest 已变化，"
+                    f"MCP Tool {descriptor.name} 的远端契约 digest 已变化，"
                     "请注册新的 ServerVersion 而非静默覆盖"
                 )
             snapshots.append(existing)
@@ -260,7 +263,8 @@ async def discover_tools(
             description=descriptor.description,
             input_schema_json=descriptor.input_schema,
             output_schema_json=descriptor.output_schema,
-            digest=contract_digest,
+            digest=full_digest,
+            contract_digest=contract_digest,
             side_effect=effect,
             idempotent=idempotent,
             timeout_seconds=timeout_seconds,
@@ -362,68 +366,115 @@ async def classify_snapshot(
     effect: str,
     idempotent: bool,
 ) -> MCPToolSnapshot:
-    """人工审核 effect/idempotent 分类，并创建**新的**不可变 ToolSnapshot。
+    """人工审核 effect/idempotent 分类，并创建**新的完整**不可变 ServerVersion。
 
     绝不 UPDATE 已存在的 ToolSnapshot：已被 WorkflowVersion 锁定的旧快照必须保持
-    原样（id/digest/effect 都不变），否则历史发布版本的执行语义会被事后改变。分类在
-    该 Server 下新建一个 ServerVersion（分类修订），把重分类后的快照写入其中并成为
-    Server 的 current。effect/idempotent 属于契约语义，digest 随之变化。
+    原样。分类在该 Server 下新建一个 ServerVersion（分类修订），**克隆原 current
+    版本的全部 Tool**，只替换目标 Tool 的审核 policy（effect/idempotent/review），
+    其余 Tool 原样复制。ServerVersion digest 覆盖完整、稳定排序的 Tool 集合与 policy；
+    只有完整版本构建成功后才把 server.current 切过去，避免 current 丢 Tool。
     """
 
     valid_effects = {"none", "write", "destructive", "unknown"}
     if effect not in valid_effects:
         raise MCPConfigurationError(f"effect 仅支持 {sorted(valid_effects)}")
-    old = await session.get(MCPToolSnapshot, snapshot_id)
-    if old is None:
+    target = await session.get(MCPToolSnapshot, snapshot_id)
+    if target is None:
         raise MCPConfigurationError("MCP ToolSnapshot 不存在")
-    old_version = await session.get(MCPServerVersion, old.server_version_id)
-    if old_version is None:
+    source_version = await session.get(MCPServerVersion, target.server_version_id)
+    if source_version is None:
         raise MCPConfigurationError("MCP ServerVersion 不存在")
-    contract = {
-        "name": old.name,
-        "description": old.description,
-        "inputSchema": old.input_schema_json,
-        "outputSchema": old.output_schema_json,
-        "effect": effect,
-        "idempotent": idempotent,
-        "timeoutSeconds": old.timeout_seconds,
-    }
-    # 新建分类修订 ServerVersion：不破坏旧版本，也不复用旧 (server_version_id, name) 键。
+    # 克隆源版本的**全部** Tool，保证新 current 是完整快照集合。
+    source_snapshots = (
+        await session.scalars(
+            select(MCPToolSnapshot).where(
+                MCPToolSnapshot.server_version_id == source_version.id
+            )
+        )
+    ).all()
+
     latest = await session.scalar(
         select(func.max(MCPServerVersion.version)).where(
-            MCPServerVersion.server_id == old_version.server_id
+            MCPServerVersion.server_id == source_version.server_id
         )
     )
     new_version = MCPServerVersion(
         id=str(uuid4()),
-        server_id=old_version.server_id,
+        server_id=source_version.server_id,
         version=(latest or 0) + 1,
-        config_json=old_version.config_json,
-        digest=digest_json({"classifyOf": old_version.digest, "tool": old.name}),
+        config_json=source_version.config_json,
+        digest="",  # 完整 Tool 集合构建后回填。
         status="published",
     )
     session.add(new_version)
     await session.flush()
-    new_snapshot = MCPToolSnapshot(
-        id=str(uuid4()),
-        server_version_id=new_version.id,
-        name=old.name,
-        description=old.description,
-        input_schema_json=old.input_schema_json,
-        output_schema_json=old.output_schema_json,
-        digest=digest_json(contract),
-        side_effect=effect,
-        idempotent=idempotent,
-        timeout_seconds=old.timeout_seconds,
-        effect_source="registry",
-        effect_review_status="unreviewed" if effect == "unknown" else "reviewed",
+
+    cloned: list[MCPToolSnapshot] = []
+    result_snapshot: MCPToolSnapshot | None = None
+    for source in source_snapshots:
+        is_target = source.id == target.id
+        new_effect = effect if is_target else source.side_effect
+        new_idempotent = idempotent if is_target else source.idempotent
+        new_review = source.effect_review_status
+        new_source = source.effect_source
+        if is_target:
+            new_review = "unreviewed" if effect == "unknown" else "reviewed"
+            new_source = "registry"
+        full_contract = {
+            "name": source.name,
+            "description": source.description,
+            "inputSchema": source.input_schema_json,
+            "outputSchema": source.output_schema_json,
+            "effect": new_effect,
+            "idempotent": new_idempotent,
+            "timeoutSeconds": source.timeout_seconds,
+        }
+        clone = MCPToolSnapshot(
+            id=str(uuid4()),
+            server_version_id=new_version.id,
+            name=source.name,
+            description=source.description,
+            input_schema_json=source.input_schema_json,
+            output_schema_json=source.output_schema_json,
+            digest=digest_json(full_contract),
+            contract_digest=source.contract_digest,
+            side_effect=new_effect,
+            idempotent=new_idempotent,
+            timeout_seconds=source.timeout_seconds,
+            effect_source=new_source,
+            effect_review_status=new_review,
+        )
+        session.add(clone)
+        cloned.append(clone)
+        if is_target:
+            result_snapshot = clone
+    await session.flush()
+
+    # ServerVersion digest 覆盖完整、稳定排序（按 name）的 Tool 集合与其 policy。
+    ordered = sorted(cloned, key=lambda item: item.name)
+    new_version.digest = digest_json(
+        {
+            "server": source_version.server_id,
+            "tools": [
+                {
+                    "name": item.name,
+                    "digest": item.digest,
+                    "effect": item.side_effect,
+                    "idempotent": item.idempotent,
+                    "review": item.effect_review_status,
+                }
+                for item in ordered
+            ],
+        }
     )
-    session.add(new_snapshot)
-    server = await session.get(MCPServer, old_version.server_id)
+    # 只有完整版本构建成功后才切换 current。
+    server = await session.get(MCPServer, source_version.server_id)
     if server is not None:
         server.current_version_id = new_version.id
     await session.flush()
-    return new_snapshot
+    if result_snapshot is None:  # pragma: no cover - 目标必在源集合中。
+        raise MCPConfigurationError("分类目标 Tool 不在源版本中")
+    return result_snapshot
 
 
 async def validate_mcp_nodes(

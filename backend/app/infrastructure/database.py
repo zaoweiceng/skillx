@@ -212,6 +212,9 @@ class MCPToolSnapshot(Base, TimestampMixin):
     input_schema_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     output_schema_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     digest: Mapped[str] = mapped_column(String(80))
+    # 远端 descriptor 契约 digest（不含本地 effect/idempotent 审核），用于 discovery
+    # 侦测真实远端漂移；本地人工分类只改 effect 审核字段时不改变它。
+    contract_digest: Mapped[str] = mapped_column(String(80), default="")
     side_effect: Mapped[str] = mapped_column(String(30), default="none")
     idempotent: Mapped[bool] = mapped_column(default=True)
     timeout_seconds: Mapped[int] = mapped_column(Integer, default=30)
