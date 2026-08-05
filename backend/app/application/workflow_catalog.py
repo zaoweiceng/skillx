@@ -416,6 +416,7 @@ async def build_manifest(
             )
             if key in lineage
         },
+        "revisionLineage": dict(version.revision_lineage_json or {}),
     }
     search_text = " ".join(
         [

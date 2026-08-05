@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import threading
 from collections.abc import Iterator
+from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -14,11 +16,17 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
+from app.api import routes
 from app.api.routes import (
+    DraftUpdate,
+    PublishRequest,
     apply_version_workflow_patch,
     propose_failure_revision,
     publish_workflow,
+    replay_dirty_revision_draft,
+    update_draft,
 )
+from app.application.compiler import WorkflowCompiler
 from app.application.orchestrator import Orchestrator, WorkerService
 from app.application.workflow_catalog import (
     resolve_workflow_manifest,
@@ -38,7 +46,10 @@ from app.application.workflow_patch import (
 from app.config import get_settings
 from app.infrastructure.database import (
     FailureObservation,
+    HumanPatch,
+    ReplayEvidence,
     ReplayFixture,
+    RevisionProposal,
     Run,
     SessionLocal,
     Workflow,
@@ -283,13 +294,26 @@ async def test_patch_endpoint_rejects_when_no_observation() -> None:
                 },
                 session,
             )
-    assert excinfo.value.status_code == 422
-    assert excinfo.value.detail["code"] == "PATCH_NOT_ELIGIBLE"
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.detail["code"] == "REVISION_PROPOSAL_MISMATCH"
 
 
 async def test_revision_agent_rejects_historical_transport_fixture(
     revision_agent: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    calls = 0
+
+    async def unexpected_agent_call(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("transport fixture 不得调用 Revision Agent")
+
+    monkeypatch.setattr(
+        routes.AgentHost,
+        "execute",
+        unexpected_agent_call,
+    )
     _version_id, run_id = await _seed_version_with_failure(
         error_code="DEPENDENCY_UNAVAILABLE",
         occurrence=1,
@@ -305,6 +329,7 @@ async def test_revision_agent_rejects_historical_transport_fixture(
             await propose_failure_revision(observation.id, session)
     assert excinfo.value.detail["code"] == "REVISION_NOT_ELIGIBLE"
     assert "transport/timeout" in excinfo.value.detail["message"]
+    assert calls == 0
 
 
 async def test_patch_endpoint_rejects_transient_single_occurrence() -> None:
@@ -313,19 +338,23 @@ async def test_patch_endpoint_rejects_transient_single_occurrence() -> None:
         error_code="TIMEOUT", occurrence=1
     )
     async with SessionLocal() as session:
-        with pytest.raises(HTTPException) as excinfo:
-            await apply_version_workflow_patch(
-                version_id,
-                {
-                    "sourceRunId": run_id,
-                    "patch": {
-                        "nodePatches": [{"nodeId": "work", "changes": {"timeoutSeconds": 90}}]
-                    },
-                },
-                session,
+        observation = await session.scalar(
+            select(FailureObservation).where(
+                FailureObservation.last_run_id == run_id
             )
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            await propose_failure_revision(observation.id, session)
+        proposals = list(
+            await session.scalars(
+                select(RevisionProposal).where(
+                    RevisionProposal.base_version_id == version_id
+                )
+            )
+        )
     assert excinfo.value.status_code == 422
-    assert excinfo.value.detail["code"] == "PATCH_NOT_ELIGIBLE"
+    assert excinfo.value.detail["code"] == "REVISION_NOT_ELIGIBLE"
+    assert proposals == []
 
 
 async def test_patch_endpoint_rejects_replayed_transport_error() -> None:
@@ -336,26 +365,23 @@ async def test_patch_endpoint_rejects_replayed_transport_error() -> None:
         real_failure=True,
     )
     async with SessionLocal() as session:
-        with pytest.raises(HTTPException) as excinfo:
-            await apply_version_workflow_patch(
-                version_id,
-                {
-                    "sourceRunId": run_id,
-                    "patch": {
-                        "nodePatches": [
-                            {
-                                "nodeId": "work",
-                                "changes": {
-                                    "config": {"operation": "passthrough"}
-                                },
-                            }
-                        ]
-                    },
-                },
-                session,
+        observation = await session.scalar(
+            select(FailureObservation).where(
+                FailureObservation.last_run_id == run_id
             )
-    assert excinfo.value.detail["code"] == "PATCH_NOT_ELIGIBLE"
-    assert excinfo.value.detail["evidenceKind"] == "transport_error"
+        )
+        with pytest.raises(HTTPException) as excinfo:
+            await propose_failure_revision(observation.id, session)
+        proposals = list(
+            await session.scalars(
+                select(RevisionProposal).where(
+                    RevisionProposal.base_version_id == version_id
+                )
+            )
+        )
+    assert excinfo.value.detail["code"] == "REVISION_NOT_ELIGIBLE"
+    assert "transport/timeout" in excinfo.value.detail["message"]
+    assert proposals == []
 
 
 class _ArticleHandler(BaseHTTPRequestHandler):
@@ -446,6 +472,42 @@ def _browser_contract_failure_definition(url: str) -> dict:
     }
 
 
+async def test_publish_same_reviewed_snapshot_is_concurrent_idempotent() -> None:
+    definition = _definition()
+    compiled = WorkflowCompiler().compile(definition)
+    async with SessionLocal() as session, session.begin():
+        workflow = Workflow(
+            id=str(uuid4()),
+            name="publish-cas",
+            draft_revision=1,
+            draft_json=definition,
+            draft_digest=compiled.digest,
+            draft_metadata_json={"status": "manual_draft"},
+        )
+        session.add(workflow)
+        workflow_id = workflow.id
+    request = PublishRequest(
+        draftRevision=1,
+        draftDigest=compiled.digest,
+    )
+
+    async def publish_once() -> dict[str, Any]:
+        async with SessionLocal() as session:
+            return await publish_workflow(workflow_id, request, session)
+
+    first, second = await asyncio.gather(publish_once(), publish_once())
+    assert first["id"] == second["id"]
+    async with SessionLocal() as session:
+        versions = list(
+            await session.scalars(
+                select(WorkflowVersion).where(
+                    WorkflowVersion.workflow_id == workflow_id
+                )
+            )
+        )
+    assert len(versions) == 1
+
+
 async def test_external_browser_failure_fixture_patch_publish_and_reuse(
     article_site: str,
     revision_agent: None,
@@ -465,7 +527,17 @@ async def test_external_browser_failure_fixture_patch_publish_and_reuse(
         await session.flush()
         workflow_id = workflow.id
     async with SessionLocal() as session:
-        published_v1 = await publish_workflow(workflow_id, session)
+        workflow = await session.get(Workflow, workflow_id)
+        published_v1 = await publish_workflow(
+            workflow_id,
+            PublishRequest(
+                draftRevision=workflow.draft_revision,
+                draftDigest=WorkflowCompiler().compile(
+                    workflow.draft_json
+                ).digest,
+            ),
+            session,
+        )
     version_id = published_v1["id"]
     v1_ref = published_v1["workflowRef"]
     worker = WorkerService("external-failure-worker")
@@ -502,10 +574,33 @@ async def test_external_browser_failure_fixture_patch_publish_and_reuse(
         "pageContract"
     ]["outputSchema"]["properties"]["content"]["type"] == "string"
     async with SessionLocal() as session:
+        reused_proposal = await propose_failure_revision(
+            observation.id, session
+        )
+    assert reused_proposal["proposalId"] == proposal["proposalId"]
+    tampered = deepcopy(proposal["proposal"])
+    tampered["reason"] = "client changed this proposal"
+    async with SessionLocal() as session:
+        with pytest.raises(HTTPException) as tamper_error:
+            await apply_version_workflow_patch(
+                version_id,
+                {
+                    "sourceRunId": source_run_id,
+                    "proposalId": proposal["proposalId"],
+                    "proposalDigest": proposal["proposalDigest"],
+                    "patch": tampered,
+                },
+                session,
+            )
+    assert tamper_error.value.status_code == 409
+    assert tamper_error.value.detail["code"] == "REVISION_PROPOSAL_TAMPERED"
+    async with SessionLocal() as session:
         proof = await apply_version_workflow_patch(
             version_id,
             {
                 "sourceRunId": source_run_id,
+                "proposalId": proposal["proposalId"],
+                "proposalDigest": proposal["proposalDigest"],
                 "patch": proposal["proposal"],
             },
             session,
@@ -518,25 +613,126 @@ async def test_external_browser_failure_fixture_patch_publish_and_reuse(
         "proposalDigest"
     ]
     async with SessionLocal() as session:
+        unchanged = await update_draft(
+            proof["draftWorkflowId"],
+            DraftUpdate(
+                revision=proof["draftRevision"],
+                definition=deepcopy(proof["definition"]),
+            ),
+            session,
+        )
+    assert unchanged["draftRevision"] == proof["draftRevision"]
+    assert unchanged["draftMetadata"]["status"] == "pending_revision"
+    async with SessionLocal() as session:
         with pytest.raises(HTTPException) as conflict:
             await apply_version_workflow_patch(
                 version_id,
                 {
                     "sourceRunId": source_run_id,
+                    "proposalId": proposal["proposalId"],
+                    "proposalDigest": proposal["proposalDigest"],
                     "patch": proposal["proposal"],
                 },
                 session,
             )
     assert conflict.value.status_code == 409
+    edited_definition = deepcopy(proof["definition"])
+    read_node = next(
+        node
+        for node in edited_definition["spec"]["nodes"]
+        if node["id"] == "read"
+    )
+    read_node["timeoutSeconds"] = 45
     async with SessionLocal() as session:
-        published = await publish_workflow(proof["draftWorkflowId"], session)
+        dirty = await update_draft(
+            proof["draftWorkflowId"],
+            DraftUpdate(
+                revision=proof["draftRevision"],
+                definition=edited_definition,
+            ),
+            session,
+        )
+    assert dirty["draftMetadata"]["status"] == "dirty_after_replay"
+    async with SessionLocal() as session:
+        with pytest.raises(HTTPException) as old_snapshot:
+            await publish_workflow(
+                proof["draftWorkflowId"],
+                PublishRequest(
+                    draftRevision=proof["draftRevision"],
+                    draftDigest=proof["draftDigest"],
+                    replayEvidenceId=proof["replay"]["replayEvidenceId"],
+                ),
+                session,
+            )
+    assert old_snapshot.value.detail["code"] == "DRAFT_SNAPSHOT_CONFLICT"
+    async with SessionLocal() as session:
+        with pytest.raises(HTTPException) as stale_proof:
+            await publish_workflow(
+                proof["draftWorkflowId"],
+                PublishRequest(
+                    draftRevision=dirty["draftRevision"],
+                    draftDigest=dirty["draftDigest"],
+                    replayEvidenceId=proof["replay"]["replayEvidenceId"],
+                ),
+                session,
+            )
+    assert stale_proof.value.detail["code"] == "REPLAY_PROOF_STALE"
+    async with SessionLocal() as session:
+        approved = await replay_dirty_revision_draft(
+            proof["draftWorkflowId"], session
+        )
+    assert approved["replay"]["passed"] is True
+    assert (
+        approved["replay"]["replayEvidenceId"]
+        != proof["replay"]["replayEvidenceId"]
+    )
+    async with SessionLocal() as session:
+        published = await publish_workflow(
+            proof["draftWorkflowId"],
+            PublishRequest(
+                draftRevision=approved["draftRevision"],
+                draftDigest=approved["draftDigest"],
+                replayEvidenceId=approved["replay"]["replayEvidenceId"],
+            ),
+            session,
+        )
+        repeated = await publish_workflow(
+            proof["draftWorkflowId"],
+            PublishRequest(
+                draftRevision=approved["draftRevision"],
+                draftDigest=approved["draftDigest"],
+                replayEvidenceId=approved["replay"]["replayEvidenceId"],
+            ),
+            session,
+        )
     assert published["workflowId"] == workflow_id
     assert published["version"] == 2
+    assert repeated["id"] == published["id"]
     async with SessionLocal() as session:
+        proposal_record = await session.get(
+            RevisionProposal, proposal["proposalId"]
+        )
+        human_patch = await session.get(
+            HumanPatch, approved["draftMetadata"]["humanPatchId"]
+        )
+        replay_evidence = await session.get(
+            ReplayEvidence, approved["replay"]["replayEvidenceId"]
+        )
+        published_record = await session.get(
+            WorkflowVersion, published["id"]
+        )
         cards = await search_manifests(
             session, "external-browser-contract"
         )
         old_manifest = await resolve_workflow_manifest(session, v1_ref)
+    assert proposal_record.proposal_digest == proposal["proposalDigest"]
+    assert replay_evidence.human_patch_id == human_patch.id
+    assert replay_evidence.patch_digest == human_patch.patch_digest
+    assert replay_evidence.patched_definition_digest == published["digest"]
+    assert published_record.revision_lineage_json["proposalId"] == proposal[
+        "proposalId"
+    ]
+    assert published_record.revision_lineage_json["humanPatchId"] == human_patch.id
     assert [item["workflowRef"] for item in cards] == [
         published["workflowRef"]
     ]

@@ -50,8 +50,7 @@ export default function RunDetailPage() {
     }
   }
 
-  // 对失败节点提出受控补丁：把超时上调，作为可复现故障的最小修复示例。
-  // 补丁只创建 draft（旧版本不变），并回放展示 diagnostics，人工发布后才生效。
+  // Revision Agent proposal 先持久化，再由服务端按 proposal id/digest 回放并创建草稿。
   async function proposePatch(failedNode: string) {
     if (!run?.workflowVersionId) {
       setError('临时计划不能直接修改源版本，请先人工固化为 Workflow draft。')
@@ -60,20 +59,15 @@ export default function RunDetailPage() {
     setPatching(true)
     setError('')
     try {
-      const failed = (run.nodes ?? []).find((node) => node.nodeId === failedNode)
-      const currentTimeout =
-        typeof failed?.input?.timeoutSeconds === 'number' ? failed.input.timeoutSeconds : 30
+      const observation = run.failureObservations?.find(
+        (item) => item.nodeId === failedNode,
+      )
+      if (!observation) throw new Error('失败节点缺少可归因的 FailureObservation')
+      const proposal = await api.proposeRevision(observation.id)
       const result = await api.applyWorkflowPatch(run.workflowVersionId, {
         sourceRunId: run.id,
-        patch: {
-          nodePatches: [
-            {
-              nodeId: failedNode,
-              changes: { timeoutSeconds: Math.min(currentTimeout * 2, 86400) },
-            },
-          ],
-          reason: `对失败节点 ${failedNode} 提出受控超时补丁`,
-        },
+        proposalId: proposal.proposalId,
+        proposalDigest: proposal.proposalDigest,
       })
       setPatchDraft(result)
     } catch (reason) {

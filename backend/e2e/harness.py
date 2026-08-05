@@ -40,6 +40,7 @@ class DemoStack:
     # 父进程持有的日志文件句柄，停止时显式关闭，避免泄漏描述符。
     _log_handles: list[Any] = field(default_factory=list)
     _env: dict[str, str] = field(default_factory=dict)
+    _worker_generation: int = 0
 
     def client(self) -> httpx.Client:
         return httpx.Client(base_url=self.base_url, timeout=30)
@@ -221,7 +222,12 @@ def start_stack(
     return stack
 
 
-def restart_worker(stack: DemoStack, *, crash: bool = False) -> None:
+def restart_worker(
+    stack: DemoStack,
+    *,
+    crash: bool = False,
+    disable_task_recovery: bool = False,
+) -> None:
     if stack._worker.poll() is None:
         if crash:
             stack._worker.kill()
@@ -231,8 +237,19 @@ def restart_worker(stack: DemoStack, *, crash: bool = False) -> None:
     worker_log_path = stack._logs["worker"]
     worker_log = open(worker_log_path, "a", encoding="utf-8")  # noqa: SIM115
     stack._log_handles.append(worker_log)
+    stack._worker_generation += 1
+    worker_id = f"demo-worker-restarted-{stack._worker_generation}"
+    command = [
+        sys.executable,
+        "-m",
+        "app.worker",
+        "--worker-id",
+        worker_id,
+    ]
+    if disable_task_recovery:
+        command.append("--disable-task-recovery")
     stack._worker = subprocess.Popen(
-        [sys.executable, "-m", "app.worker", "--worker-id", "demo-worker-restarted"],
+        command,
         cwd=BACKEND_DIR,
         env=stack._env,
         stdout=worker_log,
@@ -242,7 +259,7 @@ def restart_worker(stack: DemoStack, *, crash: bool = False) -> None:
         stack._worker,
         worker_log_path,
         timeout=30,
-        marker="worker polling worker_id=demo-worker-restarted",
+        marker=f"worker polling worker_id={worker_id}",
     )
 
 

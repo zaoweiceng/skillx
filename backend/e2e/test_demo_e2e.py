@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import time
 from collections.abc import Iterator
+from copy import deepcopy
 
 import httpx
 import pytest
@@ -59,6 +60,23 @@ def _workflow_session(client: httpx.Client) -> str:
     created = client.post("/workflow-tools/sessions", json={})
     assert created.status_code == 201, created.text
     return created.json()["id"]
+
+
+def _publish_workflow(
+    client: httpx.Client, workflow_id: str
+) -> httpx.Response:
+    workflow = client.get(f"/workflows/{workflow_id}")
+    assert workflow.status_code == 200, workflow.text
+    snapshot = workflow.json()
+    metadata = snapshot.get("draftMetadata") or {}
+    return client.post(
+        f"/workflows/{workflow_id}/publish",
+        json={
+            "draftRevision": snapshot["draftRevision"],
+            "draftDigest": snapshot["draftDigest"],
+            "replayEvidenceId": metadata.get("replayEvidenceId"),
+        },
+    )
 
 
 def test_e2e_1_deterministic_component(stack: DemoStack) -> None:
@@ -164,7 +182,7 @@ def test_e2e_5_agent_distillation_reuse(stack: DemoStack) -> None:
         assert draft["analysis"]["estimatedLlmCallsAfter"] == 0
 
         # 4) 通过 API 人工发布；第二次复用不得创建 Component 后持 id 直调。
-        published = client.post(f"/workflows/{draft_workflow_id}/publish")
+        published = _publish_workflow(client, draft_workflow_id)
         assert published.status_code == 201, published.text
         version_id = published.json()["id"]
 
@@ -378,28 +396,47 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
             "spec": {
                 "inputSchema": {
                     "type": "object",
-                    "required": ["x"],
-                    "properties": {"x": {"type": "string"}},
+                    "required": ["url"],
+                    "properties": {"url": {"type": "string"}},
                 },
                 "outputSchema": {
                     "type": "object",
-                    "required": ["y"],
-                    "properties": {"y": {"type": "string"}},
+                    "required": ["content"],
+                    "properties": {"content": {"type": "string"}},
                 },
                 "nodes": [
                     {"id": "input", "type": "input", "displayName": "输入"},
                     {
                         "id": "work",
-                        "type": "transform",
-                        "displayName": "网络瞬态对照",
-                        "input": {"value": "${input.x}"},
-                        "config": {"operation": "fail_dependency"},
+                        "type": "browser",
+                        "displayName": "真实 Browser 瞬态对照",
+                        "input": {"url": "${input.url}"},
+                        "timeoutSeconds": 10,
+                        "config": {
+                            "action": "read",
+                            "runtime": "playwright",
+                            "pageContract": {
+                                "contractVersion": "1",
+                                "urlPattern": f"{stack.form_url}/transient*",
+                                "bodySelector": "#main",
+                                "fields": {},
+                                "outputSchema": {
+                                    "type": "object",
+                                    "required": ["content"],
+                                    "properties": {
+                                        "content": {"type": "string"}
+                                    },
+                                },
+                                "timeoutMs": 1000,
+                                "retryable": True,
+                            },
+                        },
                     },
                     {
                         "id": "output",
                         "type": "output",
                         "displayName": "输出",
-                        "input": {"y": "${work.output.value}"},
+                        "input": {"content": "${work.output.content}"},
                     },
                 ],
                 "edges": [
@@ -415,8 +452,8 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
                 "definition": transient_definition,
             },
         ).json()
-        transient_v1 = client.post(
-            f"/workflows/{transient_workflow['id']}/publish"
+        transient_v1 = _publish_workflow(
+            client, transient_workflow["id"]
         ).json()
         transient_component = client.post(
             "/components",
@@ -425,21 +462,82 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
                 "workflowVersionId": transient_v1["id"],
             },
         ).json()
-        transient_created = client.post(
+        observations = {}
+        for mode in ("503", "disconnect"):
+            transient_created = client.post(
+                f"/components/{transient_component['id']}/runs",
+                json={
+                    "input": {
+                        "url": f"{stack.form_url}/transient?mode={mode}"
+                    }
+                },
+            )
+            transient_run = poll_run(
+                client, transient_created.json()["id"]
+            )
+            assert transient_run["status"] == "failed"
+            observation = transient_run["failureObservations"][0]
+            observations[observation["evidenceKind"]] = observation
+        assert observations["transport_error"]["occurrence"] == 2
+        timeout_definition = deepcopy(transient_definition)
+        timeout_definition["metadata"]["name"] = "timeout-control"
+        timeout_definition["spec"]["nodes"][1]["timeoutSeconds"] = 1
+        timeout_workflow = client.post(
+            "/workflows",
+            json={
+                "name": "Timeout Control",
+                "definition": timeout_definition,
+            },
+        ).json()
+        timeout_v1 = _publish_workflow(
+            client, timeout_workflow["id"]
+        ).json()
+        timeout_component = client.post(
+            "/components",
+            json={
+                "name": "Timeout Control",
+                "workflowVersionId": timeout_v1["id"],
+            },
+        ).json()
+        for _ in range(2):
+            timeout_created = client.post(
+                f"/components/{timeout_component['id']}/runs",
+                json={
+                    "input": {
+                        "url": f"{stack.form_url}/transient?mode=timeout"
+                    }
+                },
+            )
+            timeout_run = poll_run(client, timeout_created.json()["id"])
+            assert timeout_run["status"] == "failed"
+            timeout_observation = timeout_run["failureObservations"][0]
+            observations[timeout_observation["evidenceKind"]] = (
+                timeout_observation
+            )
+        assert observations["timeout"]["occurrence"] == 2
+        for observation in observations.values():
+            assert observation["classification"] == "transient"
+            transient_proposal = client.post(
+                f"/failure-observations/{observation['id']}/revision-proposal"
+            )
+            assert transient_proposal.status_code == 422
+            assert (
+                transient_proposal.json()["detail"]["code"]
+                == "REVISION_NOT_ELIGIBLE"
+            )
+        recovered = client.post(
             f"/components/{transient_component['id']}/runs",
-            json={"input": {"x": "safe"}},
+            json={
+                "input": {
+                    "url": f"{stack.form_url}/transient?mode=ok"
+                }
+            },
         )
-        transient_run = poll_run(
-            client, transient_created.json()["id"]
-        )
-        transient_observation = transient_run["failureObservations"][0]
-        transient_proposal = client.post(
-            f"/failure-observations/{transient_observation['id']}/revision-proposal"
-        )
-        assert transient_proposal.status_code == 422
-        assert transient_proposal.json()["detail"][
-            "code"
-        ] == "REVISION_NOT_ELIGIBLE"
+        assert poll_run(client, recovered.json()["id"])["status"] == "succeeded"
+        unchanged = client.get(
+            f"/workflows/{transient_workflow['id']}"
+        ).json()
+        assert unchanged["draftMetadata"]["status"] == "published"
 
         browser_definition = {
             "apiVersion": "workflow.platform/v1",
@@ -501,9 +599,7 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
                 "definition": browser_definition,
             },
         ).json()
-        published_v1 = client.post(
-            f"/workflows/{workflow['id']}/publish"
-        ).json()
+        published_v1 = _publish_workflow(client, workflow["id"]).json()
         browser_component = client.post(
             "/components",
             json={
@@ -537,6 +633,8 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
             f"/workflow-versions/{published_v1['id']}/workflow-patch",
             json={
                 "sourceRunId": source_run_id,
+                "proposalId": proposal["proposalId"],
+                "proposalDigest": proposal["proposalDigest"],
                 "patch": proposal["proposal"],
             },
         )
@@ -547,9 +645,59 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
         assert proof["replay"]["baselineReproduced"] is True
         assert proof["replay"]["passed"] is True
         assert proof["replay"]["replayEvidenceId"]
-        published_v2 = client.post(
-            f"/workflows/{workflow['id']}/publish"
-        ).json()
+        edited = proof["definition"]
+        edited_read = next(
+            node
+            for node in edited["spec"]["nodes"]
+            if node["id"] == "read"
+        )
+        edited_read["timeoutSeconds"] = 45
+        dirty_response = client.put(
+            f"/workflows/{workflow['id']}/draft",
+            json={
+                "revision": proof["draftRevision"],
+                "definition": edited,
+            },
+        )
+        assert dirty_response.status_code == 200, dirty_response.text
+        dirty = dirty_response.json()
+        assert dirty["draftMetadata"]["status"] == "dirty_after_replay"
+        old_snapshot_publish = client.post(
+            f"/workflows/{workflow['id']}/publish",
+            json={
+                "draftRevision": proof["draftRevision"],
+                "draftDigest": proof["draftDigest"],
+                "replayEvidenceId": proof["replay"]["replayEvidenceId"],
+            },
+        )
+        assert old_snapshot_publish.status_code == 409
+        assert (
+            old_snapshot_publish.json()["detail"]["code"]
+            == "DRAFT_SNAPSHOT_CONFLICT"
+        )
+        stale_proof_publish = client.post(
+            f"/workflows/{workflow['id']}/publish",
+            json={
+                "draftRevision": dirty["draftRevision"],
+                "draftDigest": dirty["draftDigest"],
+                "replayEvidenceId": proof["replay"]["replayEvidenceId"],
+            },
+        )
+        assert stale_proof_publish.status_code == 409
+        assert (
+            stale_proof_publish.json()["detail"]["code"]
+            == "REPLAY_PROOF_STALE"
+        )
+        reapproved_response = client.post(
+            f"/workflows/{workflow['id']}/replay"
+        )
+        assert reapproved_response.status_code == 201, reapproved_response.text
+        reapproved = reapproved_response.json()
+        assert (
+            reapproved["replay"]["replayEvidenceId"]
+            != proof["replay"]["replayEvidenceId"]
+        )
+        published_v2 = _publish_workflow(client, workflow["id"]).json()
         assert published_v2["workflowId"] == workflow["id"]
         assert published_v2["version"] == 2
 
@@ -614,6 +762,11 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
 def test_agent_run_handoff_public_api_and_completed_action_ledger(
     stack: DemoStack,
 ) -> None:
+    restart_worker(
+        stack,
+        crash=True,
+        disable_task_recovery=True,
+    )
     with stack.client() as client:
         conversation = client.post(
             "/conversations", json={"title": "公开接力"}
@@ -633,7 +786,15 @@ def test_agent_run_handoff_public_api_and_completed_action_ledger(
         source = poll_conversation_run(client, source_id)
         assert source["status"] == "failed"
         checkpoint_id = source["error"]["taskCheckpointId"]
+        pending = client.get(
+            f"/task-checkpoints/{checkpoint_id}"
+        ).json()
+        assert pending["status"] == "pending"
+        assert pending["claimGeneration"] == 0
+        assert pending["continuationRunId"] is None
+        assert pending["completedActionLedger"]
 
+        restart_worker(stack, crash=True)
         deadline = time.time() + 30
         checkpoint = {}
         while time.time() < deadline:
@@ -644,6 +805,7 @@ def test_agent_run_handoff_public_api_and_completed_action_ledger(
                 break
             time.sleep(0.1)
         continuation_id = checkpoint["continuationRunId"]
+        assert checkpoint["claimGeneration"] == 1
         assert checkpoint["completedActionLedger"]
         continuation = poll_conversation_run(client, continuation_id)
         assert continuation["status"] == "succeeded"
@@ -660,7 +822,6 @@ def test_agent_run_handoff_public_api_and_completed_action_ledger(
             and item["payload"].get("reusedFromLedger") is True
         ]
         assert len(reused) == 1
-        restart_worker(stack, crash=True)
 
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -843,7 +1004,7 @@ def test_e2e_10_progressive_catalog_composition_and_version_pinning(
             json={"revision": workflow["draftRevision"], "definition": definition},
         )
         assert updated.status_code == 200, updated.text
-        published = client.post(f"/workflows/{component['workflowId']}/publish")
+        published = _publish_workflow(client, component["workflowId"])
         assert published.status_code == 201, published.text
         changed_default = client.post(
             "/components",
@@ -894,7 +1055,7 @@ def test_e2e_11_fragment_disclosure_and_slice_safety(stack: DemoStack) -> None:
             json={"name": "片段问候工作流", "definition": source_definition},
         )
         assert created.status_code == 201, created.text
-        published = client.post(f"/workflows/{created.json()['id']}/publish")
+        published = _publish_workflow(client, created.json()["id"])
         assert published.status_code == 201, published.text
         workflow_ref = next(
             item["workflowRef"]
@@ -1034,8 +1195,8 @@ def test_e2e_8b_real_browser_distillation_to_non_fake_agent(
         assert analysis["agentNodes"] == 1
         assert analysis["publishable"] is True
 
-        published = client.post(
-            f"/workflows/{distilled.json()['draftWorkflowId']}/publish"
+        published = _publish_workflow(
+            client, distilled.json()["draftWorkflowId"]
         )
         assert published.status_code == 201, published.text
         version_id = published.json()["id"]

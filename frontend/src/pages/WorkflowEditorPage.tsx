@@ -140,25 +140,30 @@ export default function WorkflowEditorPage() {
     }
   }
 
-  async function validate(): Promise<boolean> {
+  async function validate(): Promise<{ valid: boolean; saved?: Workflow }> {
     const saved = await save()
-    if (!saved || !id) return false
+    if (!saved || !id) return { valid: false }
     const result = await api.validateWorkflow(id)
     setDiagnostics(result.diagnostics ?? [])
     setNotice(result.valid ? `静态检查通过 · ${result.digest}` : '静态检查未通过')
-    return result.valid
+    return { valid: result.valid, saved }
   }
 
   async function publish() {
     if (publishing) return
     setPublishing(true)
     try {
-      const valid = await validate()
-      if (!id || !workflow) return
-      if (!valid) return
-      const version = await api.publishWorkflow(id)
+      const validation = await validate()
+      if (!id || !validation.saved || !validation.valid) return
+      const reviewed = validation.saved
+      const version = await api.publishWorkflow(
+        id,
+        reviewed.draftRevision,
+        reviewed.draftDigest,
+        reviewed.draftMetadata?.replayEvidenceId,
+      )
       const component = await api.createComponent(
-        workflow.name,
+        reviewed.name,
         '由工作流编辑器发布的锁定版本组件。',
         version.id,
       )

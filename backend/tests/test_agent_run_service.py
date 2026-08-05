@@ -588,3 +588,55 @@ async def test_conversation_trajectory_download_reconcile_and_integrity(
         with pytest.raises(HTTPException) as exc:
             await download_artifact(artifact.id, session)
     assert exc.value.status_code == 409
+    async with SessionLocal() as session, session.begin():
+        report = await reconcile_conversation_artifacts(session, run_id)
+    assert artifact.id in report["corrupt"]
+    assert not target.exists()
+
+
+async def test_reconcile_rejects_escaped_storage_key(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _conversation()
+    run_id = await _enqueue(conversation_id, "任务 [[MODE:ok]][[REPLY:证据]]")
+    run = await _drive(run_id)
+    assert run.status == "succeeded"
+    async with SessionLocal() as session, session.begin():
+        artifact = await session.scalar(
+            select(Artifact).where(Artifact.conversation_run_id == run_id)
+        )
+        artifact.metadata_json = {
+            **artifact.metadata_json,
+            "storageKey": "../../escaped.json",
+        }
+        artifact_id = artifact.id
+    async with SessionLocal() as session, session.begin():
+        report = await reconcile_conversation_artifacts(session, run_id)
+    assert artifact_id in report["pathRejected"]
+
+
+async def test_reconcile_rejects_corrupt_staging(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _conversation()
+    run_id = await _enqueue(conversation_id, "任务 [[MODE:ok]][[REPLY:证据]]")
+    run = await _drive(run_id)
+    assert run.status == "succeeded"
+    async with SessionLocal() as session:
+        artifact = await session.scalar(
+            select(Artifact).where(Artifact.conversation_run_id == run_id)
+        )
+    root = get_settings().artifact_root / "conversation-agents" / run_id
+    target = root / artifact.metadata_json["storageKey"]
+    staging = root / artifact.metadata_json["stagingKey"]
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    target.replace(staging)
+    staging.write_bytes(b"corrupt")
+
+    async with SessionLocal() as session, session.begin():
+        report = await reconcile_conversation_artifacts(session, run_id)
+
+    assert artifact.id in report["corrupt"]
+    assert artifact.id not in report["recovered"]
+    assert not staging.exists()
+    assert not target.exists()

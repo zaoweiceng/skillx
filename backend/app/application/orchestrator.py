@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from contextlib import suppress
@@ -1671,13 +1672,22 @@ async def reconcile_conversation_artifacts(
         / conversation_run_id
     ).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    recorded = {
-        str((item.metadata_json or {}).get("storageKey"))
-        for item in artifacts
-        if (item.metadata_json or {}).get("storageKey")
-    }
+    staging_root = (root / ".staging").resolve()
+    recorded: set[str] = set()
     recovered: list[str] = []
     missing: list[str] = []
+    corrupt: list[str] = []
+    path_rejected: list[str] = []
+
+    def matches_artifact(path: Any, artifact: Artifact) -> bool:
+        if not path.is_file() or path.stat().st_size != artifact.size:
+            return False
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest() == artifact.sha256
+
     for item in artifacts:
         metadata = item.metadata_json or {}
         storage_key = metadata.get("storageKey")
@@ -1685,44 +1695,78 @@ async def reconcile_conversation_artifacts(
             missing.append(item.id)
             continue
         target = (root / storage_key).resolve()
-        if target.is_file():
+        if (
+            target == root
+            or not target.is_relative_to(root)
+            or target.is_relative_to(staging_root)
+        ):
+            path_rejected.append(item.id)
             continue
+        recorded.add(str(target.relative_to(root)))
+        if target.exists():
+            if matches_artifact(target, item):
+                continue
+            corrupt.append(item.id)
+            target.unlink(missing_ok=True)
         staging_key = metadata.get("stagingKey")
         source = (
             (root / staging_key).resolve()
             if isinstance(staging_key, str)
             else None
         )
-        if (
-            source is not None
-            and source.is_relative_to(root)
-            and source.is_file()
-        ):
-            target.parent.mkdir(parents=True, exist_ok=True)
-            source.replace(target)
-            recovered.append(item.id)
-        else:
+        if source is None:
             missing.append(item.id)
-    final_files = {
-        str(path.relative_to(root))
-        for path in root.rglob("*")
-        if path.is_file() and ".staging" not in path.relative_to(root).parts
-    }
+            continue
+        if (
+            source == root
+            or not source.is_relative_to(staging_root)
+        ):
+            path_rejected.append(item.id)
+            continue
+        if not source.exists():
+            missing.append(item.id)
+            continue
+        if not matches_artifact(source, item):
+            if item.id not in corrupt:
+                corrupt.append(item.id)
+            source.unlink(missing_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.replace(target)
+        recovered.append(item.id)
+    final_files: set[str] = set()
+    for candidate in root.rglob("*"):
+        relative = candidate.relative_to(root)
+        if ".staging" in relative.parts:
+            continue
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(root):
+            path_rejected.append(str(relative))
+            continue
+        if resolved.is_file():
+            final_files.add(str(relative))
     orphan_files = sorted(final_files - recorded)
     for name in orphan_files:
         target = (root / name).resolve()
-        if target.is_relative_to(root):
+        if target != root and target.is_relative_to(root):
             target.unlink(missing_ok=True)
-    staging_root = root / ".staging"
     staging_removed: list[str] = []
     if staging_root.is_dir():
-        for path in staging_root.rglob("*"):
-            if path.is_file():
-                staging_removed.append(str(path.relative_to(root)))
-                path.unlink(missing_ok=True)
+        for candidate in staging_root.rglob("*"):
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(staging_root):
+                path_rejected.append(str(candidate.relative_to(root)))
+                continue
+            if resolved.is_file():
+                staging_removed.append(str(candidate.relative_to(root)))
+                resolved.unlink(missing_ok=True)
+    orphan_removed = sorted([*orphan_files, *staging_removed])
     return {
         "recovered": recovered,
         "missing": missing,
+        "corrupt": corrupt,
+        "pathRejected": sorted(path_rejected),
+        "orphanRemoved": orphan_removed,
         "orphanFilesRemoved": orphan_files,
         "orphanStagingRemoved": sorted(staging_removed),
     }

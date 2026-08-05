@@ -73,7 +73,15 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
             row[1]
             for row in connection.execute("PRAGMA table_info(replay_fixtures)")
         }
-    assert revision == ("0016",)
+        evidence_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(replay_evidence)")
+        }
+        version_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(workflow_versions)")
+        }
+    assert revision == ("0017",)
     assert {
         "runs",
         "capability_versions",
@@ -91,6 +99,8 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
         "pending_selections",
         "task_checkpoints",
         "replay_fixtures",
+        "revision_proposals",
+        "human_patches",
     } <= tables
     assert "run_type" in run_type_columns
     assert "error_json" in run_type_columns
@@ -112,8 +122,21 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
     assert {
         "draft_base_version_id",
         "draft_metadata_json",
+        "draft_digest",
     } <= workflow_columns
     assert "evidence_kind" in fixture_columns
+    assert {
+        "base_definition_digest",
+        "patch_digest",
+        "patched_definition_digest",
+        "proposal_id",
+        "human_patch_id",
+    } <= evidence_columns
+    assert {
+        "published_from_draft_revision",
+        "published_from_draft_digest",
+        "revision_lineage_json",
+    } <= version_columns
     with sqlite3.connect(database) as connection:
         checkpoint_columns = {
             row[1]

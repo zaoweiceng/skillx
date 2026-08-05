@@ -3,8 +3,8 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import func, select
 
-from app.api.routes import publish_workflow
-from app.application.compiler import digest_json
+from app.api.routes import PublishRequest, publish_workflow
+from app.application.compiler import WorkflowCompiler, digest_json
 from app.application.distillation import (
     DistillationError,
     compile_agent_trajectory,
@@ -291,7 +291,17 @@ async def test_distilled_draft_reuse_varies_with_new_input() -> None:
         draft_workflow_id = result.draft_workflow_id
 
     async with SessionLocal() as session:
-        published = await publish_workflow(draft_workflow_id, session)
+        workflow = await session.get(Workflow, draft_workflow_id)
+        published = await publish_workflow(
+            draft_workflow_id,
+            PublishRequest(
+                draftRevision=workflow.draft_revision,
+                draftDigest=WorkflowCompiler().compile(
+                    workflow.draft_json
+                ).digest,
+            ),
+            session,
+        )
     version_id = published["id"]
 
     async with SessionLocal() as session, session.begin():

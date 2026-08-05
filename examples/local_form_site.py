@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -22,6 +24,7 @@ _STATE: dict[str, object] = {
     "lastSubmission": None,
     "mutated": False,
     "articleBody": "第一版正文：季度营收增长 12%。",
+    "transientCount": 0,
 }
 
 
@@ -113,6 +116,24 @@ class _Handler(BaseHTTPRequestHandler):
             with _LOCK:
                 body = str(_STATE["articleBody"])
             self._send_html(200, _article_page(body))
+        elif path == "/transient":
+            mode = parse_qs(urlparse(self.path).query).get(
+                "mode", ["503"]
+            )[0]
+            with _LOCK:
+                _STATE["transientCount"] = (
+                    int(_STATE["transientCount"]) + 1
+                )
+            if mode == "disconnect":
+                self.connection.shutdown(socket.SHUT_RDWR)
+                self.connection.close()
+                return
+            if mode == "timeout":
+                time.sleep(3)
+            if mode == "503":
+                self._send_html(503, "<h1>temporarily unavailable</h1>")
+                return
+            self._send_html(200, _article_page("恢复后的正文"))
         elif path == "/__stats":
             with _LOCK:
                 self._send_json(200, dict(_STATE))

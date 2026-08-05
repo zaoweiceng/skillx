@@ -99,6 +99,7 @@ from app.infrastructure.database import (
     Distillation,
     ExecutionCheckpoint,
     FailureObservation,
+    HumanPatch,
     MCPServer,
     MCPToolSnapshot,
     Message,
@@ -107,6 +108,7 @@ from app.infrastructure.database import (
     PlanSnapshot,
     ReplayEvidence,
     ReplayFixture,
+    RevisionProposal,
     Run,
     RunEvent,
     SecretReference,
@@ -134,6 +136,14 @@ class WorkflowCreate(BaseModel):
 class DraftUpdate(BaseModel):
     revision: int = Field(ge=1)
     definition: dict[str, Any]
+
+
+class PublishRequest(BaseModel):
+    draft_revision: int = Field(alias="draftRevision", ge=1)
+    draft_digest: str = Field(alias="draftDigest", min_length=8, max_length=80)
+    replay_evidence_id: str | None = Field(
+        default=None, alias="replayEvidenceId"
+    )
 
 
 class ComponentCreate(BaseModel):
@@ -264,11 +274,86 @@ class PlanSolidifyRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
 
 
+async def _record_human_definition_patch(
+    session: AsyncSession,
+    *,
+    proposal_id: str,
+    definition: dict[str, Any],
+    editor_id: str,
+) -> HumanPatch:
+    payload = {"kind": "DraftDefinition", "definition": definition}
+    patch_digest = digest_json(payload)
+    existing = await session.scalar(
+        select(HumanPatch).where(
+            HumanPatch.parent_proposal_id == proposal_id,
+            HumanPatch.patch_digest == patch_digest,
+        )
+    )
+    if existing is not None:
+        return existing
+    item = HumanPatch(
+        id=str(uuid4()),
+        parent_proposal_id=proposal_id,
+        editor_id=editor_id,
+        patch_json=payload,
+        patch_digest=patch_digest,
+    )
+    session.add(item)
+    await session.flush()
+    return item
+
+
+async def _mark_draft_changed(
+    session: AsyncSession,
+    workflow: Workflow,
+    definition: dict[str, Any],
+    *,
+    editor_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    metadata = dict(workflow.draft_metadata_json or {})
+    status = metadata.get("status")
+    if status not in {"pending_revision", "dirty_after_replay"}:
+        metadata["status"] = "manual_draft"
+        return definition, metadata
+
+    lineage = dict(definition.get("metadata", {}).get("revisionLineage") or {})
+    if lineage:
+        lineage["status"] = "superseded"
+        definition = {
+            **definition,
+            "metadata": {
+                **definition.get("metadata", {}),
+                "revisionLineage": lineage,
+            },
+        }
+    proposal_id = metadata.get("proposalId")
+    if isinstance(proposal_id, str):
+        human_patch = await _record_human_definition_patch(
+            session,
+            proposal_id=proposal_id,
+            definition=definition,
+            editor_id=editor_id,
+        )
+        metadata["humanPatchId"] = human_patch.id
+        metadata["humanPatchDigest"] = human_patch.patch_digest
+    metadata.pop("replayApprovedDraftDigest", None)
+    metadata["status"] = "dirty_after_replay"
+    metadata["supersededReplayEvidenceId"] = metadata.get("replayEvidenceId")
+    return definition, metadata
+
+
 def workflow_view(item: Workflow) -> dict[str, Any]:
+    draft_digest = item.draft_digest
+    if draft_digest is None:
+        try:
+            draft_digest = compiler.compile(item.draft_json).digest
+        except WorkflowValidationError:
+            draft_digest = digest_json(item.draft_json)
     return {
         "id": item.id,
         "name": item.name,
         "draftRevision": item.draft_revision,
+        "draftDigest": draft_digest,
         "draftBaseVersionId": item.draft_base_version_id,
         "draftMetadata": item.draft_metadata_json,
         "definition": item.draft_json,
@@ -360,7 +445,7 @@ async def create_workflow(
     body: WorkflowCreate, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
     try:
-        compiler.compile(body.definition)
+        compiled = compiler.compile(body.definition)
     except WorkflowValidationError as exc:
         raise HTTPException(
             status_code=422,
@@ -371,6 +456,8 @@ async def create_workflow(
         name=body.name,
         draft_revision=1,
         draft_json=body.definition,
+        draft_digest=compiled.digest,
+        draft_metadata_json={"status": "manual_draft"},
     )
     session.add(item)
     await session.commit()
@@ -405,12 +492,32 @@ async def update_draft(
                 "currentRevision": item.draft_revision,
             },
         )
-    item.draft_json = body.definition
+    try:
+        compiled = compiler.compile(body.definition)
+    except WorkflowValidationError as exc:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "WORKFLOW_VALIDATION_FAILED",
+                "diagnostics": [
+                    diagnostic.model_dump() for diagnostic in exc.diagnostics
+                ],
+            },
+        ) from exc
+    current_digest = item.draft_digest or compiler.compile(item.draft_json).digest
+    if compiled.digest == current_digest:
+        item.draft_digest = current_digest
+        return workflow_view(item)
+    definition, metadata = await _mark_draft_changed(
+        session,
+        item,
+        compiled.definition.model_dump(by_alias=True, mode="json"),
+        editor_id="local-user",
+    )
+    item.draft_json = definition
+    item.draft_digest = compiler.compile(definition).digest
     item.draft_revision += 1
-    item.draft_metadata_json = {
-        **(item.draft_metadata_json or {}),
-        "status": "manual_draft",
-    }
+    item.draft_metadata_json = metadata
     await session.commit()
     await session.refresh(item)
     return workflow_view(item)
@@ -468,7 +575,9 @@ async def validate_workflow(
 
 @router.post("/workflows/{workflow_id}/publish", status_code=201)
 async def publish_workflow(
-    workflow_id: str, session: AsyncSession = Depends(get_session)
+    workflow_id: str,
+    body: PublishRequest,
+    session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     item = await session.get(Workflow, workflow_id)
     if item is None:
@@ -489,9 +598,92 @@ async def publish_workflow(
             422,
             detail={"code": "CAPABILITY_INCOMPATIBLE", "message": str(exc)},
         ) from exc
-    revision_metadata = item.draft_metadata_json or {}
+
+    async def published_response(version: WorkflowVersion) -> dict[str, Any]:
+        manifest = await session.scalar(
+            select(WorkflowCapabilityManifest).where(
+                WorkflowCapabilityManifest.workflow_version_id == version.id
+            )
+        )
+        if manifest is None:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "PUBLISH_INCOMPLETE",
+                    "message": "已发布版本缺少 Capability Manifest",
+                },
+            )
+        return {
+            "id": version.id,
+            "workflowId": version.workflow_id,
+            "version": version.version,
+            "digest": version.digest,
+            "definition": version.definition_json,
+            "workflowRef": manifest.manifest_json["workflowRef"],
+            "manifestDigest": manifest.digest,
+            "publishedFromDraftRevision": version.published_from_draft_revision,
+            "publishedFromDraftDigest": version.published_from_draft_digest,
+        }
+
+    existing = await session.scalar(
+        select(WorkflowVersion).where(
+            WorkflowVersion.workflow_id == workflow_id,
+            WorkflowVersion.published_from_draft_revision
+            == body.draft_revision,
+            WorkflowVersion.published_from_draft_digest == body.draft_digest,
+        )
+    )
+    if existing is not None:
+        return await published_response(existing)
+    if (
+        item.draft_revision != body.draft_revision
+        or compiled.digest != body.draft_digest
+    ):
+        raise HTTPException(
+            409,
+            detail={
+                "code": "DRAFT_SNAPSHOT_CONFLICT",
+                "message": "草稿已变化，发布请求不是当前审核快照",
+                "currentRevision": item.draft_revision,
+                "currentDigest": compiled.digest,
+            },
+        )
+
+    revision_metadata = dict(item.draft_metadata_json or {})
+    revision_status = revision_metadata.get("status")
+    if revision_status == "dirty_after_replay":
+        raise HTTPException(
+            409,
+            detail={
+                "code": "REPLAY_PROOF_STALE",
+                "message": "Replay 后草稿已变化，必须重新 Replay",
+            },
+        )
     expected_base_id = revision_metadata.get("baseVersionId")
-    if revision_metadata.get("status") == "pending_revision":
+    if revision_status == "pending_revision":
+        evidence_id = revision_metadata.get("replayEvidenceId")
+        evidence = (
+            await session.get(ReplayEvidence, evidence_id)
+            if isinstance(evidence_id, str)
+            else None
+        )
+        if (
+            body.replay_evidence_id != evidence_id
+            or evidence is None
+            or not evidence.passed
+            or evidence.patched_definition_digest != compiled.digest
+            or revision_metadata.get("replayApprovedDraftDigest")
+            != compiled.digest
+            or evidence.base_version_id != expected_base_id
+            or evidence.patch_digest != revision_metadata.get("patchDigest")
+        ):
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "REPLAY_PROOF_STALE",
+                    "message": "Replay proof 与当前草稿、Patch 或 base version 不一致",
+                },
+            )
         latest_version_id = await session.scalar(
             select(WorkflowVersion.id)
             .where(WorkflowVersion.workflow_id == item.id)
@@ -506,8 +698,64 @@ async def publish_workflow(
                     "message": "修订草稿的 base version 已不是当前最新版本",
                 },
             )
+
+    publishing_metadata = {
+        **revision_metadata,
+        "status": "publishing",
+        "publishingDraftRevision": body.draft_revision,
+        "publishingDraftDigest": body.draft_digest,
+    }
+    status_expression = func.json_extract(
+        Workflow.draft_metadata_json, "$.status"
+    )
+    status_clause = (
+        status_expression == revision_status
+        if revision_status is not None
+        else status_expression.is_(None)
+    )
+    claimed = await session.execute(
+        update(Workflow)
+        .where(
+            Workflow.id == workflow_id,
+            Workflow.draft_revision == body.draft_revision,
+            or_(
+                Workflow.draft_digest == body.draft_digest,
+                Workflow.draft_digest.is_(None),
+            ),
+            status_clause,
+        )
+        .values(
+            draft_digest=body.draft_digest,
+            draft_metadata_json=publishing_metadata,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != 1:
+        await session.rollback()
+        existing = await session.scalar(
+            select(WorkflowVersion).where(
+                WorkflowVersion.workflow_id == workflow_id,
+                WorkflowVersion.published_from_draft_revision
+                == body.draft_revision,
+                WorkflowVersion.published_from_draft_digest
+                == body.draft_digest,
+            )
+        )
+        if existing is not None:
+            return await published_response(existing)
+        raise HTTPException(
+            409,
+            detail={
+                "code": "PUBLISH_CONFLICT",
+                "message": "草稿已被并发修改或发布",
+            },
+        )
+
     latest = await session.scalar(
         select(func.max(WorkflowVersion.version)).where(WorkflowVersion.workflow_id == item.id)
+    )
+    lineage = dict(
+        compiled.definition.metadata.get("revisionLineage", {})
     )
     version = WorkflowVersion(
         id=str(uuid4()),
@@ -522,36 +770,62 @@ async def publish_workflow(
             "capabilityLocks": capability_locks,
             "mcpLocks": mcp_locks,
         },
+        published_from_draft_revision=body.draft_revision,
+        published_from_draft_digest=body.draft_digest,
+        revision_lineage_json=lineage,
     )
     session.add(version)
     await session.flush()
     try:
-        manifest = await build_manifest(session, item, version)
+        await build_manifest(session, item, version)
     except CatalogError as exc:
         await session.rollback()
         raise HTTPException(
             422,
             detail={"code": "CAPABILITY_MANIFEST_INVALID", "message": str(exc)},
         ) from exc
-    item.draft_base_version_id = version.id
-    item.draft_json = version.definition_json
-    item.draft_metadata_json = {
+    published_metadata = {
         **revision_metadata,
         "status": "published",
         "publishedVersionId": version.id,
         "publishedVersion": version.version,
+        "publishedFromDraftRevision": body.draft_revision,
+        "publishedFromDraftDigest": body.draft_digest,
     }
+    finalized = await session.execute(
+        update(Workflow)
+        .where(
+            Workflow.id == workflow_id,
+            Workflow.draft_revision == body.draft_revision,
+            func.json_extract(
+                Workflow.draft_metadata_json, "$.status"
+            )
+            == "publishing",
+            func.json_extract(
+                Workflow.draft_metadata_json, "$.publishingDraftDigest"
+            )
+            == body.draft_digest,
+        )
+        .values(
+            draft_base_version_id=version.id,
+            draft_json=version.definition_json,
+            draft_digest=version.digest,
+            draft_metadata_json=published_metadata,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if finalized.rowcount != 1:
+        await session.rollback()
+        raise HTTPException(
+            409,
+            detail={
+                "code": "PUBLISH_CONFLICT",
+                "message": "发布领取已失效",
+            },
+        )
     await session.commit()
     await session.refresh(version)
-    return {
-        "id": version.id,
-        "workflowId": version.workflow_id,
-        "version": version.version,
-        "digest": version.digest,
-        "definition": version.definition_json,
-        "workflowRef": manifest.manifest_json["workflowRef"],
-        "manifestDigest": manifest.digest,
-    }
+    return await published_response(version)
 
 
 @router.post("/workflows/{workflow_id}/contract-patch", status_code=200)
@@ -571,17 +845,48 @@ async def apply_workflow_contract_patch(
         raise HTTPException(404, "工作流不存在")
     try:
         patched = apply_contract_patch(workflow.draft_json, body.node_id, body.patch)
+        compiled = compiler.compile(patched)
     except ContractPatchViolation as exc:
         raise HTTPException(
             422,
             detail={"code": "CONTRACT_PATCH_REJECTED", "message": str(exc)},
         ) from exc
+    except WorkflowValidationError as exc:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "WORKFLOW_VALIDATION_FAILED",
+                "diagnostics": [
+                    diagnostic.model_dump() for diagnostic in exc.diagnostics
+                ],
+            },
+        ) from exc
+    current_digest = (
+        workflow.draft_digest or compiler.compile(workflow.draft_json).digest
+    )
+    if compiled.digest == current_digest:
+        workflow.draft_digest = current_digest
+        return {
+            "id": workflow.id,
+            "draftRevision": workflow.draft_revision,
+            "draftDigest": current_digest,
+            "definition": workflow.draft_json,
+        }
+    patched, metadata = await _mark_draft_changed(
+        session,
+        workflow,
+        compiled.definition.model_dump(by_alias=True, mode="json"),
+        editor_id="local-user",
+    )
     workflow.draft_json = patched
+    workflow.draft_digest = compiler.compile(patched).digest
     workflow.draft_revision += 1
+    workflow.draft_metadata_json = metadata
     await session.commit()
     return {
         "id": workflow.id,
         "draftRevision": workflow.draft_revision,
+        "draftDigest": workflow.draft_digest,
         "definition": patched,
     }
 
@@ -749,6 +1054,49 @@ async def propose_failure_revision(
                 "fixtureDigest": fixture_digest,
             },
         )
+    baseline_digest = digest_json(
+        {
+            "baseDefinitionDigest": version.digest,
+            "fixtureDigest": fixture_digest,
+            "baseline": {
+                key: value
+                for key, value in baseline.items()
+                if key != "replayRunId"
+            },
+        }
+    )
+    existing = await session.scalar(
+        select(RevisionProposal)
+        .where(
+            RevisionProposal.observation_id == observation.id,
+            RevisionProposal.base_version_id == version.id,
+            RevisionProposal.baseline_digest == baseline_digest,
+            RevisionProposal.fixture_digest == fixture_digest,
+            RevisionProposal.status == "proposed",
+        )
+        .order_by(RevisionProposal.created_at.desc())
+    )
+    if existing is not None:
+        proposal = WorkflowPatch.model_validate(existing.proposal_json)
+        patched = apply_workflow_patch(version.definition_json, proposal)
+        compiled = compiler.compile(patched)
+        await session.commit()
+        return {
+            "proposalId": existing.id,
+            "observationId": observation.id,
+            "baseVersionId": version.id,
+            "agentRunId": existing.agent_run_id,
+            "promptVersion": existing.prompt_version,
+            "fixtureDigest": fixture_digest,
+            "baselineDigest": baseline_digest,
+            "baseline": baseline,
+            "proposal": existing.proposal_json,
+            "proposalDigest": existing.proposal_digest,
+            "diagnostics": [
+                item.model_dump() for item in compiled.diagnostics
+            ],
+            "published": False,
+        }
     failed_node = next(
         (
             node
@@ -759,8 +1107,10 @@ async def propose_failure_revision(
         ),
         {},
     )
+    agent_run_id = f"revision-{observation.id}-{uuid4()}"
+    prompt_version = "revision-agent-v1"
     request = AgentHostRequest(
-        run_id=f"revision-{observation.id}",
+        run_id=agent_run_id,
         prompt=(
             "Revision Agent。只输出受 WorkflowPatch Schema 限制的提议，不得扩大能力锁、"
             "副作用、权限或模型；不得发布版本。\n"
@@ -796,14 +1146,33 @@ async def propose_failure_revision(
             422,
             detail={"code": "REVISION_PROPOSAL_REJECTED", "message": str(exc)},
         ) from exc
+    proposal_json = proposal.model_dump(by_alias=True)
+    proposal_digest = digest_json(proposal_json)
+    proposal_record = RevisionProposal(
+        id=str(uuid4()),
+        observation_id=observation.id,
+        base_version_id=version.id,
+        agent_run_id=agent_run_id,
+        prompt_version=prompt_version,
+        fixture_digest=fixture_digest,
+        baseline_digest=baseline_digest,
+        proposal_json=proposal_json,
+        proposal_digest=proposal_digest,
+        status="proposed",
+    )
+    session.add(proposal_record)
     await session.commit()
     return {
+        "proposalId": proposal_record.id,
         "observationId": observation.id,
         "baseVersionId": version.id,
+        "agentRunId": agent_run_id,
+        "promptVersion": prompt_version,
         "fixtureDigest": fixture_digest,
+        "baselineDigest": baseline_digest,
         "baseline": baseline,
-        "proposal": proposal.model_dump(by_alias=True),
-        "proposalDigest": digest_json(proposal.model_dump(by_alias=True)),
+        "proposal": proposal_json,
+        "proposalDigest": proposal_digest,
         "diagnostics": [
             item.model_dump() for item in compiled.diagnostics
         ],
@@ -830,77 +1199,146 @@ async def apply_version_workflow_patch(
     version = await session.get(WorkflowVersion, version_id)
     if version is None:
         raise HTTPException(404, "工作流版本不存在")
-
-    # 1) 资格：从后端 FailureObservation 计算，前端不能自报。
+    proposal_id = body.get("proposalId")
+    proposal_digest = body.get("proposalDigest")
+    proposal = (
+        await session.get(RevisionProposal, proposal_id)
+        if isinstance(proposal_id, str)
+        else None
+    )
+    if (
+        proposal is None
+        or proposal.proposal_digest != proposal_digest
+        or proposal.base_version_id != version_id
+    ):
+        raise HTTPException(
+            409,
+            detail={
+                "code": "REVISION_PROPOSAL_MISMATCH",
+                "message": "proposalId/digest 与目标版本不匹配",
+            },
+        )
+    observation = await session.get(
+        FailureObservation, proposal.observation_id
+    )
+    if observation is None or observation.workflow_version_id != version_id:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "REVISION_PROPOSAL_MISMATCH",
+                "message": "proposal 的 FailureObservation 已失效",
+            },
+        )
     source_run_id = body.get("sourceRunId")
-    fingerprint = body.get("failureFingerprint")
-    observation = None
-    if fingerprint:
-        observation = await session.scalar(
-            select(FailureObservation).where(FailureObservation.fingerprint == fingerprint)
-        )
-    elif source_run_id:
-        observation = await session.scalar(
-            select(FailureObservation)
-            .where(FailureObservation.last_run_id == source_run_id)
-            .order_by(FailureObservation.updated_at.desc())
-        )
-    if observation is None:
-        raise HTTPException(
-            422,
-            detail={
-                "code": "PATCH_NOT_ELIGIBLE",
-                "message": "缺少可归因的失败观测；补丁必须由真实可复现失败驱动",
-            },
-        )
-    if observation.workflow_version_id != version_id:
-        raise HTTPException(
-            422,
-            detail={
-                "code": "PATCH_SOURCE_MISMATCH",
-                "message": "失败观测与目标 WorkflowVersion 不一致",
-            },
-        )
-    eligibility = observation_eligibility(observation)
-
-    # 2) 应用受控补丁（扩权/敏感字段被 DSL 拒绝）。
-    patch_body = body.get("patch", body)
-    try:
-        patch = WorkflowPatch.model_validate({**patch_body, "baseVersionId": version_id})
-        patched = apply_workflow_patch(version.definition_json, patch)
-    except WorkflowPatchViolation as exc:
-        raise HTTPException(
-            422,
-            detail={"code": "WORKFLOW_PATCH_REJECTED", "message": str(exc)},
-        ) from exc
-    except Exception as exc:  # noqa: BLE001 - Pydantic 校验失败也返回 422。
-        raise HTTPException(
-            422,
-            detail={"code": "WORKFLOW_PATCH_INVALID", "message": str(exc)},
-        ) from exc
-
-    # 3) 真实 replay：用 source run 的安全输入在隔离环境跑到原失败点。
     if not source_run_id or source_run_id != observation.last_run_id:
         raise HTTPException(
-            422,
+            409,
             detail={
                 "code": "PATCH_SOURCE_MISMATCH",
-                "message": "必须使用 observation 绑定的 sourceRunId",
+                "message": "必须使用 proposal 绑定 observation 的 sourceRunId",
             },
         )
     source_run = await session.get(Run, source_run_id)
     if source_run is None or source_run.workflow_version_id != version_id:
         raise HTTPException(
-            422,
+            409,
             detail={
                 "code": "PATCH_SOURCE_MISMATCH",
                 "message": "source Run 与目标 WorkflowVersion 不一致",
             },
         )
+
+    patch_body = body.get("patch")
+    if patch_body is None:
+        patch_body = proposal.proposal_json
+    try:
+        patch = WorkflowPatch.model_validate(
+            {**patch_body, "baseVersionId": version_id}
+        )
+        patch_json = patch.model_dump(by_alias=True)
+        submitted_digest = digest_json(patch_json)
+        human_patch: HumanPatch | None = None
+        if submitted_digest != proposal.proposal_digest:
+            if body.get("humanEdit") is not True:
+                raise HTTPException(
+                    409,
+                    detail={
+                        "code": "REVISION_PROPOSAL_TAMPERED",
+                        "message": "修改 Agent proposal 必须显式声明 humanEdit",
+                    },
+                )
+            human_patch = await session.scalar(
+                select(HumanPatch).where(
+                    HumanPatch.parent_proposal_id == proposal.id,
+                    HumanPatch.patch_digest == submitted_digest,
+                )
+            )
+            if human_patch is None:
+                human_patch = HumanPatch(
+                    id=str(uuid4()),
+                    parent_proposal_id=proposal.id,
+                    editor_id=str(body.get("editorId") or "local-user"),
+                    patch_json=patch_json,
+                    patch_digest=submitted_digest,
+                )
+                session.add(human_patch)
+                await session.flush()
+        patch_digest = (
+            human_patch.patch_digest
+            if human_patch is not None
+            else proposal.proposal_digest
+        )
+        patched = apply_workflow_patch(version.definition_json, patch)
+    except HTTPException:
+        raise
+    except WorkflowPatchViolation as exc:
+        raise HTTPException(
+            422,
+            detail={"code": "WORKFLOW_PATCH_REJECTED", "message": str(exc)},
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            422,
+            detail={"code": "WORKFLOW_PATCH_INVALID", "message": str(exc)},
+        ) from exc
+
     fixtures, fixture_digest = await _load_replay_fixtures(session, source_run)
+    if fixture_digest != proposal.fixture_digest:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "PATCH_FIXTURE_MISMATCH",
+                "message": "source Run fixture set 与 proposal 不匹配",
+            },
+        )
+    evidence_id = str(uuid4())
+    lineage = {
+        "status": "active",
+        "patchOfObservationId": observation.id,
+        "proposalId": proposal.id,
+        "proposalDigest": proposal.proposal_digest,
+        "agentRunId": proposal.agent_run_id,
+        "promptVersion": proposal.prompt_version,
+        "patchDigest": patch_digest,
+        "humanPatchId": human_patch.id if human_patch is not None else None,
+        "replayEvidenceId": evidence_id,
+        "fixtureDigest": fixture_digest,
+        "baseVersionId": version_id,
+    }
+    patched["metadata"] = {
+        **patched.get("metadata", {}),
+        "revisionLineage": {
+            key: value for key, value in lineage.items() if value is not None
+        },
+    }
+    compiled = compiler.compile(patched)
+    patched_definition = compiled.definition.model_dump(
+        by_alias=True, mode="json"
+    )
+    base_digest = compiler.compile(version.definition_json).digest
     replay = await run_replay_proof(
         version.definition_json,
-        patched,
+        patched_definition,
         safe_inputs=redact(source_run.input_json) or {},
         fail_node_id=observation.node_id,
         expected_error_code=observation.error_code,
@@ -913,7 +1351,7 @@ async def apply_version_workflow_patch(
     )
     eligibility = observation_eligibility(observation)
     evidence = ReplayEvidence(
-        id=str(uuid4()),
+        id=evidence_id,
         observation_id=observation.id,
         baseline_snapshot_json=replay["baseline"],
         patched_snapshot_json=replay["patched"] or {},
@@ -922,48 +1360,30 @@ async def apply_version_workflow_patch(
         fixture_digest=fixture_digest,
         base_version_id=version_id,
         patch_of_observation_id=observation.id,
+        base_definition_digest=base_digest,
+        patch_digest=patch_digest,
+        patched_definition_digest=compiled.digest,
+        proposal_id=proposal.id,
+        human_patch_id=human_patch.id if human_patch is not None else None,
     )
     session.add(evidence)
-    if not eligibility["eligible"]:
+    if not eligibility["eligible"] or not replay["passed"]:
         await session.commit()
         raise HTTPException(
             422,
             detail={
-                "code": "PATCH_NOT_ELIGIBLE",
-                "message": eligibility["reason"],
-                **eligibility,
-                "replayEvidenceId": evidence.id,
-            },
-        )
-    if not replay["passed"]:
-        await session.commit()
-        raise HTTPException(
-            422,
-            detail={
-                "code": "REPLAY_FAILED",
-                "message": (
-                    "真实 replay 未通过（原失败点状态="
-                    f"{replay['baseline']['failedNodeStatus']}），不生成草稿"
+                "code": (
+                    "PATCH_NOT_ELIGIBLE"
+                    if not eligibility["eligible"]
+                    else "REPLAY_FAILED"
                 ),
+                "message": eligibility["reason"],
+                "replayEvidenceId": evidence.id,
                 "replay": replay,
             },
         )
 
-    # 4) replay 通过：在同一逻辑 Workflow 上 CAS 创建下一版草稿。
-    patched["metadata"] = {
-        **patched.get("metadata", {}),
-        "revisionLineage": {
-            "patchOfObservationId": observation.id,
-            "replayEvidenceId": evidence.id,
-            "fixtureDigest": fixture_digest,
-            "baseVersionId": version_id,
-        },
-    }
-    try:
-        compiled = compiler.compile(patched)
-        diagnostics = [item.model_dump() for item in compiled.diagnostics]
-    except WorkflowValidationError as exc:
-        diagnostics = [item.model_dump() for item in exc.diagnostics]
+    diagnostics = [item.model_dump() for item in compiled.diagnostics]
     workflow = await session.get(Workflow, version.workflow_id)
     if workflow is None:
         raise HTTPException(409, "WorkflowVersion 所属 Workflow 不存在")
@@ -982,9 +1402,13 @@ async def apply_version_workflow_patch(
             },
         )
     current_metadata = workflow.draft_metadata_json or {}
-    has_pending_revision = current_metadata.get("status") == "pending_revision"
+    has_pending_revision = current_metadata.get("status") in {
+        "pending_revision",
+        "dirty_after_replay",
+        "publishing",
+    }
     draft_matches_base = (
-        digest_json(workflow.draft_json) == digest_json(version.definition_json)
+        compiler.compile(workflow.draft_json).digest == version.digest
     )
     if (
         has_pending_revision
@@ -1000,14 +1424,18 @@ async def apply_version_workflow_patch(
             },
         )
     expected_revision = workflow.draft_revision
-    proposal_digest = digest_json(patch.model_dump(by_alias=True))
     draft_metadata = {
         "status": "pending_revision",
         "baseVersionId": version_id,
         "observationId": observation.id,
+        "sourceRunId": source_run_id,
         "fixtureDigest": fixture_digest,
         "replayEvidenceId": evidence.id,
-        "proposalDigest": proposal_digest,
+        "replayApprovedDraftDigest": compiled.digest,
+        "proposalId": proposal.id,
+        "proposalDigest": proposal.proposal_digest,
+        "patchDigest": patch_digest,
+        "humanPatchId": human_patch.id if human_patch is not None else None,
     }
     claimed = await session.execute(
         update(Workflow)
@@ -1021,7 +1449,8 @@ async def apply_version_workflow_patch(
         )
         .values(
             draft_revision=expected_revision + 1,
-            draft_json=patched,
+            draft_json=patched_definition,
+            draft_digest=compiled.digest,
             draft_base_version_id=version.id,
             draft_metadata_json=draft_metadata,
         )
@@ -1040,10 +1469,11 @@ async def apply_version_workflow_patch(
     return {
         "draftWorkflowId": workflow.id,
         "draftRevision": expected_revision + 1,
+        "draftDigest": compiled.digest,
         "baseVersionId": version_id,
         "expectedNextVersion": version.version + 1,
         "draftMetadata": draft_metadata,
-        "definition": patched,
+        "definition": patched_definition,
         "diagnostics": diagnostics,
         "eligibility": eligibility,
         "replay": {
@@ -1054,6 +1484,198 @@ async def apply_version_workflow_patch(
             "sideEffectsSimulated": replay["patched"]["sideEffectsSimulated"],
         },
         "publishable": not any(item["level"] == "error" for item in diagnostics),
+    }
+
+
+@router.post("/workflows/{workflow_id}/replay", status_code=201)
+async def replay_dirty_revision_draft(
+    workflow_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    workflow = await session.get(Workflow, workflow_id)
+    if workflow is None:
+        raise HTTPException(404, "工作流不存在")
+    metadata = dict(workflow.draft_metadata_json or {})
+    if metadata.get("status") != "dirty_after_replay":
+        raise HTTPException(
+            409,
+            detail={
+                "code": "DRAFT_NOT_DIRTY_AFTER_REPLAY",
+                "message": "只有 Replay 后已变化的修订草稿可以重新 Replay",
+            },
+        )
+    proposal = await session.get(RevisionProposal, metadata.get("proposalId"))
+    human_patch = await session.get(HumanPatch, metadata.get("humanPatchId"))
+    observation = await session.get(
+        FailureObservation, metadata.get("observationId")
+    )
+    base_version = await session.get(
+        WorkflowVersion, metadata.get("baseVersionId")
+    )
+    source_run = await session.get(Run, metadata.get("sourceRunId"))
+    if (
+        proposal is None
+        or human_patch is None
+        or observation is None
+        or base_version is None
+        or source_run is None
+        or proposal.observation_id != observation.id
+        or proposal.base_version_id != base_version.id
+        or source_run.workflow_version_id != base_version.id
+    ):
+        raise HTTPException(
+            409,
+            detail={
+                "code": "REPLAY_LINEAGE_CORRUPT",
+                "message": "dirty draft 的 proposal/Patch/base/source lineage 不完整",
+            },
+        )
+    latest_version_id = await session.scalar(
+        select(WorkflowVersion.id)
+        .where(WorkflowVersion.workflow_id == workflow.id)
+        .order_by(WorkflowVersion.version.desc())
+        .limit(1)
+    )
+    if latest_version_id != base_version.id:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "DRAFT_BASE_CONFLICT",
+                "message": "修订草稿的 base version 已不是当前最新版本",
+            },
+        )
+    fixtures, fixture_digest = await _load_replay_fixtures(
+        session, source_run
+    )
+    if fixture_digest != metadata.get("fixtureDigest"):
+        raise HTTPException(
+            409,
+            detail={
+                "code": "PATCH_FIXTURE_MISMATCH",
+                "message": "重新 Replay 的 fixture set 已变化",
+            },
+        )
+    evidence_id = str(uuid4())
+    draft = dict(workflow.draft_json)
+    draft["metadata"] = {
+        **draft.get("metadata", {}),
+        "revisionLineage": {
+            "status": "active",
+            "patchOfObservationId": observation.id,
+            "proposalId": proposal.id,
+            "proposalDigest": proposal.proposal_digest,
+            "agentRunId": proposal.agent_run_id,
+            "promptVersion": proposal.prompt_version,
+            "patchDigest": human_patch.patch_digest,
+            "humanPatchId": human_patch.id,
+            "replayEvidenceId": evidence_id,
+            "fixtureDigest": fixture_digest,
+            "baseVersionId": base_version.id,
+        },
+    }
+    try:
+        compiled = compiler.compile(draft)
+    except WorkflowValidationError as exc:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "WORKFLOW_VALIDATION_FAILED",
+                "diagnostics": [
+                    diagnostic.model_dump() for diagnostic in exc.diagnostics
+                ],
+            },
+        ) from exc
+    definition = compiled.definition.model_dump(by_alias=True, mode="json")
+    replay = await run_replay_proof(
+        base_version.definition_json,
+        definition,
+        safe_inputs=redact(source_run.input_json) or {},
+        fail_node_id=observation.node_id,
+        expected_error_code=observation.error_code,
+        fixtures=fixtures,
+    )
+    evidence = ReplayEvidence(
+        id=evidence_id,
+        observation_id=observation.id,
+        baseline_snapshot_json=replay["baseline"],
+        patched_snapshot_json=replay["patched"] or {},
+        diff_json=replay["diff"],
+        passed=replay["passed"],
+        fixture_digest=fixture_digest,
+        base_version_id=base_version.id,
+        patch_of_observation_id=observation.id,
+        base_definition_digest=base_version.digest,
+        patch_digest=human_patch.patch_digest,
+        patched_definition_digest=compiled.digest,
+        proposal_id=proposal.id,
+        human_patch_id=human_patch.id,
+    )
+    session.add(evidence)
+    if not replay["passed"]:
+        await session.commit()
+        raise HTTPException(
+            422,
+            detail={
+                "code": "REPLAY_FAILED",
+                "message": "当前 dirty draft 未通过 Replay",
+                "replayEvidenceId": evidence.id,
+                "replay": replay,
+            },
+        )
+    expected_revision = workflow.draft_revision
+    current_digest = (
+        workflow.draft_digest or compiler.compile(workflow.draft_json).digest
+    )
+    approved_metadata = {
+        **metadata,
+        "status": "pending_revision",
+        "replayEvidenceId": evidence.id,
+        "replayApprovedDraftDigest": compiled.digest,
+        "patchDigest": human_patch.patch_digest,
+    }
+    claimed = await session.execute(
+        update(Workflow)
+        .where(
+            Workflow.id == workflow.id,
+            Workflow.draft_revision == expected_revision,
+            or_(
+                Workflow.draft_digest == current_digest,
+                Workflow.draft_digest.is_(None),
+            ),
+            func.json_extract(
+                Workflow.draft_metadata_json, "$.status"
+            )
+            == "dirty_after_replay",
+        )
+        .values(
+            draft_revision=expected_revision + 1,
+            draft_json=definition,
+            draft_digest=compiled.digest,
+            draft_metadata_json=approved_metadata,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != 1:
+        await session.rollback()
+        raise HTTPException(
+            409,
+            detail={
+                "code": "DRAFT_REVISION_CONFLICT",
+                "message": "重新 Replay 时草稿已被并发修改",
+            },
+        )
+    await session.commit()
+    return {
+        "draftWorkflowId": workflow.id,
+        "draftRevision": expected_revision + 1,
+        "draftDigest": compiled.digest,
+        "draftMetadata": approved_metadata,
+        "definition": definition,
+        "replay": {
+            "replayEvidenceId": evidence.id,
+            "passed": True,
+        },
+        "publishable": True,
     }
 
 
@@ -1116,6 +1738,11 @@ async def apply_plan_snapshot_patch(
         fixture_digest=fixture_digest,
         base_version_id=plan_id,
         patch_of_observation_id=observation.id,
+        base_definition_digest=compiler.compile(
+            snapshot.definition_json
+        ).digest,
+        patch_digest=digest_json(patch.model_dump(by_alias=True)),
+        patched_definition_digest=compiled.digest,
     )
     session.add(evidence)
     eligibility = observation_eligibility(observation)
@@ -2011,8 +2638,12 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
         "capabilityLocks": validation.get("capabilityLocks", []),
         "mcpLocks": validation.get("mcpLocks", []),
         "lineage": source_definition.get("metadata", {}).get("lineage", {}),
-        "revisionLineage": source_definition.get("metadata", {}).get(
-            "revisionLineage", {}
+        "revisionLineage": (
+            version.revision_lineage_json
+            if version
+            else source_definition.get("metadata", {}).get(
+                "revisionLineage", {}
+            )
         ),
     }
     # 检查点/恢复证据：暴露冻结的已完成输出、剩余子图、失败事实与恢复决定，
@@ -2061,6 +2692,13 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
                     "fixtureDigest": evidence.fixture_digest,
                     "baseVersionId": evidence.base_version_id,
                     "patchOfObservationId": evidence.patch_of_observation_id,
+                    "baseDefinitionDigest": evidence.base_definition_digest,
+                    "patchDigest": evidence.patch_digest,
+                    "patchedDefinitionDigest": (
+                        evidence.patched_definition_digest
+                    ),
+                    "proposalId": evidence.proposal_id,
+                    "humanPatchId": evidence.human_patch_id,
                 }
                 for evidence in evidence_by_observation.get(item.id, [])
             ],

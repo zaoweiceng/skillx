@@ -18,14 +18,14 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
 | E2E-7d Recovery replan | Recovery → typed plan patch → new attempt | `recovery.*`、NodeRun | patch 经 Compiler 后执行；原失败 attempts 不改写 |
 | E2E-8 动态网页读取 | Playwright read → summary → 页面变化 | `browser.read.*` | 第二次运行消费新正文 |
 | E2E-8b 对话总结复用 | Conversation A Browser Agent → distill → 人工 publish → Conversation B 语义发现 → Runtime | `tool.requested/tool.result`、L0/L1、`run.*` | URL/正文变化后新对话发现首次 lineage 并成功；禁止创建 Component 后持 id 直调 |
-| E2E-9 外部失败修订 | 外部读取真实失败 → observed contract fixture → Revision Agent proposal → 受控 patch | `node.failed`、ReplayEvidence | 两个独立 Run 的契约证据达到阈值；transport/timeout 历史 error fixture 不得获得 proposal；patched replay 通过后只在原 Workflow 创建 draft |
-| E2E-9b 修订后复用 | 原 Workflow 人工发布 v2 → 原输入 + 新输入 | `run.*`、lineage | 两次均成功；v1 精确 ref 可解析，搜索仅返回 active v2，v1 历史 Run 不变 |
+| E2E-9 外部失败修订 | 外部读取真实失败 → immutable RevisionProposal/HumanPatch → ReplayEvidence → draft | `node.failed`、ReplayEvidence | 两个独立 Run 的契约证据达到阈值；真实 transport/timeout 不得获得 proposal；proof 锁定 base/patch/patched definition digest |
+| E2E-9b 修订后复用 | Replay-approved draft → 人工审核 revision/digest → publish v2 → 原输入 + 新输入 | `run.*`、lineage | publish digest 必须等于 Replay-approved digest；v1 精确 ref 可解析，搜索仅返回 active v2 |
 | E2E-10 渐进披露与组合 | search → describe → 两个 refs → PlanSnapshot | L0 → L1、`run.*` | 默认版本更新不改变已冻结 Run |
 | E2E-11 Fragment safety | describe_fragment → run/非法裁剪 | L2、Compiler diagnostics | 只读闭包可运行；绕过审批/副作用的裁剪被拒 |
 | E2E-12 固化建议 | 同 signature 多输入成功 → 接受建议 | suggestion、draft | 仅创建 draft，未经人工不发布 |
 | Scale-1 Catalog 1000 | 1000 个已发布 Manifest → search | Registry 单元/集成门禁 | top-k≤8、总字节≤24KB、L0 不含 Schema/DAG |
 | Fence-1 迟到 Recovery | A 超租约 → B 重领 → A 返回 | generation/token、两个 Recovery NodeRun | 仅 B 的决定、替代输出和终态可提交 |
-| AgentRun handoff | AgentRun 只读 ToolResult → 失败 → TaskCheckpoint → Worker 重启 → continuation | `agent.handoff.*` | claim handle 的 owner/generation/token 约束启动与终态；action ledger 在 Host 层复用已完成结果并阻止重做；源 Run 保留失败事实 |
+| AgentRun handoff | AgentRun 只读 ToolResult → 失败 → pending TaskCheckpoint → Worker 崩溃 → 新 Worker continuation | `agent.handoff.*` | 新 Worker 领取 generation+1；claim handle 约束启动与终态；Host action ledger 复用结果且不增加外部调用 |
 | AgentRun unknown | Worker 租约丢失 → awaiting_user → answer → continuation | `agent.handoff.user_answered` | 回答只能消费一次；未确认的未知副作用不得继续 |
 | Selection-5 | 五种 action → validate/execute | action 终态、diagnostics | 类型错配、未披露 ref 和超预算 fail closed |
 | Disclosure-1 | 创建 session → L0/L1/L2 → 重启读取 | disclosure call audit | refs、level、剩余预算持久且跨 session 隔离 |
@@ -49,12 +49,29 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
   `baselineReproduced=true`，或 occurrence 未达到两个独立 Run 就调用 Revision Agent。
 - WorkflowPatch 创建新的 Workflow 行，或发布修订后 v1 与 v2 同时处于
   `published`/active；旧 Fragment 仍占 active 目录。
+- publish 未携带用户审核的 `draftRevision/draftDigest`，或最终 publish digest
+  不等于 ReplayEvidence 的 `patchedDefinitionDigest` 和 draft 的
+  `replayApprovedDraftDigest`。
+- Replay 通过后 timeout、selector、outputSchema 等任意 definition 内容发生变化，
+  旧 proof 仍可发布；相同 Compiler digest 的幂等保存除外。
+- 客户端沿用 `proposalId` 提交不同 Patch 却未创建显式 HumanPatch，或发布版本 lineage
+  无法追溯 proposal/HumanPatch、ReplayEvidence 与 base version。
 - TaskCheckpoint 启动、reconcile 或 user answer 未使用
   status/digest/owner/generation/token CAS，导致迟到 owner 创建第二 continuation 或写第二终态。
 - completed-action ledger 只写在提示词中，Host 仍执行相同
   capability ref + 参数 digest + effect + idempotency key。
 - `agent.completed.outputProvenance` 引用无效 path/digest，或输出值与确定性来源不一致。
 - 测试绕过 Alembic、API 或 Worker 主路径。
+
+## 不可变修订 lineage
+
+- `RevisionProposal`：observation/base version、Agent run、prompt version、fixture/baseline、
+  proposal JSON 与 digest。
+- `HumanPatch`：parent proposal、editor、Patch JSON 与 digest。
+- `ReplayEvidence`：base definition、Patch、patched definition digest，以及 proposal 或
+  HumanPatch ID。
+- `WorkflowVersion`：`publishedFromDraftRevision/digest` 与完整 revision lineage；历史记录
+  不原地修改。
 
 ## 质量门禁
 

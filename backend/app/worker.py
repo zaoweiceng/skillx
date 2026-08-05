@@ -15,7 +15,11 @@ from app.infrastructure.database import SessionLocal, init_database
 logger = logging.getLogger("skillx.worker")
 
 
-async def run_worker(worker_id: str | None = None) -> None:
+async def run_worker(
+    worker_id: str | None = None,
+    *,
+    task_recovery_enabled: bool = True,
+) -> None:
     settings = get_settings()
     if settings.auto_create_schema:
         await init_database()
@@ -54,13 +58,15 @@ async def run_worker(worker_id: str | None = None) -> None:
         except Exception:  # noqa: BLE001 - 恢复失败记录根因后继续。
             logger.exception("recovery driver poll_once failed on worker %s", service.worker_id)
             processed_recovery = False
-        try:
-            processed_task_recovery = await task_recovery_driver.poll_once()
-        except Exception:  # noqa: BLE001 - 保留 checkpoint 供租约过期后重新领取。
-            logger.exception(
-                "task recovery driver poll_once failed on worker %s", service.worker_id
-            )
-            processed_task_recovery = False
+        processed_task_recovery = False
+        if task_recovery_enabled:
+            try:
+                processed_task_recovery = await task_recovery_driver.poll_once()
+            except Exception:  # noqa: BLE001 - 保留 checkpoint 供租约过期后重新领取。
+                logger.exception(
+                    "task recovery driver poll_once failed on worker %s",
+                    service.worker_id,
+                )
         # 周期性 reconcile（约每 60 次空闲轮询一次），限制批量，形成可观察 GC。
         ticks += 1
         if ticks % 60 == 0:
@@ -85,8 +91,14 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description="SkillX workflow worker")
     parser.add_argument("--worker-id", default=None)
+    parser.add_argument("--disable-task-recovery", action="store_true")
     args = parser.parse_args()
-    asyncio.run(run_worker(args.worker_id))
+    asyncio.run(
+        run_worker(
+            args.worker_id,
+            task_recovery_enabled=not args.disable_task_recovery,
+        )
+    )
 
 
 if __name__ == "__main__":

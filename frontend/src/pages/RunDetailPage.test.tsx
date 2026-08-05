@@ -8,6 +8,7 @@ const getRun = vi.fn()
 const approve = vi.fn()
 const reject = vi.fn()
 const applyWorkflowPatch = vi.fn()
+const proposeRevision = vi.fn()
 
 vi.mock('@/api/client', () => ({
   api: {
@@ -15,6 +16,7 @@ vi.mock('@/api/client', () => ({
     approve: (...args: unknown[]) => approve(...args),
     reject: (...args: unknown[]) => reject(...args),
     applyWorkflowPatch: (...args: unknown[]) => applyWorkflowPatch(...args),
+    proposeRevision: (...args: unknown[]) => proposeRevision(...args),
     cancelRun: vi.fn(),
   },
   eventStreamUrl: () => 'http://localhost/stream',
@@ -79,6 +81,7 @@ describe('RunDetailPage 可观测性与审批', () => {
     approve.mockReset()
     reject.mockReset()
     applyWorkflowPatch.mockReset()
+    proposeRevision.mockReset()
   })
 
   afterEach(() => cleanup())
@@ -157,6 +160,23 @@ describe('RunDetailPage 可观测性与审批', () => {
           metrics: {},
         },
       ],
+      failureObservations: [
+        {
+          id: 'observation-1',
+          nodeId: 'work',
+          errorCode: 'CONTRACT_VIOLATION',
+          classification: 'contract_drift',
+          occurrence: 2,
+          recovered: false,
+          baselineReproduced: true,
+          replayEvidence: [],
+        },
+      ],
+    })
+    proposeRevision.mockResolvedValue({
+      proposalId: 'proposal-1',
+      proposalDigest: 'sha256:proposal',
+      proposal: { nodePatches: [] },
     })
     applyWorkflowPatch.mockResolvedValue({
       draftWorkflowId: 'draft-9',
@@ -170,10 +190,8 @@ describe('RunDetailPage 可观测性与审批', () => {
     await waitFor(() =>
       expect(applyWorkflowPatch).toHaveBeenCalledWith('v1', {
         sourceRunId: baseRun.id,
-        patch: {
-          nodePatches: [{ nodeId: 'work', changes: { timeoutSeconds: 60 } }],
-          reason: '对失败节点 work 提出受控超时补丁',
-        },
+        proposalId: 'proposal-1',
+        proposalDigest: 'sha256:proposal',
       }),
     )
     await waitFor(() => expect(screen.getByText(/打开草稿审核 diff 并发布/)).toBeInTheDocument())

@@ -49,6 +49,7 @@ class Workflow(Base, TimestampMixin):
     owner_id: Mapped[str] = mapped_column(String(120), default="local-user")
     draft_revision: Mapped[int] = mapped_column(Integer, default=1)
     draft_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    draft_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
     draft_base_version_id: Mapped[str | None] = mapped_column(
         String(36), nullable=True
     )
@@ -66,6 +67,15 @@ class WorkflowVersion(Base, TimestampMixin):
     definition_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     digest: Mapped[str] = mapped_column(String(80), index=True)
     validation_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    published_from_draft_revision: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    published_from_draft_digest: Mapped[str | None] = mapped_column(
+        String(80), nullable=True
+    )
+    revision_lineage_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict
+    )
     workflow: Mapped[Workflow] = relationship(back_populates="versions")
 
 
@@ -636,6 +646,63 @@ class ReplayEvidence(Base, TimestampMixin):
     fixture_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
     base_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     patch_of_observation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    base_definition_digest: Mapped[str | None] = mapped_column(
+        String(80), nullable=True
+    )
+    patch_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    patched_definition_digest: Mapped[str | None] = mapped_column(
+        String(80), nullable=True
+    )
+    proposal_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    human_patch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+
+class RevisionProposal(Base, TimestampMixin):
+    __tablename__ = "revision_proposals"
+    __table_args__ = (
+        Index(
+            "uq_revision_proposal_content",
+            "observation_id",
+            "baseline_digest",
+            "proposal_digest",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    observation_id: Mapped[str] = mapped_column(
+        ForeignKey("failure_observations.id", ondelete="CASCADE"), index=True
+    )
+    base_version_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_versions.id", ondelete="CASCADE"), index=True
+    )
+    agent_run_id: Mapped[str] = mapped_column(String(120))
+    prompt_version: Mapped[str] = mapped_column(String(40))
+    fixture_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    baseline_digest: Mapped[str] = mapped_column(String(80))
+    proposal_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    proposal_digest: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(24), default="proposed")
+
+
+class HumanPatch(Base, TimestampMixin):
+    __tablename__ = "human_patches"
+    __table_args__ = (
+        Index(
+            "uq_human_patch_content",
+            "parent_proposal_id",
+            "patch_digest",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    parent_proposal_id: Mapped[str] = mapped_column(
+        ForeignKey("revision_proposals.id", ondelete="CASCADE"), index=True
+    )
+    editor_id: Mapped[str] = mapped_column(String(120), default="local-user")
+    patch_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    patch_digest: Mapped[str] = mapped_column(String(80))
 
 
 class ReplayFixture(Base, TimestampMixin):

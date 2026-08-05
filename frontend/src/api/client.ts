@@ -165,6 +165,11 @@ export type Run = {
       fixtureDigest?: string | null
       baseVersionId?: string | null
       patchOfObservationId?: string | null
+      baseDefinitionDigest?: string | null
+      patchDigest?: string | null
+      patchedDefinitionDigest?: string | null
+      proposalId?: string | null
+      humanPatchId?: string | null
     }>
   }>
 }
@@ -173,6 +178,11 @@ export type Workflow = {
   id: string
   name: string
   draftRevision: number
+  draftDigest: string
+  draftMetadata?: {
+    status?: string
+    replayEvidenceId?: string
+  }
   definition: WorkflowDefinition
   createdAt: string
   updatedAt: string
@@ -336,10 +346,18 @@ export const api = {
       digest?: string
       diagnostics: Array<{ level: string; code: string; path: string; message: string }>
     }>(`/workflows/${id}/validate`, { method: 'POST' }),
-  publishWorkflow: (id: string) =>
+  publishWorkflow: (
+    id: string,
+    draftRevision: number,
+    draftDigest: string,
+    replayEvidenceId?: string,
+  ) =>
     request<{ id: string; version: number; digest: string }>(
       `/workflows/${id}/publish`,
-      { method: 'POST' },
+      {
+        method: 'POST',
+        body: JSON.stringify({ draftRevision, draftDigest, replayEvidenceId }),
+      },
     ),
   applyContractPatch: (
     id: string,
@@ -353,9 +371,10 @@ export const api = {
   applyWorkflowPatch: (
     versionId: string,
     body: {
-      sourceRunId?: string
-      failureFingerprint?: string
-      patch: {
+      sourceRunId: string
+      proposalId: string
+      proposalDigest: string
+      patch?: {
         nodePatches?: Array<{ nodeId: string; changes: Record<string, unknown> }>
         addEdges?: Array<{ source: string; target: string }>
         removeEdges?: Array<{ source: string; target: string }>
@@ -374,6 +393,19 @@ export const api = {
     }>(`/workflow-versions/${versionId}/workflow-patch`, {
       method: 'POST',
       body: JSON.stringify(body),
+    }),
+  proposeRevision: (observationId: string) =>
+    request<{
+      proposalId: string
+      proposalDigest: string
+      proposal: {
+        nodePatches?: Array<{ nodeId: string; changes: Record<string, unknown> }>
+        addEdges?: Array<{ source: string; target: string }>
+        removeEdges?: Array<{ source: string; target: string }>
+        reason?: string
+      }
+    }>(`/failure-observations/${observationId}/revision-proposal`, {
+      method: 'POST',
     }),
   createComponent: (
     name: string,

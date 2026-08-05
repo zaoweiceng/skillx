@@ -24,6 +24,10 @@ class BrowserExecutionError(RuntimeError):
     pass
 
 
+class BrowserTransportError(RuntimeError):
+    pass
+
+
 class BrowserSubmitUnknownOutcome(BrowserExecutionError):
     pass
 
@@ -67,11 +71,15 @@ class PlaywrightPageSession:
         )
         self._context = await self._browser.new_context(accept_downloads=True)
         self.page = await self._context.new_page()
-        await self.page.goto(
+        response = await self.page.goto(
             self.url,
             wait_until="domcontentloaded",
             timeout=int(self.config.get("navigationTimeoutMs", 15000)),
         )
+        if response is not None and response.status >= 500:
+            raise BrowserTransportError(
+                f"Browser 导航返回 HTTP {response.status}"
+            )
         if not url_matches(self.contract.url_pattern, self.page.url):
             raise BrowserExecutionError("重定向后的最终 URL 不符合 PageContract")
         return self

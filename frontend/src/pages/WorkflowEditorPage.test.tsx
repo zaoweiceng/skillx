@@ -67,6 +67,7 @@ describe('WorkflowEditorPage 可视化编辑', () => {
       id: 'wf-1',
       name: 'greeting',
       draftRevision: 1,
+      draftDigest: 'sha256:initial',
       definition,
       createdAt: '',
       updatedAt: '',
@@ -88,6 +89,7 @@ describe('WorkflowEditorPage 可视化编辑', () => {
       id: 'wf-1',
       name: 'greeting',
       draftRevision: 2,
+      draftDigest: 'sha256:x',
       definition,
       createdAt: '',
       updatedAt: '',
@@ -100,6 +102,12 @@ describe('WorkflowEditorPage 可视化编辑', () => {
     await waitFor(() => expect(screen.getByTestId('canvas')).toBeInTheDocument())
     fireEvent.click(screen.getByRole('button', { name: /发布版本/ }))
     await waitFor(() => expect(publishWorkflow).toHaveBeenCalled())
+    expect(publishWorkflow).toHaveBeenCalledWith(
+      'wf-1',
+      2,
+      'sha256:x',
+      undefined,
+    )
     expect(createComponent).toHaveBeenCalled()
     await waitFor(() => expect(screen.getByText(/已发布不可变版本/)).toBeInTheDocument())
   })
