@@ -8,12 +8,16 @@ import pytest
 from sqlalchemy import func, select
 
 from app.api.routes import MessageCreate, _select_workflow_candidate, create_message
+from app.application.agent_run import AgentRunWorker
 from app.application.compiler import WorkflowCompiler
+from app.application.orchestrator import WorkerService
 from app.application.workflow_catalog import build_manifest, create_disclosure_session
 from app.config import get_settings
 from app.infrastructure.database import (
     Conversation,
+    ConversationRun,
     PendingSelection,
+    PlanSnapshot,
     Run,
     SessionLocal,
     Workflow,
@@ -63,7 +67,7 @@ def greeting_definition() -> dict:
                     "displayName": "生成问候",
                     "input": {"name": "${input.name}"},
                     "config": {
-                        "operation": "format",
+                        "operation": "template",
                         "template": "你好，{name}",
                     },
                 },
@@ -71,7 +75,7 @@ def greeting_definition() -> dict:
                     "id": "output",
                     "type": "output",
                     "displayName": "输出",
-                    "input": {"message": "${format.output.message}"},
+                    "input": {"message": "${format.output.text}"},
                 },
             ],
             "edges": [
@@ -170,7 +174,7 @@ async def test_ask_user_resumes_original_selection_without_research(
     ("requested", "expected", "levels"),
     [
         ("run_full", "run_full", {"L0", "L1"}),
-        ("run_fragment", "run_fragment", {"L0", "L1"}),
+        ("run_fragment", "run_fragment", {"L0", "L1", "L2"}),
         ("compose", "compose", {"L0", "L1", "L2"}),
         ("ask_user", "ask_user", {"L0", "L1"}),
         ("continue_agent", "continue_agent", {"L0"}),
@@ -194,3 +198,45 @@ async def test_selection_five_actions_come_from_progressive_agent_loop(
         )
     assert selection.action == expected
     assert {item["level"] for item in timeline} == levels
+
+    async with SessionLocal() as session:
+        snapshots_before = await session.scalar(
+            select(func.count()).select_from(PlanSnapshot)
+        )
+        response = await create_message(
+            conversation_id,
+            MessageCreate(content=f"渐进问候 [[SELECTION:{requested}]]"),
+            session,
+        )
+    assistant = response["assistant"]
+    if requested == "ask_user":
+        assert assistant["state"] == "ask_user"
+        return
+    if requested == "continue_agent":
+        assert assistant["state"] == "queued"
+        run_id = assistant["conversationRunId"]
+        assert await AgentRunWorker("selection-continuation").poll_once()
+        async with SessionLocal() as session:
+            run = await session.get(ConversationRun, run_id)
+        assert run is not None and run.status == "succeeded"
+        context = run.input_json["disclosureContext"]
+        assert context[0]["level"] == "L0"
+        assert context[0]["result"]["candidates"][0]["workflowRef"]
+        assert context[0]["resultDigest"].startswith("sha256:")
+        assert "inputSchema" not in str(context)
+        assert run.input_json["remainingBudget"]["disclosureCallsUsed"] == 1
+        return
+
+    assert assistant["state"] == "workflow_run"
+    worker = WorkerService(f"selection-{requested}")
+    for _ in range(6):
+        await worker.run_once()
+    async with SessionLocal() as session:
+        run = await session.get(Run, assistant["runId"])
+        snapshots_after = await session.scalar(
+            select(func.count()).select_from(PlanSnapshot)
+        )
+    assert run is not None and run.status == "succeeded", run.error_json if run else None
+    assert run.output_json == {"message": "你好，Selection User"}
+    expected_snapshots = 1 if requested in {"run_fragment", "compose"} else 0
+    assert snapshots_after - snapshots_before == expected_snapshots

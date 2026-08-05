@@ -1,5 +1,4 @@
 from __future__ import annotations
-import pypolaris  # pip install bytedpypolaris
 
 import json
 import re
@@ -81,7 +80,7 @@ async def consume_session_call(
     await _active_disclosure_session(session, session_id)
     if operation not in _SESSION_LIMITS:
         raise CatalogError(f"未知 disclosure operation: {operation}")
-    json_path = f"$.{pypolaris.safe_sql_escape(operation, param_type='str')}"
+    json_path = f"$.{operation}"
     consumed = await session.execute(
         update(WorkflowDisclosureSession)
         .where(
@@ -350,6 +349,23 @@ async def build_manifest(
     ).all()
     for item in previous:
         item.status = "resolvable"
+    previous_fragments = (
+        await session.scalars(
+            select(WorkflowFragmentManifest)
+            .join(
+                WorkflowVersion,
+                WorkflowVersion.id
+                == WorkflowFragmentManifest.workflow_version_id,
+            )
+            .where(
+                WorkflowVersion.workflow_id == workflow.id,
+                WorkflowFragmentManifest.status == "published",
+                WorkflowFragmentManifest.workflow_version_id != version.id,
+            )
+        )
+    ).all()
+    for item in previous_fragments:
+        item.status = "resolvable"
     definition = WorkflowDefinition.model_validate(version.definition_json)
     semantic = _semantic_metadata(definition)
     nodes = [
@@ -366,6 +382,7 @@ async def build_manifest(
     ]
     execution_class = version.validation_json.get("executionClass", "zero_llm")
     ref = workflow_ref(version)
+    lineage = definition.metadata.get("lineage", {})
     manifest = {
         "workflowRef": ref,
         "name": workflow.name,
@@ -390,6 +407,15 @@ async def build_manifest(
         "mcpLocks": version.validation_json.get("mcpLocks", []),
         "workflowVersionId": version.id,
         "workflowDigest": version.digest,
+        "lineage": {
+            key: lineage[key]
+            for key in (
+                "sourceConversationRunId",
+                "sourceTrajectoryDigest",
+                "distillationId",
+            )
+            if key in lineage
+        },
     }
     search_text = " ".join(
         [
@@ -635,7 +661,9 @@ async def resolve_fragment_manifest(
     item = await session.scalar(
         select(WorkflowFragmentManifest).where(
             WorkflowFragmentManifest.fragment_ref == ref,
-            WorkflowFragmentManifest.status.in_(["published", "private"]),
+            WorkflowFragmentManifest.status.in_(
+                ["published", "resolvable", "private"]
+            ),
         )
     )
     if item is None:

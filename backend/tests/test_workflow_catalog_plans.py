@@ -18,6 +18,7 @@ from app.application.workflow_catalog import (
     describe_workflow,
     disclose_refs,
     require_disclosed_ref,
+    resolve_fragment_manifest,
     resolve_workflow_manifest,
     search_manifests,
 )
@@ -357,8 +358,13 @@ async def test_expired_plan_rejects_new_run_but_existing_run_resumes() -> None:
 
 
 async def test_search_returns_only_active_version_but_old_ref_resolves() -> None:
-    workflow, version_one, manifest_one = await _published(name="版本目录")
+    workflow, version_one, manifest_one = await _published(
+        name="版本目录", fragment=True
+    )
     old_ref = manifest_one.manifest_json["workflowRef"]
+    old_fragment_ref = manifest_one.manifest_json["fragments"][0][
+        "fragmentRef"
+    ]
     definition = version_one.definition_json
     async with SessionLocal() as session, session.begin():
         workflow = await session.get(Workflow, workflow.id)
@@ -381,3 +387,7 @@ async def test_search_returns_only_active_version_but_old_ref_resolves() -> None
         assert old_ref not in refs
         resolved = await resolve_workflow_manifest(session, old_ref)
         assert resolved.workflow_version_id == version_one.id
+        old_fragment = await resolve_fragment_manifest(
+            session, old_fragment_ref
+        )
+        assert old_fragment.status == "resolvable"

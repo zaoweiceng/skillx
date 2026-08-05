@@ -62,6 +62,7 @@ class WorkflowSelection(BaseModel):
     missing_inputs: list[str] = Field(default_factory=list, alias="missingInputs")
     question: str | None = None
     plan: dict[str, Any] | None = None
+    compiled_plan: dict[str, Any] | None = Field(default=None, alias="compiledPlan")
     session_id: str = Field(alias="sessionId")
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
@@ -71,24 +72,24 @@ class WorkflowSelection(BaseModel):
         if self.action == "ask_user":
             if not self.question or not self.missing_inputs:
                 raise ValueError("ask_user 需要 question 和 missingInputs")
-            if len(self.refs) > 1 or self.plan is not None:
-                raise ValueError("ask_user 最多保留一个已披露 ref，且禁止 plan")
+            if self.plan is None and len(self.refs) > 1:
+                raise ValueError("非 compose ask_user 最多保留一个已披露 ref")
         elif self.action == "continue_agent":
             if not self.reason:
                 raise ValueError("continue_agent 需要 reason")
-            if self.refs or self.plan is not None:
+            if self.refs or self.plan is not None or self.compiled_plan is not None:
                 raise ValueError("continue_agent 禁止 refs/plan")
         elif self.action == "run_full":
             if len(self.refs) != 1 or not self.refs[0].startswith("workflow:"):
                 raise ValueError("run_full 需要恰好一个 workflowRef")
-            if self.plan is not None:
+            if self.plan is not None or self.compiled_plan is not None:
                 raise ValueError("run_full 禁止 plan")
         elif self.action == "run_fragment":
             if len(self.refs) != 1 or not self.refs[0].startswith(
                 ("fragment:", "fragment-snapshot:")
             ):
                 raise ValueError("run_fragment 需要恰好一个 fragmentRef")
-            if self.plan is not None:
+            if self.plan is not None or self.compiled_plan is not None:
                 raise ValueError("run_fragment 禁止 plan")
         elif self.action == "compose":
             if self.plan is None:
@@ -532,9 +533,12 @@ async def create_plan_snapshot(
     created_by_conversation_run_id: str | None = None,
     ttl_hours: int = 168,
 ) -> PlanSnapshot:
-    plan, definition, source_refs, locks, source_map = await PlanCompiler().compile(
-        session, raw_plan
-    )
+    compiled = await compile_plan(session, raw_plan)
+    plan = ExecutionPlan.model_validate(compiled["plan"])
+    definition = compiled["definition"]
+    source_refs = compiled["sourceRefs"]
+    locks = compiled["locks"]
+    source_map = compiled["sourceMap"]
     snapshot_payload = {
         "definition": definition,
         "sourceRefs": source_refs,
@@ -556,6 +560,29 @@ async def create_plan_snapshot(
     session.add(item)
     await session.flush()
     return item
+
+
+async def compile_plan(
+    session: AsyncSession,
+    raw_plan: dict[str, Any],
+) -> dict[str, Any]:
+    """Compile a plan without persisting a snapshot."""
+
+    plan, definition, source_refs, locks, source_map = await PlanCompiler().compile(
+        session, raw_plan
+    )
+    payload = {
+        "plan": plan.model_dump(by_alias=True, mode="json"),
+        "definition": definition,
+        "sourceRefs": source_refs,
+        "locks": locks,
+        "sourceMap": source_map,
+    }
+    return {
+        **payload,
+        "digest": digest_json(payload),
+        "planSignature": plan_signature(plan, source_refs),
+    }
 
 
 def verify_plan_snapshot(snapshot: PlanSnapshot, *, for_new_run: bool = True) -> None:

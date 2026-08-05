@@ -4,6 +4,7 @@ import re
 from typing import Any
 from uuid import uuid4
 
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.action_compilers import ActionCompilerRegistry, CompileContext
@@ -28,6 +29,40 @@ DIRECTIVE = re.compile(r"\[\[.*?\]\]")
 
 class DistillationError(ValueError):
     pass
+
+
+class CapabilityDescriptor(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    summary: str = Field(min_length=1, max_length=240)
+    use_when: list[str] = Field(alias="useWhen", min_length=1, max_length=8)
+    do_not_use_when: list[str] = Field(
+        alias="doNotUseWhen", min_length=1, max_length=8
+    )
+    tags: list[str] = Field(min_length=1, max_length=12)
+    examples: list[str] = Field(min_length=1, max_length=6)
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    @field_validator("use_when", "do_not_use_when", "tags", "examples")
+    @classmethod
+    def validate_items(cls, values: list[str]) -> list[str]:
+        if any(not isinstance(value, str) or not value.strip() for value in values):
+            raise ValueError("CapabilityDescriptor 数组元素必须是非空字符串")
+        if any(len(value) > 300 for value in values):
+            raise ValueError("CapabilityDescriptor 数组元素过长")
+        return values
+
+    @field_validator("name", "summary", "use_when", "do_not_use_when", "tags", "examples")
+    @classmethod
+    def reject_instance_data(cls, value: Any) -> Any:
+        encoded = str(value)
+        if re.search(
+            r"https?://|\[\[.*?\]\]|(?:api[_-]?key|token|password|secret)\s*[:=]",
+            encoded,
+            re.I,
+        ):
+            raise ValueError("CapabilityDescriptor 禁止包含 URL、Secret 或测试指令")
+        return value
 
 
 def _clean_message(prompt: str) -> str:
@@ -366,6 +401,7 @@ def _enrich_distilled_definition(
     definition: dict[str, Any],
     trajectory: dict[str, Any],
     *,
+    capability: CapabilityDescriptor,
     conversation_run_id: str,
     distillation_id: str,
     source_trajectory_digest: str,
@@ -373,7 +409,6 @@ def _enrich_distilled_definition(
 ) -> dict[str, Any]:
     """派生可发现、可拆取、可恢复且带完整来源的固化 metadata。"""
 
-    prompt = _clean_message(str(trajectory.get("prompt", ""))).strip()
     actions = list(trajectory.get("actions") or [])
     action_kinds = sorted(
         {
@@ -382,30 +417,20 @@ def _enrich_distilled_definition(
             if isinstance(action, dict)
         }
     )
-    semantic_seed = prompt or "已验证的 Agent 轨迹"
     logical_id = digest_json(
         {
             "inputSchema": definition["spec"]["inputSchema"],
             "outputSchema": definition["spec"]["outputSchema"],
             "kinds": action_kinds,
-            "summary": semantic_seed[:200],
+            "summary": capability.summary,
         }
     )
-    display_name = semantic_seed[:80]
-    if trajectory.get("name") not in {None, "", "conversation-agent-draft"}:
-        display_name = str(trajectory["name"])[:80]
+    display_name = capability.name
     definition["metadata"] = {
         **definition.get("metadata", {}),
         "name": display_name,
         "logicalWorkflowId": logical_id,
-        "capability": {
-            "name": display_name,
-            "summary": f"复用已验证轨迹完成：{semantic_seed[:240]}",
-            "useWhen": [semantic_seed[:300]],
-            "doNotUseWhen": ["输入不满足冻结 Schema 或需要扩大副作用权限"],
-            "tags": ["distilled", *action_kinds][:12],
-            "examples": [semantic_seed[:300]],
-        },
+        "capability": capability.model_dump(by_alias=True),
         "lineage": {
             "sourceConversationRunId": conversation_run_id,
             "sourceTrajectoryDigest": source_trajectory_digest,
@@ -469,8 +494,8 @@ def _enrich_distilled_definition(
         definition["metadata"]["callableFragments"] = [
             {
                 "name": "verified-task",
-                "summary": f"复用任务中的已验证动作：{semantic_seed[:160]}",
-                "useWhen": [semantic_seed[:240]],
+                "summary": capability.summary,
+                "useWhen": capability.use_when,
                 "nodeIds": [node["id"] for node in business_nodes],
             }
         ]
@@ -542,6 +567,49 @@ def _build_output_mapping(
     return {key: last_output_ref for key in properties}, diagnostics
 
 
+def _default_capability_descriptor(
+    trajectory: dict[str, Any],
+) -> CapabilityDescriptor:
+    actions = [item for item in trajectory.get("actions", []) if isinstance(item, dict)]
+    kinds = {str(item.get("kind", "")).lower() for item in actions}
+    capabilities = {str(item.get("capability", "")).lower() for item in actions}
+    if "browser" in kinds or "browser.read" in capabilities:
+        return CapabilityDescriptor(
+            name="网页内容读取与总结",
+            summary="访问网页并基于实时正文生成结构化总结",
+            useWhen=["需要读取网页当前内容并提取或总结关键信息"],
+            doNotUseWhen=["目标不是网页读取任务或请求包含未授权副作用"],
+            tags=["网页", "读取", "总结", "distilled"],
+            examples=["读取另一个同类网页并总结正文"],
+        )
+    if "read.local" in capabilities or "file" in kinds:
+        return CapabilityDescriptor(
+            name="本地文件读取与处理",
+            summary="读取受控本地文件并按冻结契约处理内容",
+            useWhen=["需要读取同类本地文件并提取或总结内容"],
+            doNotUseWhen=["文件不在授权目录或任务需要写入文件"],
+            tags=["文件", "读取", "处理", "distilled"],
+            examples=["读取另一个同类文件并返回结构化结果"],
+        )
+    if "lookup.table" in capabilities or "transform" in kinds:
+        return CapabilityDescriptor(
+            name="结构化查询与结果返回",
+            summary="根据变化的业务键执行已验证查询并返回结构化结果",
+            useWhen=["需要使用同类业务键查询冻结数据映射"],
+            doNotUseWhen=["查询语义或输出契约与已发布版本不一致"],
+            tags=["查询", "结构化", "lookup", "distilled"],
+            examples=["使用另一个业务键执行同类查询"],
+        )
+    return CapabilityDescriptor(
+        name="已验证任务复用",
+        summary="按冻结输入输出契约复用已验证的任务步骤",
+        useWhen=["新任务意图与已验证步骤及输入类别一致"],
+        doNotUseWhen=["任务需要扩大能力、网络范围、Secret 或副作用"],
+        tags=["任务复用", "distilled"],
+        examples=["使用新的同类输入执行已验证任务"],
+    )
+
+
 async def distill_conversation_run(
     session: AsyncSession,
     conversation_run: ConversationRun,
@@ -577,9 +645,20 @@ async def distill_conversation_run(
         digest_json(proposal.model_dump(by_alias=True)) if proposal else None
     )
     distillation_id = str(uuid4())
+    capability = _default_capability_descriptor(conversation_run.trajectory_json)
+    capability_source = "platform_fallback"
+    if get_settings().traex_command:
+        proposed_capability = await _request_capability_descriptor(
+            conversation_run.id,
+            conversation_run.trajectory_json,
+        )
+        if proposed_capability is not None:
+            capability = proposed_capability
+            capability_source = "distillation_agent"
     definition = _enrich_distilled_definition(
         definition,
         conversation_run.trajectory_json,
+        capability=capability,
         conversation_run_id=conversation_run.id,
         distillation_id=distillation_id,
         source_trajectory_digest=source_trajectory_digest,
@@ -609,6 +688,8 @@ async def distill_conversation_run(
         "proposalSource": proposal_source,
         "sourceTrajectoryDigest": source_trajectory_digest,
         "proposalDigest": proposal_digest,
+        "capabilityDescriptor": capability.model_dump(by_alias=True),
+        "capabilityDescriptorSource": capability_source,
         "logicalWorkflowId": definition["metadata"]["logicalWorkflowId"],
         "fragmentProposals": definition["metadata"].get("callableFragments", []),
         "recoverableNodes": [
@@ -636,6 +717,43 @@ async def distill_conversation_run(
     session.add(result)
     await session.flush()
     return result
+
+
+async def _request_capability_descriptor(
+    run_id: str,
+    trajectory: dict[str, Any],
+) -> CapabilityDescriptor | None:
+    """Ask the restricted distillation stage for instance-independent semantics."""
+
+    action_summary = [
+        {
+            "kind": action.get("kind"),
+            "capability": action.get("capability"),
+            "inputFields": sorted((action.get("arguments") or {}).keys()),
+            "outputFields": sorted((action.get("result") or {}).keys()),
+        }
+        for action in trajectory.get("actions", [])
+        if isinstance(action, dict)
+    ]
+    request = AgentHostRequest(
+        run_id=f"capability-{run_id}",
+        prompt=(
+            "你是受限 CapabilityDescriptor Agent。仅根据动作类别、能力名和 I/O 字段"
+            "描述可复用任务意图与输入类别；禁止复制 URL、Secret、测试指令或具体输入值。\n"
+            f"actions={action_summary}"
+        ),
+        output_schema=CapabilityDescriptor.model_json_schema(by_alias=True),
+        working_directory=get_settings().artifact_root / "distillation" / run_id,
+        requested_capabilities=(),
+        max_steps=1,
+        max_total_tokens=4000,
+        max_duration_seconds=60,
+    )
+    try:
+        result = await AgentHost().execute(request)
+        return CapabilityDescriptor.model_validate(result.output)
+    except (AgentHostError, ValueError):
+        return None
 
 
 async def _request_distillation_proposal(

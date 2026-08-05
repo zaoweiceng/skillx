@@ -3,14 +3,27 @@
 from __future__ import annotations
 
 import sys
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from app.api.routes import apply_version_workflow_patch, propose_failure_revision
+from app.api.routes import (
+    apply_version_workflow_patch,
+    propose_failure_revision,
+    publish_workflow,
+)
+from app.application.orchestrator import Orchestrator, WorkerService
+from app.application.workflow_catalog import (
+    resolve_workflow_manifest,
+    search_manifests,
+)
 from app.application.workflow_patch import (
     REPRODUCIBLE_THRESHOLD,
     WorkflowPatch,
@@ -25,6 +38,7 @@ from app.application.workflow_patch import (
 from app.config import get_settings
 from app.infrastructure.database import (
     FailureObservation,
+    ReplayFixture,
     Run,
     SessionLocal,
     Workflow,
@@ -273,10 +287,10 @@ async def test_patch_endpoint_rejects_when_no_observation() -> None:
     assert excinfo.value.detail["code"] == "PATCH_NOT_ELIGIBLE"
 
 
-async def test_revision_agent_only_proposes_after_baseline_reproduction(
+async def test_revision_agent_rejects_historical_transport_fixture(
     revision_agent: None,
 ) -> None:
-    version_id, run_id = await _seed_version_with_failure(
+    _version_id, run_id = await _seed_version_with_failure(
         error_code="DEPENDENCY_UNAVAILABLE",
         occurrence=1,
         real_failure=True,
@@ -287,11 +301,10 @@ async def test_revision_agent_only_proposes_after_baseline_reproduction(
                 FailureObservation.last_run_id == run_id
             )
         )
-        result = await propose_failure_revision(observation.id, session)
-    assert result["baseVersionId"] == version_id
-    assert result["baseline"]["failedNodeErrorCode"] == "DEPENDENCY_UNAVAILABLE"
-    assert result["proposal"]["kind"] == "WorkflowPatch"
-    assert result["published"] is False
+        with pytest.raises(HTTPException) as excinfo:
+            await propose_failure_revision(observation.id, session)
+    assert excinfo.value.detail["code"] == "REVISION_NOT_ELIGIBLE"
+    assert "transport/timeout" in excinfo.value.detail["message"]
 
 
 async def test_patch_endpoint_rejects_transient_single_occurrence() -> None:
@@ -315,35 +328,232 @@ async def test_patch_endpoint_rejects_transient_single_occurrence() -> None:
     assert excinfo.value.detail["code"] == "PATCH_NOT_ELIGIBLE"
 
 
-async def test_patch_endpoint_creates_draft_after_real_replay() -> None:
-    # 可复现的确定性失败 + 真实 replay 通过 → 创建 draft，旧版本不变。
+async def test_patch_endpoint_rejects_replayed_transport_error() -> None:
+    # 即使同一历史 Run 被重复登记，transport fixture 也只能用于诊断。
     version_id, run_id = await _seed_version_with_failure(
         error_code="DEPENDENCY_UNAVAILABLE",
         occurrence=REPRODUCIBLE_THRESHOLD,
         real_failure=True,
     )
     async with SessionLocal() as session:
-        original = (await session.get(WorkflowVersion, version_id)).definition_json
-        result = await apply_version_workflow_patch(
+        with pytest.raises(HTTPException) as excinfo:
+            await apply_version_workflow_patch(
+                version_id,
+                {
+                    "sourceRunId": run_id,
+                    "patch": {
+                        "nodePatches": [
+                            {
+                                "nodeId": "work",
+                                "changes": {
+                                    "config": {"operation": "passthrough"}
+                                },
+                            }
+                        ]
+                    },
+                },
+                session,
+            )
+    assert excinfo.value.detail["code"] == "PATCH_NOT_ELIGIBLE"
+    assert excinfo.value.detail["evidenceKind"] == "transport_error"
+
+
+class _ArticleHandler(BaseHTTPRequestHandler):
+    content = "external-A"
+
+    def do_GET(self) -> None:
+        if not self.path.startswith("/article"):
+            self.send_error(404)
+            return
+        encoded = f"<main id='main'>{self.content}</main>".encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, *_: Any) -> None:
+        return
+
+
+@pytest.fixture
+def article_site() -> Iterator[str]:
+    _ArticleHandler.content = "external-A"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ArticleHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/article"
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()
+
+
+def _browser_contract_failure_definition(url: str) -> dict:
+    return {
+        "apiVersion": "workflow.platform/v1",
+        "kind": "Workflow",
+        "metadata": {"name": "external-browser-contract"},
+        "spec": {
+            "inputSchema": {
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                    "url": {"type": "string"},
+                },
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["content"],
+                "properties": {"content": {}},
+            },
+            "nodes": [
+                {"id": "input", "type": "input", "displayName": "输入"},
+                {
+                    "id": "read",
+                    "type": "browser",
+                    "displayName": "外部读取",
+                    "input": {"url": "${input.url}"},
+                    "config": {
+                        "action": "read",
+                        "runtime": "playwright",
+                        "pageContract": {
+                            "contractVersion": "1",
+                            "urlPattern": f"{url}*",
+                            "bodySelector": "#main",
+                            "fields": {},
+                            "outputSchema": {
+                                "type": "object",
+                                "required": ["content"],
+                                "properties": {"content": {"type": "integer"}},
+                            },
+                        },
+                    },
+                },
+                {
+                    "id": "output",
+                    "type": "output",
+                    "displayName": "输出",
+                    "input": {"content": "${read.output.content}"},
+                },
+            ],
+            "edges": [
+                {"source": "input", "target": "read"},
+                {"source": "read", "target": "output"},
+            ],
+        },
+    }
+
+
+async def test_external_browser_failure_fixture_patch_publish_and_reuse(
+    article_site: str,
+    revision_agent: None,
+) -> None:
+    definition = _browser_contract_failure_definition(article_site)
+    original_input = {
+        "url": f"{article_site}?version=a",
+    }
+    async with SessionLocal() as session, session.begin():
+        workflow = Workflow(
+            id=str(uuid4()),
+            name="external-browser-contract",
+            draft_revision=1,
+            draft_json=definition,
+        )
+        session.add(workflow)
+        await session.flush()
+        workflow_id = workflow.id
+    async with SessionLocal() as session:
+        published_v1 = await publish_workflow(workflow_id, session)
+    version_id = published_v1["id"]
+    v1_ref = published_v1["workflowRef"]
+    worker = WorkerService("external-failure-worker")
+    source_run_ids = []
+    for _ in range(REPRODUCIBLE_THRESHOLD):
+        async with SessionLocal() as session, session.begin():
+            version = await session.get(WorkflowVersion, version_id)
+            run = await Orchestrator().create_run(
+                session, version, original_input
+            )
+            source_run_ids.append(run.id)
+        for _ in range(5):
+            await worker.run_once()
+    source_run_id = source_run_ids[-1]
+    async with SessionLocal() as session:
+        source_run = await session.get(Run, source_run_id)
+        fixture = await session.scalar(
+            select(ReplayFixture).where(ReplayFixture.run_id == source_run_id)
+        )
+    assert source_run.status == "failed"
+    assert source_run.error_json["code"] == "CONTRACT_VIOLATION"
+    assert fixture is not None
+    assert fixture.capture_policy.startswith("failure_")
+    assert fixture.evidence_kind == "observed_contract_output"
+    async with SessionLocal() as session:
+        observation = await session.scalar(
+            select(FailureObservation).where(
+                FailureObservation.last_run_id == source_run_id
+            )
+        )
+        proposal = await propose_failure_revision(observation.id, session)
+    assert proposal["proposal"]["nodePatches"][0]["nodeId"] == "read"
+    assert proposal["proposal"]["nodePatches"][0]["changes"]["config"][
+        "pageContract"
+    ]["outputSchema"]["properties"]["content"]["type"] == "string"
+    async with SessionLocal() as session:
+        proof = await apply_version_workflow_patch(
             version_id,
             {
-                "sourceRunId": run_id,
-                "patch": {
-                    "nodePatches": [
-                        {
-                            "nodeId": "work",
-                            "changes": {"config": {"operation": "passthrough"}},
-                        }
-                    ]
-                },
+                "sourceRunId": source_run_id,
+                "patch": proposal["proposal"],
             },
             session,
         )
-    assert result["draftWorkflowId"]
-    assert result["replay"]["passed"] is True
-    assert result["eligibility"]["eligible"] is True
+    assert proof["replay"]["baselineReproduced"] is True
+    assert proof["replay"]["passed"] is True
+    assert proof["draftWorkflowId"] == workflow_id
+    assert proof["expectedNextVersion"] == 2
+    assert proof["draftMetadata"]["proposalDigest"] == proposal[
+        "proposalDigest"
+    ]
     async with SessionLocal() as session:
-        version = await session.get(WorkflowVersion, version_id)
-        assert version.definition_json == original
-        work = next(n for n in version.definition_json["spec"]["nodes"] if n["id"] == "work")
-        assert work["config"]["operation"] == "fail_dependency"
+        with pytest.raises(HTTPException) as conflict:
+            await apply_version_workflow_patch(
+                version_id,
+                {
+                    "sourceRunId": source_run_id,
+                    "patch": proposal["proposal"],
+                },
+                session,
+            )
+    assert conflict.value.status_code == 409
+    async with SessionLocal() as session:
+        published = await publish_workflow(proof["draftWorkflowId"], session)
+    assert published["workflowId"] == workflow_id
+    assert published["version"] == 2
+    async with SessionLocal() as session:
+        cards = await search_manifests(
+            session, "external-browser-contract"
+        )
+        old_manifest = await resolve_workflow_manifest(session, v1_ref)
+    assert [item["workflowRef"] for item in cards] == [
+        published["workflowRef"]
+    ]
+    assert old_manifest.status == "resolvable"
+
+    for suffix in ("a", "b"):
+        _ArticleHandler.content = f"external-{suffix.upper()}"
+        run_input = {
+            "url": f"{article_site}?version={suffix}",
+        }
+        async with SessionLocal() as session, session.begin():
+            version = await session.get(WorkflowVersion, published["id"])
+            run = await Orchestrator().create_run(session, version, run_input)
+            run_id = run.id
+        for _ in range(5):
+            await worker.run_once()
+        async with SessionLocal() as session:
+            completed = await session.get(Run, run_id)
+        assert completed.status == "succeeded"
+        assert completed.output_json == {"content": f"external-{suffix.upper()}"}

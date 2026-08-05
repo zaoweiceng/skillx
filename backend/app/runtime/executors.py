@@ -736,6 +736,7 @@ class BrowserContractExecutor:
             if errors:
                 return NodeResult(
                     status="failed",
+                    output=result,
                     artifacts=artifacts,
                     error=ExecutionError(
                         code="CONTRACT_VIOLATION",

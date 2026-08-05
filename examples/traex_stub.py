@@ -23,6 +23,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 def emit(event: dict[str, Any]) -> None:
@@ -43,6 +44,39 @@ def read_tool_result(call_id: str) -> dict[str, Any]:
     ):
         raise RuntimeError("Host ToolResult 协议不匹配")
     return payload
+
+
+def deterministic_output_provenance(
+    field: str,
+    tool_result: dict[str, Any],
+    path: str,
+) -> dict[str, Any]:
+    return {
+        field: {
+            "mode": "deterministic",
+            "callId": tool_result["callId"],
+            "path": path,
+            "evidenceDigest": tool_result["evidenceDigest"],
+        }
+    }
+
+
+def generative_output_provenance(
+    output: dict[str, Any],
+    tool_results: list[dict[str, Any]],
+    prompt_version: str,
+) -> dict[str, Any]:
+    source_call_ids = [item["callId"] for item in tool_results]
+    evidence_digests = [item["evidenceDigest"] for item in tool_results]
+    return {
+        field: {
+            "mode": "generative",
+            "sourceCallIds": source_call_ids,
+            "evidenceDigests": evidence_digests,
+            "promptVersion": prompt_version,
+        }
+        for field in output
+    }
 
 
 def _directive(prompt: str, key: str, default: str) -> str:
@@ -103,22 +137,26 @@ def main() -> int:
         search_result = read_tool_result("workflow-search")
         cards = (search_result.get("output") or {}).get("items", [])
         if not cards or requested_action == "continue_agent":
+            output = {
+                "action": "continue_agent",
+                "reason": "目录没有适合当前任务的能力",
+                "refs": [],
+                "bindings": {},
+                "missingInputs": [],
+            }
             emit(
                 {
                     "type": "agent.completed",
                     "payload": {
                         "steps": 1,
                         "totalTokens": 20,
-                        "output": {
-                            "action": "continue_agent",
-                            "reason": "目录没有适合当前任务的能力",
-                            "refs": [],
-                            "bindings": {},
-                            "missingInputs": [],
-                        },
+                        "output": output,
                         "provenance": [
                             {"callId": "workflow-search", "path": "output.items"}
                         ],
+                        "outputProvenance": generative_output_provenance(
+                            output, [search_result], "workflow-selection-v1"
+                        ),
                     },
                 }
             )
@@ -137,14 +175,29 @@ def main() -> int:
         describe_result = read_tool_result("workflow-describe")
         workflow = (describe_result.get("output") or {}).get("workflow", {})
         required = workflow.get("inputSchema", {}).get("required", [])
+        url_match = re.search(r"https?://[^\s]+", user_text)
+        lookup_match = re.search(r"\bq\d+\b", user_text)
+        concrete_input = (
+            url_match.group(0)
+            if url_match
+            else lookup_match.group(0)
+            if lookup_match
+            else None
+        )
+        bindings = (
+            {required[0]: concrete_input}
+            if len(required) == 1 and concrete_input is not None
+            else {}
+        )
         action = requested_action
         if action == "auto":
-            action = "ask_user" if required else "run_full"
+            action = "ask_user" if required and not bindings else "run_full"
         output: dict[str, Any]
         provenance = [
             {"callId": "workflow-search", "path": "output.items"},
             {"callId": "workflow-describe", "path": "output.workflow"},
         ]
+        provenance_results = [search_result, describe_result]
         if action == "ask_user":
             output = {
                 "action": "ask_user",
@@ -165,11 +218,37 @@ def main() -> int:
                     "missingInputs": [],
                 }
             else:
+                fragment_ref = fragments[0]["fragmentRef"]
+                emit(
+                    {
+                        "type": "tool.requested",
+                        "payload": {
+                            "callId": "workflow-describe-fragment",
+                            "capabilityRef": "workflow.describe_fragment",
+                            "arguments": {"ref": fragment_ref},
+                        },
+                    }
+                )
+                fragment_result = read_tool_result("workflow-describe-fragment")
+                fragment = (fragment_result.get("output") or {}).get("fragment", {})
+                fragment_required = fragment.get("boundaryInputSchema", {}).get(
+                    "required", []
+                )
+                provenance.append(
+                    {
+                        "callId": "workflow-describe-fragment",
+                        "path": "output.fragment",
+                    }
+                )
+                provenance_results.append(fragment_result)
                 output = {
                     "action": "run_fragment",
                     "reason": "任务只需要已披露局部能力",
-                    "refs": [fragments[0]["fragmentRef"]],
-                    "bindings": {},
+                    "refs": [fragment_ref],
+                    "bindings": {
+                        field: concrete_input or "Selection User"
+                        for field in fragment_required
+                    },
                     "missingInputs": [],
                 }
         elif action == "compose":
@@ -209,12 +288,16 @@ def main() -> int:
                 {"callId": "workflow-compile", "path": "output.diagnostics"}
             )
             compiled = compile_result.get("output") or {}
+            provenance_results.append(compile_result)
             output = (
                 {
                     "action": "compose",
                     "reason": "Plan 已由 Compiler 冻结并通过校验",
                     "refs": [workflow_ref],
-                    "bindings": {},
+                    "bindings": {
+                        field: concrete_input or "Selection User"
+                        for field in required
+                    },
                     "missingInputs": [],
                     "plan": plan,
                 }
@@ -232,7 +315,10 @@ def main() -> int:
                 "action": "run_full",
                 "reason": "L1 契约满足任务需要",
                 "refs": [workflow_ref],
-                "bindings": {},
+                "bindings": {
+                    field: concrete_input or "Selection User"
+                    for field in required
+                },
                 "missingInputs": [],
             }
         emit(
@@ -249,6 +335,9 @@ def main() -> int:
                     "totalTokens": 30,
                     "output": output,
                     "provenance": provenance,
+                    "outputProvenance": generative_output_provenance(
+                        output, provenance_results, "workflow-selection-v1"
+                    ),
                 },
             }
         )
@@ -278,6 +367,50 @@ def main() -> int:
                         "missingInputs": [],
                     },
                 },
+            }
+        )
+        return 0
+
+    if "CapabilityDescriptor Agent" in args.prompt:
+        lowered = args.prompt.lower()
+        if "browser.read" in lowered or "'kind': 'browser'" in lowered:
+            output = {
+                "name": "网页内容读取与总结",
+                "summary": "访问网页并基于实时正文生成结构化总结",
+                "useWhen": ["需要读取网页当前内容并提取或总结关键信息"],
+                "doNotUseWhen": ["目标不是网页读取任务或请求包含未授权副作用"],
+                "tags": ["网页", "读取", "总结", "distilled"],
+                "examples": ["读取另一个同类网页并总结正文"],
+            }
+        elif "read.local" in lowered or "'kind': 'file'" in lowered:
+            output = {
+                "name": "本地文件读取与处理",
+                "summary": "读取受控本地文件并按冻结契约处理内容",
+                "useWhen": ["需要读取同类本地文件并提取或总结内容"],
+                "doNotUseWhen": ["文件不在授权目录或任务需要写入文件"],
+                "tags": ["文件", "读取", "处理", "distilled"],
+                "examples": ["读取另一个同类文件并返回结构化结果"],
+            }
+        else:
+            output = {
+                "name": "结构化查询与结果返回",
+                "summary": "根据变化的业务键执行已验证查询并返回结构化结果",
+                "useWhen": ["需要使用同类业务键查询冻结数据映射"],
+                "doNotUseWhen": ["查询语义或输出契约与已发布版本不一致"],
+                "tags": ["查询", "结构化", "lookup", "distilled"],
+                "examples": ["使用另一个业务键执行同类查询"],
+            }
+        emit({"type": "agent.plan", "payload": {"summary": "生成稳定能力描述"}})
+        emit(
+            {
+                "type": "agent.step.completed",
+                "payload": {"step": 1, "inputTokens": 10, "outputTokens": 8},
+            }
+        )
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {"steps": 1, "totalTokens": 18, "output": output},
             }
         )
         return 0
@@ -325,6 +458,27 @@ def main() -> int:
     if "Revision Agent" in args.prompt:
         version_match = re.search(r"baseVersionId=([^\s]+)", args.prompt)
         node_match = re.search(r"failedNodeId=([^\s]+)", args.prompt)
+        failed_config: dict[str, Any] = {}
+        config_match = re.search(r"failedNodeConfig=(\{.*\})", args.prompt)
+        if config_match:
+            try:
+                failed_config = json.loads(config_match.group(1))
+            except json.JSONDecodeError:
+                failed_config = {}
+        if isinstance(failed_config.get("pageContract"), dict):
+            changes = {
+                "config": {
+                    "pageContract": {
+                        "outputSchema": {
+                            "type": "object",
+                            "required": ["content"],
+                            "properties": {"content": {"type": "string"}},
+                        }
+                    }
+                }
+            }
+        else:
+            changes = {"config": {"operation": "passthrough"}}
         emit({"type": "agent.plan", "payload": {"summary": "生成受控修订提议"}})
         emit(
             {
@@ -348,9 +502,7 @@ def main() -> int:
                                 "nodeId": (
                                     node_match.group(1) if node_match else "unknown"
                                 ),
-                                "changes": {
-                                    "config": {"operation": "passthrough"}
-                                },
+                                "changes": changes,
                             }
                         ],
                         "addEdges": [],
@@ -420,6 +572,70 @@ def main() -> int:
         )
         return 0
 
+    if "AgentRun Recovery Agent" in args.prompt:
+        checkpoint: dict[str, Any] = {}
+        original_task = ""
+        if "checkpoint=" in args.prompt:
+            try:
+                checkpoint = json.loads(
+                    args.prompt.split("checkpoint=", 1)[1].split(
+                        "\noriginalTask=", 1
+                    )[0]
+                )
+                original_task = args.prompt.split(
+                    "\noriginalTask=", 1
+                )[1]
+            except json.JSONDecodeError:
+                checkpoint = {}
+        completed = checkpoint.get("completed", [])
+        latest = completed[-1].get("output", {}) if completed else {}
+        provenance_result: dict[str, Any] | None = None
+        if "[[RECOVERY_REPEAT]]" in original_task:
+            emit(
+                {
+                    "type": "tool.requested",
+                    "payload": {
+                        "callId": "recovery-repeat",
+                        "capabilityRef": "lookup.table",
+                        "arguments": {
+                            "key": _clean_message(original_task)
+                        },
+                    },
+                }
+            )
+            provenance_result = read_tool_result("recovery-repeat")
+            latest = provenance_result.get("output", {})
+        reply_value = latest.get("value", latest.get("content", "恢复完成"))
+        emit({"type": "agent.plan", "payload": {"summary": "从 checkpoint 剩余步骤继续"}})
+        emit(
+            {
+                "type": "agent.step.completed",
+                "payload": {"step": 1, "inputTokens": 8, "outputTokens": 4},
+            }
+        )
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {
+                    "steps": 1,
+                    "totalTokens": 12,
+                    "output": {"reply": reply_value},
+                    **(
+                        {
+                            "outputProvenance": deterministic_output_provenance(
+                                "reply",
+                                provenance_result,
+                                "output.value",
+                            )
+                        }
+                        if provenance_result is not None
+                        else {}
+                    ),
+                },
+            }
+        )
+        return 0
+
     if mode == "hang":
         # 模拟长时间无进展，交给 Host 超时/取消。
         time.sleep(30)
@@ -427,7 +643,11 @@ def main() -> int:
 
     emit({"type": "agent.plan", "payload": {"summary": "解析输入并调用允许的工具", "steps": 2}})
 
-    if mode == "deterministic":
+    if mode in {
+        "deterministic",
+        "deterministic_bad_output",
+        "deterministic_fail_after_tool",
+    }:
         # Agent 只提交 key；整表、选值与固化 evidence 均由 Host Adapter 返回。
         key = _clean_message(args.prompt)
         tool_name = allowed[0] if allowed else "lookup.table"
@@ -458,6 +678,8 @@ def main() -> int:
         )
         tool_result = read_tool_result("call-1")
         output = tool_result.get("output") or {}
+        if mode == "deterministic_fail_after_tool":
+            return 0
         emit(
             {
                 "type": "agent.step.completed",
@@ -470,8 +692,17 @@ def main() -> int:
                 "payload": {
                     "steps": 1,
                     "totalTokens": 16,
-                    "output": {"reply": output.get("value", "未知季度")},
+                    "output": {
+                        "reply": (
+                            "fixture-constant"
+                            if mode == "deterministic_bad_output"
+                            else output.get("value", "未知季度")
+                        )
+                    },
                     "provenance": [{"callId": "call-1", "path": "output.value"}],
+                    "outputProvenance": deterministic_output_provenance(
+                        "reply", tool_result, "output.value"
+                    ),
                 },
             }
         )
@@ -479,11 +710,12 @@ def main() -> int:
 
     if mode == "browser_summary":
         url = _clean_message(args.prompt)
+        parsed_url = urlsplit(url)
         browser_capability = "browser.read"
         summary_capability = "summarize.text"
         page_contract = {
             "contractVersion": "1",
-            "urlPattern": url,
+            "urlPattern": f"{parsed_url.scheme}://{parsed_url.netloc}/*",
             "bodySelector": "#main",
             "fields": {},
         }
@@ -586,6 +818,9 @@ def main() -> int:
                     "provenance": [
                         {"callId": "call-browser", "path": "output.content"}
                     ],
+                    "outputProvenance": deterministic_output_provenance(
+                        "reply", tool_result, "output.content"
+                    ),
                 },
             }
         )
@@ -646,6 +881,15 @@ def main() -> int:
                             ),
                         }
                     ],
+                    **(
+                        {
+                            "outputProvenance": deterministic_output_provenance(
+                                "reply", tool_result, "output.content"
+                            )
+                        }
+                        if tool_result["status"] == "succeeded"
+                        else {}
+                    ),
                 },
             }
         )

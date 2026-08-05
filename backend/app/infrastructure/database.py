@@ -49,6 +49,10 @@ class Workflow(Base, TimestampMixin):
     owner_id: Mapped[str] = mapped_column(String(120), default="local-user")
     draft_revision: Mapped[int] = mapped_column(Integer, default=1)
     draft_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    draft_base_version_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    draft_metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     versions: Mapped[list[WorkflowVersion]] = relationship(back_populates="workflow")
 
 
@@ -308,6 +312,13 @@ class Artifact(Base, TimestampMixin):
             "(run_id IS NOT NULL) != (conversation_run_id IS NOT NULL)",
             name="ck_artifact_source",
         ),
+        Index(
+            "uq_conversation_artifact_name",
+            "conversation_run_id",
+            "kind",
+            "name",
+            unique=True,
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -511,6 +522,13 @@ class FailureObservation(Base, TimestampMixin):
     occurrence: Mapped[int] = mapped_column(Integer, default=1)
     recovered: Mapped[bool] = mapped_column(default=False)
     baseline_reproduced: Mapped[bool] = mapped_column(default=False)
+    evidence_kind: Mapped[str] = mapped_column(
+        String(40), default="unsupported"
+    )
+    reproduction_policy_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict
+    )
+    evidence_ids_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     last_run_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     last_checkpoint_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     locks_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
@@ -639,6 +657,9 @@ class ReplayFixture(Base, TimestampMixin):
     input_digest: Mapped[str] = mapped_column(String(80))
     output_digest: Mapped[str] = mapped_column(String(80))
     capture_policy: Mapped[str] = mapped_column(String(40))
+    evidence_kind: Mapped[str] = mapped_column(
+        String(40), default="unsupported"
+    )
 
 
 settings = get_settings()

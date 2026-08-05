@@ -10,7 +10,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
@@ -20,6 +20,7 @@ from app.application.agent_run import (
     request_cancellation,
     summarize_run,
 )
+from app.application.agent_run import _append_event as append_agent_event
 from app.application.capabilities import (
     CapabilityResolutionError,
     register_skillx,
@@ -30,7 +31,6 @@ from app.application.conversation import (
     ComponentCandidate,
     candidate_message,
     candidate_snapshot_digest,
-    match_component,
 )
 from app.application.distillation import (
     DistillationError,
@@ -50,6 +50,7 @@ from app.application.orchestrator import Orchestrator, append_event
 from app.application.plans import (
     PlanCompileError,
     WorkflowSelection,
+    compile_plan,
     create_plan_snapshot,
     expire_plan_snapshot,
     verify_plan_snapshot,
@@ -78,6 +79,8 @@ from app.application.workflow_catalog import (
     search_manifests,
 )
 from app.application.workflow_patch import (
+    PATCHABLE_EVIDENCE_KINDS,
+    TRANSPORT_EVIDENCE_KINDS,
     WorkflowPatch,
     WorkflowPatchViolation,
     apply_workflow_patch,
@@ -107,6 +110,7 @@ from app.infrastructure.database import (
     Run,
     RunEvent,
     SecretReference,
+    TaskCheckpoint,
     Workflow,
     WorkflowCapabilityManifest,
     WorkflowFragmentManifest,
@@ -116,7 +120,6 @@ from app.infrastructure.database import (
 )
 from app.infrastructure.migrations import alembic_head_revision
 from app.runtime.contract_patch import ContractPatchViolation, apply_contract_patch
-from app.runtime.models import OpenAICompatibleAdapter
 
 router = APIRouter()
 compiler = WorkflowCompiler()
@@ -151,6 +154,11 @@ class Decision(BaseModel):
 class RecoveryAnswer(BaseModel):
     snapshot_digest: str = Field(alias="snapshotDigest")
     answer: Any
+
+
+class TaskCheckpointAnswer(BaseModel):
+    snapshot_digest: str = Field(alias="snapshotDigest")
+    answer: dict[str, Any]
 
 
 class CapabilityCreate(BaseModel):
@@ -261,6 +269,8 @@ def workflow_view(item: Workflow) -> dict[str, Any]:
         "id": item.id,
         "name": item.name,
         "draftRevision": item.draft_revision,
+        "draftBaseVersionId": item.draft_base_version_id,
+        "draftMetadata": item.draft_metadata_json,
         "definition": item.draft_json,
         "createdAt": item.created_at,
         "updatedAt": item.updated_at,
@@ -397,6 +407,10 @@ async def update_draft(
         )
     item.draft_json = body.definition
     item.draft_revision += 1
+    item.draft_metadata_json = {
+        **(item.draft_metadata_json or {}),
+        "status": "manual_draft",
+    }
     await session.commit()
     await session.refresh(item)
     return workflow_view(item)
@@ -475,6 +489,23 @@ async def publish_workflow(
             422,
             detail={"code": "CAPABILITY_INCOMPATIBLE", "message": str(exc)},
         ) from exc
+    revision_metadata = item.draft_metadata_json or {}
+    expected_base_id = revision_metadata.get("baseVersionId")
+    if revision_metadata.get("status") == "pending_revision":
+        latest_version_id = await session.scalar(
+            select(WorkflowVersion.id)
+            .where(WorkflowVersion.workflow_id == item.id)
+            .order_by(WorkflowVersion.version.desc())
+            .limit(1)
+        )
+        if latest_version_id != expected_base_id:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "DRAFT_BASE_CONFLICT",
+                    "message": "修订草稿的 base version 已不是当前最新版本",
+                },
+            )
     latest = await session.scalar(
         select(func.max(WorkflowVersion.version)).where(WorkflowVersion.workflow_id == item.id)
     )
@@ -502,6 +533,14 @@ async def publish_workflow(
             422,
             detail={"code": "CAPABILITY_MANIFEST_INVALID", "message": str(exc)},
         ) from exc
+    item.draft_base_version_id = version.id
+    item.draft_json = version.definition_json
+    item.draft_metadata_json = {
+        **revision_metadata,
+        "status": "published",
+        "publishedVersionId": version.id,
+        "publishedVersion": version.version,
+    }
     await session.commit()
     await session.refresh(version)
     return {
@@ -550,6 +589,26 @@ async def apply_workflow_contract_patch(
 async def _load_replay_fixtures(
     session: AsyncSession, source_run: Run
 ) -> tuple[dict[str, dict[str, Any]], str | None]:
+    if source_run.workflow_version_id is not None:
+        execution_source = await session.get(
+            WorkflowVersion, source_run.workflow_version_id
+        )
+    else:
+        execution_source = await session.get(PlanSnapshot, source_run.plan_snapshot_id)
+    if execution_source is None:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "REPLAY_EVIDENCE_CORRUPT",
+                "message": "Replay 执行源不存在",
+            },
+        )
+    definition = execution_source.definition_json
+    nodes = {
+        str(node.get("id")): node
+        for node in definition.get("spec", {}).get("nodes", [])
+        if isinstance(node, dict)
+    }
     rows = (
         await session.execute(
             select(ReplayFixture, Artifact)
@@ -577,22 +636,66 @@ async def _load_replay_fixtures(
                 },
             )
         payload = json.loads(content)
-        output = payload.get("output")
-        if not isinstance(output, dict) or digest_json(output) != fixture.output_digest:
+        node = nodes.get(fixture.node_id)
+        node_run = await session.get(NodeRun, fixture.node_run_id)
+        expected_source_digest = (
+            digest_json(
+                {
+                    "type": node.get("type"),
+                    "config": node.get("config", {}),
+                }
+            )
+            if node is not None
+            else None
+        )
+        if (
+            node_run is None
+            or node_run.run_id != source_run.id
+            or node_run.node_id != fixture.node_id
+            or expected_source_digest != fixture.source_digest
+            or digest_json(redact(node_run.input_json)) != fixture.input_digest
+        ):
             raise HTTPException(
                 409,
                 detail={
                     "code": "REPLAY_EVIDENCE_CORRUPT",
-                    "message": f"Replay fixture {fixture.id} output digest 不匹配",
+                    "message": f"Replay fixture {fixture.id} 来源或输入 digest 不匹配",
                 },
             )
-        fixtures[fixture.node_id] = output
+        status = payload.get("status")
+        if status == "failed":
+            evidence_value = {
+                "error": payload.get("error"),
+                "observedOutput": payload.get("observedOutput"),
+            }
+            valid_payload = isinstance(payload.get("error"), dict)
+        elif status == "succeeded":
+            evidence_value = payload.get("output")
+            valid_payload = isinstance(evidence_value, dict)
+        else:
+            evidence_value = payload.get("output")
+            valid_payload = isinstance(evidence_value, dict)
+            payload = {"status": "succeeded", "output": evidence_value}
+        if (
+            not valid_payload
+            or digest_json(evidence_value) != fixture.output_digest
+        ):
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "REPLAY_EVIDENCE_CORRUPT",
+                    "message": f"Replay fixture {fixture.id} output/error digest 不匹配",
+                },
+            )
+        fixtures[fixture.node_id] = payload
+        fixtures[fixture.node_id]["evidenceKind"] = fixture.evidence_kind
         locked.append(
             {
                 "nodeId": fixture.node_id,
                 "sourceDigest": fixture.source_digest,
                 "inputDigest": fixture.input_digest,
                 "outputDigest": fixture.output_digest,
+                "evidenceKind": fixture.evidence_kind,
             }
         )
     return fixtures, digest_json(locked) if locked else None
@@ -625,9 +728,14 @@ async def propose_failure_revision(
         fail_node_id=observation.node_id,
         fixtures=fixtures,
     )
-    observation.baseline_reproduced = (
+    baseline_matches = (
         baseline["failedNodeStatus"] == "failed"
         and baseline["failedNodeErrorCode"] == observation.error_code
+    )
+    observation.baseline_reproduced = bool(
+        baseline_matches
+        and observation.evidence_kind in PATCHABLE_EVIDENCE_KINDS
+        and observation.evidence_kind not in TRANSPORT_EVIDENCE_KINDS
     )
     eligibility = observation_eligibility(observation)
     if not eligibility["eligible"]:
@@ -641,6 +749,16 @@ async def propose_failure_revision(
                 "fixtureDigest": fixture_digest,
             },
         )
+    failed_node = next(
+        (
+            node
+            for node in version.definition_json.get("spec", {}).get(
+                "nodes", []
+            )
+            if node.get("id") == observation.node_id
+        ),
+        {},
+    )
     request = AgentHostRequest(
         run_id=f"revision-{observation.id}",
         prompt=(
@@ -650,6 +768,8 @@ async def propose_failure_revision(
             f"failedNodeId={observation.node_id}\n"
             f"failure={observation.error_code}\n"
             f"locks={observation.locks_json}\n"
+            "failedNodeConfig="
+            f"{json.dumps(redact(failed_node.get('config', {})), ensure_ascii=False)}\n"
             f"replayDiagnostics={baseline.get('schemaDiagnostics', [])}"
         ),
         output_schema=WorkflowPatch.model_json_schema(by_alias=True),
@@ -786,7 +906,11 @@ async def apply_version_workflow_patch(
         expected_error_code=observation.error_code,
         fixtures=fixtures,
     )
-    observation.baseline_reproduced = replay["baselineReproduced"]
+    observation.baseline_reproduced = bool(
+        replay["baselineReproduced"]
+        and observation.evidence_kind in PATCHABLE_EVIDENCE_KINDS
+        and observation.evidence_kind not in TRANSPORT_EVIDENCE_KINDS
+    )
     eligibility = observation_eligibility(observation)
     evidence = ReplayEvidence(
         id=str(uuid4()),
@@ -825,12 +949,13 @@ async def apply_version_workflow_patch(
             },
         )
 
-    # 4) replay 通过：创建新草稿（不触碰已发布版本）。
+    # 4) replay 通过：在同一逻辑 Workflow 上 CAS 创建下一版草稿。
     patched["metadata"] = {
         **patched.get("metadata", {}),
         "revisionLineage": {
             "patchOfObservationId": observation.id,
             "replayEvidenceId": evidence.id,
+            "fixtureDigest": fixture_digest,
             "baseVersionId": version_id,
         },
     }
@@ -839,25 +964,92 @@ async def apply_version_workflow_patch(
         diagnostics = [item.model_dump() for item in compiled.diagnostics]
     except WorkflowValidationError as exc:
         diagnostics = [item.model_dump() for item in exc.diagnostics]
-    draft = Workflow(
-        id=str(uuid4()),
-        name=f"patch-of-{version.workflow_id[:8]}",
-        owner_id="local-user",
-        draft_revision=1,
-        draft_json=patched,
+    workflow = await session.get(Workflow, version.workflow_id)
+    if workflow is None:
+        raise HTTPException(409, "WorkflowVersion 所属 Workflow 不存在")
+    latest = await session.scalar(
+        select(WorkflowVersion)
+        .where(WorkflowVersion.workflow_id == workflow.id)
+        .order_by(WorkflowVersion.version.desc())
+        .limit(1)
     )
-    session.add(draft)
+    if latest is None or latest.id != version.id:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "DRAFT_BASE_CONFLICT",
+                "message": "只能从当前最新发布版本创建修订草稿",
+            },
+        )
+    current_metadata = workflow.draft_metadata_json or {}
+    has_pending_revision = current_metadata.get("status") == "pending_revision"
+    draft_matches_base = (
+        digest_json(workflow.draft_json) == digest_json(version.definition_json)
+    )
+    if (
+        has_pending_revision
+        or workflow.draft_base_version_id not in {None, version.id}
+        or not draft_matches_base
+    ):
+        raise HTTPException(
+            409,
+            detail={
+                "code": "DRAFT_REVISION_CONFLICT",
+                "message": "原 Workflow 已存在其它草稿修订，拒绝静默覆盖",
+                "currentRevision": workflow.draft_revision,
+            },
+        )
+    expected_revision = workflow.draft_revision
+    proposal_digest = digest_json(patch.model_dump(by_alias=True))
+    draft_metadata = {
+        "status": "pending_revision",
+        "baseVersionId": version_id,
+        "observationId": observation.id,
+        "fixtureDigest": fixture_digest,
+        "replayEvidenceId": evidence.id,
+        "proposalDigest": proposal_digest,
+    }
+    claimed = await session.execute(
+        update(Workflow)
+        .where(
+            Workflow.id == workflow.id,
+            Workflow.draft_revision == expected_revision,
+            or_(
+                Workflow.draft_base_version_id == version.id,
+                Workflow.draft_base_version_id.is_(None),
+            ),
+        )
+        .values(
+            draft_revision=expected_revision + 1,
+            draft_json=patched,
+            draft_base_version_id=version.id,
+            draft_metadata_json=draft_metadata,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != 1:
+        await session.rollback()
+        raise HTTPException(
+            409,
+            detail={
+                "code": "DRAFT_REVISION_CONFLICT",
+                "message": "草稿已被并发修改",
+            },
+        )
     await session.commit()
     return {
-        "draftWorkflowId": draft.id,
+        "draftWorkflowId": workflow.id,
+        "draftRevision": expected_revision + 1,
         "baseVersionId": version_id,
+        "expectedNextVersion": version.version + 1,
+        "draftMetadata": draft_metadata,
         "definition": patched,
         "diagnostics": diagnostics,
         "eligibility": eligibility,
         "replay": {
             "replayEvidenceId": evidence.id,
             "passed": replay["passed"],
-            "baselineReproduced": replay["baselineReproduced"],
+            "baselineReproduced": observation.baseline_reproduced,
             "failedNodeStatus": replay["patched"]["failedNodeStatus"],
             "sideEffectsSimulated": replay["patched"]["sideEffectsSimulated"],
         },
@@ -909,7 +1101,11 @@ async def apply_plan_snapshot_patch(
         expected_error_code=observation.error_code,
         fixtures=fixtures,
     )
-    observation.baseline_reproduced = replay["baselineReproduced"]
+    observation.baseline_reproduced = bool(
+        replay["baselineReproduced"]
+        and observation.evidence_kind in PATCHABLE_EVIDENCE_KINDS
+        and observation.evidence_kind not in TRANSPORT_EVIDENCE_KINDS
+    )
     evidence = ReplayEvidence(
         id=str(uuid4()),
         observation_id=observation.id,
@@ -1050,14 +1246,47 @@ async def workflow_describe(
             session,
             body.session_id,
             [
-                item["fragmentRef"]
-                for item in result.get("fragments", [])
-                if item.get("fragmentRef")
+                body.ref,
+                *[
+                    item["fragmentRef"]
+                    for item in result.get("fragments", [])
+                    if item.get("fragmentRef")
+                ],
             ],
             "L1",
         )
         response = {"level": "L1", "workflow": result}
         await record_disclosure_response(session, call.id, response, level="L1")
+        await session.commit()
+        return response
+    except CatalogError as exc:
+        await session.rollback()
+        raise HTTPException(
+            404,
+            detail={"code": "WORKFLOW_REF_NOT_FOUND", "message": str(exc)},
+        ) from exc
+
+
+@router.post("/workflow-tools/resolve")
+async def workflow_resolve_exact(
+    body: WorkflowDescribeRequest,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """按调用方持有的精确版本 ref 解析 published/resolvable Manifest。"""
+
+    try:
+        call = await consume_session_call(
+            session,
+            body.session_id,
+            "describe",
+            {"exactRefDigest": digest_json(body.ref)},
+        )
+        result = await describe_workflow(session, body.ref)
+        await disclose_refs(session, body.session_id, [body.ref], "L1")
+        response = {"level": "L1", "workflow": result}
+        await record_disclosure_response(
+            session, call.id, response, level="L1"
+        )
         await session.commit()
         return response
     except CatalogError as exc:
@@ -1185,6 +1414,13 @@ async def execute_workflow_selection(
 async def _execute_selection_service(
     session: AsyncSession, body: WorkflowSelection
 ) -> dict[str, Any]:
+    if body.action in {"run_full", "run_fragment", "compose"}:
+        prepared, _ = await _prepare_selection(session, body)
+        if prepared.action == "ask_user":
+            raise PlanCompileError(
+                f"{body.action} 缺少必填 bindings: {prepared.missing_inputs}"
+            )
+        body = prepared
     for ref in body.refs:
         await require_disclosed_ref(session, body.session_id, ref)
     if body.action == "ask_user":
@@ -1814,6 +2050,9 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             "occurrence": item.occurrence,
             "recovered": item.recovered,
             "baselineReproduced": item.baseline_reproduced,
+            "evidenceKind": item.evidence_kind,
+            "reproductionPolicy": item.reproduction_policy_json,
+            "evidenceIds": item.evidence_ids_json,
             "checkpointId": item.last_checkpoint_id,
             "replayEvidence": [
                 {
@@ -2560,6 +2799,7 @@ async def _unbound_conversation_message(
     selection, tool_timeline = await _select_workflow_candidate(
         session, body.content, disclosure.id
     )
+    selection, resume_action = await _prepare_selection(session, selection)
     if selection.action == "ask_user":
         pending = PendingSelection(
             id=str(uuid4()),
@@ -2568,14 +2808,7 @@ async def _unbound_conversation_message(
             original_task=body.content,
             selection_json={
                 **selection.model_dump(by_alias=True),
-                "resumeAction": (
-                    "run_fragment"
-                    if selection.refs
-                    and selection.refs[0].startswith(
-                        ("fragment:", "fragment-snapshot:")
-                    )
-                    else "run_full"
-                ),
+                "resumeAction": resume_action,
             },
             bindings_json=selection.bindings,
             missing_inputs_json=selection.missing_inputs,
@@ -2600,10 +2833,53 @@ async def _unbound_conversation_message(
             None,
         )
     if selection.action == "continue_agent":
-        candidate = await match_component(session, body.content)
-        if candidate is not None:
-            return candidate_message(candidate), None
-        content, run = await _general_agent_message(conversation, body.content)
+        used_steps = sum(
+            item.get("type") == "tool.requested" for item in tool_timeline
+        )
+        config = AgentRunConfig.default()
+        config.max_steps = max(1, config.max_steps - used_steps)
+        continuation_context = [
+            {
+                "callId": item.get("callId"),
+                "capabilityRef": item.get("capabilityRef"),
+                "level": item.get("level"),
+                "status": item.get("status"),
+                "diagnostics": item.get("diagnostics", []),
+                "result": item.get("result"),
+                "resultDigest": item.get("resultDigest"),
+            }
+            for item in tool_timeline
+            if item.get("type") == "tool.result"
+        ]
+        remaining_budget = {
+            "steps": config.max_steps,
+            "totalTokens": config.max_total_tokens,
+            "disclosureCallsUsed": used_steps,
+        }
+        run = await enqueue_agent_run(
+            session,
+            conversation,
+            body.content,
+            config=config,
+            prompt=(
+                "继续原始用户任务。Workflow 发现阶段已完成，禁止把用户回答重新当作"
+                " Catalog 查询；保留以下已完成 ToolResult 摘要并在剩余预算内继续："
+                f"{json.dumps(continuation_context, ensure_ascii=False)}\n"
+                f"remainingBudget={json.dumps(remaining_budget)}\n"
+                f"用户任务：{body.content}"
+            ),
+        )
+        run.input_json = {
+            **run.input_json,
+            "disclosureContext": continuation_context,
+            "remainingBudget": remaining_budget,
+        }
+        content = {
+            "type": "agent_run",
+            "state": "queued",
+            "conversationRunId": run.id,
+            "text": "目录中没有适合的已发布能力，已由通用 Agent 继续处理。",
+        }
         return (
             {
                 **content,
@@ -2678,6 +2954,7 @@ async def _select_workflow_candidate(
             )
         ref = str(cards[0]["workflowRef"])
         workflow = await describe_workflow(session, ref)
+        await disclose_refs(session, session_id, [ref], "L1")
         required = workflow["inputSchema"].get("required", [])
         if required:
             return (
@@ -2762,6 +3039,7 @@ async def _select_workflow_candidate(
         if capability not in level_by_capability:
             continue
         output = payload.get("output")
+        bounded_result = _bounded_disclosure_result(capability, output)
         timeline.append(
             {
                 "type": event["type"],
@@ -2769,6 +3047,14 @@ async def _select_workflow_candidate(
                 "capabilityRef": capability,
                 "level": level_by_capability[capability],
                 "status": payload.get("status", "pending"),
+                **(
+                    {
+                        "result": bounded_result,
+                        "resultDigest": digest_json(bounded_result),
+                    }
+                    if bounded_result is not None
+                    else {}
+                ),
                 **(
                     {"diagnostics": output.get("diagnostics", [])}
                     if isinstance(output, dict) and output.get("diagnostics")
@@ -2779,10 +3065,139 @@ async def _select_workflow_candidate(
     return selection, timeline
 
 
+def _bounded_disclosure_result(
+    capability: str | None, output: Any
+) -> dict[str, Any] | None:
+    """保留 continuation 推理所需的 L0/L1 摘要，不复制完整 Manifest/DAG。"""
+
+    if not isinstance(output, dict):
+        return None
+    if capability == "workflow.search":
+        return {
+            "level": "L0",
+            "count": output.get("count", 0),
+            "candidates": [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "workflowRef",
+                        "summary",
+                        "inputSynopsis",
+                        "outputSynopsis",
+                        "matchReason",
+                    )
+                }
+                for item in output.get("items", [])[:8]
+                if isinstance(item, dict)
+            ],
+        }
+    if capability == "workflow.describe":
+        workflow = output.get("workflow")
+        if not isinstance(workflow, dict):
+            return None
+        return {
+            "level": "L1",
+            "workflowRef": workflow.get("workflowRef"),
+            "summary": workflow.get("summary"),
+            "inputSynopsis": workflow.get("inputSynopsis"),
+            "outputSynopsis": workflow.get("outputSynopsis"),
+            "doNotUseWhen": workflow.get("doNotUseWhen", [])[:8],
+            "fragments": [
+                {
+                    "fragmentRef": item.get("fragmentRef"),
+                    "name": item.get("name"),
+                    "summary": item.get("summary"),
+                }
+                for item in workflow.get("fragments", [])[:8]
+                if isinstance(item, dict)
+            ],
+        }
+    if capability in {
+        "workflow.describe_fragment",
+        "workflow.slice",
+        "workflow.compile_plan",
+    }:
+        return {
+            "level": output.get("level", "L2"),
+            "compiled": output.get("compiled"),
+            "diagnostics": output.get("diagnostics", [])[:8],
+            "digest": output.get("digest"),
+        }
+    return None
+
+
 def body_text(value: str) -> str:
     """限制进入选择 prompt 的用户文本长度。"""
 
     return value[:2000]
+
+
+def _selection_resume_action(selection: WorkflowSelection) -> str:
+    if selection.action != "ask_user":
+        return selection.action
+    if selection.plan is not None:
+        return "compose"
+    if selection.refs and selection.refs[0].startswith(
+        ("fragment:", "fragment-snapshot:")
+    ):
+        return "run_fragment"
+    return "run_full"
+
+
+async def _prepare_selection(
+    session: AsyncSession,
+    selection: WorkflowSelection,
+) -> tuple[WorkflowSelection, str]:
+    """Validate disclosure and turn missing executable inputs into resumable state."""
+
+    resume_action = _selection_resume_action(selection)
+    if selection.action in {"ask_user", "continue_agent"}:
+        return selection, resume_action
+
+    required: list[str]
+    compiled_plan: dict[str, Any] | None = selection.compiled_plan
+    if selection.action == "run_full":
+        level = await require_disclosed_ref(
+            session, selection.session_id, selection.refs[0]
+        )
+        if level not in {"L1", "L2"}:
+            raise CatalogError("run_full 必须先披露 Workflow L1")
+        workflow = await describe_workflow(session, selection.refs[0])
+        required = list(workflow["inputSchema"].get("required", []))
+    elif selection.action == "run_fragment":
+        level = await require_disclosed_ref(
+            session, selection.session_id, selection.refs[0]
+        )
+        if level != "L2":
+            raise CatalogError("run_fragment 必须先调用 workflow.describe_fragment 披露 L2")
+        fragment = await describe_fragment(session, selection.refs[0])
+        required = list(fragment["boundaryInputSchema"].get("required", []))
+    else:
+        assert selection.plan is not None
+        await require_plan_refs_disclosed(
+            session, selection.session_id, selection.plan
+        )
+        compiled_plan = await compile_plan(session, selection.plan)
+        required = list(selection.plan.get("inputSchema", {}).get("required", []))
+
+    missing = [field for field in required if field not in selection.bindings]
+    if not missing:
+        if compiled_plan is not selection.compiled_plan:
+            selection = selection.model_copy(
+                update={"compiled_plan": compiled_plan}
+            )
+        return selection, resume_action
+
+    pending = WorkflowSelection.model_validate(
+        {
+            **selection.model_dump(by_alias=True),
+            "action": "ask_user",
+            "missingInputs": missing,
+            "question": f"请补充输入：{', '.join(missing)}",
+            "compiledPlan": compiled_plan,
+        }
+    )
+    return pending, resume_action
 
 
 async def _bound_component_message(
@@ -2831,91 +3246,6 @@ async def _bound_component_message(
         "runId": run.id,
         "text": "组件已启动，后续执行由 Workflow Runtime 接管。",
     }
-
-
-async def _general_agent_message(
-    conversation: Conversation,
-    content: str,
-) -> tuple[dict[str, Any], ConversationRun | None]:
-    """未匹配组件的通用任务。
-
-    区分运行类型：单次模型回答记为 ``llm_response``，绝不伪装成 ``agent_run``。
-    真实 Agent 运行事实只能由服务端 AgentRunService 通过
-    ``POST /conversations/{id}/agent-runs`` 创建。此处始终附带 ``offerAgentRun`` 提示，
-    前端据此提供“启动通用 Agent”入口。
-    """
-
-    settings = get_settings()
-    if not settings.model_endpoint or not settings.model_name:
-        return (
-            {
-                "type": "error",
-                "code": "MODEL_NOT_CONFIGURED",
-                "text": "未匹配到组件，且通用 LLM/Agent Runtime 尚未配置。",
-                "offerAgentRun": bool(settings.traex_command),
-            },
-            None,
-        )
-    output_schema = {
-        "type": "object",
-        "properties": {"reply": {"type": "string"}},
-        "required": ["reply"],
-        "additionalProperties": False,
-    }
-    try:
-        model_result = await OpenAICompatibleAdapter().generate(
-            "请直接回答用户请求，并输出结构化 reply 字段。\n用户：" + content,
-            output_schema,
-            1200,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            502,
-            detail={"code": "MODEL_CALL_FAILED", "message": str(exc)},
-        ) from exc
-    conversation_run = ConversationRun(
-        id=str(uuid4()),
-        conversation_id=conversation.id,
-        status="succeeded",
-        run_type="llm_response",
-        input_json={"message": content},
-        output_json=model_result.output,
-        trajectory_json={
-            "runType": "llm_response",
-            "name": "conversation-draft",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"message": {"type": "string"}},
-                "required": ["message"],
-            },
-            "outputSchema": output_schema,
-            "steps": [
-                {
-                    "id": "answer",
-                    "kind": "llm",
-                    "displayName": "生成回答",
-                    "input": {"message": "${input.message}"},
-                    "config": {
-                        "prompt": "请回答输入消息：{input}",
-                        "outputSchema": output_schema,
-                        "maxOutputTokens": 1200,
-                    },
-                }
-            ],
-            "outputMapping": {"reply": "${answer.output.reply}"},
-            "originalModelCalls": 1,
-        },
-    )
-    assistant_content = {
-        "type": "llm_response",
-        "state": "llm_response",
-        "text": model_result.output["reply"],
-        "conversationRunId": conversation_run.id,
-        "runType": "llm_response",
-        # 单次回答不是可固化的 Agent 运行；提示前端可升级为真实通用 Agent。
-        "offerAgentRun": bool(get_settings().traex_command),
-    }
-    return assistant_content, conversation_run
 
 
 @router.post("/conversations/{conversation_id}/confirm-component", status_code=201)
@@ -3096,6 +3426,86 @@ async def list_conversation_run_events(
         }
         for item in events
     ]
+
+
+@router.get("/task-checkpoints/{checkpoint_id}")
+async def get_task_checkpoint(
+    checkpoint_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    checkpoint = await session.get(TaskCheckpoint, checkpoint_id)
+    if checkpoint is None:
+        raise HTTPException(404, "TaskCheckpoint 不存在")
+    snapshot = checkpoint.snapshot_json
+    return {
+        "id": checkpoint.id,
+        "sourceKind": checkpoint.source_kind,
+        "sourceId": checkpoint.source_id,
+        "sourceDigest": checkpoint.source_digest,
+        "status": checkpoint.status,
+        "digest": checkpoint.digest,
+        "outcomeCertainty": snapshot.get("outcomeCertainty"),
+        "pendingQuestion": snapshot.get("pendingQuestion"),
+        "continuationRunId": snapshot.get("continuationRunId"),
+        "claimGeneration": checkpoint.claim_generation,
+        "completedActionLedger": snapshot.get("completedActionLedger", []),
+    }
+
+
+@router.post("/task-checkpoints/{checkpoint_id}/answer")
+async def answer_task_checkpoint(
+    checkpoint_id: str,
+    body: TaskCheckpointAnswer,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    checkpoint = await session.get(TaskCheckpoint, checkpoint_id)
+    if checkpoint is None:
+        raise HTTPException(404, "TaskCheckpoint 不存在")
+    if checkpoint.status != "awaiting_user":
+        raise HTTPException(409, "TaskCheckpoint 不可回答或已消费")
+    if (
+        checkpoint.digest != body.snapshot_digest
+        or digest_json(checkpoint.snapshot_json) != checkpoint.digest
+    ):
+        raise HTTPException(409, "TaskCheckpoint 快照已变化")
+    next_status = (
+        "pending" if body.answer.get("continue") is True else "cancelled"
+    )
+    next_snapshot = {
+        **checkpoint.snapshot_json,
+        "userAnswer": redact(body.answer),
+    }
+    answered = await session.execute(
+        update(TaskCheckpoint)
+        .where(
+            TaskCheckpoint.id == checkpoint_id,
+            TaskCheckpoint.status == "awaiting_user",
+            TaskCheckpoint.digest == body.snapshot_digest,
+        )
+        .values(
+            status=next_status,
+            snapshot_json=next_snapshot,
+            digest=digest_json(next_snapshot),
+            lease_owner=None,
+            lease_expires_at=None,
+            claim_token=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if answered.rowcount != 1:
+        await session.rollback()
+        raise HTTPException(409, "TaskCheckpoint 回答已被并发消费")
+    await append_agent_event(
+        session,
+        checkpoint.source_id,
+        "agent.handoff.user_answered",
+        {
+            "taskCheckpointId": checkpoint.id,
+            "continue": body.answer.get("continue") is True,
+        },
+    )
+    await session.commit()
+    return {"id": checkpoint.id, "status": next_status}
 
 
 @router.post("/conversations/{conversation_id}/trajectory-imports", status_code=201)

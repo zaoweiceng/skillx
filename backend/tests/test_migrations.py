@@ -65,7 +65,15 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
                 "PRAGMA table_info(workflow_disclosure_calls)"
             )
         }
-    assert revision == ("0015",)
+        workflow_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(workflows)")
+        }
+        fixture_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(replay_fixtures)")
+        }
+    assert revision == ("0016",)
     assert {
         "runs",
         "capability_versions",
@@ -94,8 +102,18 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
         "claim_token",
     } <= run_type_columns
     assert {"effect_source", "effect_review_status", "contract_digest"} <= snapshot_columns
-    assert "baseline_reproduced" in observation_columns
+    assert {
+        "baseline_reproduced",
+        "evidence_kind",
+        "reproduction_policy_json",
+        "evidence_ids_json",
+    } <= observation_columns
     assert {"status", "error_json"} <= disclosure_call_columns
+    assert {
+        "draft_base_version_id",
+        "draft_metadata_json",
+    } <= workflow_columns
+    assert "evidence_kind" in fixture_columns
     with sqlite3.connect(database) as connection:
         checkpoint_columns = {
             row[1]

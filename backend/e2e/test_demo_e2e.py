@@ -163,28 +163,25 @@ def test_e2e_5_agent_distillation_reuse(stack: DemoStack) -> None:
         assert draft["analysis"]["agentNodes"] == 0
         assert draft["analysis"]["estimatedLlmCallsAfter"] == 0
 
-        # 4) 通过 API 人工发布并创建组件。
+        # 4) 通过 API 人工发布；第二次复用不得创建 Component 后持 id 直调。
         published = client.post(f"/workflows/{draft_workflow_id}/publish")
         assert published.status_code == 201, published.text
         version_id = published.json()["id"]
-        component = client.post(
-            "/components",
-            json={
-                "name": "固化-季度复盘查表",
-                "description": "由对话 Agent 探索固化并人工发布。",
-                "workflowVersionId": version_id,
-            },
-        )
-        assert component.status_code == 201, component.text
-        component_id = component.json()["id"]
 
-        # 5) 用与探索时不同的输入运行发布组件：结果随输入变化，且零模型调用。
-        created = client.post(
-            f"/components/{component_id}/runs",
-            json={"input": {"message": "q2"}},
+        # 5) 新 Conversation 以自然语言和不同业务键发现固化版本并交给 Runtime。
+        second_conversation = client.post(
+            "/conversations", json={"title": "非网页新对话复用"}
+        ).json()
+        selected = client.post(
+            f"/conversations/{second_conversation['id']}/messages",
+            json={"content": "使用业务键 q2 执行结构化查询"},
         )
-        assert created.status_code == 202, created.text
-        run = poll_run(client, created.json()["id"])
+        assert selected.status_code == 201, selected.text
+        assistant = selected.json()["assistant"]
+        assert assistant["state"] == "workflow_run"
+        assert assistant["workflowVersionId"] == version_id
+        assert {item["level"] for item in assistant["toolTimeline"]} == {"L0", "L1"}
+        run = poll_run(client, assistant["runId"])
         assert run["status"] == "succeeded", run
         # 新输入 q2 选出不同结果（编译复用，而非重跑同一 prompt）。
         assert run["output"] == {"reply": "第二季度：营收增长 8%"}
@@ -371,29 +368,13 @@ def test_e2e_8_dynamic_web_summary_reflects_page_change(stack: DemoStack) -> Non
 
 
 def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
-    """F-03：一次瞬态失败不生成补丁；可复现失败经真实 replay 通过后才生成 draft。"""
+    """公开 Browser 故障链：瞬态拒绝，契约漂移经 Agent proposal 发布同源 v2。"""
 
     with stack.client() as client:
-        # 用检查点接力组件的已发布版本作为补丁基线（其 risky 节点会确定性失败）。
-        component = _component(client, "反馈分类")
-        version_id = component["defaultVersionId"]
-        # 尚无失败观测：补丁不合格。
-        rejected = client.post(
-            f"/workflow-versions/{version_id}/workflow-patch",
-            json={
-                "sourceRunId": "no-such-run",
-                "patch": {
-                    "nodePatches": [{"nodeId": "classify", "changes": {"timeoutSeconds": 60}}]
-                },
-            },
-        )
-        assert rejected.status_code == 422, rejected.text
-        assert rejected.json()["detail"]["code"] == "PATCH_NOT_ELIGIBLE"
-
-        definition = {
+        transient_definition = {
             "apiVersion": "workflow.platform/v1",
             "kind": "Workflow",
-            "metadata": {"name": "replay-proof"},
+            "metadata": {"name": "transient-control"},
             "spec": {
                 "inputSchema": {
                     "type": "object",
@@ -410,7 +391,7 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
                     {
                         "id": "work",
                         "type": "transform",
-                        "displayName": "确定失败",
+                        "displayName": "网络瞬态对照",
                         "input": {"value": "${input.x}"},
                         "config": {"operation": "fail_dependency"},
                     },
@@ -427,49 +408,337 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
                 ],
             },
         }
-        workflow = client.post(
-            "/workflows", json={"name": "Replay Proof", "definition": definition}
-        )
-        published = client.post(
-            f"/workflows/{workflow.json()['id']}/publish"
-        ).json()
-        replay_component = client.post(
-            "/components",
+        transient_workflow = client.post(
+            "/workflows",
             json={
-                "name": "Replay Proof",
-                "workflowVersionId": published["id"],
+                "name": "Transient Control",
+                "definition": transient_definition,
             },
         ).json()
-        source_run_id = ""
-        for _ in range(2):
+        transient_v1 = client.post(
+            f"/workflows/{transient_workflow['id']}/publish"
+        ).json()
+        transient_component = client.post(
+            "/components",
+            json={
+                "name": "Transient Control",
+                "workflowVersionId": transient_v1["id"],
+            },
+        ).json()
+        transient_created = client.post(
+            f"/components/{transient_component['id']}/runs",
+            json={"input": {"x": "safe"}},
+        )
+        transient_run = poll_run(
+            client, transient_created.json()["id"]
+        )
+        transient_observation = transient_run["failureObservations"][0]
+        transient_proposal = client.post(
+            f"/failure-observations/{transient_observation['id']}/revision-proposal"
+        )
+        assert transient_proposal.status_code == 422
+        assert transient_proposal.json()["detail"][
+            "code"
+        ] == "REVISION_NOT_ELIGIBLE"
+
+        browser_definition = {
+            "apiVersion": "workflow.platform/v1",
+            "kind": "Workflow",
+            "metadata": {"name": "revision-browser"},
+            "spec": {
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": {"url": {"type": "string"}},
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "required": ["content"],
+                    "properties": {"content": {}},
+                },
+                "nodes": [
+                    {"id": "input", "type": "input", "displayName": "输入"},
+                    {
+                        "id": "read",
+                        "type": "browser",
+                        "displayName": "外部读取",
+                        "input": {"url": "${input.url}"},
+                        "config": {
+                            "action": "read",
+                            "runtime": "playwright",
+                            "pageContract": {
+                                "contractVersion": "1",
+                                "urlPattern": f"{stack.form_url}/article*",
+                                "bodySelector": "#main",
+                                "fields": {},
+                                "outputSchema": {
+                                    "type": "object",
+                                    "required": ["content"],
+                                    "properties": {
+                                        "content": {"type": "integer"}
+                                    },
+                                },
+                            },
+                        },
+                    },
+                    {
+                        "id": "output",
+                        "type": "output",
+                        "displayName": "输出",
+                        "input": {"content": "${read.output.content}"},
+                    },
+                ],
+                "edges": [
+                    {"source": "input", "target": "read"},
+                    {"source": "read", "target": "output"},
+                ],
+            },
+        }
+        workflow = client.post(
+            "/workflows",
+            json={
+                "name": "Revision Browser",
+                "definition": browser_definition,
+            },
+        ).json()
+        published_v1 = client.post(
+            f"/workflows/{workflow['id']}/publish"
+        ).json()
+        browser_component = client.post(
+            "/components",
+            json={
+                "name": "Revision Browser v1",
+                "workflowVersionId": published_v1["id"],
+            },
+        ).json()
+        source_run_id = None
+        failed = None
+        for index in range(2):
             created = client.post(
-                f"/components/{replay_component['id']}/runs",
-                json={"input": {"x": "safe"}},
+                f"/components/{browser_component['id']}/runs",
+                json={
+                    "input": {
+                        "url": f"{stack.form_url}/article?failure={index}"
+                    }
+                },
             )
             failed = poll_run(client, created.json()["id"])
             assert failed["status"] == "failed", failed
             source_run_id = failed["id"]
-
+        observation = failed["failureObservations"][0]
+        assert observation["occurrence"] == 2
+        assert observation["evidenceKind"] == "observed_contract_output"
+        proposal_response = client.post(
+            f"/failure-observations/{observation['id']}/revision-proposal"
+        )
+        assert proposal_response.status_code == 200, proposal_response.text
+        proposal = proposal_response.json()
         patched = client.post(
-            f"/workflow-versions/{published['id']}/workflow-patch",
+            f"/workflow-versions/{published_v1['id']}/workflow-patch",
             json={
                 "sourceRunId": source_run_id,
-                "patch": {
-                    "nodePatches": [
-                        {
-                            "nodeId": "work",
-                            "changes": {"config": {"operation": "passthrough"}},
-                        }
-                    ]
-                },
+                "patch": proposal["proposal"],
             },
         )
         assert patched.status_code == 201, patched.text
         proof = patched.json()
+        assert proof["draftWorkflowId"] == workflow["id"]
+        assert proof["expectedNextVersion"] == 2
         assert proof["replay"]["baselineReproduced"] is True
         assert proof["replay"]["passed"] is True
         assert proof["replay"]["replayEvidenceId"]
-        assert proof["draftWorkflowId"]
+        published_v2 = client.post(
+            f"/workflows/{workflow['id']}/publish"
+        ).json()
+        assert published_v2["workflowId"] == workflow["id"]
+        assert published_v2["version"] == 2
+
+        def run_discovered(url: str) -> dict:
+            session_id = _workflow_session(client)
+            searched = client.post(
+                "/workflow-tools/search",
+                json={
+                    "sessionId": session_id,
+                    "query": "Revision Browser",
+                },
+            ).json()
+            refs = [
+                item["workflowRef"]
+                for item in searched["items"]
+                if item["name"] == "Revision Browser"
+            ]
+            assert refs == [published_v2["workflowRef"]]
+            described = client.post(
+                "/workflow-tools/describe",
+                json={"sessionId": session_id, "ref": refs[0]},
+            )
+            assert described.status_code == 200, described.text
+            selected = client.post(
+                "/workflow-tools/execute-selection",
+                json={
+                    "action": "run_full",
+                    "reason": "E2E revised reuse",
+                    "refs": refs,
+                    "bindings": {"url": url},
+                    "missingInputs": [],
+                    "sessionId": session_id,
+                },
+            )
+            assert selected.status_code == 202, selected.text
+            return poll_run(client, selected.json()["runId"])
+
+        stack.set_article("修订后原输入正文")
+        original = run_discovered(f"{stack.form_url}/article?version=a")
+        stack.set_article("修订后新输入正文")
+        revised = run_discovered(f"{stack.form_url}/article?version=b")
+        assert original["output"] == {"content": "修订后原输入正文"}
+        assert revised["output"] == {"content": "修订后新输入正文"}
+        assert revised["dependencyVersions"]["revisionLineage"][
+            "patchOfObservationId"
+        ] == observation["id"]
+
+        old_session = _workflow_session(client)
+        old_resolved = client.post(
+            "/workflow-tools/resolve",
+            json={
+                "sessionId": old_session,
+                "ref": published_v1["workflowRef"],
+            },
+        )
+        assert old_resolved.status_code == 200, old_resolved.text
+        assert old_resolved.json()["workflow"]["versionLock"][
+            "versionId"
+        ] == published_v1["id"]
+
+
+def test_agent_run_handoff_public_api_and_completed_action_ledger(
+    stack: DemoStack,
+) -> None:
+    with stack.client() as client:
+        conversation = client.post(
+            "/conversations", json={"title": "公开接力"}
+        ).json()
+        created = client.post(
+            f"/conversations/{conversation['id']}/agent-runs",
+            json={
+                "content": (
+                    "q1 [[MODE:deterministic_fail_after_tool]]"
+                    "[[RECOVERY_REPEAT]]"
+                ),
+                "allowedCapabilities": ["lookup.table"],
+            },
+        )
+        assert created.status_code == 202, created.text
+        source_id = created.json()["conversationRunId"]
+        source = poll_conversation_run(client, source_id)
+        assert source["status"] == "failed"
+        checkpoint_id = source["error"]["taskCheckpointId"]
+
+        deadline = time.time() + 30
+        checkpoint = {}
+        while time.time() < deadline:
+            response = client.get(f"/task-checkpoints/{checkpoint_id}")
+            assert response.status_code == 200, response.text
+            checkpoint = response.json()
+            if checkpoint.get("continuationRunId"):
+                break
+            time.sleep(0.1)
+        continuation_id = checkpoint["continuationRunId"]
+        assert checkpoint["completedActionLedger"]
+        continuation = poll_conversation_run(client, continuation_id)
+        assert continuation["status"] == "succeeded"
+        assert continuation["output"] == {
+            "reply": "第一季度：营收增长 12%"
+        }
+        events = client.get(
+            f"/conversation-runs/{continuation_id}/events"
+        ).json()
+        reused = [
+            item
+            for item in events
+            if item["type"] == "tool.result"
+            and item["payload"].get("reusedFromLedger") is True
+        ]
+        assert len(reused) == 1
+        restart_worker(stack, crash=True)
+
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            checkpoint = client.get(
+                f"/task-checkpoints/{checkpoint_id}"
+            ).json()
+            if checkpoint["status"] == "succeeded":
+                break
+            time.sleep(0.1)
+        assert checkpoint["status"] == "succeeded"
+        assert poll_conversation_run(client, source_id)["status"] == "failed"
+
+
+def test_agent_run_unknown_outcome_answer_consumed_once(
+    stack: DemoStack,
+) -> None:
+    with stack.client() as client:
+        conversation = client.post(
+            "/conversations", json={"title": "未知结果接力"}
+        ).json()
+        created = client.post(
+            f"/conversations/{conversation['id']}/agent-runs",
+            json={"content": "任务 [[MODE:hang]]"},
+        )
+        assert created.status_code == 202, created.text
+        source_id = created.json()["conversationRunId"]
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            source = client.get(
+                f"/conversation-runs/{source_id}"
+            ).json()
+            if source["status"] == "running":
+                break
+            time.sleep(0.1)
+        assert source["status"] == "running"
+        restart_worker(stack, crash=True)
+        source = poll_conversation_run(client, source_id, timeout=30)
+        assert source["status"] == "failed"
+        assert source["error"]["code"] == "UNKNOWN_OUTCOME"
+        checkpoint_id = source["error"]["taskCheckpointId"]
+        checkpoint = client.get(
+            f"/task-checkpoints/{checkpoint_id}"
+        ).json()
+        assert checkpoint["status"] == "awaiting_user"
+        answered = client.post(
+            f"/task-checkpoints/{checkpoint_id}/answer",
+            json={
+                "snapshotDigest": checkpoint["digest"],
+                "answer": {
+                    "continue": True,
+                    "externalStateChecked": True,
+                },
+            },
+        )
+        assert answered.status_code == 200, answered.text
+        duplicate = client.post(
+            f"/task-checkpoints/{checkpoint_id}/answer",
+            json={
+                "snapshotDigest": checkpoint["digest"],
+                "answer": {"continue": True},
+            },
+        )
+        assert duplicate.status_code == 409
+
+        deadline = time.time() + 30
+        continuation_id = None
+        while time.time() < deadline:
+            checkpoint = client.get(
+                f"/task-checkpoints/{checkpoint_id}"
+            ).json()
+            continuation_id = checkpoint.get("continuationRunId")
+            if continuation_id:
+                break
+            time.sleep(0.1)
+        continuation = poll_conversation_run(
+            client, continuation_id, timeout=30
+        )
+        assert continuation["status"] == "succeeded"
 
 
 def test_e2e_10_progressive_catalog_composition_and_version_pinning(
@@ -769,22 +1038,35 @@ def test_e2e_8b_real_browser_distillation_to_non_fake_agent(
             f"/workflows/{distilled.json()['draftWorkflowId']}/publish"
         )
         assert published.status_code == 201, published.text
-        component = client.post(
-            "/components",
+        version_id = published.json()["id"]
+        stack.set_article("第二次运行的新正文：利润增长 21%。")
+        second_url = f"{article_url}?version=b"
+        second_conversation = client.post(
+            "/conversations", json={"title": "新对话语义复用"}
+        ).json()
+        selected = client.post(
+            f"/conversations/{second_conversation['id']}/messages",
+            json={"content": f"访问并总结这个网页：{second_url}"},
+        )
+        assert selected.status_code == 201, selected.text
+        assistant = selected.json()["assistant"]
+        assert assistant["state"] == "workflow_run"
+        assert assistant["agentAction"] == "run_full"
+        assert assistant["workflowVersionId"] == version_id
+        assert {item["level"] for item in assistant["toolTimeline"]} == {"L0", "L1"}
+        described = client.post(
+            "/workflow-tools/describe",
             json={
-                "name": "Browser 固化总结",
-                "description": "真实 Browser 轨迹固化",
-                "workflowVersionId": published.json()["id"],
+                "sessionId": assistant["disclosureSessionId"],
+                "ref": assistant["refs"][0],
             },
         )
-        assert component.status_code == 201, component.text
-
-        stack.set_article("第二次运行的新正文：利润增长 21%。")
-        created = client.post(
-            f"/components/{component.json()['id']}/runs",
-            json={"input": {"message": article_url}},
+        assert described.status_code == 200, described.text
+        assert described.json()["workflow"]["lineage"]["sourceConversationRunId"] == (
+            conversation_run_id
         )
-        completed = poll_run(client, created.json()["id"], timeout=60)
+
+        completed = poll_run(client, assistant["runId"], timeout=60)
         assert completed["status"] == "succeeded", completed
         assert "利润增长 21%" in completed["output"]["reply"]
         node_types = {

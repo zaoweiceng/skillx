@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.compiler import WorkflowValidationError, digest_json
-from app.application.plans import PlanCompileError, create_plan_snapshot
+from app.application.plans import PlanCompileError, compile_plan
 from app.application.tool_broker import ToolExecutionContext
 from app.application.workflow_catalog import (
     CatalogError,
@@ -103,9 +103,12 @@ class WorkflowDescribeAdapter(_WorkflowToolBase):
             self.session,
             self.disclosure_session_id,
             [
-                item["fragmentRef"]
-                for item in result.get("fragments", [])
-                if item.get("fragmentRef")
+                ref,
+                *[
+                    item["fragmentRef"]
+                    for item in result.get("fragments", [])
+                    if item.get("fragmentRef")
+                ],
             ],
             "L1",
         )
@@ -243,11 +246,11 @@ class WorkflowCompilePlanAdapter(_WorkflowToolBase):
             await require_plan_refs_disclosed(
                 self.session, self.disclosure_session_id, plan
             )
-            snapshot = await create_plan_snapshot(self.session, plan)
+            compiled = await compile_plan(self.session, plan)
             response = {
                 "compiled": True,
-                "planSnapshotId": snapshot.id,
-                "digest": snapshot.digest,
+                "compiledPlan": compiled,
+                "digest": compiled["digest"],
                 "diagnostics": [],
             }
         except (PlanCompileError, WorkflowValidationError, CatalogError) as exc:

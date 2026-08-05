@@ -84,6 +84,7 @@ class CompletedPayload(_PayloadBase):
     totalTokens: StrictInt | None = None
     output: dict[str, Any] | None = None
     provenance: list[dict[str, Any]] = Field(default_factory=list)
+    outputProvenance: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 class ToolPayload(_PayloadBase):
@@ -274,6 +275,8 @@ class AgentEventValidator:
                 audit["status"] = payload["status"]
             if "evidenceDigest" in payload:
                 audit["evidenceDigest"] = payload["evidenceDigest"]
+            if payload.get("reusedFromLedger") is True:
+                audit["reusedFromLedger"] = True
             return {"type": event_type, "payload": audit}
         if event_type == "agent.completed":
             # 完成事件只保留步数/Token 与输出摘要，不落原始 output。

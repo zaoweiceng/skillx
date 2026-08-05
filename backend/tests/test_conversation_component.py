@@ -9,8 +9,8 @@ from app.api.routes import (
     create_message,
 )
 from app.application.compiler import WorkflowCompiler
+from app.application.conversation import candidate_snapshot_digest
 from app.application.orchestrator import WorkerService
-from app.config import get_settings
 from app.infrastructure.database import (
     Component,
     Conversation,
@@ -20,7 +20,6 @@ from app.infrastructure.database import (
     Workflow,
     WorkflowVersion,
 )
-from app.runtime.models import ModelResult, OpenAICompatibleAdapter
 from tests.fixtures import deterministic_workflow
 
 
@@ -78,53 +77,27 @@ async def test_conversation_confirmed_component_hands_control_to_workflow() -> N
         assert run.output_json == {"message": "你好，Alice"}
 
 
-async def test_unbound_conversation_uses_configured_model_and_records_trajectory(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = get_settings()
-    previous_endpoint = settings.model_endpoint
-    previous_name = settings.model_name
-    settings.model_endpoint = "http://model.test/v1/chat/completions"
-    settings.model_name = "test-model"
-
-    async def fake_generate(
-        _self: OpenAICompatibleAdapter,
-        _prompt: str,
-        _schema: dict,
-        _max_tokens: int,
-    ) -> ModelResult:
-        return ModelResult(
-            output={"reply": "结构化回答"},
-            input_tokens=10,
-            output_tokens=4,
-            model="test-model",
+async def test_unbound_conversation_continues_with_persistent_agent_run() -> None:
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="通用 Agent 对话")
+        session.add(conversation)
+    async with SessionLocal() as session:
+        response = await create_message(
+            conversation.id,
+            MessageCreate(content="分析这个新任务"),
+            session,
         )
-
-    monkeypatch.setattr(OpenAICompatibleAdapter, "generate", fake_generate)
-    try:
-        async with SessionLocal() as session, session.begin():
-            conversation = Conversation(id=str(uuid4()), title="模型对话")
-            session.add(conversation)
-        async with SessionLocal() as session:
-            response = await create_message(
-                conversation.id,
-                MessageCreate(content="分析这个新任务"),
-                session,
-            )
-        assert response["assistant"]["type"] == "llm_response"
-        assert response["assistant"]["text"] == "结构化回答"
-        assert response["assistant"]["runType"] == "llm_response"
-        async with SessionLocal() as session:
-            run = await session.get(
-                ConversationRun,
-                response["assistant"]["conversationRunId"],
-            )
-            assert run is not None
-            assert run.run_type == "llm_response"
-            assert run.trajectory_json["steps"][0]["kind"] == "llm"
-    finally:
-        settings.model_endpoint = previous_endpoint
-        settings.model_name = previous_name
+    assert response["assistant"]["type"] == "agent_run"
+    assert response["assistant"]["state"] == "queued"
+    assert response["assistant"]["agentAction"] == "continue_agent"
+    async with SessionLocal() as session:
+        run = await session.get(
+            ConversationRun,
+            response["assistant"]["conversationRunId"],
+        )
+    assert run is not None
+    assert run.run_type == "agent_run"
+    assert run.status == "queued"
 
 
 async def _seed_greeting_component(name: str, description: str) -> tuple[str, str]:
@@ -162,8 +135,7 @@ async def _seed_greeting_component(name: str, description: str) -> tuple[str, st
     return component.id, conversation.id
 
 
-async def test_structured_intent_matches_without_literal_name() -> None:
-    # 组件名不出现在自然语言里，靠描述词元匹配。
+async def test_continue_agent_does_not_use_undisclosed_component_heuristic() -> None:
     _, conversation_id = await _seed_greeting_component(
         "问候组件", "生成问候语 greeting 欢迎 welcome"
     )
@@ -174,10 +146,9 @@ async def test_structured_intent_matches_without_literal_name() -> None:
             session,
         )
     assistant = response["assistant"]
-    assert assistant["type"] == "component_candidate"
-    assert assistant["confidence"] > 0
-    assert "candidateSnapshotDigest" in assistant
-    assert assistant["inputSchema"]["required"] == ["name"]
+    assert assistant["type"] == "agent_run"
+    assert assistant["agentAction"] == "continue_agent"
+    assert "candidateSnapshotDigest" not in assistant
 
 
 async def test_confirm_component_starts_run_with_locked_token() -> None:
@@ -185,12 +156,13 @@ async def test_confirm_component_starts_run_with_locked_token() -> None:
         "问候组件", "生成问候语 greeting"
     )
     async with SessionLocal() as session:
-        candidate = await create_message(
-            conversation_id,
-            MessageCreate(content="生成 greeting"),
-            session,
+        component = await session.get(Component, component_id)
+        version = await session.get(WorkflowVersion, component.default_version_id)
+        token = candidate_snapshot_digest(
+            component.id,
+            version.id,
+            version.definition_json["spec"]["inputSchema"],
         )
-    token = candidate["assistant"]["candidateSnapshotDigest"]
     async with SessionLocal() as session:
         confirmed = await confirm_component(
             conversation_id,

@@ -1381,6 +1381,7 @@ class WorkerService:
                             input_digest=metadata["inputDigest"],
                             output_digest=metadata["outputDigest"],
                             capture_policy=metadata["capturePolicy"],
+                            evidence_kind=metadata["evidenceKind"],
                         )
                     )
                 await append_event(
@@ -1415,15 +1416,49 @@ class WorkerService:
             NodeType.LLM,
         }
         if (
-            result.status != "succeeded"
-            or result.output is None
-            or claimed.node.type not in replayable_types
+            claimed.node.type not in replayable_types
             or claimed.node.side_effect
+            or (
+                result.status == "succeeded"
+                and result.output is None
+            )
+            or (
+                result.status == "failed"
+                and result.error is None
+            )
+            or result.status not in {"succeeded", "failed"}
         ):
             return None
-        safe_output = redact(result.output)
+        if result.status == "succeeded":
+            evidence = {
+                "status": "succeeded",
+                "output": redact(result.output),
+            }
+            evidence_value = evidence["output"]
+            capture_policy = "success_redacted_schema_validated_64k"
+            evidence_kind = "observed_output"
+        else:
+            from app.application.workflow_patch import evidence_kind_for_error
+
+            evidence = {
+                "status": "failed",
+                "error": redact(result.error.model_dump()),
+                "observedOutput": redact(result.output),
+            }
+            evidence_value = {
+                "error": evidence["error"],
+                "observedOutput": evidence["observedOutput"],
+            }
+            capture_policy = "failure_redacted_contract_evidence_64k"
+            evidence_kind = evidence_kind_for_error(result.error.code)
+            if (
+                evidence_kind == "observed_contract_output"
+                and not isinstance(evidence["observedOutput"], dict)
+            ):
+                evidence_kind = "unsupported"
+        evidence["evidenceKind"] = evidence_kind
         encoded = json.dumps(
-            safe_output, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode()
         if len(encoded) > 64 * 1024:
             return None
@@ -1433,7 +1468,7 @@ class WorkerService:
             claimed.node_id,
             f"{claimed.node_id}-replay-fixture.json",
             "replay_fixture",
-            {"output": safe_output},
+            evidence,
         )
         artifact["metadata"] = {
             **artifact.get("metadata", {}),
@@ -1444,8 +1479,9 @@ class WorkerService:
                 }
             ),
             "inputDigest": digest_json(redact(claimed.inputs)),
-            "outputDigest": digest_json(safe_output),
-            "capturePolicy": "redacted_schema_validated_64k",
+            "outputDigest": digest_json(evidence_value),
+            "capturePolicy": capture_policy,
+            "evidenceKind": evidence_kind,
         }
         return artifact
 
@@ -1668,17 +1704,27 @@ async def reconcile_conversation_artifacts(
         else:
             missing.append(item.id)
     final_files = {
-        path.name
-        for path in root.iterdir()
-        if path.is_file()
+        str(path.relative_to(root))
+        for path in root.rglob("*")
+        if path.is_file() and ".staging" not in path.relative_to(root).parts
     }
     orphan_files = sorted(final_files - recorded)
     for name in orphan_files:
-        (root / name).unlink(missing_ok=True)
+        target = (root / name).resolve()
+        if target.is_relative_to(root):
+            target.unlink(missing_ok=True)
+    staging_root = root / ".staging"
+    staging_removed: list[str] = []
+    if staging_root.is_dir():
+        for path in staging_root.rglob("*"):
+            if path.is_file():
+                staging_removed.append(str(path.relative_to(root)))
+                path.unlink(missing_ok=True)
     return {
         "recovered": recovered,
         "missing": missing,
         "orphanFilesRemoved": orphan_files,
+        "orphanStagingRemoved": sorted(staging_removed),
     }
 
 
@@ -1701,7 +1747,11 @@ async def reconcile_recent_runs(session: AsyncSession, *, limit: int = 50) -> di
     conversation_runs = (
         await session.scalars(
             select(ConversationRun.id)
-            .where(ConversationRun.status == "succeeded")
+            .where(
+                ConversationRun.status.in_(
+                    ["succeeded", "failed", "cancelled"]
+                )
+            )
             .order_by(ConversationRun.created_at.desc())
             .limit(limit)
         )

@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from app.application.compiler import WorkflowCompiler, WorkflowValidationError, digest_json
 from app.application.expressions import ExpressionError, resolve_mapping
-from app.domain.workflow import NodeType
+from app.domain.workflow import ExecutionError, NodeResult, NodeType
 from app.runtime.executors import (
     CancellationToken,
     ExecutorRegistry,
@@ -124,8 +124,6 @@ async def run_isolated_replay(
         if node.side_effect or node.type in external_types:
             fixture = fixtures.get(node_id)
             if not isinstance(fixture, dict):
-                from app.domain.workflow import ExecutionError, NodeResult
-
                 result = NodeResult(
                     status="failed",
                     error=ExecutionError(
@@ -135,33 +133,87 @@ async def run_isolated_replay(
                 )
             else:
                 fixture_digests[node_id] = digest_json(fixture)
+                fixture_status = fixture.get("status")
                 schema = node.config.get("outputSchema")
-                errors = (
-                    output_schema_errors(schema, fixture)
-                    if isinstance(schema, dict)
-                    else []
-                )
-                if node.side_effect and not isinstance(schema, dict):
-                    errors = ["副作用模拟缺少冻结 outputSchema"]
-                if errors:
-                    from app.domain.workflow import ExecutionError, NodeResult
-
-                    schema_diagnostics.append(
-                        {"nodeId": node_id, "errors": errors}
+                if not isinstance(schema, dict):
+                    page_contract = node.config.get("pageContract", {})
+                    schema = (
+                        page_contract.get("outputSchema")
+                        if isinstance(page_contract, dict)
+                        else None
                     )
-                    result = NodeResult(
-                        status="failed",
-                        error=ExecutionError(
-                            code="REPLAY_UNSUPPORTED",
-                            message=f"节点 {node_id} fixture 不满足输出契约",
-                        ),
+                if fixture_status == "failed":
+                    error_data = fixture.get("error") or {}
+                    observed_output = fixture.get("observedOutput")
+                    errors = (
+                        output_schema_errors(schema, observed_output)
+                        if isinstance(schema, dict)
+                        and isinstance(observed_output, dict)
+                        else []
                     )
+                    contract_error = error_data.get("code") in {
+                        "CONTRACT_VIOLATION",
+                        "MCP_CONTRACT_DRIFT",
+                    }
+                    if contract_error and isinstance(observed_output, dict) and not errors:
+                        result = NodeResult(
+                            status="succeeded", output=observed_output
+                        )
+                    else:
+                        if errors:
+                            schema_diagnostics.append(
+                                {"nodeId": node_id, "errors": errors}
+                            )
+                        result = NodeResult(
+                            status="failed",
+                            output=(
+                                observed_output
+                                if isinstance(observed_output, dict)
+                                else None
+                            ),
+                            error=ExecutionError.model_validate(
+                                {
+                                    "code": error_data.get(
+                                        "code", "REPLAY_UNSUPPORTED"
+                                    ),
+                                    "message": error_data.get(
+                                        "message", "失败 fixture 缺少错误信息"
+                                    ),
+                                    "retryable": error_data.get(
+                                        "retryable", False
+                                    ),
+                                    "details": error_data.get("details", {}),
+                                }
+                            ),
+                        )
                 else:
-                    from app.domain.workflow import NodeResult
-
-                    result = NodeResult(status="succeeded", output=fixture)
-                    if node.side_effect:
-                        side_effects_simulated.append(node_id)
+                    output = (
+                        fixture.get("output")
+                        if fixture_status == "succeeded"
+                        else fixture
+                    )
+                    errors = (
+                        output_schema_errors(schema, output)
+                        if isinstance(schema, dict)
+                        else []
+                    )
+                    if node.side_effect and not isinstance(schema, dict):
+                        errors = ["副作用模拟缺少冻结 outputSchema"]
+                    if errors:
+                        schema_diagnostics.append(
+                            {"nodeId": node_id, "errors": errors}
+                        )
+                        result = NodeResult(
+                            status="failed",
+                            error=ExecutionError(
+                                code="REPLAY_UNSUPPORTED",
+                                message=f"节点 {node_id} fixture 不满足输出契约",
+                            ),
+                        )
+                    else:
+                        result = NodeResult(status="succeeded", output=output)
+                        if node.side_effect:
+                            side_effects_simulated.append(node_id)
         else:
             result = await _execute_node(
                 registry, replay_run_id, node, resolved, safe_inputs

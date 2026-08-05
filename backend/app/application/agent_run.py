@@ -363,8 +363,15 @@ class AgentRunWorker:
 
         host = AgentHost(adapter=self._adapter)
 
-        async def event_sink(_runtime: dict[str, Any], audit: dict[str, Any]) -> None:
-            # 只把脱敏的审计事件写入数据库；原始 payload 不落库。
+        async def event_sink(runtime: dict[str, Any], audit: dict[str, Any]) -> None:
+            if runtime["type"] == "tool.result":
+                await self._persist_tool_result_artifact(
+                    run_id,
+                    runtime["payload"],
+                    claim_generation,
+                    claim_token,
+                )
+            # 审计事件只保存摘要；可恢复值由独立、有界 Artifact 承载。
             await self._append_committed(
                 run_id,
                 audit["type"],
@@ -385,6 +392,9 @@ class AgentRunWorker:
             max_steps=config.max_steps,
             max_total_tokens=config.max_total_tokens,
             max_duration_seconds=config.max_duration_seconds,
+            completed_actions=tuple(
+                run.input_json.get("completedActionLedger", [])
+            ),
         )
 
         terminal: AgentRunError | None = None
@@ -504,6 +514,122 @@ class AgentRunWorker:
                 raise asyncio.CancelledError
             await _append_event(session, run_id, event_type, payload)
 
+    async def _persist_tool_result_artifact(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+        claim_generation: int,
+        claim_token: str | None,
+    ) -> None:
+        if payload.get("status") != "succeeded" or payload.get("effect") != "none":
+            return
+        from app.application.security import redact
+
+        envelope = {
+            "callId": payload.get("callId"),
+            "capabilityRef": payload.get("capabilityRef"),
+            "output": redact(payload.get("output", {})),
+            "evidenceDigest": payload.get("evidenceDigest"),
+            "outputSchema": payload.get("outputSchema"),
+            "actionSignature": payload.get("actionSignature"),
+        }
+        content = json.dumps(
+            envelope,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        if len(content) > 64 * 1024:
+            return
+        call_id = str(payload.get("callId", "unknown"))
+        storage_key = (
+            "tool-results/"
+            + hashlib.sha256(call_id.encode()).hexdigest()[:24]
+            + ".json"
+        )
+        token = claim_token or "unclaimed"
+        staging_key = f".staging/{token}/{storage_key}"
+        root = self._trajectory_dir(run_id)
+        staging = (root / staging_key).resolve()
+        if not staging.is_relative_to(root):
+            raise AgentHostError(
+                "EVIDENCE_CONFLICT", "ToolResult staging 路径越界"
+            )
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        staging.write_bytes(content)
+        content_hash = hashlib.sha256(content).hexdigest()
+        created = False
+        async with SessionLocal() as session, session.begin():
+            owned = await session.scalar(
+                select(ConversationRun.id).where(
+                    ConversationRun.id == run_id,
+                    ConversationRun.status == "running",
+                    ConversationRun.lease_owner == self.worker_id,
+                    ConversationRun.claim_generation == claim_generation,
+                    ConversationRun.claim_token == claim_token,
+                )
+            )
+            if owned is None:
+                staging.unlink(missing_ok=True)
+                raise asyncio.CancelledError
+            existing = await session.scalar(
+                select(Artifact).where(
+                    Artifact.conversation_run_id == run_id,
+                    Artifact.kind == "tool_result",
+                    Artifact.name == f"{call_id}.json",
+                )
+            )
+            if existing is not None:
+                staging.unlink(missing_ok=True)
+                if existing.sha256 != content_hash:
+                    raise AgentHostError(
+                        "EVIDENCE_CONFLICT",
+                        f"duplicate call id {call_id} 的 ToolResult hash 不一致",
+                    )
+                return
+            session.add(
+                Artifact(
+                    id=str(uuid4()),
+                    run_id=None,
+                    conversation_run_id=run_id,
+                    kind="tool_result",
+                    name=f"{call_id}.json",
+                    uri=f"artifact://conversation-agents/{run_id}/{storage_key}",
+                    sha256=content_hash,
+                    size=len(content),
+                    media_type="application/json",
+                    metadata_json={
+                        "callId": call_id,
+                        "capabilityRef": payload.get("capabilityRef"),
+                        "evidenceDigest": payload.get("evidenceDigest"),
+                        "effect": payload.get("effect"),
+                        "idempotent": payload.get("idempotent"),
+                        "actionSignature": payload.get("actionSignature"),
+                        "resultDigest": digest_json(envelope["output"]),
+                        "storageKey": storage_key,
+                        "stagingKey": staging_key,
+                        "retentionClass": "checkpoint",
+                    },
+                )
+            )
+            created = True
+        if created:
+            target = (root / storage_key).resolve()
+            if not target.is_relative_to(root):
+                raise AgentHostError(
+                    "EVIDENCE_CONFLICT", "ToolResult 最终路径越界"
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                if hashlib.sha256(target.read_bytes()).hexdigest() != content_hash:
+                    raise AgentHostError(
+                        "EVIDENCE_CONFLICT",
+                        f"ToolResult 最终文件 {storage_key} hash 冲突",
+                    )
+                staging.unlink(missing_ok=True)
+            else:
+                staging.replace(target)
+
     async def _finalize_failure(
         self,
         run_id: str,
@@ -513,7 +639,7 @@ class AgentRunWorker:
     ) -> None:
         async with SessionLocal() as session, session.begin():
             run = await session.get(ConversationRun, run_id)
-            if not self._owns(run, claim_generation, claim_token):
+            if run is None:
                 return
             checkpoint = await self._create_task_checkpoint(
                 session,
@@ -529,21 +655,39 @@ class AgentRunWorker:
                     else "terminal"
                 ),
             )
-            run.status = "failed"
-            run.finished_at = utcnow()
-            run.lease_owner = None
-            run.lease_expires_at = None
-            run.error_json = {
+            error_json = {
                 "code": error.code,
                 "message": error.message,
                 "retryable": error.code in {"TIMEOUT", "EXECUTION_FAILED"},
                 "taskCheckpointId": checkpoint.id,
             }
+            claimed = await session.execute(
+                update(ConversationRun)
+                .where(
+                    ConversationRun.id == run_id,
+                    ConversationRun.status == "running",
+                    ConversationRun.lease_owner == self.worker_id,
+                    ConversationRun.claim_generation == claim_generation,
+                    ConversationRun.claim_token == claim_token,
+                )
+                .values(
+                    status="failed",
+                    finished_at=utcnow(),
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    claim_token=None,
+                    error_json=error_json,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if claimed.rowcount != 1:
+                await session.delete(checkpoint)
+                return
             await _append_event(
                 session,
                 run_id,
                 "agent.run.failed",
-                {"conversationRunId": run_id, "error": run.error_json},
+                {"conversationRunId": run_id, "error": error_json},
             )
 
     async def _finalize_cancelled(
@@ -553,18 +697,32 @@ class AgentRunWorker:
         claim_token: str | None,
     ) -> None:
         async with SessionLocal() as session, session.begin():
-            run = await session.get(ConversationRun, run_id)
-            if not self._owns(run, claim_generation, claim_token):
-                return
-            run.status = "cancelled"
-            run.finished_at = utcnow()
-            run.lease_owner = None
-            run.lease_expires_at = None
-            run.error_json = {
+            error_json = {
                 "code": "CANCELLED",
                 "message": "Agent 运行已按请求取消",
                 "retryable": False,
             }
+            claimed = await session.execute(
+                update(ConversationRun)
+                .where(
+                    ConversationRun.id == run_id,
+                    ConversationRun.status == "running",
+                    ConversationRun.lease_owner == self.worker_id,
+                    ConversationRun.claim_generation == claim_generation,
+                    ConversationRun.claim_token == claim_token,
+                )
+                .values(
+                    status="cancelled",
+                    finished_at=utcnow(),
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    claim_token=None,
+                    error_json=error_json,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if claimed.rowcount != 1:
+                return
             await _append_event(
                 session,
                 run_id,
@@ -586,10 +744,6 @@ class AgentRunWorker:
         claim_token: str | None,
     ) -> None:
         # 先把原始轨迹写入 staging（不落最终目录），DB 只保存受控 artifact:// 引用与 hash。
-        async with SessionLocal() as session:
-            run = await session.get(ConversationRun, run_id)
-            if not self._owns(run, claim_generation, claim_token):
-                return
         staged = self._stage_trajectory(
             run_id, raw_events, output, claim_token or "unclaimed"
         )
@@ -606,43 +760,57 @@ class AgentRunWorker:
         }
         committed = False
         async with SessionLocal() as session, session.begin():
-            run = await session.get(ConversationRun, run_id)
-            if not self._owns(run, claim_generation, claim_token):
-                return
-            run.status = "succeeded"
-            run.finished_at = utcnow()
-            run.lease_owner = None
-            run.lease_expires_at = None
-            run.output_json = output
-            run.trajectory_json = trajectory
-            session.add(
-                Artifact(
-                    id=str(uuid4()),
-                    run_id=None,
-                    conversation_run_id=run.id,
-                    kind="conversation_trajectory",
-                    name="trajectory.json",
-                    uri=staged["uri"],
-                    sha256=staged["sha256"],
-                    size=staged["bytes"],
-                    media_type="application/json",
-                    metadata_json={
-                        "conversationRunId": run.id,
-                        "sourceKind": "conversation_run",
-                        "sourceId": run.id,
-                        "storageKey": "trajectory.json",
-                        "stagingKey": staged["stagingKey"],
-                        "retentionClass": "trajectory",
-                    },
+            claimed = await session.execute(
+                update(ConversationRun)
+                .where(
+                    ConversationRun.id == run_id,
+                    ConversationRun.status == "running",
+                    ConversationRun.lease_owner == self.worker_id,
+                    ConversationRun.claim_generation == claim_generation,
+                    ConversationRun.claim_token == claim_token,
                 )
+                .values(
+                    status="succeeded",
+                    finished_at=utcnow(),
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    claim_token=None,
+                    output_json=output,
+                    trajectory_json=trajectory,
+                )
+                .execution_options(synchronize_session=False)
             )
-            await _append_event(
-                session,
-                run_id,
-                "agent.run.succeeded",
-                {"conversationRunId": run_id, "summary": summary},
-            )
-            committed = True
+            if claimed.rowcount != 1:
+                committed = False
+            else:
+                session.add(
+                    Artifact(
+                        id=str(uuid4()),
+                        run_id=None,
+                        conversation_run_id=run_id,
+                        kind="conversation_trajectory",
+                        name="trajectory.json",
+                        uri=staged["uri"],
+                        sha256=staged["sha256"],
+                        size=staged["bytes"],
+                        media_type="application/json",
+                        metadata_json={
+                            "conversationRunId": run_id,
+                            "sourceKind": "conversation_run",
+                            "sourceId": run_id,
+                            "storageKey": "trajectory.json",
+                            "stagingKey": staged["stagingKey"],
+                            "retentionClass": "trajectory",
+                        },
+                    )
+                )
+                await _append_event(
+                    session,
+                    run_id,
+                    "agent.run.succeeded",
+                    {"conversationRunId": run_id, "summary": summary},
+                )
+                committed = True
         # 事务提交后再从 staging 原子落位；提交失败则 staging 文件由 reconcile 清理。
         if committed:
             self._promote_trajectory(run_id, staged["stagingKey"])
@@ -679,6 +847,17 @@ class AgentRunWorker:
                 .order_by(ConversationRunEvent.seq)
             )
         ).all()
+        artifacts = (
+            await session.scalars(
+                select(Artifact).where(
+                    Artifact.conversation_run_id == run.id,
+                    Artifact.kind == "tool_result",
+                )
+            )
+        ).all()
+        artifact_by_call = {
+            str(item.metadata_json.get("callId")): item for item in artifacts
+        }
         requested = {
             item.payload_json.get("callId")
             for item in events
@@ -697,6 +876,21 @@ class AgentRunWorker:
             "trajectory": run.trajectory_json or {},
         }
         source_digest = digest_json(source)
+        action_ledger = [
+            {
+                "signature": item.metadata_json.get("actionSignature"),
+                "capabilityRef": item.metadata_json.get("capabilityRef"),
+                "effect": item.metadata_json.get("effect"),
+                "idempotencyKey": item.metadata_json.get("idempotencyKey"),
+                "resultArtifact": {
+                    "id": item.id,
+                    "sha256": item.sha256,
+                    "resultDigest": item.metadata_json.get("resultDigest"),
+                },
+            }
+            for item in artifacts
+            if item.metadata_json.get("actionSignature")
+        ]
         snapshot = {
             "source": {
                 "kind": "conversation_run",
@@ -708,6 +902,26 @@ class AgentRunWorker:
                     "seq": item.seq,
                     "type": item.type,
                     "payload": item.payload_json,
+                    **(
+                        {
+                            "artifact": {
+                                "id": artifact_by_call[
+                                    str(item.payload_json.get("callId"))
+                                ].id,
+                                "sha256": artifact_by_call[
+                                    str(item.payload_json.get("callId"))
+                                ].sha256,
+                                "uri": artifact_by_call[
+                                    str(item.payload_json.get("callId"))
+                                ].uri,
+                                "evidenceDigest": artifact_by_call[
+                                    str(item.payload_json.get("callId"))
+                                ].metadata_json.get("evidenceDigest"),
+                            }
+                        }
+                        if str(item.payload_json.get("callId")) in artifact_by_call
+                        else {}
+                    ),
                 }
                 for item in events
                 if item.type in {"tool.result", "agent.step.completed"}
@@ -717,12 +931,22 @@ class AgentRunWorker:
                 str(call_id) for call_id in requested - closed if call_id
             ),
             "remainingPlan": {"resumeSameTask": True},
+            "completedActionLedger": action_ledger,
             "locks": list(
                 (run.config_json or {}).get("allowedCapabilities", [])
             ),
             "committedSideEffects": [],
             "outcomeCertainty": (
                 "unknown" if error.get("code") == "UNKNOWN_OUTCOME" else "known_failed"
+            ),
+            **(
+                {
+                    "pendingQuestion": (
+                        "前一 Worker 的副作用结果未知。确认已核对外部状态并继续剩余步骤？"
+                    )
+                }
+                if error.get("code") == "UNKNOWN_OUTCOME"
+                else {}
             ),
             "userContext": {"message": run.input_json.get("message", "")},
         }

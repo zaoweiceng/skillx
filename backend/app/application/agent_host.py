@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -48,6 +50,7 @@ class AgentHostRequest:
     max_steps: int = 6
     max_total_tokens: int = 30000
     max_duration_seconds: int = 120
+    completed_actions: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass
@@ -141,6 +144,7 @@ class AgentHost:
         result = AgentHostResult(output={})
         open_calls: dict[str, dict[str, Any]] = {}
         broker_results: set[str] = set()
+        broker_payloads: dict[str, dict[str, Any]] = {}
         output: dict[str, Any] | None = None
 
         try:
@@ -211,6 +215,9 @@ class AgentHost:
                             )
                         )
                         broker_results.add(request_payload["callId"])
+                        broker_payloads[request_payload["callId"]] = runtime_result[
+                            "payload"
+                        ]
                         continue
                     try:
                         runtime_event, audit_event = validator.validate_pair(raw)
@@ -256,19 +263,17 @@ class AgentHost:
                                 f"Agent Token 超过 Host 上限 {request.max_total_tokens}",
                             )
                     elif event_type == "agent.completed":
-                        if broker_results:
-                            provenance_ids = {
-                                str(item.get("callId"))
-                                for item in payload.get("provenance", [])
-                                if isinstance(item, dict)
-                            }
-                            if not broker_results <= provenance_ids:
-                                await self._cancel(adapter, request.run_id)
-                                raise AgentHostError(
-                                    "AGENT_EVENT_INVALID",
-                                    "最终输出 provenance 未覆盖真实 ToolResult",
-                                )
                         output = payload.get("output")
+                        if broker_results:
+                            try:
+                                self._validate_output_provenance(
+                                    output,
+                                    payload.get("outputProvenance"),
+                                    broker_payloads,
+                                )
+                            except AgentHostError:
+                                await self._cancel(adapter, request.run_id)
+                                raise
                         final_tokens = payload.get("totalTokens")
                         if final_tokens is not None:
                             # 终态 Token 一致性校验：必须非负、不得小于可信步骤累计值，
@@ -310,6 +315,91 @@ class AgentHost:
         result.output = output
         return result
 
+    @staticmethod
+    def _validate_output_provenance(
+        output: Any,
+        provenance: Any,
+        broker_payloads: dict[str, dict[str, Any]],
+    ) -> None:
+        if not isinstance(output, dict) or not isinstance(provenance, dict):
+            raise AgentHostError(
+                "AGENT_EVENT_INVALID",
+                "最终输出必须提供逐字段 outputProvenance",
+            )
+        if set(provenance) != set(output):
+            raise AgentHostError(
+                "AGENT_EVENT_INVALID",
+                "outputProvenance 必须恰好覆盖所有输出字段",
+            )
+        for output_field, source in provenance.items():
+            if not isinstance(source, dict):
+                raise AgentHostError(
+                    "AGENT_EVENT_INVALID",
+                    f"outputProvenance.{output_field} 必须是对象",
+                )
+            mode = source.get("mode", "deterministic")
+            if mode == "generative":
+                call_ids = source.get("sourceCallIds")
+                digests = source.get("evidenceDigests")
+                if (
+                    not isinstance(call_ids, list)
+                    or not call_ids
+                    or not isinstance(digests, list)
+                    or len(call_ids) != len(digests)
+                    or not source.get("promptVersion")
+                ):
+                    raise AgentHostError(
+                        "AGENT_EVENT_INVALID",
+                        f"outputProvenance.{output_field} 缺少生成式来源集合或提示词版本",
+                    )
+                for call_id, digest in zip(call_ids, digests, strict=True):
+                    payload = broker_payloads.get(str(call_id))
+                    if (
+                        payload is None
+                        or payload.get("status") != "succeeded"
+                        or payload.get("evidenceDigest") != digest
+                    ):
+                        raise AgentHostError(
+                            "AGENT_EVENT_INVALID",
+                            f"outputProvenance.{output_field} 引用了无效 ToolResult",
+                        )
+                continue
+            call_id = str(source.get("callId", ""))
+            payload = broker_payloads.get(call_id)
+            if (
+                payload is None
+                or payload.get("status") != "succeeded"
+                or payload.get("evidenceDigest") != source.get("evidenceDigest")
+            ):
+                raise AgentHostError(
+                    "AGENT_EVENT_INVALID",
+                    f"outputProvenance.{output_field} 引用了无效 ToolResult",
+                )
+            path = source.get("path")
+            try:
+                source_value = AgentHost._provenance_path(payload, path)
+            except (KeyError, TypeError):
+                raise AgentHostError(
+                    "AGENT_EVENT_INVALID",
+                    f"outputProvenance.{output_field} path 无效",
+                ) from None
+            if output[output_field] != source_value:
+                raise AgentHostError(
+                    "AGENT_EVENT_INVALID",
+                    f"输出字段 {output_field} 与 ToolResult provenance 值不一致",
+                )
+
+    @staticmethod
+    def _provenance_path(payload: dict[str, Any], path: Any) -> Any:
+        if not isinstance(path, str) or not path:
+            raise KeyError(path)
+        current: Any = payload
+        for segment in path.split("."):
+            if not isinstance(current, dict) or segment not in current:
+                raise KeyError(segment)
+            current = current[segment]
+        return current
+
     async def _execute_tool_request(
         self,
         request: AgentHostRequest,
@@ -317,6 +407,49 @@ class AgentHost:
     ) -> dict[str, Any]:
         capability_ref = payload["capabilityRef"]
         try:
+            descriptor = self._tool_registry.describe(capability_ref)
+            signature = action_signature(
+                capability_ref,
+                payload["arguments"],
+                effect=descriptor["effect"],
+            )
+            completed = next(
+                (
+                    item
+                    for item in request.completed_actions
+                    if item.get("signature") == signature
+                ),
+                None,
+            )
+            if completed is not None:
+                if descriptor["effect"] != "none":
+                    raise AgentHostError(
+                        "ACTION_OUTCOME_UNKNOWN",
+                        "已完成或结果未知的副作用动作不得由 continuation 重做",
+                    )
+                saved_output = completed.get("result")
+                if not isinstance(saved_output, dict):
+                    raise AgentHostError(
+                        "ACTION_ALREADY_COMPLETED",
+                        "已完成动作缺少可复用 Artifact，拒绝重做",
+                    )
+                evidence = {"status": "succeeded", "output": saved_output}
+                return {
+                    "type": "tool.result",
+                    "payload": {
+                        "callId": payload["callId"],
+                        "capabilityRef": capability_ref,
+                        "status": "succeeded",
+                        "output": saved_output,
+                        "evidenceDigest": evidence_digest(evidence),
+                        "effect": descriptor["effect"],
+                        "idempotent": descriptor["idempotent"],
+                        "fixturePolicy": descriptor["fixturePolicy"],
+                        "actionSignature": signature,
+                        "reusedFromLedger": True,
+                        **self._tool_result_metadata(payload),
+                    },
+                }
             output = await self._tool_registry.execute(
                 capability_ref,
                 ToolExecutionContext(
@@ -335,6 +468,10 @@ class AgentHost:
                     "status": "succeeded",
                     "output": output,
                     "evidenceDigest": evidence_digest(evidence),
+                    "effect": descriptor["effect"],
+                    "idempotent": descriptor["idempotent"],
+                    "fixturePolicy": descriptor["fixturePolicy"],
+                    "actionSignature": signature,
                     **self._tool_result_metadata(
                         payload,
                         self._tool_registry.distillation_evidence(
@@ -344,6 +481,12 @@ class AgentHost:
                 },
             }
         except ToolBrokerError as exc:
+            descriptor = self._tool_registry.describe(capability_ref)
+            signature = action_signature(
+                capability_ref,
+                payload["arguments"],
+                effect=descriptor["effect"],
+            )
             error = {"code": exc.code, "message": exc.message}
             evidence = {"status": "failed", "error": error}
             return {
@@ -354,6 +497,10 @@ class AgentHost:
                     "status": "failed",
                     "error": error,
                     "evidenceDigest": evidence_digest(evidence),
+                    "effect": descriptor["effect"],
+                    "idempotent": descriptor["idempotent"],
+                    "fixturePolicy": descriptor["fixturePolicy"],
+                    "actionSignature": signature,
                     **self._tool_result_metadata(payload),
                 },
             }
@@ -447,3 +594,33 @@ class AgentHost:
             await adapter.cancel(run_id)
         except Exception:  # noqa: BLE001 - 取消失败不应掩盖原始终态。
             pass
+
+
+def action_signature(
+    capability_ref: str,
+    arguments: dict[str, Any],
+    *,
+    effect: str,
+) -> str:
+    payload = {
+        "capabilityRef": capability_ref,
+        "argumentsDigest": "sha256:"
+        + hashlib.sha256(
+            json.dumps(
+                arguments,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest(),
+        "effect": effect,
+        "idempotencyKey": arguments.get("idempotencyKey"),
+    }
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()

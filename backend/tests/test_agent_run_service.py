@@ -11,6 +11,8 @@ from sqlalchemy import select
 
 from app.api.routes import (
     AgentRunCreate,
+    TaskCheckpointAnswer,
+    answer_task_checkpoint,
     cancel_conversation_run,
     distill_run,
     download_artifact,
@@ -18,6 +20,7 @@ from app.api.routes import (
     list_conversation_run_events,
     start_agent_run,
 )
+from app.application.agent_host import AgentHostError
 from app.application.agent_run import (
     AgentRunConfig,
     AgentRunWorker,
@@ -25,6 +28,7 @@ from app.application.agent_run import (
     resolve_effective_capabilities,
 )
 from app.application.orchestrator import reconcile_conversation_artifacts
+from app.application.task_recovery import TaskCheckpointDriver
 from app.config import get_settings
 from app.infrastructure.database import (
     Artifact,
@@ -242,6 +246,202 @@ async def test_recover_expired_lease_marks_unknown_outcome(traex_stub: None) -> 
     assert checkpoint is not None
     assert checkpoint.status == "awaiting_user"
     assert checkpoint.snapshot_json["outcomeCertainty"] == "unknown"
+
+    async with SessionLocal() as session:
+        answered = await answer_task_checkpoint(
+            checkpoint.id,
+            TaskCheckpointAnswer(
+                snapshotDigest=checkpoint.digest,
+                answer={"continue": True, "externalStateChecked": True},
+            ),
+            session,
+        )
+    assert answered["status"] == "pending"
+    async with SessionLocal() as session:
+        with pytest.raises(HTTPException) as exc:
+            await answer_task_checkpoint(
+                checkpoint.id,
+                TaskCheckpointAnswer(
+                    snapshotDigest=checkpoint.digest,
+                    answer={"continue": True},
+                ),
+                session,
+            )
+    assert exc.value.status_code == 409
+
+
+async def test_task_checkpoint_claims_and_continues_from_tool_artifact(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _conversation()
+    run_id = await _enqueue(
+        conversation_id,
+        "q1 [[MODE:deterministic_fail_after_tool]]",
+        config=AgentRunConfig(
+            output_schema=AgentRunConfig.default().output_schema,
+            allowed_capabilities=("lookup.table",),
+        ),
+    )
+    source = await _drive(run_id)
+    assert source.status == "failed"
+    async with SessionLocal() as session:
+        checkpoint = await session.scalar(
+            select(TaskCheckpoint).where(TaskCheckpoint.source_id == run_id)
+        )
+        artifacts = list(
+            await session.scalars(
+                select(Artifact).where(
+                    Artifact.conversation_run_id == run_id,
+                    Artifact.kind == "tool_result",
+                )
+            )
+        )
+    assert checkpoint is not None and checkpoint.status == "pending"
+    assert len(artifacts) == 1
+    assert checkpoint.snapshot_json["completedSteps"][-1]["artifact"]["id"] == (
+        artifacts[0].id
+    )
+
+    driver = TaskCheckpointDriver("test-task-recovery")
+    assert await driver.poll_once()
+    async with SessionLocal() as session:
+        checkpoint = await session.get(TaskCheckpoint, checkpoint.id)
+        continuation_id = checkpoint.snapshot_json["continuationRunId"]
+    assert await AgentRunWorker("test-continuation-agent").poll_once()
+    assert await driver.poll_once()
+
+    async with SessionLocal() as session:
+        source = await session.get(ConversationRun, run_id)
+        continuation = await session.get(ConversationRun, continuation_id)
+        checkpoint = await session.get(TaskCheckpoint, checkpoint.id)
+    assert source.status == "failed"
+    assert continuation.status == "succeeded"
+    assert continuation.output_json == {"reply": "第一季度：营收增长 12%"}
+    assert continuation.input_json["continuationOfCheckpointId"] == checkpoint.id
+    assert checkpoint.status == "succeeded"
+
+
+async def test_task_checkpoint_late_same_owner_cannot_start_second_continuation(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _conversation()
+    run_id = await _enqueue(
+        conversation_id,
+        "q1 [[MODE:deterministic_fail_after_tool]]",
+        config=AgentRunConfig(
+            output_schema=AgentRunConfig.default().output_schema,
+            allowed_capabilities=("lookup.table",),
+        ),
+    )
+    await _drive(run_id)
+    driver_a = TaskCheckpointDriver("same-owner", lease_seconds=1)
+    driver_b = TaskCheckpointDriver("same-owner", lease_seconds=1)
+    async with SessionLocal() as session, session.begin():
+        handle_a = await driver_a.claim(session)
+    assert handle_a is not None
+    async with SessionLocal() as session, session.begin():
+        checkpoint = await session.get(TaskCheckpoint, handle_a.id)
+        checkpoint.lease_expires_at = utcnow() - timedelta(seconds=1)
+    async with SessionLocal() as session, session.begin():
+        handle_b = await driver_b.claim(session)
+    assert handle_b is not None
+    assert handle_b.generation == handle_a.generation + 1
+    assert await driver_a.start_continuation(handle_a) is False
+    assert await driver_b.start_continuation(handle_b) is True
+    assert await driver_a.start_continuation(handle_a) is False
+
+    async with SessionLocal() as session:
+        continuations = list(
+            await session.scalars(
+                select(ConversationRun).where(
+                    ConversationRun.input_json["continuationOfCheckpointId"]
+                    .as_string()
+                    == handle_a.id
+                )
+            )
+        )
+        started = list(
+            await session.scalars(
+                select(ConversationRunEvent).where(
+                    ConversationRunEvent.conversation_run_id == run_id,
+                    ConversationRunEvent.type == "agent.handoff.started",
+                )
+            )
+        )
+    assert len(continuations) == 1
+    assert len(started) == 1
+
+
+async def test_tool_result_duplicate_call_id_requires_identical_hash(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _conversation()
+    run_id = await _enqueue(conversation_id, "q1")
+    worker = AgentRunWorker("artifact-owner")
+    async with SessionLocal() as session, session.begin():
+        assert await worker.claim(session) == run_id
+    async with SessionLocal() as session:
+        run = await session.get(ConversationRun, run_id)
+        generation = run.claim_generation
+        token = run.claim_token
+    payload = {
+        "callId": "duplicate",
+        "capabilityRef": "lookup.table",
+        "status": "succeeded",
+        "output": {"value": "first"},
+        "evidenceDigest": "sha256:" + "1" * 64,
+        "effect": "none",
+        "idempotent": True,
+        "actionSignature": "sha256:" + "2" * 64,
+    }
+    await worker._persist_tool_result_artifact(
+        run_id, payload, generation, token
+    )
+    await worker._persist_tool_result_artifact(
+        run_id, payload, generation, token
+    )
+    with pytest.raises(AgentHostError, match="hash 不一致"):
+        await worker._persist_tool_result_artifact(
+            run_id,
+            {**payload, "output": {"value": "conflict"}},
+            generation,
+            token,
+        )
+    async with SessionLocal() as session:
+        artifacts = list(
+            await session.scalars(
+                select(Artifact).where(
+                    Artifact.conversation_run_id == run_id,
+                    Artifact.kind == "tool_result",
+                )
+            )
+        )
+    assert len(artifacts) == 1
+
+
+async def test_reconcile_removes_unregistered_tool_result_staging() -> None:
+    conversation_id = await _conversation()
+    run_id = await _enqueue(conversation_id, "staging crash")
+    async with SessionLocal() as session, session.begin():
+        run = await session.get(ConversationRun, run_id)
+        run.status = "failed"
+    root = (
+        get_settings().artifact_root
+        / "conversation-agents"
+        / run_id
+    )
+    orphan = root / ".staging/crashed/tool-results/orphan.json"
+    orphan.parent.mkdir(parents=True, exist_ok=True)
+    orphan.write_text('{"orphan":true}', encoding="utf-8")
+
+    async with SessionLocal() as session, session.begin():
+        report = await reconcile_conversation_artifacts(session, run_id)
+
+    assert ".staging/crashed/tool-results/orphan.json" in report[
+        "orphanStagingRemoved"
+    ]
+    assert not orphan.exists()
+    assert not (root / "tool-results/orphan.json").exists()
 
 
 async def test_late_owner_cannot_commit_output_or_artifact(

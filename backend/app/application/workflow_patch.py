@@ -8,7 +8,6 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.infrastructure.database import FailureObservation, utcnow
@@ -25,8 +24,14 @@ FailureClass = Literal[
     "transient", "contract_drift", "deterministic_input", "platform_bug", "unknown"
 ]
 
-# 出现次数只用于聚合热度，不作为 baseline reproduction 证据。
+# occurrence 必须来自不同持久 Run；它不能替代 baseline reproduction，但仍是资格门禁。
 REPRODUCIBLE_THRESHOLD = 2
+CONTRACT_EVIDENCE_KIND = "observed_contract_output"
+DETERMINISTIC_EVIDENCE_KIND = "deterministic_error"
+TRANSPORT_EVIDENCE_KINDS = frozenset({"transport_error", "timeout"})
+PATCHABLE_EVIDENCE_KINDS = frozenset(
+    {CONTRACT_EVIDENCE_KIND, DETERMINISTIC_EVIDENCE_KIND}
+)
 
 # 补丁绝不允许出现的敏感/越权字段（键名规范化后递归匹配，防大小写/嵌套绕过）。
 _FORBIDDEN_CONFIG_KEYS = frozenset(
@@ -76,6 +81,18 @@ _ALLOWED_CONFIG_KEYS = frozenset(
         "extract",
         "successAssertions",
         "resultSelectors",
+        "pageContract",
+    }
+)
+_ALLOWED_PAGE_CONTRACT_KEYS = frozenset(
+    {
+        "contractVersion",
+        "urlPattern",
+        "bodySelector",
+        "fields",
+        "outputSchema",
+        "timeoutMs",
+        "retryable",
     }
 )
 
@@ -99,19 +116,77 @@ def failure_fingerprint(
     在多次运行间得到相同指纹。
     """
 
+    stable_contract_keys = {
+        "executionSourceDigest",
+        "contractDigest",
+        "schemaDigest",
+        "contractVersion",
+        "capabilityDigest",
+        "pageContractDigest",
+    }
+    stable_contract_summary = {
+        key: value
+        for key, value in (contract_summary or {}).items()
+        if key in stable_contract_keys
+    }
     payload = {
         "workflowVersionId": workflow_version_id,
         "nodeId": node_id,
         "nodeType": node_type,
         "errorCode": error_code,
         "capabilityLock": capability_lock,
-        "contractSummary": contract_summary or {},
+        "contractSummary": stable_contract_summary,
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def classify_failure(error_code: str, *, recovered: bool, reproducible: bool) -> FailureClass:
+def evidence_kind_for_error(error_code: str) -> str:
+    if error_code == "TIMEOUT":
+        return "timeout"
+    if error_code == "DEPENDENCY_UNAVAILABLE":
+        return "transport_error"
+    if error_code in {
+        "PAGE_DRIFT",
+        "MCP_CONTRACT_DRIFT",
+        "CONTRACT_VIOLATION",
+    }:
+        return CONTRACT_EVIDENCE_KIND
+    if error_code in {"INVALID_INPUT"}:
+        return DETERMINISTIC_EVIDENCE_KIND
+    return "unsupported"
+
+
+def reproduction_policy(evidence_kind: str) -> dict[str, Any]:
+    if evidence_kind == CONTRACT_EVIDENCE_KIND:
+        return {
+            "kind": "frozen_contract_revalidation",
+            "minimumIndependentRuns": REPRODUCIBLE_THRESHOLD,
+            "patchEligible": True,
+        }
+    if evidence_kind == DETERMINISTIC_EVIDENCE_KIND:
+        return {
+            "kind": "isolated_execution",
+            "minimumIndependentRuns": REPRODUCIBLE_THRESHOLD,
+            "patchEligible": True,
+        }
+    if evidence_kind in TRANSPORT_EVIDENCE_KINDS:
+        return {
+            "kind": "independent_probe_or_runs",
+            "minimumIndependentRuns": REPRODUCIBLE_THRESHOLD,
+            "patchEligible": False,
+            "diagnosticOnly": True,
+        }
+    return {"kind": "unsupported", "patchEligible": False}
+
+
+def classify_failure(
+    error_code: str,
+    *,
+    recovered: bool,
+    reproducible: bool,
+    evidence_kind: str | None = None,
+) -> FailureClass:
     """把失败归类，决定是否值得生成 WorkflowPatch。
 
     - 网络/依赖类且未稳定复现 → transient；
@@ -120,9 +195,12 @@ def classify_failure(error_code: str, *, recovered: bool, reproducible: bool) ->
     - 其它可复现 → platform_bug；否则 unknown。
     """
 
-    if error_code in {"DEPENDENCY_UNAVAILABLE", "TIMEOUT"} and not reproducible:
+    if error_code in {"DEPENDENCY_UNAVAILABLE", "TIMEOUT"}:
         return "transient"
-    if error_code in {"MCP_CONTRACT_DRIFT", "PAGE_DRIFT"}:
+    if error_code in {"MCP_CONTRACT_DRIFT", "PAGE_DRIFT"} or (
+        error_code == "CONTRACT_VIOLATION"
+        and evidence_kind == CONTRACT_EVIDENCE_KIND
+    ):
         return "contract_drift"
     if not reproducible:
         return "transient" if not recovered else "unknown"
@@ -207,7 +285,32 @@ def apply_workflow_patch(
                             f"补丁不得修改 config 键 {config_key}（不在受限白名单内）"
                         )
                 base = node.get("config") if isinstance(node.get("config"), dict) else {}
-                node["config"] = {**base, **value}
+                next_config = dict(value)
+                if "pageContract" in value:
+                    page_patch = value["pageContract"]
+                    base_contract = base.get("pageContract", {})
+                    if not isinstance(page_patch, dict) or not isinstance(
+                        base_contract, dict
+                    ):
+                        raise WorkflowPatchViolation("pageContract 补丁必须是对象")
+                    unknown = set(page_patch) - _ALLOWED_PAGE_CONTRACT_KEYS
+                    if unknown:
+                        raise WorkflowPatchViolation(
+                            f"pageContract 补丁包含未授权字段: {sorted(unknown)}"
+                        )
+                    for immutable in ("contractVersion", "urlPattern"):
+                        if (
+                            immutable in page_patch
+                            and page_patch[immutable] != base_contract.get(immutable)
+                        ):
+                            raise WorkflowPatchViolation(
+                                f"pageContract 补丁不得修改 {immutable}"
+                            )
+                    next_config["pageContract"] = {
+                        **base_contract,
+                        **page_patch,
+                    }
+                node["config"] = {**base, **next_config}
             else:
                 node[field] = value
     edges = next_definition.setdefault("spec", {}).setdefault("edges", [])
@@ -255,53 +358,68 @@ async def record_failure_observation(
         error_code=error_code,
         contract_summary=contract_summary,
     )
+    evidence_kind = evidence_kind_for_error(error_code)
     classification = classify_failure(
-        error_code, recovered=recovered, reproducible=False
+        error_code,
+        recovered=recovered,
+        reproducible=False,
+        evidence_kind=evidence_kind,
     )
     now = utcnow()
-    statement = sqlite_insert(FailureObservation).values(
-        id=str(uuid4()),
-        fingerprint=fingerprint,
-        workflow_version_id=workflow_version_id,
-        plan_snapshot_id=plan_snapshot_id,
-        source_node_run_id=source_node_run_id,
-        node_id=node_id,
-        node_type=node_type,
-        error_code=error_code,
-        classification=classification,
-        occurrence=1,
-        recovered=recovered,
-        last_run_id=run_id,
-        last_checkpoint_id=checkpoint_id,
-        locks_json=locks or [],
-        contract_summary_json=contract_summary or {},
-        recovered_outcome_json=recovered_outcome,
-        created_at=now,
-        updated_at=now,
-    )
-    await session.execute(
-        statement.on_conflict_do_update(
-            index_elements=[FailureObservation.fingerprint],
-            set_={
-                "occurrence": FailureObservation.occurrence + 1,
-                "recovered": FailureObservation.recovered | recovered,
-                "last_run_id": run_id,
-                "last_checkpoint_id": checkpoint_id,
-                "source_node_run_id": source_node_run_id,
-                "locks_json": locks or [],
-                "contract_summary_json": contract_summary or {},
-                "recovered_outcome_json": recovered_outcome,
-                "updated_at": now,
-            },
+    observation = await session.scalar(
+        select(FailureObservation).where(
+            FailureObservation.fingerprint == fingerprint
         )
     )
-    observation = await session.scalar(
-        select(FailureObservation).where(FailureObservation.fingerprint == fingerprint)
-    )
-    assert observation is not None
+    evidence_id = run_id or source_node_run_id or checkpoint_id
+    if observation is None:
+        evidence_ids = [evidence_id] if evidence_id else []
+        observation = FailureObservation(
+            id=str(uuid4()),
+            fingerprint=fingerprint,
+            workflow_version_id=workflow_version_id,
+            plan_snapshot_id=plan_snapshot_id,
+            source_node_run_id=source_node_run_id,
+            node_id=node_id,
+            node_type=node_type,
+            error_code=error_code,
+            classification=classification,
+            occurrence=max(1, len(evidence_ids)),
+            recovered=recovered,
+            evidence_kind=evidence_kind,
+            reproduction_policy_json=reproduction_policy(evidence_kind),
+            evidence_ids_json=evidence_ids,
+            last_run_id=run_id,
+            last_checkpoint_id=checkpoint_id,
+            locks_json=locks or [],
+            contract_summary_json=contract_summary or {},
+            recovered_outcome_json=recovered_outcome,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(observation)
+    else:
+        evidence_ids = list(observation.evidence_ids_json or [])
+        if evidence_id and evidence_id not in evidence_ids:
+            evidence_ids.append(evidence_id)
+        observation.evidence_ids_json = evidence_ids
+        observation.occurrence = max(1, len(evidence_ids))
+        observation.recovered = observation.recovered or recovered
+        observation.last_run_id = run_id
+        observation.last_checkpoint_id = checkpoint_id
+        observation.source_node_run_id = source_node_run_id
+        observation.locks_json = locks or []
+        observation.contract_summary_json = contract_summary or {}
+        observation.recovered_outcome_json = recovered_outcome
+        observation.evidence_kind = evidence_kind
+        observation.reproduction_policy_json = reproduction_policy(evidence_kind)
+        observation.updated_at = now
     reproducible = bool(observation.baseline_reproduced)
     observation.classification = classify_failure(
-        error_code, recovered=observation.recovered, reproducible=reproducible
+        error_code,
+        recovered=observation.recovered,
+        reproducible=reproducible,
+        evidence_kind=evidence_kind,
     )
     await session.flush()
     return observation
@@ -313,12 +431,36 @@ def observation_eligibility(observation: FailureObservation) -> dict[str, Any]:
     返回 {eligible, reason, reproducible, occurrence, classification}，前端不能自报。
     """
 
-    reproducible = bool(observation.baseline_reproduced)
+    evidence_kind = observation.evidence_kind or evidence_kind_for_error(
+        observation.error_code
+    )
+    enough_occurrences = observation.occurrence >= REPRODUCIBLE_THRESHOLD
+    baseline_reproduced = bool(observation.baseline_reproduced)
+    reproducible = (
+        baseline_reproduced
+        and enough_occurrences
+        and evidence_kind in PATCHABLE_EVIDENCE_KINDS
+    )
     classification = classify_failure(
-        observation.error_code, recovered=observation.recovered, reproducible=reproducible
+        observation.error_code,
+        recovered=observation.recovered,
+        reproducible=reproducible,
+        evidence_kind=evidence_kind,
     )
     eligible = should_propose_patch(classification, reproducible=reproducible)
-    if not reproducible:
+    if evidence_kind in TRANSPORT_EVIDENCE_KINDS:
+        reason = (
+            "transport/timeout 历史 fixture 仅用于诊断；需独立主动探测，"
+            "且不得由 Revision Agent 修改网络、URL 或 Secret"
+        )
+    elif evidence_kind not in PATCHABLE_EVIDENCE_KINDS:
+        reason = f"证据类型 {evidence_kind} 不支持自动修订"
+    elif not enough_occurrences:
+        reason = (
+            f"独立失败观测不足：{observation.occurrence}/"
+            f"{REPRODUCIBLE_THRESHOLD}"
+        )
+    elif not baseline_reproduced:
         reason = "尚未通过隔离 baseline reproduction"
     elif not eligible:
         reason = f"分类 {classification} 不适合生成补丁（瞬态或未知）"
@@ -328,8 +470,12 @@ def observation_eligibility(observation: FailureObservation) -> dict[str, Any]:
         "eligible": eligible,
         "reason": reason,
         "reproducible": reproducible,
+        "baselineReproduced": baseline_reproduced,
         "occurrence": observation.occurrence,
         "classification": classification,
+        "evidenceKind": evidence_kind,
+        "reproductionPolicy": observation.reproduction_policy_json
+        or reproduction_policy(evidence_kind),
     }
 
 
