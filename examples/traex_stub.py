@@ -90,6 +90,76 @@ def _clean_message(prompt: str) -> str:
     return re.sub(r"\[\[.*?\]\]", "", prompt).strip()
 
 
+def _plan_step(
+    step_id: str,
+    capability: str,
+    *,
+    action: str,
+    depends_on: list[str] | None = None,
+    argument_refs: dict[str, Any] | None = None,
+    output_name: str,
+    fallback: str = "abort",
+) -> dict[str, Any]:
+    return {
+        "id": step_id,
+        "action": action,
+        "capabilityRef": capability,
+        "dependsOn": depends_on or [],
+        "argumentRefs": argument_refs or {},
+        "effect": "none",
+        "idempotencyKey": None,
+        "outputName": output_name,
+        "fallback": fallback,
+    }
+
+
+def _structured_plan(
+    plan_id: str,
+    summary: str,
+    steps: list[dict[str, Any]],
+    *,
+    revision: int = 1,
+) -> dict[str, Any]:
+    return {
+        "type": "agent.plan",
+        "payload": {
+            "schemaVersion": "1",
+            "planId": plan_id,
+            "revision": revision,
+            "summary": summary,
+            "steps": steps,
+            "replanBoundary": "remaining_only",
+        },
+    }
+
+
+def _tool_arguments(
+    step: dict[str, Any],
+    original_input: str,
+    outputs: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    arguments: dict[str, Any] = {}
+    for name, reference in step.get("argumentRefs", {}).items():
+        if not isinstance(reference, dict):
+            continue
+        source = reference.get("source")
+        if source == "literal":
+            arguments[name] = reference.get("value")
+        elif source == "user_input":
+            value = _clean_message(original_input)
+            if reference.get("extract") == "url":
+                match = re.search(r"https?://[^\s\"}]+", value)
+                value = match.group(0) if match else value
+            arguments[name] = value
+        elif source == "step_output":
+            value: Any = outputs.get(str(reference.get("stepId")), {})
+            for part in str(reference.get("path", "")).split("."):
+                if part and isinstance(value, dict):
+                    value = value.get(part)
+            arguments[name] = value
+    return arguments
+
+
 def _emit_tool_call(
     call_id: str, tool: str, arguments: dict[str, Any], result: dict[str, Any]
 ) -> None:
@@ -573,74 +643,123 @@ def main() -> int:
         return 0
 
     if "AgentRun Recovery Agent" in args.prompt:
-        checkpoint: dict[str, Any] = {}
-        original_task = ""
-        if "checkpoint=" in args.prompt:
+        continuation: dict[str, Any] = {}
+        if "continuationRequest=" in args.prompt:
             try:
-                checkpoint = json.loads(
-                    args.prompt.split("checkpoint=", 1)[1].split(
-                        "\noriginalTask=", 1
-                    )[0]
+                continuation = json.loads(
+                    args.prompt.split("continuationRequest=", 1)[1]
                 )
-                original_task = args.prompt.split(
-                    "\noriginalTask=", 1
-                )[1]
             except json.JSONDecodeError:
-                checkpoint = {}
-        completed = checkpoint.get("completed", [])
-        latest = completed[-1].get("output", {}) if completed else {}
-        provenance_result: dict[str, Any] | None = None
-        if "[[MODE:browser_failure_handoff]]" in original_task:
+                continuation = {}
+        original_input = str(continuation.get("originalInput", ""))
+        completed = continuation.get("completedOutputs", [])
+        completed_plan_steps = continuation.get("completedPlanSteps", [])
+        remaining_plan = continuation.get("remainingPlan") or {}
+        remaining_steps = remaining_plan.get("steps", [])
+        if remaining_plan.get("mode") == "integrity_failed":
             emit(
                 {
-                    "type": "tool.requested",
+                    "type": "agent.failed",
                     "payload": {
-                        "callId": "recovery-preflight",
-                        "capabilityRef": "lookup.table",
-                        "action": "lookup",
-                        "actionKind": "transform",
-                        "arguments": {"key": "q1"},
-                        "effect": "none",
-                        "idempotent": True,
+                        "code": "EVIDENCE_CONFLICT",
+                        "message": "PlanSnapshot 完整性校验失败",
+                        "retryable": True,
+                        "callId": None,
                     },
                 }
             )
-            read_tool_result("recovery-preflight")
-            url_match = re.search(r"https?://[^\s\"}]+", original_task)
-            url = url_match.group(0) if url_match else _clean_message(original_task)
-            parsed_url = urlsplit(url)
-            page_contract = {
-                "contractVersion": "1",
-                "urlPattern": f"{parsed_url.scheme}://{parsed_url.netloc}/*",
-                "bodySelector": "#main",
-                "fields": {},
+            return 0
+        outputs: dict[str, dict[str, Any]] = {}
+        latest: dict[str, Any] = {}
+        source_steps = [
+            {
+                key: value
+                for key, value in item.items()
+                if key
+                in {
+                    "id",
+                    "action",
+                    "capabilityRef",
+                    "dependsOn",
+                    "argumentRefs",
+                    "effect",
+                    "idempotencyKey",
+                    "outputName",
+                    "fallback",
+                }
             }
+            for item in [*completed_plan_steps, *remaining_steps]
+            if isinstance(item, dict)
+        ]
+        if source_steps:
+            step_ids = {str(item["id"]) for item in source_steps}
+            for step in source_steps:
+                step["dependsOn"] = [
+                    dependency
+                    for dependency in step.get("dependsOn", [])
+                    if dependency in step_ids
+                ]
+            emit(
+                _structured_plan(
+                    f"continuation-{continuation.get('budget', {}).get('generation', 1)}",
+                    "按已验证的 remaining DAG 继续",
+                    source_steps,
+                )
+            )
+        else:
             emit(
                 {
-                    "type": "tool.requested",
-                    "payload": {
-                        "callId": "recovery-browser",
-                        "capabilityRef": "browser.read",
-                        "action": "read",
-                        "actionKind": "browser",
-                        "arguments": {
-                            "url": url,
-                            "pageContract": page_contract,
-                        },
+                    "type": "agent.plan",
+                    "payload": {"summary": "复用已完成输出，无剩余 Tool 步骤"},
+                }
+            )
+        for item in completed:
+            if isinstance(item, dict) and isinstance(item.get("output"), dict):
+                latest = item["output"]
+                if item.get("planStepId"):
+                    outputs[str(item["planStepId"])] = latest
+        provenance_result: dict[str, Any] | None = None
+        for index, step in enumerate(source_steps, start=1):
+            capability = str(step["capabilityRef"])
+            arguments = _tool_arguments(step, original_input, outputs)
+            if capability == "browser.read":
+                url = str(arguments.get("url", ""))
+                parsed_url = urlsplit(url)
+                page_contract = {
+                    "contractVersion": "1",
+                    "urlPattern": f"{parsed_url.scheme}://{parsed_url.netloc}/*",
+                    "bodySelector": "#main",
+                    "fields": {},
+                }
+                arguments["pageContract"] = page_contract
+            call_id = f"continuation-{index}-{step['id']}"
+            request_payload: dict[str, Any] = {
+                "callId": call_id,
+                "planStepId": step["id"],
+                "capabilityRef": capability,
+                "action": step["action"],
+                "actionKind": (
+                    "browser"
+                    if capability == "browser.read"
+                    else "transform"
+                ),
+                "arguments": arguments,
+                "effect": "none",
+                "idempotent": True,
+            }
+            if capability == "browser.read":
+                request_payload.update(
+                    {
                         "argumentBindings": {
                             "url": {
                                 "source": "user_input",
                                 "inputKey": "message",
                             }
                         },
-                        "effect": "none",
-                        "idempotent": True,
                         "replayability": "parameterizable",
                         "outputSchema": {
                             "type": "object",
-                            "properties": {
-                                "content": {"type": "string"}
-                            },
+                            "properties": {"content": {"type": "string"}},
                             "required": ["content"],
                         },
                         "observations": {
@@ -648,28 +767,93 @@ def main() -> int:
                             "action": "read",
                             "pageContract": page_contract,
                         },
-                    },
-                }
-            )
-            provenance_result = read_tool_result("recovery-browser")
-            latest = provenance_result.get("output", {})
-        if "[[RECOVERY_REPEAT]]" in original_task:
+                    }
+                )
+            elif capability == "lookup.table":
+                request_payload.update(
+                    {
+                        "argumentBindings": {
+                            "key": (
+                                {
+                                    "source": "user_input",
+                                    "inputKey": "message",
+                                }
+                                if step.get("argumentRefs", {})
+                                .get("key", {})
+                                .get("source")
+                                == "user_input"
+                                else {
+                                    "source": "constant",
+                                    "value": arguments.get("key"),
+                                }
+                            )
+                        },
+                        "replayability": "deterministic",
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "table": {"type": "object"},
+                                "value": {"type": "string"},
+                            },
+                            "required": ["table", "value"],
+                        },
+                    }
+                )
+            elif capability == "summarize.text":
+                request_payload.update(
+                    {
+                        "actionKind": "agent",
+                        "argumentBindings": {
+                            "text": {
+                                "source": "prior_output",
+                                "fromAction": (
+                                    f"continuation-{index - 1}-"
+                                    f"{step.get('dependsOn', [''])[0]}"
+                                ),
+                                "fromPath": "content",
+                            }
+                        },
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {"reply": {"type": "string"}},
+                            "required": ["reply"],
+                            "additionalProperties": False,
+                        },
+                        "observations": {
+                            "prompt": "[[MODE:echo_input]] 根据 text 生成 reply",
+                            "allowedCapabilities": [],
+                            "maxSteps": 2,
+                        },
+                    }
+                )
             emit(
                 {
                     "type": "tool.requested",
-                    "payload": {
-                        "callId": "recovery-repeat",
-                        "capabilityRef": "lookup.table",
-                        "arguments": {
-                            "key": _clean_message(original_task)
-                        },
-                    },
+                    "payload": request_payload,
                 }
             )
-            provenance_result = read_tool_result("recovery-repeat")
+            provenance_result = read_tool_result(call_id)
+            if provenance_result["status"] != "succeeded":
+                emit(
+                    {
+                        "type": "agent.failed",
+                        "payload": {
+                            "code": provenance_result["error"]["code"],
+                            "message": provenance_result["error"]["message"],
+                            "retryable": provenance_result["error"].get(
+                                "retryable", False
+                            ),
+                            "callId": call_id,
+                        },
+                    }
+                )
+                return 0
             latest = provenance_result.get("output", {})
-        reply_value = latest.get("value", latest.get("content", "恢复完成"))
-        emit({"type": "agent.plan", "payload": {"summary": "从 checkpoint 剩余步骤继续"}})
+            outputs[str(step["id"])] = latest
+        reply_value = latest.get(
+            "reply",
+            latest.get("value", latest.get("content", "恢复完成")),
+        )
         emit(
             {
                 "type": "agent.step.completed",
@@ -689,10 +873,15 @@ def main() -> int:
                                 "reply",
                                 provenance_result,
                                 (
-                                    "output.content"
-                                    if "content"
+                                    "output.reply"
+                                    if "reply"
                                     in provenance_result.get("output", {})
-                                    else "output.value"
+                                    else (
+                                        "output.content"
+                                        if "content"
+                                        in provenance_result.get("output", {})
+                                        else "output.value"
+                                    )
                                 ),
                             )
                         }
@@ -704,12 +893,256 @@ def main() -> int:
         )
         return 0
 
+    if mode == "reported_failure":
+        emit(
+            {
+                "type": "agent.plan",
+                "payload": {"summary": "报告 Runtime 失败"},
+            }
+        )
+        emit(
+            {
+                "type": "agent.failed",
+                "payload": {
+                    "code": _directive(
+                        args.prompt, "ERROR", "EXECUTION_FAILED"
+                    ),
+                    "message": "Runtime 自报失败",
+                    "retryable": _directive(
+                        args.prompt, "RETRYABLE", "true"
+                    ).lower()
+                    == "true",
+                    "callId": (
+                        "untrusted-call"
+                        if "[[WITH_CALL_ID]]" in args.prompt
+                        else None
+                    ),
+                },
+            }
+        )
+        return 0
+
     if mode == "hang":
         # 模拟长时间无进展，交给 Host 超时/取消。
         time.sleep(30)
         return 0
 
-    emit({"type": "agent.plan", "payload": {"summary": "解析输入并调用允许的工具", "steps": 2}})
+    if mode == "deterministic_fail_after_tool":
+        emit(
+            _structured_plan(
+                "deterministic-lookup",
+                "查表后生成结果",
+                [
+                    _plan_step(
+                        "lookup",
+                        "lookup.table",
+                        action="lookup",
+                        argument_refs={
+                            "key": {"source": "user_input"}
+                        },
+                        output_name="lookupResult",
+                        fallback="retry",
+                    )
+                ],
+            )
+        )
+    elif mode == "planned_browser_summary":
+        emit(
+            _structured_plan(
+                "browser-summary",
+                "预检、读取网页并总结",
+                [
+                    _plan_step(
+                        "preflight",
+                        "lookup.table",
+                        action="lookup",
+                        argument_refs={
+                            "key": {"source": "literal", "value": "q1"}
+                        },
+                        output_name="preflightResult",
+                        fallback="retry",
+                    ),
+                    _plan_step(
+                        "browser",
+                        "browser.read",
+                        action="read",
+                        depends_on=["preflight"],
+                        argument_refs={
+                            "url": {
+                                "source": "user_input",
+                                "extract": "url",
+                            }
+                        },
+                        output_name="page",
+                        fallback="retry",
+                    ),
+                    _plan_step(
+                        "summarize",
+                        "summarize.text",
+                        action="summarize",
+                        depends_on=["browser"],
+                        argument_refs={
+                            "text": {
+                                "source": "step_output",
+                                "stepId": "browser",
+                                "path": "content",
+                            }
+                        },
+                        output_name="reply",
+                    ),
+                ],
+            )
+        )
+    elif mode == "planned_lookup_transform":
+        emit(
+            _structured_plan(
+                "lookup-transform",
+                "查找、转换并输出",
+                [
+                    _plan_step(
+                        "lookup",
+                        "lookup.table",
+                        action="lookup",
+                        argument_refs={
+                            "key": {"source": "literal", "value": "q1"}
+                        },
+                        output_name="source",
+                        fallback="retry",
+                    ),
+                    _plan_step(
+                        "transform",
+                        "lookup.table",
+                        action="transform",
+                        depends_on=["lookup"],
+                        argument_refs={
+                            "key": {"source": "literal", "value": "q2"}
+                        },
+                        output_name="transformed",
+                        fallback="retry",
+                    ),
+                    _plan_step(
+                        "output",
+                        "lookup.table",
+                        action="output",
+                        depends_on=["transform"],
+                        argument_refs={
+                            "key": {"source": "literal", "value": "q3"}
+                        },
+                        output_name="reply",
+                    ),
+                ],
+            )
+        )
+    elif mode == "planned_file_transform":
+        emit(
+            _structured_plan(
+                "file-transform",
+                "读取文件、转换并输出",
+                [
+                    _plan_step(
+                        "read",
+                        "read.local",
+                        action="read",
+                        argument_refs={
+                            "path": {
+                                "source": "literal",
+                                "value": "input.txt",
+                            }
+                        },
+                        output_name="file",
+                        fallback="retry",
+                    ),
+                    _plan_step(
+                        "transform",
+                        "summarize.text",
+                        action="transform",
+                        depends_on=["read"],
+                        argument_refs={
+                            "text": {
+                                "source": "step_output",
+                                "stepId": "read",
+                                "path": "content",
+                            }
+                        },
+                        output_name="reply",
+                    ),
+                ],
+            )
+        )
+    else:
+        emit(
+            {
+                "type": "agent.plan",
+                "payload": {
+                    "summary": "解析输入并调用允许的工具",
+                    "steps": 2,
+                },
+            }
+        )
+
+    if mode == "planned_lookup_transform":
+        emit(
+            {
+                "type": "tool.requested",
+                "payload": {
+                    "callId": "call-lookup-source",
+                    "planStepId": "lookup",
+                    "capabilityRef": "lookup.table",
+                    "action": "lookup",
+                    "actionKind": "transform",
+                    "arguments": {"key": "q1"},
+                    "effect": "none",
+                    "idempotent": True,
+                },
+            }
+        )
+        read_tool_result("call-lookup-source")
+        emit(
+            {
+                "type": "agent.failed",
+                "payload": {
+                    "code": "DEPENDENCY_UNAVAILABLE",
+                    "message": "转换依赖暂时不可用",
+                    "retryable": False,
+                    "callId": None,
+                },
+            }
+        )
+        return 0
+
+    if mode == "planned_file_transform":
+        Path("input.txt").write_text(
+            _directive(args.prompt, "CONTENT", "文件恢复内容"),
+            encoding="utf-8",
+        )
+        emit(
+            {
+                "type": "tool.requested",
+                "payload": {
+                    "callId": "call-file-source",
+                    "planStepId": "read",
+                    "capabilityRef": "read.local",
+                    "action": "read",
+                    "actionKind": "file",
+                    "arguments": {"path": "input.txt"},
+                    "effect": "none",
+                    "idempotent": True,
+                },
+            }
+        )
+        read_tool_result("call-file-source")
+        emit(
+            {
+                "type": "agent.failed",
+                "payload": {
+                    "code": "TIMEOUT",
+                    "message": "转换阶段暂时超时",
+                    "retryable": False,
+                    "callId": None,
+                },
+            }
+        )
+        return 0
 
     if mode in {
         "deterministic",
@@ -724,6 +1157,11 @@ def main() -> int:
                 "type": "tool.requested",
                 "payload": {
                     "callId": "call-1",
+                    **(
+                        {"planStepId": "lookup"}
+                        if mode == "deterministic_fail_after_tool"
+                        else {}
+                    ),
                     "capabilityRef": tool_name,
                     "arguments": {"key": key},
                     "argumentBindings": {
@@ -778,15 +1216,16 @@ def main() -> int:
 
     if mode in {
         "browser_summary",
-        "browser_failure_handoff",
+        "planned_browser_summary",
         "browser_invalid_completed",
     }:
-        if mode == "browser_failure_handoff":
+        if mode == "planned_browser_summary":
             emit(
                 {
                     "type": "tool.requested",
                     "payload": {
                         "callId": "call-preflight",
+                        "planStepId": "preflight",
                         "capabilityRef": "lookup.table",
                         "action": "lookup",
                         "actionKind": "transform",
@@ -828,6 +1267,11 @@ def main() -> int:
                 "type": "tool.requested",
                 "payload": {
                     "callId": "call-browser",
+                    **(
+                        {"planStepId": "browser"}
+                        if mode == "planned_browser_summary"
+                        else {}
+                    ),
                     "capabilityRef": browser_capability,
                     "action": "read",
                     "actionKind": "browser",

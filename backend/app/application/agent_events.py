@@ -69,7 +69,11 @@ class _PayloadBase(BaseModel):
 
 class PlanPayload(_PayloadBase):
     summary: str = ""
-    steps: StrictInt | None = None
+    steps: list[dict[str, Any]] | StrictInt | None = None
+    schemaVersion: str | None = None
+    planId: str | None = None
+    revision: StrictInt | None = None
+    replanBoundary: str | None = None
 
 
 class StepCompletedPayload(_PayloadBase):
@@ -94,6 +98,14 @@ class FailedPayload(_PayloadBase):
     callId: str | None = Field(default=None, min_length=1)
 
 
+class ReplanPayload(_PayloadBase):
+    schemaVersion: Literal["1"]
+    basePlanDigest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    baseRevision: StrictInt = Field(ge=1)
+    replacementSteps: list[dict[str, Any]] = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
 class ToolPayload(_PayloadBase):
     # Tool 事件必须携带 callId 与 tool，用于 started/completed 一一配对与权限核对。
     callId: str = Field(min_length=1)
@@ -111,6 +123,7 @@ class ToolRequestPayload(_PayloadBase):
     callId: str = Field(min_length=1)
     capabilityRef: str = Field(min_length=1)
     arguments: dict[str, Any]
+    planStepId: str | None = Field(default=None, min_length=1)
 
 
 class ToolResultPayload(_PayloadBase):
@@ -144,6 +157,11 @@ class AgentCompletedEvent(BaseModel):
 class AgentFailedEvent(BaseModel):
     type: Literal["agent.failed"]
     payload: FailedPayload
+
+
+class AgentReplanEvent(BaseModel):
+    type: Literal["agent.replan"]
+    payload: ReplanPayload
 
 
 class ToolStartedEvent(BaseModel):
@@ -186,6 +204,7 @@ AgentEvent = Annotated[
     | AgentStepEvent
     | AgentCompletedEvent
     | AgentFailedEvent
+    | AgentReplanEvent
     | ToolStartedEvent
     | ToolCompletedEvent
     | BrowserActionStartedEvent
@@ -298,6 +317,8 @@ class AgentEventValidator:
                 audit["evidenceDigest"] = payload["evidenceDigest"]
             if payload.get("reusedFromLedger") is True:
                 audit["reusedFromLedger"] = True
+            if payload.get("planStepId"):
+                audit["planStepId"] = payload["planStepId"]
             return {"type": event_type, "payload": audit}
         if event_type == "agent.completed":
             # 完成事件只保留步数/Token 与输出摘要，不落原始 output。
@@ -328,7 +349,38 @@ class AgentEventValidator:
                 },
             }
         if event_type == "agent.plan":
-            return {"type": event_type, "payload": {"summary": payload.get("summary", "")}}
+            audit = {"summary": payload.get("summary", "")}
+            if isinstance(payload.get("steps"), list):
+                audit.update(
+                    {
+                        "schemaVersion": payload.get("schemaVersion"),
+                        "planId": payload.get("planId"),
+                        "revision": payload.get("revision"),
+                        "stepIds": [
+                            item.get("id")
+                            for item in payload["steps"]
+                            if isinstance(item, dict)
+                        ],
+                        "planDigest": _digest(payload),
+                    }
+                )
+            return {"type": event_type, "payload": audit}
+        if event_type == "agent.replan":
+            return {
+                "type": event_type,
+                "payload": {
+                    "schemaVersion": payload["schemaVersion"],
+                    "basePlanDigest": payload["basePlanDigest"],
+                    "baseRevision": payload["baseRevision"],
+                    "replacementStepIds": [
+                        item.get("id")
+                        for item in payload["replacementSteps"]
+                        if isinstance(item, dict)
+                    ],
+                    "reason": redact(payload["reason"]),
+                    "patchDigest": _digest(payload),
+                },
+            }
         # log.emitted：只保留脱敏后的短消息。
         return {"type": event_type, "payload": summarize_value(payload)}
 

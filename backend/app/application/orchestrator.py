@@ -1823,7 +1823,10 @@ async def reconcile_recent_runs(session: AsyncSession, *, limit: int = 50) -> di
 
     run_ids = (
         await session.scalars(
-            select(Run.id).order_by(Run.created_at.desc()).limit(limit)
+            select(Run.id)
+            .where(Run.status.in_(["succeeded", "failed", "cancelled"]))
+            .order_by(Run.created_at.desc())
+            .limit(limit)
         )
     ).all()
     recovered = 0

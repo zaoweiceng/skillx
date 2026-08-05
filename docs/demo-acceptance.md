@@ -27,6 +27,8 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
 | Fence-1 迟到 Recovery | A 超租约 → B 重领 → A 返回 | generation/token、两个 Recovery NodeRun | 仅 B 的决定、替代输出和终态可提交 |
 | AgentRun handoff | AgentRun 只读 ToolResult → 失败 → pending TaskCheckpoint → Worker 崩溃 → 新 Worker continuation | `agent.handoff.*` | 新 Worker 领取 generation+1；claim handle 约束启动与终态；Host action ledger 复用结果且不增加外部调用 |
 | Real Tool failure handoff | 首次 Browser 503/断连 → 有限重试耗尽 → Worker 重启 → 外部恢复 → continuation → distill/publish → 新对话复用 | `tool.result(status=failed)`、`agent.failed`、`agent.handoff.*`、L0/L1 | 主错误保持 Tool 标准 code；失败 Artifact 可校验；只重试失败 action，已完成 action 不重做 |
+| Generic lookup continuation | lookup 成功 → transform 瞬态失败 → output 未运行 | `agent.plan`、`tool.result`、`agent.handoff.*` | 同一 ContinuationRequest 复用 lookup ledger，只执行 remaining transform/output |
+| Generic file continuation | file/read 成功 → transform 失败 → Worker 重启 | `agent.plan`、PlanSnapshot Artifact、`agent.handoff.*` | 路径/内容参数化；恢复消费冻结 remaining plan，不缓存首次正文 |
 | AgentRun unknown | Worker 租约丢失 → awaiting_user → answer → continuation | `agent.handoff.user_answered` | 回答只能消费一次；未确认的未知副作用不得继续 |
 | Selection-5 | 五种 action → validate/execute | action 终态、diagnostics | 类型错配、未披露 ref 和超预算 fail closed |
 | Disclosure-1 | 创建 session → L0/L1/L2 → 重启读取 | disclosure call audit | refs、level、剩余预算持久且跨 session 隔离 |
@@ -64,21 +66,44 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
 - `agent.completed.outputProvenance` 引用无效 path/digest，或输出值与确定性来源不一致。
 - failed ToolResult 后的非法 `agent.completed`、子进程退出或次生关闭异常覆盖原始 Tool
   `code/message/retryable`；`protocolViolation` 只能作为附加审计信息。
+- Agent 自报的 code/retryable 改变 Host `ErrorPolicy`，或带 `callId` 却无法对应 Host 已见的
+  failed ToolResult。
+- checkpoint 以 `resumeSameTask` 或原始 prompt 重规划冒充断点继续；缺少结构化计划的旧运行必须
+  标为 `replan_required`。
+- PlanSnapshot、step 状态或 Artifact 引用未进入 source digest，或完整性失败后静默重做原任务。
 - 测试绕过 Alembic、API 或 Worker 主路径。
 
 ## Agent 终态与接力
 
 - `agent.completed` 只表示成功，输出必须通过 Schema 且逐字段 provenance 指向成功
   ToolResult；失败文本不得伪装成成功输出。
-- `agent.failed` 必须包含 `code/message/retryable/callId`。Host 已知 failed ToolResult 时，
-  Tool 标准错误是主错误；Agent 的错误或非法 completed 不能覆盖它。
+- `agent.failed` 必须包含 `code/message/retryable/callId`。payload 形成 `reportedError`，其中
+  `retryable` 仅作诊断提示。状态机只读取 Host `ErrorPolicy` 生成的 `effectiveError`。
+- `callId` 存在时必须指向 Host 已见的 failed ToolResult，effective code/message/retryable 全取
+  Host ToolResult 与 ErrorPolicy；无 ToolResult 时未知、Permission、Safety、Contract、budget 和
+  invalid event 一律 fail closed。
 - 共享 ErrorPolicy 将 `DEPENDENCY_UNAVAILABLE`、`TIMEOUT`、`RATE_LIMITED` 视为瞬态；
   只读或幂等 action 可按有限 budget/backoff 重试。Permission、Safety、Contract、非法事件
   fail closed，未知副作用进入人工确认。
 - 重试耗尽后，可恢复错误创建 `pending` TaskCheckpoint；claim 后为 `running`，创建
   continuation 后为 `continuing`，最终随 continuation 进入 `succeeded/failed`。checkpoint
-  分别保存 completed actions、failed action、pending calls 和 remaining plan，并在加载前
-  校验 source digest 与 Artifact id/size/sha256/evidence digest。
+  分别保存 completed/failed/remaining plan steps、pending calls 和 action ledger，并在加载前
+  校验 source digest、PlanSnapshot digest 与 Artifact id/size/sha256/evidence digest。
+
+## Agent PlanSnapshot 与 Continuation
+
+- 结构化 `agent.plan` 使用 schema version、plan id、revision 和稳定 step id。每个 step 包含
+  action/capability、依赖、参数引用、effect、idempotency key、输出名和 fallback。
+- Host 校验能力锁、DAG、effect 和 step budget；结构化计划下每个 `tool.requested` 必须携带
+  `planStepId`。计划作为不可变 `agent_plan_snapshot` Artifact 持久化。
+- checkpoint 只从 PlanSnapshot 与 Host ToolResult 计算 `completed/failed/remaining`。无结构化
+  计划的旧运行进入 `replan_required`；损坏计划进入 `integrity_failed`。
+- `ContinuationRequest` 固定包含 original input、reported/effective error、已完成/失败输出、
+  remaining plan、capability locks 和 attempt/generation budget。默认执行 remaining DAG；
+  replan 只能提交 typed patch 并产生新 revision。
+- completed step 只能命中 Host ledger；effect=none 的 failed step 可重试；未知副作用必须先由用户
+  确认。总 continuation generation 默认上限为 3。
+- 从原始 prompt 重新规划不是从断点继续，不得记录为 continuation 成功证据。
 
 ## 不可变修订 lineage
 

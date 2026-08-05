@@ -16,7 +16,7 @@ SkillX Workflow 是一个契约驱动的可视化工作流平台。首次任务�
 | Agent/TraeX | `available` | 唯一 `AgentHost` 信任边界（ConversationRun 与 Workflow Agent 共用）：requested∩host_granted、判别联合事件契约、callId 配对、step/Token/time/payload 上限、输出 Schema 与取消；事件双投影，审计只存脱敏摘要与 Artifact 引用，Secret 不落库 |
 | 通用对话调用组件 | `available` | 结构化意图候选、锁定版本快照摘要、补参确认启动 Workflow；单次模型答记为 `llm_response`；conversationId 写入 `/chat/:id` 路由可刷新恢复，候选卡片绑定来源用户消息 |
 | 通用 Agent 探索与固化 | `available` | Action group 必须连续且拓扑闭合，保留全部 capability digest；首次 Browser 正文由 Host 内真实 Browser Tool Broker 获取，轨迹登记为标准 Artifact |
-| 通用失败接力 | `available` | Checkpoint claim 使用 generation + 随机 token 全路径 CAS；迟到 Worker 无提交权；Replan 仅允许受限节点/映射/边补丁，锁由 Compiler 重新生成 |
+| 通用失败接力 | `available` | Host 区分 reported/effective error；不可变 Agent PlanSnapshot 冻结 completed/failed/remaining steps；Browser、lookup/transform、file/transform 共用 ContinuationRequest；generation + token CAS 与总接力预算阻止迟到提交和无限接力 |
 | 失败可复现性与受控修订 | `available` | WorkflowVersion/PlanSnapshot 失败使用判别联合归因；Runtime/Replay 共用边选择与 Output Schema 终态，外部和副作用 replay 只接受捕获 fixture |
 | Workflow 能力目录与临时组合 | `available` | 持久 disclosure session 审计 L0/L1/L2 与预算；Selection-5 严格互斥；FragmentPort、Plan source map、TTL 恢复和 active-version catalog 已接通 |
 | MCP 副作用与幂等分类 | `available` | annotations 仅作提示且始终 `unreviewed`，分类创建**新的不可变快照**（旧快照/历史版本不变）；多 Tool Server 分类某 Tool 时克隆完整版本、分离远端 contract digest 与本地审核 digest，重复 discovery 稳定；0009 迁移用运行时 canonical 算法从行字段重算 remote-only contract_digest，非空 0008 升级后首次 discovery 不伪漂移；发布保存完整 lock，运行前逐项核对 digest/effect/idempotent/timeout，漂移即 `MCP_CONTRACT_DRIFT` fail closed |

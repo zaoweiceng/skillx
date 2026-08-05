@@ -181,6 +181,56 @@ async def test_denied_capability_fails_closed_not_narrowed(traex_stub: None) -> 
     assert run.error_json["code"] == "PERMISSION_DENIED"
 
 
+@pytest.mark.parametrize(
+    ("reported_code", "effective_code", "retryable"),
+    [
+        ("DEPENDENCY_UNAVAILABLE", "DEPENDENCY_UNAVAILABLE", True),
+        ("CONNECTION_ERROR", "DEPENDENCY_UNAVAILABLE", True),
+        ("TIMEOUT", "TIMEOUT", True),
+        ("RATE_LIMITED", "RATE_LIMITED", True),
+        ("EXECUTION_FAILED", "EXECUTION_FAILED", True),
+        ("PERMISSION_DENIED", "PERMISSION_DENIED", False),
+        ("CONTRACT_VIOLATION", "CONTRACT_VIOLATION", False),
+        ("STEP_BUDGET_EXCEEDED", "STEP_BUDGET_EXCEEDED", False),
+        ("AGENT_EVENT_INVALID", "AGENT_EVENT_INVALID", False),
+        ("UNKNOWN_AGENT_CODE", "UNKNOWN_AGENT_CODE", False),
+    ],
+)
+async def test_agent_reported_retryable_is_advisory(
+    traex_stub: None,
+    reported_code: str,
+    effective_code: str,
+    retryable: bool,
+) -> None:
+    run = await _conversation_run(
+        (
+            "[[MODE:reported_failure]]"
+            f"[[ERROR:{reported_code}]][[RETRYABLE:{str(not retryable).lower()}]]"
+        ),
+        AgentRunConfig(output_schema=OUTPUT_SCHEMA, allowed_capabilities=()),
+    )
+    assert run.status == "failed"
+    assert run.error_json["reportedError"]["code"] == reported_code
+    assert run.error_json["reportedError"]["retryable"] is (not retryable)
+    assert run.error_json["effectiveError"] == {
+        "code": effective_code,
+        "message": "Runtime 自报失败",
+        "retryable": retryable,
+    }
+    assert run.error_json["retryable"] is retryable
+
+
+async def test_agent_failed_call_id_requires_failed_tool_result(
+    traex_stub: None,
+) -> None:
+    run = await _conversation_run(
+        "[[MODE:reported_failure]][[ERROR:TIMEOUT]][[WITH_CALL_ID]]",
+        AgentRunConfig(output_schema=OUTPUT_SCHEMA, allowed_capabilities=()),
+    )
+    assert run.error_json["code"] == "AGENT_EVENT_INVALID"
+    assert run.error_json["retryable"] is False
+
+
 async def test_audit_events_do_not_leak_secrets_or_raw_content(traex_stub: None) -> None:
     config = AgentRunConfig(
         output_schema=OUTPUT_SCHEMA,

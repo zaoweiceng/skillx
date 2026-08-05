@@ -863,7 +863,7 @@ def test_real_tool_failure_handoff_distill_and_second_reuse(
             f"/conversations/{conversation['id']}/agent-runs",
             json={
                 "content": (
-                    f"{transient_url} [[MODE:browser_failure_handoff]]"
+                    f"{transient_url} [[MODE:planned_browser_summary]]"
                 ),
                 "allowedCapabilities": [
                     "lookup.table",
@@ -962,6 +962,85 @@ def test_real_tool_failure_handoff_distill_and_second_reuse(
         ).json()
         assert checkpoint["status"] == "succeeded"
         assert poll_conversation_run(client, source_id)["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    ("mode", "capabilities", "expected", "completed", "remaining"),
+    [
+        (
+            "planned_lookup_transform",
+            ["lookup.table"],
+            "第三季度：营收持平",
+            ["lookup"],
+            ["transform", "output"],
+        ),
+        (
+            "planned_file_transform",
+            ["read.local", "summarize.text"],
+            "黑盒文件新内容",
+            ["read"],
+            ["transform"],
+        ),
+    ],
+)
+def test_generic_non_browser_failure_continuation(
+    isolated_stack: DemoStack,
+    mode: str,
+    capabilities: list[str],
+    expected: str,
+    completed: list[str],
+    remaining: list[str],
+) -> None:
+    stack = isolated_stack
+    restart_worker(stack, crash=True, disable_task_recovery=True)
+    with stack.client() as client:
+        conversation = client.post(
+            "/conversations", json={"title": f"通用接力-{mode}"}
+        ).json()
+        created = client.post(
+            f"/conversations/{conversation['id']}/agent-runs",
+            json={
+                "content": (
+                    f"任务 [[MODE:{mode}]][[CONTENT:{expected}]]"
+                ),
+                "allowedCapabilities": capabilities,
+            },
+        )
+        assert created.status_code == 202, created.text
+        source = poll_conversation_run(
+            client, created.json()["conversationRunId"]
+        )
+        assert source["status"] == "failed"
+        checkpoint_id = source["error"]["taskCheckpointId"]
+        checkpoint = client.get(
+            f"/task-checkpoints/{checkpoint_id}"
+        ).json()
+        assert checkpoint["status"] == "pending"
+        assert checkpoint["planSnapshot"]["digest"].startswith("sha256:")
+        assert [item["id"] for item in checkpoint["completedSteps"]] == completed
+        assert [
+            item["id"] for item in checkpoint["remainingPlan"]["steps"]
+        ] == remaining
+        assert checkpoint["reportedError"]["retryable"] is False
+        assert checkpoint["effectiveError"]["retryable"] is True
+
+        restart_worker(stack, crash=True)
+        deadline = time.time() + 30
+        continuation_id = None
+        while time.time() < deadline:
+            checkpoint = client.get(
+                f"/task-checkpoints/{checkpoint_id}"
+            ).json()
+            continuation_id = checkpoint.get("continuationRunId")
+            if continuation_id:
+                break
+            time.sleep(0.1)
+        continuation = poll_conversation_run(
+            client, continuation_id, timeout=30
+        )
+        assert continuation["status"] == "succeeded"
+        assert continuation["output"] == {"reply": expected}
+        assert continuation["input"]["continuationGeneration"] == 1
 
 
 def test_agent_run_unknown_outcome_answer_consumed_once(

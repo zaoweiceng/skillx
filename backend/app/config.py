@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     agent_max_duration_seconds: int = 120
     agent_max_event_payload_bytes: int = 65536
     agent_lease_seconds: int = 30
+    agent_max_continuation_generations: int = 3
     browser_allowed_hosts: list[str] = []
 
 

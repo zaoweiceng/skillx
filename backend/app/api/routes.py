@@ -572,13 +572,32 @@ async def validate_workflow(
             "valid": True,
             "digest": compiled.digest,
             "topologicalOrder": compiled.topological_order,
-            "diagnostics": compiled.diagnostics,
+            "diagnostics": [
+                {
+                    "level": diagnostic.level,
+                    "code": diagnostic.code,
+                    "path": diagnostic.path,
+                    "message": diagnostic.message,
+                }
+                for diagnostic in compiled.diagnostics
+            ],
             "executionClass": execution_class,
             "capabilityLocks": capability_locks,
             "mcpLocks": mcp_locks,
         }
     except WorkflowValidationError as exc:
-        return {"valid": False, "diagnostics": exc.diagnostics}
+        return {
+            "valid": False,
+            "diagnostics": [
+                {
+                    "level": diagnostic.level,
+                    "code": diagnostic.code,
+                    "path": diagnostic.path,
+                    "message": diagnostic.message,
+                }
+                for diagnostic in exc.diagnostics
+            ],
+        }
     except CapabilityResolutionError as exc:
         return {
             "valid": False,
@@ -623,7 +642,18 @@ async def publish_workflow(
     except WorkflowValidationError as exc:
         raise HTTPException(
             422,
-            detail={"code": "WORKFLOW_VALIDATION_FAILED", "diagnostics": exc.diagnostics},
+            detail={
+                "code": "WORKFLOW_VALIDATION_FAILED",
+                "diagnostics": [
+                    {
+                        "level": diagnostic.level,
+                        "code": diagnostic.code,
+                        "path": diagnostic.path,
+                        "message": diagnostic.message,
+                    }
+                    for diagnostic in exc.diagnostics
+                ],
+            },
         ) from exc
     except (CapabilityResolutionError, MCPConfigurationError) as exc:
         raise HTTPException(
@@ -1167,7 +1197,7 @@ async def propose_failure_revision(
         if proposal.base_version_id != version.id:
             raise WorkflowPatchViolation("Revision Agent 修改了 baseVersionId")
         patched = apply_workflow_patch(version.definition_json, proposal)
-        compiled = compiler.compile(patched)
+        compiler.compile(patched)
     except (
         AgentHostError,
         ValueError,
@@ -1195,19 +1225,26 @@ async def propose_failure_revision(
     proposal_record = await _commit_revision_proposal(
         session, proposal_record
     )
+    persisted_proposal = WorkflowPatch.model_validate(
+        proposal_record.proposal_json
+    )
+    persisted_patched = apply_workflow_patch(
+        version.definition_json, persisted_proposal
+    )
+    persisted_compiled = compiler.compile(persisted_patched)
     return {
         "proposalId": proposal_record.id,
-        "observationId": observation.id,
-        "baseVersionId": version.id,
-        "agentRunId": agent_run_id,
-        "promptVersion": prompt_version,
-        "fixtureDigest": fixture_digest,
-        "baselineDigest": baseline_digest,
+        "observationId": proposal_record.observation_id,
+        "baseVersionId": proposal_record.base_version_id,
+        "agentRunId": proposal_record.agent_run_id,
+        "promptVersion": proposal_record.prompt_version,
+        "fixtureDigest": proposal_record.fixture_digest,
+        "baselineDigest": proposal_record.baseline_digest,
         "baseline": baseline,
-        "proposal": proposal_json,
-        "proposalDigest": proposal_digest,
+        "proposal": proposal_record.proposal_json,
+        "proposalDigest": proposal_record.proposal_digest,
         "diagnostics": [
-            item.model_dump() for item in compiled.diagnostics
+            item.model_dump() for item in persisted_compiled.diagnostics
         ],
         "published": False,
     }
@@ -4119,6 +4156,11 @@ async def get_task_checkpoint(
         "pendingQuestion": snapshot.get("pendingQuestion"),
         "continuationRunId": snapshot.get("continuationRunId"),
         "claimGeneration": checkpoint.claim_generation,
+        "planSnapshot": snapshot.get("planSnapshot"),
+        "reportedError": snapshot.get("reportedError"),
+        "effectiveError": snapshot.get("effectiveError"),
+        "completedSteps": snapshot.get("completedSteps", []),
+        "failedStep": snapshot.get("failedStep"),
         "completedActionLedger": snapshot.get("completedActionLedger", []),
         "failedAction": snapshot.get("failedAction"),
         "pendingToolCalls": snapshot.get("pendingToolCalls", []),

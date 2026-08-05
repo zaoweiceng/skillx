@@ -48,7 +48,11 @@ def traex_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = get_settings()
     monkeypatch.setattr(settings, "traex_command", [sys.executable, str(STUB)])
     monkeypatch.setattr(settings, "traex_allowed_executables", [Path(sys.executable).name])
-    monkeypatch.setattr(settings, "agent_host_capabilities", ["search.web", "lookup.table"])
+    monkeypatch.setattr(
+        settings,
+        "agent_host_capabilities",
+        ["search.web", "lookup.table", "read.local", "summarize.text"],
+    )
 
 
 async def _conversation() -> str:
@@ -319,6 +323,114 @@ async def test_task_checkpoint_claims_and_continues_from_tool_artifact(
     assert continuation.output_json == {"reply": "第一季度：营收增长 12%"}
     assert continuation.input_json["continuationOfCheckpointId"] == checkpoint.id
     assert checkpoint.status == "succeeded"
+
+
+@pytest.mark.parametrize(
+    ("mode", "capabilities", "expected_reply", "completed_id", "remaining_ids"),
+    [
+        (
+            "planned_lookup_transform",
+            ("lookup.table",),
+            "第三季度：营收持平",
+            "lookup",
+            ["transform", "output"],
+        ),
+        (
+            "planned_file_transform",
+            ("read.local", "summarize.text"),
+            "文件参数化内容",
+            "read",
+            ["transform"],
+        ),
+    ],
+)
+async def test_generic_continuation_executes_frozen_remaining_plan(
+    traex_stub: None,
+    mode: str,
+    capabilities: tuple[str, ...],
+    expected_reply: str,
+    completed_id: str,
+    remaining_ids: list[str],
+) -> None:
+    conversation_id = await _conversation()
+    content = (
+        f"任务 [[MODE:{mode}]][[CONTENT:{expected_reply}]]"
+    )
+    run_id = await _enqueue(
+        conversation_id,
+        content,
+        config=AgentRunConfig(
+            output_schema=AgentRunConfig.default().output_schema,
+            allowed_capabilities=capabilities,
+        ),
+    )
+    source = await _drive(run_id)
+    assert source.status == "failed"
+    async with SessionLocal() as session:
+        checkpoint = await session.scalar(
+            select(TaskCheckpoint).where(TaskCheckpoint.source_id == run_id)
+        )
+    assert checkpoint is not None and checkpoint.status == "pending"
+    assert checkpoint.snapshot_json["planSnapshot"]["digest"].startswith(
+        "sha256:"
+    )
+    assert [
+        item["id"] for item in checkpoint.snapshot_json["completedSteps"]
+    ] == [completed_id]
+    assert [
+        item["id"]
+        for item in checkpoint.snapshot_json["remainingPlan"]["steps"]
+    ] == remaining_ids
+    assert checkpoint.snapshot_json["reportedError"]["retryable"] is False
+    assert checkpoint.snapshot_json["effectiveError"]["retryable"] is True
+
+    driver = TaskCheckpointDriver(f"generic-{mode}")
+    assert await driver.poll_once()
+    async with SessionLocal() as session:
+        checkpoint = await session.get(TaskCheckpoint, checkpoint.id)
+        continuation_id = checkpoint.snapshot_json["continuationRunId"]
+    assert await AgentRunWorker(f"continuation-{mode}").poll_once()
+    assert await driver.poll_once()
+    async with SessionLocal() as session:
+        continuation = await session.get(ConversationRun, continuation_id)
+        checkpoint = await session.get(TaskCheckpoint, checkpoint.id)
+    assert continuation.status == "succeeded"
+    assert continuation.output_json == {"reply": expected_reply}
+    assert continuation.input_json["continuationGeneration"] == 1
+    assert checkpoint.status == "succeeded"
+
+
+async def test_continuation_generation_budget_stops_retry_chain(
+    traex_stub: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "agent_max_continuation_generations", 1)
+    conversation_id = await _conversation()
+    run_id = await _enqueue(
+        conversation_id,
+        "q1 [[MODE:deterministic_fail_after_tool]]",
+        config=AgentRunConfig(
+            output_schema=AgentRunConfig.default().output_schema,
+            allowed_capabilities=("lookup.table",),
+        ),
+    )
+    await _drive(run_id)
+    driver = TaskCheckpointDriver("bounded-continuation")
+    async with SessionLocal() as session, session.begin():
+        checkpoint = await session.scalar(
+            select(TaskCheckpoint).where(TaskCheckpoint.source_id == run_id)
+        )
+        checkpoint.claim_generation = 1
+        checkpoint_id = checkpoint.id
+    assert await driver.poll_once() is False
+    async with SessionLocal() as session:
+        checkpoint = await session.get(TaskCheckpoint, checkpoint_id)
+    assert checkpoint.status == "terminal"
+    assert checkpoint.snapshot_json["budgetExhausted"] == {
+        "maxGenerations": 1,
+        "actualGenerations": 1,
+    }
 
 
 async def test_failed_tool_result_creates_pending_checkpoint_with_original_error(

@@ -132,7 +132,7 @@ def start_stack(
         "SKILLX_AGENT_HOST_CAPABILITIES": (
             '["search.web", "lookup.table", "browser.read", "summarize.text",'
             '"workflow.search", "workflow.describe", "workflow.describe_fragment",'
-            '"workflow.slice", "workflow.compile_plan"]'
+            '"workflow.slice", "workflow.compile_plan", "read.local"]'
         ),
         "SKILLX_AGENT_LEASE_SECONDS": "2",
         "SKILLX_BROWSER_ALLOWED_HOSTS": '["127.0.0.1"]',

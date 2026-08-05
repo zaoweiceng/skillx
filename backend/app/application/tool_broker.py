@@ -57,6 +57,7 @@ class ToolAdapterRegistry:
             BrowserReadAdapter(),
             LocalReadAdapter(),
             LookupTableAdapter(),
+            SummarizeTextAdapter(),
         ]
         for adapter in defaults if adapters is None else adapters:
             self.register(adapter)
@@ -339,3 +340,32 @@ class LookupTableAdapter:
             "table": output.get("table", {}),
             "resultSource": "host_tool_broker",
         }
+
+
+class SummarizeTextAdapter:
+    """Local Demo 的受控文本转换 Adapter。
+
+    生产环境可替换为锁定模型的生成节点；恢复协议只依赖其 Host-owned ToolResult。
+    """
+
+    capability_ref = "summarize.text"
+    input_schema = {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "properties": {"reply": {"type": "string"}},
+        "required": ["reply"],
+        "additionalProperties": False,
+    }
+    effect = "none"
+    idempotent = True
+    fixture_policy = "capture_redacted"
+
+    async def execute(
+        self, _context: ToolExecutionContext, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {"reply": arguments["text"]}

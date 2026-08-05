@@ -17,6 +17,11 @@ from app.application.agent_host import (
     AgentHostRequest,
     resolve_effective_capabilities,
 )
+from app.application.artifact_integrity import (
+    ArtifactPathError,
+    artifact_record_matches,
+    safe_artifact_path,
+)
 from app.application.compiler import digest_json
 from app.application.error_policy import error_policy
 from app.config import get_settings
@@ -45,13 +50,20 @@ class AgentRunError(Exception):
         retryable: bool | None = None,
         failed_call_id: str | None = None,
         protocol_violation: str | None = None,
+        reported_error: dict[str, Any] | None = None,
     ) -> None:
         policy = error_policy(code)
         self.code = policy.code
         self.message = message
-        self.retryable = policy.retryable if retryable is None else retryable
+        self.retryable = policy.retryable
         self.failed_call_id = failed_call_id
         self.protocol_violation = protocol_violation
+        self.reported_error = reported_error
+        self.effective_error = {
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+        }
         super().__init__(message)
 
 
@@ -377,7 +389,16 @@ class AgentRunWorker:
         host = AgentHost(adapter=self._adapter)
 
         async def event_sink(runtime: dict[str, Any], audit: dict[str, Any]) -> None:
-            if runtime["type"] == "tool.result":
+            if runtime["type"] == "agent.plan" and isinstance(
+                runtime["payload"].get("steps"), list
+            ):
+                await self._persist_plan_snapshot_artifact(
+                    run_id,
+                    runtime["payload"],
+                    claim_generation,
+                    claim_token,
+                )
+            elif runtime["type"] == "tool.result":
                 await self._persist_tool_result_artifact(
                     run_id,
                     runtime["payload"],
@@ -423,6 +444,7 @@ class AgentRunWorker:
                 retryable=exc.retryable,
                 failed_call_id=exc.failed_call_id,
                 protocol_violation=exc.protocol_violation,
+                reported_error=exc.reported_error,
             )
         except asyncio.CancelledError:
             terminal = None  # 由 signal 决定 cancelled/lost
@@ -554,6 +576,7 @@ class AgentRunWorker:
             "evidenceDigest": payload.get("evidenceDigest"),
             "outputSchema": payload.get("outputSchema"),
             "actionSignature": payload.get("actionSignature"),
+            "planStepId": payload.get("planStepId"),
         }
         content = json.dumps(
             envelope,
@@ -629,6 +652,7 @@ class AgentRunWorker:
                         "effect": payload.get("effect"),
                         "idempotent": payload.get("idempotent"),
                         "actionSignature": payload.get("actionSignature"),
+                        "planStepId": payload.get("planStepId"),
                         "resultDigest": digest_json(
                             envelope["output"]
                             if payload.get("status") == "succeeded"
@@ -658,6 +682,96 @@ class AgentRunWorker:
             else:
                 staging.replace(target)
 
+    async def _persist_plan_snapshot_artifact(
+        self,
+        run_id: str,
+        payload: dict[str, Any],
+        claim_generation: int,
+        claim_token: str | None,
+    ) -> None:
+        content = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        if len(content) > 64 * 1024:
+            raise AgentHostError(
+                "PAYLOAD_TOO_LARGE", "Agent PlanSnapshot 超过 64 KiB"
+            )
+        content_hash = hashlib.sha256(content).hexdigest()
+        revision = int(payload.get("revision", 1))
+        storage_key = f"plans/revision-{revision}.json"
+        token = claim_token or "unclaimed"
+        staging_key = f".staging/{token}/{storage_key}"
+        root = self._trajectory_dir(run_id)
+        staging = (root / staging_key).resolve()
+        if not staging.is_relative_to(root):
+            raise AgentHostError("EVIDENCE_CONFLICT", "PlanSnapshot staging 路径越界")
+        staging.parent.mkdir(parents=True, exist_ok=True)
+        staging.write_bytes(content)
+        artifact_id = str(uuid4())
+        async with SessionLocal() as session, session.begin():
+            owned = await session.scalar(
+                select(ConversationRun.id).where(
+                    ConversationRun.id == run_id,
+                    ConversationRun.status == "running",
+                    ConversationRun.lease_owner == self.worker_id,
+                    ConversationRun.claim_generation == claim_generation,
+                    ConversationRun.claim_token == claim_token,
+                )
+            )
+            if owned is None:
+                staging.unlink(missing_ok=True)
+                raise asyncio.CancelledError
+            existing = await session.scalar(
+                select(Artifact).where(
+                    Artifact.conversation_run_id == run_id,
+                    Artifact.kind == "agent_plan_snapshot",
+                    Artifact.name == f"revision-{revision}.json",
+                )
+            )
+            if existing is not None:
+                staging.unlink(missing_ok=True)
+                if existing.sha256 != content_hash:
+                    raise AgentHostError(
+                        "EVIDENCE_CONFLICT",
+                        f"PlanSnapshot revision {revision} 内容冲突",
+                    )
+                return
+            session.add(
+                Artifact(
+                    id=artifact_id,
+                    run_id=None,
+                    conversation_run_id=run_id,
+                    kind="agent_plan_snapshot",
+                    name=f"revision-{revision}.json",
+                    uri=f"artifact://conversation-agents/{run_id}/{storage_key}",
+                    sha256=content_hash,
+                    size=len(content),
+                    media_type="application/json",
+                    metadata_json={
+                        "schemaVersion": payload.get("schemaVersion"),
+                        "planId": payload.get("planId"),
+                        "revision": revision,
+                        "planDigest": digest_json(payload),
+                        "storageKey": storage_key,
+                        "stagingKey": staging_key,
+                        "retentionClass": "checkpoint",
+                    },
+                )
+            )
+        target = (root / storage_key).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            if hashlib.sha256(target.read_bytes()).hexdigest() != content_hash:
+                raise AgentHostError(
+                    "EVIDENCE_CONFLICT", "PlanSnapshot 最终文件 hash 冲突"
+                )
+            staging.unlink(missing_ok=True)
+        else:
+            staging.replace(target)
+
     async def _finalize_failure(
         self,
         run_id: str,
@@ -676,6 +790,12 @@ class AgentRunWorker:
                     "code": error.code,
                     "message": error.message,
                     "retryable": error.retryable,
+                    "effectiveError": error.effective_error,
+                    **(
+                        {"reportedError": error.reported_error}
+                        if error.reported_error
+                        else {}
+                    ),
                     **(
                         {"failedCallId": error.failed_call_id}
                         if error.failed_call_id
@@ -693,7 +813,13 @@ class AgentRunWorker:
                 "code": error.code,
                 "message": error.message,
                 "retryable": error.retryable,
+                "effectiveError": error.effective_error,
                 "taskCheckpointId": checkpoint.id,
+                **(
+                    {"reportedError": error.reported_error}
+                    if error.reported_error
+                    else {}
+                ),
                 **(
                     {"failedCallId": error.failed_call_id}
                     if error.failed_call_id
@@ -895,12 +1021,18 @@ class AgentRunWorker:
             await session.scalars(
                 select(Artifact).where(
                     Artifact.conversation_run_id == run.id,
-                    Artifact.kind == "tool_result",
+                    Artifact.kind.in_(
+                        ["tool_result", "agent_plan_snapshot"]
+                    ),
                 )
             )
         ).all()
+        tool_artifacts = [
+            item for item in artifacts if item.kind == "tool_result"
+        ]
         artifact_by_call = {
-            str(item.metadata_json.get("callId")): item for item in artifacts
+            str(item.metadata_json.get("callId")): item
+            for item in tool_artifacts
         }
         requested = {
             item.payload_json.get("callId")
@@ -924,31 +1056,150 @@ class AgentRunWorker:
             else None
         )
         failed_artifact = artifact_by_call.get(str(failed_call_id))
-        completed_results = [
-            item
+        plan_artifacts = [
+            item for item in artifacts if item.kind == "agent_plan_snapshot"
+        ]
+        plan_artifact = (
+            max(
+                plan_artifacts,
+                key=lambda item: int(
+                    item.metadata_json.get("revision", 0)
+                ),
+            )
+            if plan_artifacts
+            else None
+        )
+        plan_snapshot: dict[str, Any] | None = None
+        plan_ref: dict[str, Any] | None = None
+        plan_integrity_error: str | None = None
+        if plan_artifact is not None:
+            root = AgentRunWorker._trajectory_dir(run.id)
+            try:
+                path = safe_artifact_path(
+                    root,
+                    plan_artifact.metadata_json.get("storageKey"),
+                    forbidden_root=root / ".staging",
+                )
+                if not artifact_record_matches(path, plan_artifact):
+                    raise ValueError("PlanSnapshot Artifact 不存在或已损坏")
+                plan_snapshot = json.loads(path.read_bytes())
+                if digest_json(plan_snapshot) != plan_artifact.metadata_json.get(
+                    "planDigest"
+                ):
+                    raise ValueError("PlanSnapshot digest 不一致")
+                plan_ref = {
+                    "id": plan_artifact.id,
+                    "uri": plan_artifact.uri,
+                    "sha256": plan_artifact.sha256,
+                    "bytes": plan_artifact.size,
+                    "digest": plan_artifact.metadata_json.get("planDigest"),
+                    "schemaVersion": plan_artifact.metadata_json.get(
+                        "schemaVersion"
+                    ),
+                    "revision": plan_artifact.metadata_json.get("revision"),
+                }
+            except (
+                ArtifactPathError,
+                ValueError,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+            ) as exc:
+                plan_integrity_error = str(exc)
+
+        results_by_step = {
+            str(item.payload_json.get("planStepId")): item
             for item in events
             if item.type == "tool.result"
-            and item.payload_json.get("status") == "succeeded"
-        ]
-        resume_state = {
-            "completedActionCallIds": [
-                item.payload_json.get("callId") for item in completed_results
-            ],
-            "failedActionCallId": failed_call_id,
-            "pendingToolCalls": sorted(
-                str(call_id) for call_id in requested - closed if call_id
-            ),
-            "remainingPlan": {"resumeSameTask": True},
+            and item.payload_json.get("planStepId")
         }
-        source = {
-            "kind": "conversation_run",
-            "id": run.id,
-            "input": run.input_json,
-            "config": run.config_json or {},
-            "trajectory": run.trajectory_json or {},
-            "handoff": resume_state,
-        }
-        source_digest = digest_json(source)
+        completed_steps: list[dict[str, Any]] = []
+        failed_step: dict[str, Any] | None = None
+        remaining_steps: list[dict[str, Any]] = []
+        step_states: list[dict[str, Any]] = []
+        if plan_snapshot is not None:
+            for plan_step in plan_snapshot.get("steps", []):
+                step_id = str(plan_step.get("id"))
+                result_event = results_by_step.get(step_id)
+                result_status = (
+                    result_event.payload_json.get("status")
+                    if result_event is not None
+                    else None
+                )
+                artifact = (
+                    artifact_by_call.get(
+                        str(result_event.payload_json.get("callId"))
+                    )
+                    if result_event is not None
+                    else None
+                )
+                artifact_ref = (
+                    {
+                        "id": artifact.id,
+                        "sha256": artifact.sha256,
+                        "bytes": artifact.size,
+                        "uri": artifact.uri,
+                        "evidenceDigest": artifact.metadata_json.get(
+                            "evidenceDigest"
+                        ),
+                    }
+                    if artifact is not None
+                    else None
+                )
+                state = (
+                    "completed"
+                    if result_status == "succeeded"
+                    else "failed"
+                    if result_status == "failed"
+                    else "remaining"
+                )
+                entry = {
+                    **plan_step,
+                    "status": state,
+                    **(
+                        {
+                            "callId": result_event.payload_json.get("callId"),
+                            "artifact": artifact_ref,
+                        }
+                        if result_event is not None and artifact_ref is not None
+                        else {}
+                    ),
+                }
+                step_states.append({"id": step_id, "status": state})
+                if state == "completed":
+                    completed_steps.append(entry)
+                elif state == "failed":
+                    failed_step = {**entry, "error": error}
+                    remaining_steps.append(entry)
+                else:
+                    remaining_steps.append(entry)
+        elif plan_integrity_error is None:
+            # Legacy runs are allowed to fail, but are never represented as a
+            # checkpoint continuation from a frozen plan.
+            remaining_steps = []
+
+        pending_calls = sorted(
+            str(call_id) for call_id in requested - closed if call_id
+        )
+        remaining_plan = (
+            {
+                "mode": "integrity_failed",
+                "reason": plan_integrity_error,
+                "steps": [],
+            }
+            if plan_integrity_error
+            else {
+                "mode": "execute_remaining",
+                "planDigest": plan_ref["digest"],
+                "revision": plan_ref["revision"],
+                "steps": remaining_steps,
+            }
+            if plan_ref is not None
+            else {
+                "mode": "replan_required",
+                "reason": "源运行没有结构化 PlanSnapshot",
+                "steps": [],
+            }
+        )
         action_ledger = [
             {
                 "signature": item.metadata_json.get("actionSignature"),
@@ -961,49 +1212,41 @@ class AgentRunWorker:
                     "resultDigest": item.metadata_json.get("resultDigest"),
                 },
             }
-            for item in artifacts
+            for item in tool_artifacts
             if item.metadata_json.get("actionSignature")
             and item.metadata_json.get("status") == "succeeded"
         ]
+        artifact_refs = [
+            {
+                "id": item.id,
+                "sha256": item.sha256,
+                "bytes": item.size,
+                "evidenceDigest": item.metadata_json.get("evidenceDigest"),
+            }
+            for item in tool_artifacts
+        ]
+        source_evidence = {
+            "kind": "conversation_run",
+            "id": run.id,
+            "input": run.input_json,
+            "config": run.config_json or {},
+            "planSnapshot": plan_ref,
+            "stepStates": step_states,
+            "artifactRefs": artifact_refs,
+        }
+        source_digest = digest_json(source_evidence)
         snapshot = {
             "source": {
                 "kind": "conversation_run",
                 "id": run.id,
                 "digest": source_digest,
             },
-            "completedSteps": [
-                {
-                    "seq": item.seq,
-                    "type": item.type,
-                    "payload": item.payload_json,
-                    **(
-                        {
-                            "artifact": {
-                                "id": artifact_by_call[
-                                    str(item.payload_json.get("callId"))
-                                ].id,
-                                "sha256": artifact_by_call[
-                                    str(item.payload_json.get("callId"))
-                                ].sha256,
-                                "uri": artifact_by_call[
-                                    str(item.payload_json.get("callId"))
-                                ].uri,
-                                "evidenceDigest": artifact_by_call[
-                                    str(item.payload_json.get("callId"))
-                                ].metadata_json.get("evidenceDigest"),
-                            }
-                        }
-                        if str(item.payload_json.get("callId")) in artifact_by_call
-                        else {}
-                    ),
-                }
-                for item in events
-                if item.type == "agent.step.completed"
-                or item in completed_results
-            ],
+            "sourceEvidence": source_evidence,
+            "planSnapshot": plan_ref,
+            "completedSteps": completed_steps,
             "failedAction": {
                 "callId": failed_call_id,
-                "error": error,
+                "error": error.get("effectiveError", error),
                 **(
                     {
                         "artifact": {
@@ -1019,10 +1262,12 @@ class AgentRunWorker:
                     else {}
                 ),
             },
-            # 兼容既有 API，同时显式区分 completed/failed/pending/remaining。
-            "failedStep": {"error": error},
-            "pendingToolCalls": resume_state["pendingToolCalls"],
-            "remainingPlan": resume_state["remainingPlan"],
+            "failedStep": failed_step
+            or {"error": error.get("effectiveError", error)},
+            "reportedError": error.get("reportedError"),
+            "effectiveError": error.get("effectiveError", error),
+            "pendingToolCalls": pending_calls,
+            "remainingPlan": remaining_plan,
             "completedActionLedger": action_ledger,
             "locks": list(
                 (run.config_json or {}).get("allowedCapabilities", [])
@@ -1047,7 +1292,7 @@ class AgentRunWorker:
             source_kind="conversation_run",
             source_id=run.id,
             source_digest=source_digest,
-            status=status,
+            status="terminal" if plan_integrity_error else status,
             snapshot_json=snapshot,
             digest=digest_json(snapshot),
             claim_generation=0,

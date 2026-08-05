@@ -12,6 +12,12 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from app.application.agent_events import AgentEventError, AgentEventValidator
+from app.application.agent_plans import (
+    AgentPlanError,
+    AgentPlanSnapshot,
+    apply_replan_patch,
+    validate_agent_plan,
+)
 from app.application.error_policy import error_policy
 from app.application.tool_broker import (
     ToolAdapterRegistry,
@@ -41,13 +47,22 @@ class AgentHostError(Exception):
         retryable: bool | None = None,
         failed_call_id: str | None = None,
         protocol_violation: str | None = None,
+        reported_error: dict[str, Any] | None = None,
     ) -> None:
         policy = error_policy(code)
         self.code = policy.code
         self.message = message
-        self.retryable = policy.retryable if retryable is None else retryable
+        # retryable is deliberately advisory. The Host policy owns the effective
+        # state transition even when an Agent or Tool payload reports otherwise.
+        self.retryable = policy.retryable
         self.failed_call_id = failed_call_id
         self.protocol_violation = protocol_violation
+        self.reported_error = reported_error
+        self.effective_error = {
+            "code": self.code,
+            "message": self.message,
+            "retryable": self.retryable,
+        }
         super().__init__(message)
 
 
@@ -76,6 +91,7 @@ class AgentHostResult:
     audit_events: list[dict[str, Any]] = field(default_factory=list)
     step_count: int = 0
     total_tokens: int = 0
+    plan_snapshot: dict[str, Any] | None = None
 
 
 # event_sink 接收 (runtime_event, audit_event)，由调用方决定如何持久化。
@@ -160,6 +176,8 @@ class AgentHost:
         broker_payloads: dict[str, dict[str, Any]] = {}
         failed_tool_result: dict[str, Any] | None = None
         output: dict[str, Any] | None = None
+        plan: AgentPlanSnapshot | None = None
+        completed_plan_steps: set[str] = set()
 
         try:
             async with asyncio.timeout(request.max_duration_seconds):
@@ -212,6 +230,12 @@ class AgentHost:
                         if event_sink is not None:
                             await event_sink(runtime_event, audit_event)
                         request_payload = runtime_event["payload"]
+                        if plan is not None:
+                            self._validate_planned_tool_request(
+                                plan,
+                                request_payload,
+                                completed_plan_steps,
+                            )
                         open_calls[request_payload["callId"]] = request_payload
                         tool_result = await self._execute_tool_request(
                             request, request_payload
@@ -234,6 +258,8 @@ class AgentHost:
                         ]
                         if runtime_result["payload"].get("status") == "failed":
                             failed_tool_result = runtime_result["payload"]
+                        elif request_payload.get("planStepId"):
+                            completed_plan_steps.add(request_payload["planStepId"])
                         continue
                     try:
                         runtime_event, audit_event = validator.validate_pair(raw)
@@ -255,13 +281,78 @@ class AgentHost:
                             ) from exc
                         raise AgentHostError("AGENT_EVENT_INVALID", str(exc)) from exc
 
+                    event_type = runtime_event["type"]
+                    payload = runtime_event["payload"]
+                    if event_type == "agent.plan" and isinstance(
+                        payload.get("steps"), list
+                    ):
+                        if plan is not None:
+                            raise AgentHostError(
+                                "AGENT_EVENT_INVALID",
+                                "同一 AgentRun 不得直接替换计划；必须提交 ReplanPatch",
+                            )
+                        try:
+                            plan = validate_agent_plan(
+                                payload,
+                                allowed_capabilities=set(effective),
+                                max_steps=request.max_steps,
+                            )
+                        except AgentPlanError as exc:
+                            await self._cancel(adapter, request.run_id)
+                            raise AgentHostError(
+                                "AGENT_EVENT_INVALID", str(exc)
+                            ) from exc
+                        for planned_step in plan.steps:
+                            try:
+                                descriptor = self._tool_registry.describe(
+                                    planned_step.capabilityRef
+                                )
+                            except ToolBrokerError:
+                                continue
+                            if descriptor["effect"] != planned_step.effect:
+                                raise AgentHostError(
+                                    "AGENT_EVENT_INVALID",
+                                    f"计划步骤 {planned_step.id} 的 effect 与 Host 能力契约不一致",
+                                )
+                        result.plan_snapshot = plan.canonical()
+                    elif event_type == "agent.replan":
+                        if plan is None:
+                            raise AgentHostError(
+                                "AGENT_EVENT_INVALID",
+                                "agent.replan 必须引用已验证的 PlanSnapshot",
+                            )
+                        try:
+                            plan = apply_replan_patch(
+                                plan,
+                                payload,
+                                completed_step_ids=completed_plan_steps,
+                                allowed_capabilities=set(effective),
+                                max_steps=request.max_steps,
+                            )
+                        except AgentPlanError as exc:
+                            raise AgentHostError(
+                                "AGENT_EVENT_INVALID", str(exc)
+                            ) from exc
+                        # Persist the immutable replacement revision rather than
+                        # the patch envelope as the executable source of truth.
+                        runtime_event = {
+                            "type": "agent.plan",
+                            "payload": plan.canonical(),
+                        }
+                        audit_event = {
+                            "type": "agent.replan",
+                            "payload": {
+                                **audit_event["payload"],
+                                "newPlanDigest": plan.digest,
+                                "newRevision": plan.revision,
+                            },
+                        }
+                        result.plan_snapshot = plan.canonical()
                     result.runtime_events.append(runtime_event)
                     result.audit_events.append(audit_event)
                     if event_sink is not None:
                         await event_sink(runtime_event, audit_event)
 
-                    event_type = runtime_event["type"]
-                    payload = runtime_event["payload"]
                     if event_type in ("tool.call.started", "browser.action.started"):
                         open_calls[payload["callId"]] = payload
                     elif event_type in ("tool.call.completed", "browser.action.completed"):
@@ -329,6 +420,12 @@ class AgentHost:
                             result.total_tokens = final_tokens
                     elif event_type == "agent.failed":
                         await self._cancel(adapter, request.run_id)
+                        reported_error = {
+                            "code": payload["code"],
+                            "message": payload["message"],
+                            "retryable": payload["retryable"],
+                            "callId": payload.get("callId"),
+                        }
                         if failed_tool_result is not None:
                             call_id = payload.get("callId")
                             if call_id != failed_tool_result.get("callId"):
@@ -337,13 +434,35 @@ class AgentHost:
                                     protocol_violation=(
                                         "agent.failed.callId 未指向最后一个 failed ToolResult"
                                     ),
+                                    reported_error=reported_error,
                                 )
-                            raise self._failed_tool_error(failed_tool_result)
+                            raise self._failed_tool_error(
+                                failed_tool_result,
+                                reported_error=reported_error,
+                            )
+                        if payload.get("callId") is not None:
+                            raise AgentHostError(
+                                "AGENT_EVENT_INVALID",
+                                "agent.failed.callId 未指向 Host 已见的 failed ToolResult",
+                                failed_call_id=payload.get("callId"),
+                                reported_error=reported_error,
+                            )
+                        policy = error_policy(payload["code"])
+                        message = payload["message"]
+                        if policy.code not in {
+                            "EXECUTION_FAILED",
+                            "TIMEOUT",
+                            "RATE_LIMITED",
+                            "DEPENDENCY_UNAVAILABLE",
+                        }:
+                            # Unknown, permission, safety, contract and budget
+                            # reports all normalize through the fail-closed policy.
+                            message = payload["message"]
                         raise AgentHostError(
-                            payload["code"],
-                            payload["message"],
-                            retryable=payload["retryable"],
+                            policy.code,
+                            message,
                             failed_call_id=payload.get("callId"),
+                            reported_error=reported_error,
                         )
         except TimeoutError as exc:
             await self._cancel(adapter, request.run_id)
@@ -374,15 +493,46 @@ class AgentHost:
         payload: dict[str, Any],
         *,
         protocol_violation: str | None = None,
+        reported_error: dict[str, Any] | None = None,
     ) -> AgentHostError:
         error = payload.get("error") or {}
         return AgentHostError(
             str(error.get("code", "EXECUTION_FAILED")),
             str(error.get("message", "Tool 执行失败")),
-            retryable=bool(error.get("retryable", False)),
             failed_call_id=str(payload.get("callId", "")) or None,
             protocol_violation=protocol_violation,
+            reported_error=reported_error,
         )
+
+    @staticmethod
+    def _validate_planned_tool_request(
+        plan: AgentPlanSnapshot,
+        payload: dict[str, Any],
+        completed_plan_steps: set[str],
+    ) -> None:
+        step_id = payload.get("planStepId")
+        if not step_id:
+            raise AgentHostError(
+                "AGENT_EVENT_INVALID",
+                "结构化计划下的 tool.requested 必须关联 planStepId",
+            )
+        step = next((item for item in plan.steps if item.id == step_id), None)
+        if step is None:
+            raise AgentHostError(
+                "AGENT_EVENT_INVALID",
+                f"Tool request 引用了未知计划步骤 {step_id}",
+            )
+        if step.capabilityRef != payload.get("capabilityRef"):
+            raise AgentHostError(
+                "AGENT_EVENT_INVALID",
+                f"计划步骤 {step_id} 的 capabilityRef 不一致",
+            )
+        missing = set(step.dependsOn) - completed_plan_steps
+        if missing:
+            raise AgentHostError(
+                "AGENT_EVENT_INVALID",
+                f"计划步骤 {step_id} 的依赖尚未完成: {sorted(missing)}",
+            )
 
     @staticmethod
     def _validate_output_provenance(
@@ -608,6 +758,7 @@ class AgentHost:
             "idempotent",
             "observations",
             "outputSchema",
+            "planStepId",
             "replayability",
         )
         metadata = {key: payload[key] for key in keys if key in payload}

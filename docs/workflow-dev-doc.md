@@ -479,7 +479,7 @@ class AgentRuntime(Protocol):
 
 | **事件**                     | **字段**                         |
 |------------------------------|----------------------------------|
-| agent.plan                   | 公开计划摘要，不保存私有推理     |
+| agent.plan                   | 公开结构化计划，不保存私有推理   |
 | agent.step.started/completed | 步骤 ID、类型、耗时、结果摘要    |
 | tool.call.started/completed  | Tool、参数来源、结果摘要、错误   |
 | browser.action               | URL、动作、定位器、截图 Artifact |
@@ -489,6 +489,16 @@ class AgentRuntime(Protocol):
 | **隐私要求**                                                                    |
 |---------------------------------------------------------------------------------|
 | 平台只保存可审计的行动摘要、Tool 调用和结果，不要求保存或展示模型的私有思维链。 |
+
+生产 TraeX Adapter 必须在执行 Tool 前输出结构化 `agent.plan`。计划包含
+`schemaVersion/planId/revision`，step 至少包含稳定 `id`、`action/capabilityRef`、
+`dependsOn`、`argumentRefs`、`effect/idempotencyKey`、`outputName` 与 `fallback`。
+后续 `tool.requested` 必须携带对应 `planStepId`。Host 校验能力、DAG、effect 和预算后，
+将计划保存为不可变 PlanSnapshot Artifact；Agent 自报的 `retryable` 不能控制重试或接力。
+
+恢复入口只消费统一 `ContinuationRequest`，按冻结的 remaining DAG 执行。没有结构化计划时必须
+返回 `replan_required`，不得从原始 prompt 静默重做并称为断点继续。改变 remaining plan 时必须
+返回受类型约束的 ReplanPatch，并生成新的 PlanSnapshot revision。
 
 # 11. 浏览器运行时与页面契约
 

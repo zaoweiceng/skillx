@@ -6,7 +6,12 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import select, update
 
-from app.application.orchestrator import Orchestrator, WorkerService, reconcile_run_artifacts
+from app.application.orchestrator import (
+    Orchestrator,
+    WorkerService,
+    reconcile_recent_runs,
+    reconcile_run_artifacts,
+)
 from app.config import get_settings
 from app.domain.workflow import NodeResult
 from app.infrastructure.database import (
@@ -120,6 +125,54 @@ async def test_staged_artifact_promoted_only_after_cas_success() -> None:
     # 落位后最终文件存在，暂存目录已清空。
     assert (_run_root(run_id) / artifact["storageKey"]).is_file()
     assert not (_run_root(run_id) / ".staging" / claimed.node_run_id).exists()
+
+
+async def test_second_worker_reconcile_does_not_delete_active_staging() -> None:
+    run_id, _ = await _make_run()
+    worker_a = WorkerService("artifact-worker-a")
+    async with SessionLocal() as session, session.begin():
+        claimed_input = await worker_a.claim(session)
+    assert claimed_input is not None
+    await worker_a._commit_result(
+        claimed_input, NodeResult(status="succeeded", output={})
+    )
+    async with SessionLocal() as session, session.begin():
+        await Orchestrator().advance_run(session, run_id)
+    async with SessionLocal() as session, session.begin():
+        claimed = await worker_a.claim(session)
+    assert claimed is not None and claimed.node_id == "agent"
+
+    artifact = write_json_artifact(
+        run_id,
+        claimed.node_run_id,
+        "agent",
+        "trajectory.json",
+        "agent-trajectory",
+        {"events": [], "output": {"value": "active"}},
+    )
+    staging = (
+        _run_root(run_id)
+        / ".staging"
+        / artifact["stagingKey"]["nodeRunId"]
+        / artifact["stagingKey"]["file"]
+    )
+    assert staging.is_file()
+
+    # Worker B 的启动 reconcile 默认只扫描终态 Run。
+    async with SessionLocal() as session, session.begin():
+        report = await reconcile_recent_runs(session)
+    assert report["runsScanned"] == 0
+    assert staging.is_file()
+
+    await worker_a._commit_result(
+        claimed,
+        NodeResult(
+            status="succeeded",
+            output={"value": "active"},
+            artifacts=[artifact],
+        ),
+    )
+    assert (_run_root(run_id) / artifact["storageKey"]).is_file()
 
 
 async def test_late_result_after_takeover_leaves_no_orphan_file() -> None:
