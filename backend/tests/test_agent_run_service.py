@@ -6,12 +6,14 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import select
 
 from app.api.routes import (
     AgentRunCreate,
     cancel_conversation_run,
     distill_run,
+    download_artifact,
     get_conversation_run,
     list_conversation_run_events,
     start_agent_run,
@@ -22,12 +24,15 @@ from app.application.agent_run import (
     enqueue_agent_run,
     resolve_effective_capabilities,
 )
+from app.application.orchestrator import reconcile_conversation_artifacts
 from app.config import get_settings
 from app.infrastructure.database import (
+    Artifact,
     Conversation,
     ConversationRun,
     ConversationRunEvent,
     SessionLocal,
+    TaskCheckpoint,
     utcnow,
 )
 
@@ -229,8 +234,55 @@ async def test_recover_expired_lease_marks_unknown_outcome(traex_stub: None) -> 
     assert recovered == 1
     async with SessionLocal() as session:
         run = await session.get(ConversationRun, run_id)
+        checkpoint = await session.scalar(
+            select(TaskCheckpoint).where(TaskCheckpoint.source_id == run_id)
+        )
     assert run.status == "failed"
     assert run.error_json["code"] == "UNKNOWN_OUTCOME"
+    assert checkpoint is not None
+    assert checkpoint.status == "awaiting_user"
+    assert checkpoint.snapshot_json["outcomeCertainty"] == "unknown"
+
+
+async def test_late_owner_cannot_commit_output_or_artifact(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _conversation()
+    run_id = await _enqueue(conversation_id, "任务")
+    old_worker = AgentRunWorker("old-owner")
+    async with SessionLocal() as session, session.begin():
+        assert await old_worker.claim(session) == run_id
+    async with SessionLocal() as session, session.begin():
+        run = await session.get(ConversationRun, run_id)
+        old_generation = run.claim_generation
+        old_token = run.claim_token
+        run.lease_owner = "new-owner"
+        run.claim_generation += 1
+        run.claim_token = str(uuid4())
+
+    await old_worker._finalize_success(
+        run_id,
+        AgentRunConfig.default(),
+        "任务",
+        {"reply": "迟到结果"},
+        [],
+        [],
+        1,
+        1,
+        old_generation,
+        old_token,
+    )
+
+    async with SessionLocal() as session:
+        run = await session.get(ConversationRun, run_id)
+        artifacts = list(
+            await session.scalars(
+                select(Artifact).where(Artifact.conversation_run_id == run_id)
+            )
+        )
+    assert run.status == "running"
+    assert run.output_json == {}
+    assert artifacts == []
 
 
 async def test_agent_endpoint_returns_202_and_is_distillable(traex_stub: None) -> None:
@@ -306,3 +358,33 @@ async def test_secret_never_appears_in_trajectory_or_disk(traex_stub: None) -> N
             content = path.read_bytes()
             for secret in leaked:
                 assert secret.encode() not in content
+
+
+async def test_conversation_trajectory_download_reconcile_and_integrity(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _conversation()
+    run_id = await _enqueue(conversation_id, "任务 [[MODE:ok]][[REPLY:证据]]")
+    run = await _drive(run_id)
+    assert run.status == "succeeded"
+    async with SessionLocal() as session:
+        artifact = await session.scalar(
+            select(Artifact).where(Artifact.conversation_run_id == run_id)
+        )
+        response = await download_artifact(artifact.id, session)
+    target = Path(response.path)
+    assert target.is_file()
+
+    staging = target.parent / artifact.metadata_json["stagingKey"]
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    target.replace(staging)
+    async with SessionLocal() as session, session.begin():
+        report = await reconcile_conversation_artifacts(session, run_id)
+    assert artifact.id in report["recovered"]
+    assert target.is_file()
+
+    target.write_bytes(b"tampered")
+    async with SessionLocal() as session:
+        with pytest.raises(HTTPException) as exc:
+            await download_artifact(artifact.id, session)
+    assert exc.value.status_code == 409

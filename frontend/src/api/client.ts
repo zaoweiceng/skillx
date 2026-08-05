@@ -131,6 +131,8 @@ export type Run = {
     executionClass?: string | null
     capabilityLocks?: unknown[]
     mcpLocks?: unknown[]
+    lineage?: Record<string, unknown>
+    revisionLineage?: Record<string, unknown>
   }
   checkpoints?: Array<{
     id: string
@@ -146,6 +148,24 @@ export type Run = {
     remainingSubgraph: string[]
     committedSideEffects: Array<{ nodeId: string; idempotent: boolean }>
     decision: Record<string, unknown> | null
+  }>
+  failureObservations?: Array<{
+    id: string
+    fingerprint: string
+    nodeId: string
+    errorCode: string
+    classification: string
+    occurrence: number
+    recovered: boolean
+    baselineReproduced: boolean
+    checkpointId?: string | null
+    replayEvidence: Array<{
+      id: string
+      passed: boolean
+      fixtureDigest?: string | null
+      baseVersionId?: string | null
+      patchOfObservationId?: string | null
+    }>
   }>
 }
 
@@ -183,6 +203,17 @@ export type ChatMessageContent = {
   selectionReason?: string
   disclosureSessionId?: string
   disclosureLevel?: string
+  pendingSelectionId?: string
+  resumedPendingSelection?: boolean
+  refs?: string[]
+  toolTimeline?: Array<{
+    type: string
+    callId?: string
+    capabilityRef?: string
+    level?: string
+    status?: string
+    diagnostics?: Array<{ level: string; code: string; message: string }>
+  }>
 }
 
 export type WorkflowCapabilityCard = {

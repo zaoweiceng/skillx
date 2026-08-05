@@ -113,7 +113,9 @@ async def test_staged_artifact_promoted_only_after_cas_success() -> None:
 
     async with SessionLocal() as session:
         rows = (await session.scalars(select(Artifact).where(Artifact.run_id == run_id))).all()
-    assert len(rows) == 1
+    assert {row.kind for row in rows} == {"agent-trajectory", "replay_fixture"}
+    replay_fixture = next(row for row in rows if row.kind == "replay_fixture")
+    assert replay_fixture.metadata_json["outputDigest"].startswith("sha256:")
     # 落位后最终文件存在，暂存目录已清空。
     assert (_run_root(run_id) / artifact["storageKey"]).is_file()
     assert not (_run_root(run_id) / ".staging" / claimed.node_run_id).exists()

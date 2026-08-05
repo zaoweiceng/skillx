@@ -24,19 +24,25 @@ import time
 from pathlib import Path
 from typing import Any
 
-# deterministic 模式下 Tool 的确定性查表：输出取决于输入，而非固定 reply 指令。
-# 用于 004-D 证明“真实轨迹提炼”——不同输入产生不同结果。
-LOOKUP_TABLE = {
-    "q1": "第一季度：营收增长 12%",
-    "q2": "第二季度：营收增长 8%",
-    "q3": "第三季度：营收持平",
-    "q4": "第四季度：营收增长 15%",
-}
-
 
 def emit(event: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
     sys.stdout.flush()
+
+
+def read_tool_result(call_id: str) -> dict[str, Any]:
+    line = sys.stdin.readline()
+    if not line:
+        raise RuntimeError("Host 未回送 ToolResult")
+    event = json.loads(line)
+    payload = event.get("payload", {})
+    if (
+        event.get("type") != "tool.result"
+        or payload.get("callId") != call_id
+        or payload.get("status") not in {"succeeded", "failed"}
+    ):
+        raise RuntimeError("Host ToolResult 协议不匹配")
+    return payload
 
 
 def _directive(prompt: str, key: str, default: str) -> str:
@@ -78,6 +84,175 @@ def main() -> int:
     mode = _directive(args.prompt, "MODE", "ok")
     reply = _directive(args.prompt, "REPLY", "已完成任务")
     allowed = json.loads(args.allowed_tools) if args.allowed_tools else []
+
+    if "Progressive WorkflowSelection" in args.prompt:
+        user_match = re.search(r"user=(.*)", args.prompt)
+        user_text = user_match.group(1).strip() if user_match else _clean_message(args.prompt)
+        requested_action = _directive(args.prompt, "SELECTION", "auto")
+        emit({"type": "agent.plan", "payload": {"summary": "渐进发现 Workflow"}})
+        emit(
+            {
+                "type": "tool.requested",
+                "payload": {
+                    "callId": "workflow-search",
+                    "capabilityRef": "workflow.search",
+                    "arguments": {"query": user_text, "limit": 5},
+                },
+            }
+        )
+        search_result = read_tool_result("workflow-search")
+        cards = (search_result.get("output") or {}).get("items", [])
+        if not cards or requested_action == "continue_agent":
+            emit(
+                {
+                    "type": "agent.completed",
+                    "payload": {
+                        "steps": 1,
+                        "totalTokens": 20,
+                        "output": {
+                            "action": "continue_agent",
+                            "reason": "目录没有适合当前任务的能力",
+                            "refs": [],
+                            "bindings": {},
+                            "missingInputs": [],
+                        },
+                        "provenance": [
+                            {"callId": "workflow-search", "path": "output.items"}
+                        ],
+                    },
+                }
+            )
+            return 0
+        workflow_ref = cards[0]["workflowRef"]
+        emit(
+            {
+                "type": "tool.requested",
+                "payload": {
+                    "callId": "workflow-describe",
+                    "capabilityRef": "workflow.describe",
+                    "arguments": {"ref": workflow_ref},
+                },
+            }
+        )
+        describe_result = read_tool_result("workflow-describe")
+        workflow = (describe_result.get("output") or {}).get("workflow", {})
+        required = workflow.get("inputSchema", {}).get("required", [])
+        action = requested_action
+        if action == "auto":
+            action = "ask_user" if required else "run_full"
+        output: dict[str, Any]
+        provenance = [
+            {"callId": "workflow-search", "path": "output.items"},
+            {"callId": "workflow-describe", "path": "output.workflow"},
+        ]
+        if action == "ask_user":
+            output = {
+                "action": "ask_user",
+                "reason": "已选择能力但缺少必填绑定",
+                "refs": [workflow_ref],
+                "bindings": {},
+                "missingInputs": required or ["input"],
+                "question": f"请补充输入：{', '.join(required or ['input'])}",
+            }
+        elif action == "run_fragment":
+            fragments = workflow.get("fragments", [])
+            if not fragments:
+                output = {
+                    "action": "continue_agent",
+                    "reason": "已选 Workflow 没有披露可调用 Fragment",
+                    "refs": [],
+                    "bindings": {},
+                    "missingInputs": [],
+                }
+            else:
+                output = {
+                    "action": "run_fragment",
+                    "reason": "任务只需要已披露局部能力",
+                    "refs": [fragments[0]["fragmentRef"]],
+                    "bindings": {},
+                    "missingInputs": [],
+                }
+        elif action == "compose":
+            input_schema = workflow.get("inputSchema", {"type": "object"})
+            output_schema = workflow.get("outputSchema", {"type": "object"})
+            plan = {
+                "inputSchema": input_schema,
+                "outputSchema": output_schema,
+                "steps": [
+                    {
+                        "id": "selected",
+                        "kind": "workflow",
+                        "ref": workflow_ref,
+                        "input": {
+                            key: f"${{input.{key}}}"
+                            for key in input_schema.get("properties", {})
+                        },
+                    }
+                ],
+                "output": {
+                    key: f"${{selected.{key}}}"
+                    for key in output_schema.get("properties", {})
+                },
+            }
+            emit(
+                {
+                    "type": "tool.requested",
+                    "payload": {
+                        "callId": "workflow-compile",
+                        "capabilityRef": "workflow.compile_plan",
+                        "arguments": {"plan": plan},
+                    },
+                }
+            )
+            compile_result = read_tool_result("workflow-compile")
+            provenance.append(
+                {"callId": "workflow-compile", "path": "output.diagnostics"}
+            )
+            compiled = compile_result.get("output") or {}
+            output = (
+                {
+                    "action": "compose",
+                    "reason": "Plan 已由 Compiler 冻结并通过校验",
+                    "refs": [workflow_ref],
+                    "bindings": {},
+                    "missingInputs": [],
+                    "plan": plan,
+                }
+                if compiled.get("compiled")
+                else {
+                    "action": "continue_agent",
+                    "reason": f"Plan 编译失败：{compiled.get('diagnostics', [])}",
+                    "refs": [],
+                    "bindings": {},
+                    "missingInputs": [],
+                }
+            )
+        else:
+            output = {
+                "action": "run_full",
+                "reason": "L1 契约满足任务需要",
+                "refs": [workflow_ref],
+                "bindings": {},
+                "missingInputs": [],
+            }
+        emit(
+            {
+                "type": "agent.step.completed",
+                "payload": {"step": 1, "inputTokens": 20, "outputTokens": 10},
+            }
+        )
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {
+                    "steps": 1,
+                    "totalTokens": 30,
+                    "output": output,
+                    "provenance": provenance,
+                },
+            }
+        )
+        return 0
 
     if "WorkflowSelection" in args.prompt:
         refs = re.findall(r"workflow:[^'\"\s,}\]]+", args.prompt)
@@ -141,6 +316,46 @@ def main() -> int:
                         "estimatedCost": {"llmCalls": sum(
                             node["strategy"] in {"agent", "llm"} for node in nodes
                         )},
+                    },
+                },
+            }
+        )
+        return 0
+
+    if "Revision Agent" in args.prompt:
+        version_match = re.search(r"baseVersionId=([^\s]+)", args.prompt)
+        node_match = re.search(r"failedNodeId=([^\s]+)", args.prompt)
+        emit({"type": "agent.plan", "payload": {"summary": "生成受控修订提议"}})
+        emit(
+            {
+                "type": "agent.step.completed",
+                "payload": {"step": 1, "inputTokens": 12, "outputTokens": 8},
+            }
+        )
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {
+                    "steps": 1,
+                    "totalTokens": 20,
+                    "output": {
+                        "kind": "WorkflowPatch",
+                        "baseVersionId": (
+                            version_match.group(1) if version_match else "unknown"
+                        ),
+                        "nodePatches": [
+                            {
+                                "nodeId": (
+                                    node_match.group(1) if node_match else "unknown"
+                                ),
+                                "changes": {
+                                    "config": {"operation": "passthrough"}
+                                },
+                            }
+                        ],
+                        "addEdges": [],
+                        "removeEdges": [],
+                        "reason": "baseline 可复现且修订受 Schema 限制",
                     },
                 },
             }
@@ -213,28 +428,36 @@ def main() -> int:
     emit({"type": "agent.plan", "payload": {"summary": "解析输入并调用允许的工具", "steps": 2}})
 
     if mode == "deterministic":
-        # 确定性查表：Tool 事件显式携带固化证据（kind=transform、operation=lookup、整表），
-        # Compiler 据此裁决为确定节点，而非依赖“结果恰好是 dict”。
+        # Agent 只提交 key；整表、选值与固化 evidence 均由 Host Adapter 返回。
         key = _clean_message(args.prompt)
         tool_name = allowed[0] if allowed else "lookup.table"
-        started = {
-            "callId": "call-1",
-            "tool": tool_name,
-            "arguments": {"key": key},
-            "actionKind": "transform",
-        }
-        completed = {
-            "callId": "call-1",
-            "tool": tool_name,
-            "result": dict(LOOKUP_TABLE),
-            "actionKind": "transform",
-            "replayability": "deterministic",
-            "effect": "none",
-            "idempotent": True,
-            "observations": {"operation": "lookup", "table": dict(LOOKUP_TABLE)},
-        }
-        emit({"type": "tool.call.started", "payload": started})
-        emit({"type": "tool.call.completed", "payload": completed})
+        emit(
+            {
+                "type": "tool.requested",
+                "payload": {
+                    "callId": "call-1",
+                    "capabilityRef": tool_name,
+                    "arguments": {"key": key},
+                    "argumentBindings": {
+                        "key": {"source": "user_input", "inputKey": "message"}
+                    },
+                    "actionKind": "transform",
+                    "replayability": "deterministic",
+                    "effect": "none",
+                    "idempotent": True,
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "table": {"type": "object"},
+                            "value": {"type": "string"},
+                        },
+                        "required": ["table", "value"],
+                    },
+                },
+            }
+        )
+        tool_result = read_tool_result("call-1")
+        output = tool_result.get("output") or {}
         emit(
             {
                 "type": "agent.step.completed",
@@ -247,7 +470,8 @@ def main() -> int:
                 "payload": {
                     "steps": 1,
                     "totalTokens": 16,
-                    "output": {"reply": LOOKUP_TABLE.get(key, "未知季度")},
+                    "output": {"reply": output.get("value", "未知季度")},
+                    "provenance": [{"callId": "call-1", "path": "output.value"}],
                 },
             }
         )
@@ -257,28 +481,24 @@ def main() -> int:
         url = _clean_message(args.prompt)
         browser_capability = "browser.read"
         summary_capability = "summarize.text"
+        page_contract = {
+            "contractVersion": "1",
+            "urlPattern": url,
+            "bodySelector": "#main",
+            "fields": {},
+        }
         emit(
             {
-                "type": "browser.action.started",
+                "type": "tool.requested",
                 "payload": {
                     "callId": "call-browser",
-                    "capability": browser_capability,
+                    "capabilityRef": browser_capability,
                     "action": "read",
-                    "arguments": {"url": url},
+                    "actionKind": "browser",
+                    "arguments": {"url": url, "pageContract": page_contract},
                     "argumentBindings": {
                         "url": {"source": "user_input", "inputKey": "message"}
                     },
-                },
-            }
-        )
-        emit(
-            {
-                "type": "browser.action.completed",
-                "payload": {
-                    "callId": "call-browser",
-                    "capability": browser_capability,
-                    "action": "read",
-                    "result": {"content": "首次探索正文"},
                     "effect": "none",
                     "idempotent": True,
                     "replayability": "parameterizable",
@@ -290,23 +510,34 @@ def main() -> int:
                     "observations": {
                         "runtime": "playwright",
                         "action": "read",
-                        "pageContract": {
-                            "contractVersion": "1",
-                            "urlPattern": url,
-                            "bodySelector": "#main",
-                            "fields": {},
-                        },
+                        "pageContract": page_contract,
                     },
                 },
             }
         )
+        tool_result = read_tool_result("call-browser")
+        if tool_result["status"] != "succeeded":
+            emit(
+                {
+                    "type": "agent.completed",
+                    "payload": {
+                        "steps": 1,
+                        "totalTokens": 10,
+                        "output": {"reply": tool_result["error"]["message"]},
+                        "provenance": [{"callId": "call-browser", "path": "error"}],
+                    },
+                }
+            )
+            return 0
+        browser_output = tool_result["output"]
+        browser_content = browser_output["content"]
         emit(
             {
                 "type": "tool.call.started",
                 "payload": {
                     "callId": "call-summary",
                     "tool": summary_capability,
-                    "arguments": {"text": "首次探索正文"},
+                    "arguments": {"text": browser_content},
                     "argumentBindings": {
                         "text": {
                             "source": "prior_output",
@@ -324,7 +555,7 @@ def main() -> int:
                     "callId": "call-summary",
                     "tool": summary_capability,
                     "actionKind": "agent",
-                    "result": {"reply": "首次探索正文"},
+                    "result": {"reply": browser_content},
                     "outputSchema": {
                         "type": "object",
                         "properties": {"reply": {"type": "string"}},
@@ -351,7 +582,70 @@ def main() -> int:
                 "payload": {
                     "steps": 1,
                     "totalTokens": 30,
-                    "output": {"reply": "首次探索正文"},
+                    "output": {"reply": browser_content},
+                    "provenance": [
+                        {"callId": "call-browser", "path": "output.content"}
+                    ],
+                },
+            }
+        )
+        return 0
+
+    if mode == "local_summary":
+        path = _directive(args.prompt, "FILE", "source.txt")
+        emit(
+            {
+                "type": "tool.requested",
+                "payload": {
+                    "callId": "call-local",
+                    "capabilityRef": "read.local",
+                    "action": "read",
+                    "actionKind": "file",
+                    "arguments": {"path": path},
+                    "argumentBindings": {
+                        "path": {"source": "constant", "value": path}
+                    },
+                    "effect": "none",
+                    "idempotent": True,
+                    "replayability": "parameterizable",
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                            "bytes": {"type": "integer"},
+                        },
+                        "required": ["path", "content", "bytes"],
+                    },
+                },
+            }
+        )
+        tool_result = read_tool_result("call-local")
+        output = tool_result.get("output") or {}
+        reply = output.get("content", tool_result.get("error", {}).get("message", ""))
+        emit(
+            {
+                "type": "agent.step.completed",
+                "payload": {"step": 1, "inputTokens": 10, "outputTokens": 10},
+            }
+        )
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {
+                    "steps": 1,
+                    "totalTokens": 20,
+                    "output": {"reply": reply},
+                    "provenance": [
+                        {
+                            "callId": "call-local",
+                            "path": (
+                                "output.content"
+                                if tool_result["status"] == "succeeded"
+                                else "error.message"
+                            ),
+                        }
+                    ],
                 },
             }
         )

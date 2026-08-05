@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import select
 
-from app.api.routes import apply_version_workflow_patch
+from app.api.routes import apply_version_workflow_patch, propose_failure_revision
 from app.application.workflow_patch import (
     REPRODUCIBLE_THRESHOLD,
     WorkflowPatch,
@@ -19,6 +22,7 @@ from app.application.workflow_patch import (
     record_failure_observation,
     should_propose_patch,
 )
+from app.config import get_settings
 from app.infrastructure.database import (
     FailureObservation,
     Run,
@@ -28,6 +32,16 @@ from app.infrastructure.database import (
     utcnow,
 )
 
+STUB = Path(__file__).resolve().parents[2] / "examples" / "traex_stub.py"
+
+
+@pytest.fixture
+def revision_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "traex_command", [sys.executable, str(STUB)])
+    monkeypatch.setattr(
+        settings, "traex_allowed_executables", [Path(sys.executable).name]
+    )
 
 def test_fingerprint_stable_and_excludes_noise() -> None:
     a = failure_fingerprint(
@@ -257,6 +271,27 @@ async def test_patch_endpoint_rejects_when_no_observation() -> None:
             )
     assert excinfo.value.status_code == 422
     assert excinfo.value.detail["code"] == "PATCH_NOT_ELIGIBLE"
+
+
+async def test_revision_agent_only_proposes_after_baseline_reproduction(
+    revision_agent: None,
+) -> None:
+    version_id, run_id = await _seed_version_with_failure(
+        error_code="DEPENDENCY_UNAVAILABLE",
+        occurrence=1,
+        real_failure=True,
+    )
+    async with SessionLocal() as session:
+        observation = await session.scalar(
+            select(FailureObservation).where(
+                FailureObservation.last_run_id == run_id
+            )
+        )
+        result = await propose_failure_revision(observation.id, session)
+    assert result["baseVersionId"] == version_id
+    assert result["baseline"]["failedNodeErrorCode"] == "DEPENDENCY_UNAVAILABLE"
+    assert result["proposal"]["kind"] == "WorkflowPatch"
+    assert result["published"] is False
 
 
 async def test_patch_endpoint_rejects_transient_single_occurrence() -> None:

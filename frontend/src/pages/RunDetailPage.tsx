@@ -239,20 +239,35 @@ export default function RunDetailPage() {
         </section>
       )}
 
-      {(run.checkpoints ?? []).length > 0 && (
+      {(run.failureObservations?.length ?? 0) > 0 && (
         <section className="panel result-panel">
           <div className="panel-heading">
-            <h2>Recovery fencing</h2>
-          </div>
-          {(run.checkpoints ?? []).map((checkpoint) => (
-            <div className="node-row" key={checkpoint.id}>
-              <strong>{checkpoint.failedNode}</strong>
-              <small>
-                generation {checkpoint.claimGeneration ?? 0} · {checkpoint.status}
-              </small>
-              <JsonBlock value={checkpoint.decision} />
+            <div>
+              <span className="eyebrow">FAILURE / REPLAY LINEAGE</span>
+              <h2>失败观测与回放证据</h2>
             </div>
-          ))}
+          </div>
+          <div className="node-table">
+            {run.failureObservations?.map((observation) => (
+              <details className="node-row" key={observation.id}>
+                <summary>
+                  <div>
+                    <strong>
+                      {observation.nodeId} · {observation.errorCode}
+                    </strong>
+                    <small>
+                      {observation.classification} · occurrence {observation.occurrence} · baseline{' '}
+                      {observation.baselineReproduced ? 'reproduced' : 'not reproduced'}
+                    </small>
+                    <code className="digest-line">{observation.fingerprint}</code>
+                  </div>
+                </summary>
+                <div className="node-detail">
+                  <JsonBlock value={observation} />
+                </div>
+              </details>
+            ))}
+          </div>
         </section>
       )}
 
@@ -339,7 +354,7 @@ export default function RunDetailPage() {
                     <strong>失败节点 {checkpoint.failedNode}</strong>
                     <small>
                       attempt {checkpoint.attempt} · 剩余子图 {checkpoint.remainingSubgraph.length}{' '}
-                      个节点
+                      个节点 · generation {checkpoint.claimGeneration ?? 0}
                       {checkpoint.fallbackTarget ? ` · fallback → ${checkpoint.fallbackTarget}` : ''}
                       {checkpoint.approvalStatus && checkpoint.approvalStatus !== 'none'
                         ? ` · 审批 ${checkpoint.approvalStatus}`

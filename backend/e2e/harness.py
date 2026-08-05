@@ -121,7 +121,9 @@ def start_stack(
         "SKILLX_TRAEX_ALLOWED_EXECUTABLES": f'["{Path(sys.executable).name}"]',
         # Host policy 授予的 Agent Tool 集合：请求方能力只能取交集缩小，不能扩大。
         "SKILLX_AGENT_HOST_CAPABILITIES": (
-            '["search.web", "lookup.table", "browser.read", "summarize.text"]'
+            '["search.web", "lookup.table", "browser.read", "summarize.text",'
+            '"workflow.search", "workflow.describe", "workflow.describe_fragment",'
+            '"workflow.slice", "workflow.compile_plan"]'
         ),
         "SKILLX_AGENT_LEASE_SECONDS": "2",
         "SKILLX_BROWSER_ALLOWED_HOSTS": '["127.0.0.1"]',

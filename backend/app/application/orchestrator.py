@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
@@ -19,7 +20,7 @@ from app.application.compiler import digest_json
 from app.application.expressions import ExpressionError, resolve_mapping
 from app.application.mcp import MCPConfigurationError, MCPLockDriftError, resolve_mcp_node
 from app.application.retries import auto_retry_allowed
-from app.application.security import event_payload
+from app.application.security import event_payload, redact
 from app.config import get_settings
 from app.domain.workflow import NodeResult, NodeType, WorkflowDefinition, WorkflowNode
 from app.infrastructure.database import (
@@ -31,6 +32,7 @@ from app.infrastructure.database import (
     NodeRun,
     PlanSnapshot,
     RecoveryAttempt,
+    ReplayFixture,
     Run,
     RunEvent,
     SessionLocal,
@@ -45,6 +47,7 @@ from app.runtime.executors import (
     clear_staging,
     list_final_files,
     promote_staged_artifact,
+    write_json_artifact,
 )
 from app.runtime.state_machine import (
     edge_ready,
@@ -1245,6 +1248,9 @@ class WorkerService:
         )
 
     async def _commit_result(self, claimed: ClaimedExecution, result: NodeResult) -> None:
+        fixture = self._capture_replay_fixture(claimed, result)
+        if fixture is not None:
+            result.artifacts.append(fixture)
         async with SessionLocal() as session, session.begin():
             values: dict[str, Any] = {
                 "worker_id": None,
@@ -1362,6 +1368,21 @@ class WorkerService:
                         },
                     )
                 )
+                if item["kind"] == "replay_fixture":
+                    metadata = item.get("metadata", {})
+                    session.add(
+                        ReplayFixture(
+                            id=str(uuid4()),
+                            run_id=claimed.run_id,
+                            node_run_id=claimed.node_run_id,
+                            node_id=claimed.node_id,
+                            artifact_id=item["id"],
+                            source_digest=metadata["sourceDigest"],
+                            input_digest=metadata["inputDigest"],
+                            output_digest=metadata["outputDigest"],
+                            capture_policy=metadata["capturePolicy"],
+                        )
+                    )
                 await append_event(
                     session,
                     claimed.run_id,
@@ -1381,6 +1402,52 @@ class WorkerService:
             promote_staged_artifact(claimed.run_id, item)
         # 落位后清理该 node_run 的剩余暂存文件。
         clear_staging(claimed.run_id, claimed.node_run_id)
+
+    @staticmethod
+    def _capture_replay_fixture(
+        claimed: ClaimedExecution, result: NodeResult
+    ) -> dict[str, Any] | None:
+        replayable_types = {
+            NodeType.BROWSER,
+            NodeType.MCP,
+            NodeType.SKILLX,
+            NodeType.AGENT,
+            NodeType.LLM,
+        }
+        if (
+            result.status != "succeeded"
+            or result.output is None
+            or claimed.node.type not in replayable_types
+            or claimed.node.side_effect
+        ):
+            return None
+        safe_output = redact(result.output)
+        encoded = json.dumps(
+            safe_output, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()
+        if len(encoded) > 64 * 1024:
+            return None
+        artifact = write_json_artifact(
+            claimed.run_id,
+            claimed.node_run_id,
+            claimed.node_id,
+            f"{claimed.node_id}-replay-fixture.json",
+            "replay_fixture",
+            {"output": safe_output},
+        )
+        artifact["metadata"] = {
+            **artifact.get("metadata", {}),
+            "sourceDigest": digest_json(
+                {
+                    "type": claimed.node.type.value,
+                    "config": claimed.node.config,
+                }
+            ),
+            "inputDigest": digest_json(redact(claimed.inputs)),
+            "outputDigest": digest_json(safe_output),
+            "capturePolicy": "redacted_schema_validated_64k",
+        }
+        return artifact
 
     async def _schedule_retry(
         self,
@@ -1552,6 +1619,69 @@ async def reconcile_run_artifacts(session: AsyncSession, run_id: str) -> dict[st
     return {"recovered": recovered, "missing": missing, "orphanFilesRemoved": orphan_files}
 
 
+async def reconcile_conversation_artifacts(
+    session: AsyncSession, conversation_run_id: str
+) -> dict[str, list[str]]:
+    artifacts = (
+        await session.scalars(
+            select(Artifact).where(
+                Artifact.conversation_run_id == conversation_run_id
+            )
+        )
+    ).all()
+    root = (
+        get_settings().artifact_root
+        / "conversation-agents"
+        / conversation_run_id
+    ).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    recorded = {
+        str((item.metadata_json or {}).get("storageKey"))
+        for item in artifacts
+        if (item.metadata_json or {}).get("storageKey")
+    }
+    recovered: list[str] = []
+    missing: list[str] = []
+    for item in artifacts:
+        metadata = item.metadata_json or {}
+        storage_key = metadata.get("storageKey")
+        if not isinstance(storage_key, str):
+            missing.append(item.id)
+            continue
+        target = (root / storage_key).resolve()
+        if target.is_file():
+            continue
+        staging_key = metadata.get("stagingKey")
+        source = (
+            (root / staging_key).resolve()
+            if isinstance(staging_key, str)
+            else None
+        )
+        if (
+            source is not None
+            and source.is_relative_to(root)
+            and source.is_file()
+        ):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            source.replace(target)
+            recovered.append(item.id)
+        else:
+            missing.append(item.id)
+    final_files = {
+        path.name
+        for path in root.iterdir()
+        if path.is_file()
+    }
+    orphan_files = sorted(final_files - recorded)
+    for name in orphan_files:
+        (root / name).unlink(missing_ok=True)
+    return {
+        "recovered": recovered,
+        "missing": missing,
+        "orphanFilesRemoved": orphan_files,
+    }
+
+
 async def reconcile_recent_runs(session: AsyncSession, *, limit: int = 50) -> dict[str, Any]:
     """扫描最近若干个 Run 并调用 Artifact reconcile，补落位提交后未完成的文件。
 
@@ -1568,9 +1698,6 @@ async def reconcile_recent_runs(session: AsyncSession, *, limit: int = 50) -> di
     for run_id in run_ids:
         report = await reconcile_run_artifacts(session, run_id)
         recovered += len(report["recovered"])
-    # Conversation Agent 轨迹：成功 run 若 staging 仍有文件，补落位。
-    from app.application.agent_run import AgentRunWorker
-
     conversation_runs = (
         await session.scalars(
             select(ConversationRun.id)
@@ -1580,5 +1707,10 @@ async def reconcile_recent_runs(session: AsyncSession, *, limit: int = 50) -> di
         )
     ).all()
     for cr_id in conversation_runs:
-        AgentRunWorker._promote_trajectory(cr_id)
-    return {"runsScanned": len(run_ids), "artifactsRecovered": recovered}
+        report = await reconcile_conversation_artifacts(session, cr_id)
+        recovered += len(report["recovered"])
+    return {
+        "runsScanned": len(run_ids),
+        "conversationRunsScanned": len(conversation_runs),
+        "artifactsRecovered": recovered,
+    }

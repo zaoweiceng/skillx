@@ -231,14 +231,14 @@ def test_selection_five_actions_are_mutually_exclusive() -> None:
             refs=["fragment:w@1/part#digest"],
             sessionId=session_id,
         )
-    with pytest.raises(ValueError):
-        WorkflowSelection(
-            action="ask_user",
-            question="x",
-            missingInputs=["name"],
-            refs=["workflow:w@1#digest"],
-            sessionId=session_id,
-        )
+    pending = WorkflowSelection(
+        action="ask_user",
+        question="x",
+        missingInputs=["name"],
+        refs=["workflow:w@1#digest"],
+        sessionId=session_id,
+    )
+    assert pending.refs == ["workflow:w@1#digest"]
 
 
 async def test_fragment_alias_ports_compile_and_run() -> None:

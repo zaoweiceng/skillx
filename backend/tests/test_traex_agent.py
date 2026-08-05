@@ -10,7 +10,9 @@ from app.application.compiler import WorkflowCompiler
 from app.application.orchestrator import Orchestrator, WorkerService
 from app.config import get_settings
 from app.infrastructure.database import (
+    Artifact,
     NodeRun,
+    ReplayFixture,
     Run,
     RunEvent,
     SessionLocal,
@@ -126,6 +128,17 @@ async def test_traex_agent_records_plan_tool_and_output(traex_stub: None) -> Non
             select(NodeRun).where(NodeRun.run_id == run_id, NodeRun.node_id == "agent")
         )
         assert node is not None
+        fixture = await session.scalar(
+            select(ReplayFixture).where(ReplayFixture.node_run_id == node.id)
+        )
+        artifact = (
+            await session.get(Artifact, fixture.artifact_id)
+            if fixture is not None
+            else None
+        )
+        assert fixture is not None
+        assert fixture.output_digest.startswith("sha256:")
+        assert artifact is not None and artifact.kind == "replay_fixture"
 
 
 async def test_traex_unauthorized_tool_fails_run(traex_stub: None) -> None:

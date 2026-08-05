@@ -388,7 +388,39 @@ export default function ChatPage() {
                     <code className="digest-line">
                       session {message.content.disclosureSessionId.slice(0, 8)}
                     </code>
+                    {message.content.pendingSelectionId && (
+                      <code className="digest-line">
+                        pending {message.content.pendingSelectionId.slice(0, 8)}
+                      </code>
+                    )}
+                    {message.content.resumedPendingSelection && (
+                      <span className="effect-label">已恢复原选择</span>
+                    )}
                   </div>
+                )}
+                {(message.content.toolTimeline?.length ?? 0) > 0 && (
+                  <ol className="trace-timeline" aria-label="Workflow Broker 时间线">
+                    {message.content.toolTimeline?.map((item, index) => (
+                      <li className="trace-item" key={`${item.callId}-${item.type}-${index}`}>
+                        <span className="trace-type">{item.type}</span>
+                        <span className="metric-chip">{item.level ?? 'L0'}</span>
+                        {item.capabilityRef && (
+                          <span className="trace-tool">{item.capabilityRef}</span>
+                        )}
+                        {item.callId && <code className="digest-line">{item.callId}</code>}
+                        {item.status && <span className="metric-chip">{item.status}</span>}
+                        {(item.diagnostics ?? []).map((diagnostic) => (
+                          <div
+                            className={`diagnostic ${diagnostic.level}`}
+                            key={`${diagnostic.code}-${diagnostic.message}`}
+                          >
+                            <strong>{diagnostic.code}</strong>
+                            <span>{diagnostic.message}</span>
+                          </div>
+                        ))}
+                      </li>
+                    ))}
+                  </ol>
                 )}
                 {message.content.type === 'component_candidate' && renderCandidate(message)}
                 {message.content.type === 'workflow_candidates' &&

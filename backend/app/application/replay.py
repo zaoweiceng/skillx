@@ -1,5 +1,4 @@
 from __future__ import annotations
-from pypolaris import safe_eval  # pip install bytedpypolaris
 
 import asyncio
 from typing import Any
@@ -36,6 +35,7 @@ async def run_isolated_replay(
     *,
     safe_inputs: dict[str, Any],
     fail_node_id: str,
+    fixtures: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """在内存中回放 patched 图直到 fail_node 及其下游，返回 replay 证据。
 
@@ -46,6 +46,7 @@ async def run_isolated_replay(
     """
 
     replay_run_id = f"replay-{uuid4()}"
+    fixtures = fixtures or {}
     try:
         compiled = WorkflowCompiler().compile(patched_definition)
     except WorkflowValidationError as exc:
@@ -106,7 +107,7 @@ async def run_isolated_replay(
             continue
         selected_edges.extend(selected)
         try:
-            resolved = resolve_mapping(node.input, safe_inputs, outputs)  # 内部已替换为pypolaris.safe_eval
+            resolved = resolve_mapping(node.input, safe_inputs, outputs)
         except ExpressionError as exc:
             if node_id == fail_node_id:
                 failed_status = "failed"
@@ -121,8 +122,7 @@ async def run_isolated_replay(
             NodeType.AGENT,
         }
         if node.side_effect or node.type in external_types:
-            fixtures = safe_inputs.get("_replayFixtures", {})
-            fixture = fixtures.get(node_id) if isinstance(fixtures, dict) else None
+            fixture = fixtures.get(node_id)
             if not isinstance(fixture, dict):
                 from app.domain.workflow import ExecutionError, NodeResult
 
@@ -212,11 +212,13 @@ async def run_replay_proof(
     safe_inputs: dict[str, Any],
     fail_node_id: str,
     expected_error_code: str,
+    fixtures: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     baseline = await run_isolated_replay(
         base_definition,
         safe_inputs=safe_inputs,
         fail_node_id=fail_node_id,
+        fixtures=fixtures,
     )
     reproduced = (
         baseline["failedNodeStatus"] == "failed"
@@ -237,6 +239,7 @@ async def run_replay_proof(
         patched_definition,
         safe_inputs=safe_inputs,
         fail_node_id=fail_node_id,
+        fixtures=fixtures,
     )
     return {
         "passed": patched["passed"],

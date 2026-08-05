@@ -83,6 +83,7 @@ class CompletedPayload(_PayloadBase):
     steps: StrictInt | None = None
     totalTokens: StrictInt | None = None
     output: dict[str, Any] | None = None
+    provenance: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class ToolPayload(_PayloadBase):
@@ -96,6 +97,21 @@ class BrowserActionPayload(_PayloadBase):
     callId: str = Field(min_length=1)
     capability: str = Field(min_length=1)
     action: str = Field(min_length=1)
+
+
+class ToolRequestPayload(_PayloadBase):
+    callId: str = Field(min_length=1)
+    capabilityRef: str = Field(min_length=1)
+    arguments: dict[str, Any]
+
+
+class ToolResultPayload(_PayloadBase):
+    callId: str = Field(min_length=1)
+    capabilityRef: str = Field(min_length=1)
+    status: Literal["succeeded", "failed"]
+    output: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    evidenceDigest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
 
 
 class LogPayload(_PayloadBase):
@@ -137,6 +153,16 @@ class BrowserActionCompletedEvent(BaseModel):
     payload: BrowserActionPayload
 
 
+class ToolRequestedEvent(BaseModel):
+    type: Literal["tool.requested"]
+    payload: ToolRequestPayload
+
+
+class ToolResultEvent(BaseModel):
+    type: Literal["tool.result"]
+    payload: ToolResultPayload
+
+
 class LogEvent(BaseModel):
     type: Literal["log.emitted"]
     payload: LogPayload
@@ -150,6 +176,8 @@ AgentEvent = Annotated[
     | ToolCompletedEvent
     | BrowserActionStartedEvent
     | BrowserActionCompletedEvent
+    | ToolRequestedEvent
+    | ToolResultEvent
     | LogEvent,
     Field(discriminator="type"),
 ]
@@ -158,8 +186,16 @@ _ADAPTER: TypeAdapter[Any] = TypeAdapter(AgentEvent)
 
 # 事件类型 → (started 后缀, completed 后缀, 权限字段, 动作 kind)。
 # tool.* 与 browser.action.* 共享同一套 callId 配对与权限核对逻辑。
-_CALL_STARTED = {"tool.call.started": "tool", "browser.action.started": "capability"}
-_CALL_COMPLETED = {"tool.call.completed": "tool", "browser.action.completed": "capability"}
+_CALL_STARTED = {
+    "tool.call.started": "tool",
+    "browser.action.started": "capability",
+    "tool.requested": "capabilityRef",
+}
+_CALL_COMPLETED = {
+    "tool.call.completed": "tool",
+    "browser.action.completed": "capability",
+    "tool.result": "capabilityRef",
+}
 
 
 class AgentEventValidator:
@@ -230,6 +266,14 @@ class AgentEventValidator:
                 audit["arguments"] = summarize_value(payload["arguments"])
             if "result" in payload:
                 audit["result"] = summarize_value(payload["result"])
+            if "output" in payload:
+                audit["output"] = summarize_value(payload["output"])
+            if "error" in payload and payload["error"] is not None:
+                audit["error"] = summarize_value(payload["error"])
+            if "status" in payload:
+                audit["status"] = payload["status"]
+            if "evidenceDigest" in payload:
+                audit["evidenceDigest"] = payload["evidenceDigest"]
             return {"type": event_type, "payload": audit}
         if event_type == "agent.completed":
             # 完成事件只保留步数/Token 与输出摘要，不落原始 output。

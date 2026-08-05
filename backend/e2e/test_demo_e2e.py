@@ -97,24 +97,24 @@ def test_e2e_4_conversation_component(stack: DemoStack) -> None:
         message = client.post(
             f"/conversations/{conversation['id']}/messages",
             json={"content": "生成问候语 greeting 欢迎 welcome"},
-        ).json()
-        candidate = message["assistant"]
-        assert candidate["type"] == "component_candidate"
-        assert candidate.get("candidateSnapshotDigest")
-        assert candidate["selectionSource"] == "traex"
-        assert candidate["disclosureLevel"] == "L0"
-        assert candidate["workflowRef"].startswith("workflow:")
-        # 补参并显式确认，启动锁定版本的 Workflow。
-        confirmed = client.post(
-            f"/conversations/{conversation['id']}/confirm-component",
-            json={
-                "componentId": candidate["componentId"],
-                "candidateSnapshotDigest": candidate["candidateSnapshotDigest"],
-                "inputs": {"name": "Bob"},
-            },
         )
-        assert confirmed.status_code == 201, confirmed.text
-        run = poll_run(client, confirmed.json()["runId"])
+        assert message.status_code == 201, message.text
+        pending = message.json()["assistant"]
+        assert pending["state"] == "ask_user"
+        assert pending["agentAction"] == "ask_user"
+        assert pending["pendingSelectionId"]
+        assert pending["refs"][0].startswith("workflow:")
+        assert {item["level"] for item in pending["toolTimeline"]} == {"L0", "L1"}
+
+        resumed = client.post(
+            f"/conversations/{conversation['id']}/messages",
+            json={"content": "Bob"},
+        )
+        assert resumed.status_code == 201, resumed.text
+        selected = resumed.json()["assistant"]
+        assert selected["state"] == "workflow_run"
+        assert selected["resumedPendingSelection"] is True
+        run = poll_run(client, selected["runId"])
         assert run["status"] == "succeeded"
         assert run["output"] == {"message": "你好，Bob"}
 
@@ -740,13 +740,17 @@ def test_e2e_8b_real_browser_distillation_to_non_fake_agent(
         events = client.get(
             f"/conversation-runs/{conversation_run_id}/events"
         ).json()
-        assert "browser.action.started" in {event["type"] for event in events}
+        assert {"tool.requested", "tool.result"} <= {
+            event["type"] for event in events
+        }
         browser_completed = next(
-            event for event in events if event["type"] == "browser.action.completed"
+            event for event in events if event["type"] == "tool.result"
         )
-        assert browser_completed["payload"]["result"]["digest"]
+        assert browser_completed["payload"]["output"]["digest"]
+        assert browser_completed["payload"]["evidenceDigest"].startswith("sha256:")
+        assert summary["output"] == {"reply": "探索阶段正文"}
         evidence = summary["browserEvidence"][0]
-        assert evidence["resultSource"] == "browser_tool_broker"
+        assert evidence["resultSource"] == "host_tool_broker"
         assert evidence["contentSha256"] == hashlib.sha256(
             "探索阶段正文".encode()
         ).hexdigest()

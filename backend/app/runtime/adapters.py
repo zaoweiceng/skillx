@@ -300,7 +300,7 @@ class TraeXSubprocessAdapter:
             "--allowed-tools",
             json.dumps(request.allowed_tools, ensure_ascii=False),
             cwd=working_directory,
-            stdin=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env={"PATH": os.environ.get("PATH", "")},
@@ -326,6 +326,20 @@ class TraeXSubprocessAdapter:
                 except TimeoutError:
                     process.kill()
             self._processes.pop(run_id, None)
+
+    async def send_tool_result(
+        self, run_id: str, result: dict[str, Any]
+    ) -> None:
+        """把 Host 产生的 ToolResult 回送给暂停中的同一 Agent 进程。"""
+
+        process = self._processes.get(run_id)
+        if process is None or process.returncode is not None or process.stdin is None:
+            raise AdapterError("TraeX stdin 不可用，无法回送 ToolResult")
+        process.stdin.write(
+            json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()
+            + b"\n"
+        )
+        await process.stdin.drain()
 
     async def cancel(self, run_id: str) -> None:
         process = self._processes.get(run_id)

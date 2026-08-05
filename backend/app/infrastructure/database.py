@@ -383,6 +383,8 @@ class ConversationRun(Base, TimestampMixin):
     )
     attempt: Mapped[int] = mapped_column(Integer, default=1)
     next_event_seq: Mapped[int] = mapped_column(Integer, default=0)
+    claim_generation: Mapped[int] = mapped_column(Integer, default=0)
+    claim_token: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
 
 class ConversationRunEvent(Base):
@@ -490,6 +492,10 @@ class FailureObservation(Base, TimestampMixin):
 
     __tablename__ = "failure_observations"
     __table_args__ = (
+        CheckConstraint(
+            "(workflow_version_id IS NOT NULL) != (plan_snapshot_id IS NOT NULL)",
+            name="ck_failure_observation_source",
+        ),
         Index("uq_failure_observation_fingerprint", "fingerprint", unique=True),
     )
 
@@ -538,6 +544,48 @@ class WorkflowDisclosureCall(Base, TimestampMixin):
     request_summary_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     response_digest: Mapped[str] = mapped_column(String(80))
     disclosure_level: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending")
+    error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+
+class PendingSelection(Base, TimestampMixin):
+    __tablename__ = "pending_selections"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    disclosure_session_id: Mapped[str] = mapped_column(
+        ForeignKey("workflow_disclosure_sessions.id", ondelete="CASCADE"),
+        index=True,
+    )
+    original_task: Mapped[str] = mapped_column(Text)
+    selection_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    bindings_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    missing_inputs_json: Mapped[list[str]] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(24), default="awaiting_input", index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class TaskCheckpoint(Base, TimestampMixin):
+    __tablename__ = "task_checkpoints"
+    __table_args__ = (
+        Index("ix_task_checkpoint_source", "source_kind", "source_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    source_kind: Mapped[str] = mapped_column(String(24))
+    source_id: Mapped[str] = mapped_column(String(36))
+    source_digest: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
+    snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    digest: Mapped[str] = mapped_column(String(80))
+    lease_owner: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    claim_generation: Mapped[int] = mapped_column(Integer, default=0)
+    claim_token: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
 
 class RecoveryAttempt(Base, TimestampMixin):
@@ -567,6 +615,30 @@ class ReplayEvidence(Base, TimestampMixin):
     patched_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     diff_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     passed: Mapped[bool] = mapped_column(default=False)
+    fixture_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    base_version_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    patch_of_observation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+
+class ReplayFixture(Base, TimestampMixin):
+    __tablename__ = "replay_fixtures"
+    __table_args__ = (
+        Index("uq_replay_fixture_node_run", "node_run_id", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), index=True
+    )
+    node_run_id: Mapped[str] = mapped_column(String(36))
+    node_id: Mapped[str] = mapped_column(String(64))
+    artifact_id: Mapped[str] = mapped_column(
+        ForeignKey("artifacts.id", ondelete="CASCADE")
+    )
+    source_digest: Mapped[str] = mapped_column(String(80))
+    input_digest: Mapped[str] = mapped_column(String(80))
+    output_digest: Mapped[str] = mapped_column(String(80))
+    capture_policy: Mapped[str] = mapped_column(String(40))
 
 
 settings = get_settings()

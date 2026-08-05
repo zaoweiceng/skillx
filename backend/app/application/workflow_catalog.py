@@ -1,4 +1,5 @@
 from __future__ import annotations
+import pypolaris  # pip install bytedpypolaris
 
 import json
 import re
@@ -76,9 +77,11 @@ async def consume_session_call(
     session_id: str,
     operation: str,
     request_summary: dict[str, Any],
-) -> WorkflowDisclosureSession:
+) -> WorkflowDisclosureCall:
     await _active_disclosure_session(session, session_id)
-    json_path = f"$.{operation}"
+    if operation not in _SESSION_LIMITS:
+        raise CatalogError(f"未知 disclosure operation: {operation}")
+    json_path = f"$.{pypolaris.safe_sql_escape(operation, param_type='str')}"
     consumed = await session.execute(
         update(WorkflowDisclosureSession)
         .where(
@@ -106,42 +109,42 @@ async def consume_session_call(
     item = await session.get(WorkflowDisclosureSession, session_id)
     assert item is not None
     await session.refresh(item)
-    session.add(
-        WorkflowDisclosureCall(
-            id=str(uuid4()),
-            session_id=item.id,
-            operation=operation,
-            request_summary_json=request_summary,
-            response_digest="pending",
-            disclosure_level=None,
-        )
+    call = WorkflowDisclosureCall(
+        id=str(uuid4()),
+        session_id=item.id,
+        operation=operation,
+        request_summary_json=request_summary,
+        response_digest="pending",
+        disclosure_level=None,
+        status="pending",
     )
+    session.add(call)
     await session.flush()
-    return item
+    return call
 
 
 async def record_disclosure_response(
     session: AsyncSession,
-    session_id: str,
-    operation: str,
+    call_id: str,
     response: Any,
     *,
     level: str | None,
 ) -> None:
-    call = await session.scalar(
-        select(WorkflowDisclosureCall)
+    recorded = await session.execute(
+        update(WorkflowDisclosureCall)
         .where(
-            WorkflowDisclosureCall.session_id == session_id,
-            WorkflowDisclosureCall.operation == operation,
+            WorkflowDisclosureCall.id == call_id,
             WorkflowDisclosureCall.response_digest == "pending",
+            WorkflowDisclosureCall.status == "pending",
         )
-        .order_by(WorkflowDisclosureCall.created_at.desc())
-        .limit(1)
+        .values(
+            response_digest=digest_json(response),
+            disclosure_level=level,
+            status="succeeded",
+        )
     )
-    if call is None:
-        raise CatalogError("disclosure call 审计记录不存在")
-    call.response_digest = digest_json(response)
-    call.disclosure_level = level
+    if recorded.rowcount != 1:
+        raise CatalogError("disclosure call 不存在或已闭合")
 
 
 async def disclose_refs(

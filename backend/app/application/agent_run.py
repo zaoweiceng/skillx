@@ -17,6 +17,7 @@ from app.application.agent_host import (
     AgentHostRequest,
     resolve_effective_capabilities,
 )
+from app.application.compiler import digest_json
 from app.config import get_settings
 from app.infrastructure.database import (
     Artifact,
@@ -24,6 +25,7 @@ from app.infrastructure.database import (
     ConversationRun,
     ConversationRunEvent,
     SessionLocal,
+    TaskCheckpoint,
     utcnow,
 )
 from app.runtime.adapters import TraeXSubprocessAdapter
@@ -249,17 +251,24 @@ class AgentRunWorker:
                 "message": "Worker 租约过期，无法确认 Agent 副作用是否已完成",
                 "retryable": False,
             }
+            checkpoint = await self._create_task_checkpoint(
+                session, run, error, status="awaiting_user"
+            )
+            error["taskCheckpointId"] = checkpoint.id
             result = await session.execute(
                 update(ConversationRun)
                 .where(
                     ConversationRun.id == run.id,
                     ConversationRun.status == "running",
                     ConversationRun.lease_owner == run.lease_owner,
+                    ConversationRun.claim_generation == run.claim_generation,
+                    ConversationRun.claim_token == run.claim_token,
                 )
                 .values(
                     status="failed",
                     lease_owner=None,
                     lease_expires_at=None,
+                    claim_token=None,
                     error_json=error,
                     finished_at=now,
                 )
@@ -273,6 +282,8 @@ class AgentRunWorker:
                     {"conversationRunId": run.id, "error": error},
                 )
                 recovered += 1
+            else:
+                await session.delete(checkpoint)
         return recovered
 
     async def claim(self, session: AsyncSession) -> str | None:
@@ -290,13 +301,19 @@ class AgentRunWorker:
             return None
         result = await session.execute(
             update(ConversationRun)
-            .where(ConversationRun.id == candidate.id, ConversationRun.status == "queued")
+            .where(
+                ConversationRun.id == candidate.id,
+                ConversationRun.status == "queued",
+                ConversationRun.claim_generation == candidate.claim_generation,
+            )
             .values(
                 status="running",
                 lease_owner=self.worker_id,
                 lease_expires_at=now + timedelta(seconds=self.lease_seconds),
                 heartbeat_at=now,
                 started_at=now,
+                claim_generation=candidate.claim_generation + 1,
+                claim_token=str(uuid4()),
             )
         )
         if result.rowcount != 1:
@@ -317,6 +334,8 @@ class AgentRunWorker:
             config = AgentRunConfig.from_dict(run.config_json or {})
             content = run.input_json.get("message", "")
             prompt = run.input_json.get("prompt", content)
+            claim_generation = run.claim_generation
+            claim_token = run.claim_token
 
         # denied 能力在 Host 内 fail closed（PERMISSION_DENIED）；这里仅提前记录审计事件。
         _, denied = resolve_effective_capabilities(config.allowed_capabilities)
@@ -325,18 +344,34 @@ class AgentRunWorker:
                 run_id,
                 "agent.capabilities.denied",
                 {"requested": list(config.allowed_capabilities), "denied": denied},
+                claim_generation,
+                claim_token,
             )
 
         # 后台 watcher 负责租约心跳与取消/丢失检测，主执行交给统一 AgentHost。
         signal: dict[str, Any] = {}
         stop_watch = asyncio.Event()
-        watcher = asyncio.create_task(self._watch(run_id, signal, stop_watch))
+        watcher = asyncio.create_task(
+            self._watch(
+                run_id,
+                signal,
+                stop_watch,
+                claim_generation,
+                claim_token,
+            )
+        )
 
         host = AgentHost(adapter=self._adapter)
 
         async def event_sink(_runtime: dict[str, Any], audit: dict[str, Any]) -> None:
             # 只把脱敏的审计事件写入数据库；原始 payload 不落库。
-            await self._append_committed(run_id, audit["type"], audit["payload"])
+            await self._append_committed(
+                run_id,
+                audit["type"],
+                audit["payload"],
+                claim_generation,
+                claim_token,
+            )
 
         async def cancellation() -> bool:
             return bool(signal)
@@ -370,14 +405,21 @@ class AgentRunWorker:
         if signal.get("kind") == "lost":
             return  # 已被恢复或另一个 Worker 接管，不再写入终态。
         if signal.get("kind") == "cancelled":
-            await self._finalize_cancelled(run_id)
+            await self._finalize_cancelled(
+                run_id, claim_generation, claim_token
+            )
             return
         if terminal is not None:
-            await self._finalize_failure(run_id, terminal)
+            await self._finalize_failure(
+                run_id, terminal, claim_generation, claim_token
+            )
             return
         if result is None:
             await self._finalize_failure(
-                run_id, AgentRunError("EXECUTION_FAILED", "Agent 未产生结果")
+                run_id,
+                AgentRunError("EXECUTION_FAILED", "Agent 未产生结果"),
+                claim_generation,
+                claim_token,
             )
             return
         await self._finalize_success(
@@ -389,6 +431,8 @@ class AgentRunWorker:
             result.runtime_events,
             result.step_count,
             result.total_tokens,
+            claim_generation,
+            claim_token,
         )
 
     async def _watch(
@@ -396,6 +440,8 @@ class AgentRunWorker:
         run_id: str,
         signal: dict[str, Any],
         stop: asyncio.Event,
+        claim_generation: int,
+        claim_token: str | None,
     ) -> None:
         """周期性刷新租约并观察取消请求；置位 signal 让 AgentHost 停止。"""
 
@@ -424,6 +470,8 @@ class AgentRunWorker:
                         ConversationRun.id == run_id,
                         ConversationRun.status == "running",
                         ConversationRun.lease_owner == self.worker_id,
+                        ConversationRun.claim_generation == claim_generation,
+                        ConversationRun.claim_token == claim_token,
                     )
                     .values(
                         heartbeat_at=utcnow(),
@@ -435,16 +483,52 @@ class AgentRunWorker:
                     break
 
     async def _append_committed(
-        self, run_id: str, event_type: str, payload: dict[str, Any]
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+        claim_generation: int,
+        claim_token: str | None,
     ) -> None:
         async with SessionLocal() as session, session.begin():
+            owned = await session.scalar(
+                select(ConversationRun.id).where(
+                    ConversationRun.id == run_id,
+                    ConversationRun.status == "running",
+                    ConversationRun.lease_owner == self.worker_id,
+                    ConversationRun.claim_generation == claim_generation,
+                    ConversationRun.claim_token == claim_token,
+                )
+            )
+            if owned is None:
+                raise asyncio.CancelledError
             await _append_event(session, run_id, event_type, payload)
 
-    async def _finalize_failure(self, run_id: str, error: AgentRunError) -> None:
+    async def _finalize_failure(
+        self,
+        run_id: str,
+        error: AgentRunError,
+        claim_generation: int,
+        claim_token: str | None,
+    ) -> None:
         async with SessionLocal() as session, session.begin():
             run = await session.get(ConversationRun, run_id)
-            if run is None or run.status in FINAL_STATES:
+            if not self._owns(run, claim_generation, claim_token):
                 return
+            checkpoint = await self._create_task_checkpoint(
+                session,
+                run,
+                {
+                    "code": error.code,
+                    "message": error.message,
+                    "retryable": error.code in {"TIMEOUT", "EXECUTION_FAILED"},
+                },
+                status=(
+                    "pending"
+                    if error.code in {"TIMEOUT", "EXECUTION_FAILED"}
+                    else "terminal"
+                ),
+            )
             run.status = "failed"
             run.finished_at = utcnow()
             run.lease_owner = None
@@ -453,6 +537,7 @@ class AgentRunWorker:
                 "code": error.code,
                 "message": error.message,
                 "retryable": error.code in {"TIMEOUT", "EXECUTION_FAILED"},
+                "taskCheckpointId": checkpoint.id,
             }
             await _append_event(
                 session,
@@ -461,10 +546,15 @@ class AgentRunWorker:
                 {"conversationRunId": run_id, "error": run.error_json},
             )
 
-    async def _finalize_cancelled(self, run_id: str) -> None:
+    async def _finalize_cancelled(
+        self,
+        run_id: str,
+        claim_generation: int,
+        claim_token: str | None,
+    ) -> None:
         async with SessionLocal() as session, session.begin():
             run = await session.get(ConversationRun, run_id)
-            if run is None or run.status in FINAL_STATES:
+            if not self._owns(run, claim_generation, claim_token):
                 return
             run.status = "cancelled"
             run.finished_at = utcnow()
@@ -492,9 +582,17 @@ class AgentRunWorker:
         raw_events: list[dict[str, Any]],
         step_count: int,
         total_tokens: int,
+        claim_generation: int,
+        claim_token: str | None,
     ) -> None:
         # 先把原始轨迹写入 staging（不落最终目录），DB 只保存受控 artifact:// 引用与 hash。
-        staged = self._stage_trajectory(run_id, raw_events, output)
+        async with SessionLocal() as session:
+            run = await session.get(ConversationRun, run_id)
+            if not self._owns(run, claim_generation, claim_token):
+                return
+        staged = self._stage_trajectory(
+            run_id, raw_events, output, claim_token or "unclaimed"
+        )
         trajectory = build_trajectory(config, prompt, output, actions, step_count, staged["uri"])
         summary = {
             "totalTokens": total_tokens,
@@ -509,7 +607,7 @@ class AgentRunWorker:
         committed = False
         async with SessionLocal() as session, session.begin():
             run = await session.get(ConversationRun, run_id)
-            if run is None or run.status in FINAL_STATES:
+            if not self._owns(run, claim_generation, claim_token):
                 return
             run.status = "succeeded"
             run.finished_at = utcnow()
@@ -530,6 +628,10 @@ class AgentRunWorker:
                     media_type="application/json",
                     metadata_json={
                         "conversationRunId": run.id,
+                        "sourceKind": "conversation_run",
+                        "sourceId": run.id,
+                        "storageKey": "trajectory.json",
+                        "stagingKey": staged["stagingKey"],
                         "retentionClass": "trajectory",
                     },
                 )
@@ -543,7 +645,100 @@ class AgentRunWorker:
             committed = True
         # 事务提交后再从 staging 原子落位；提交失败则 staging 文件由 reconcile 清理。
         if committed:
-            self._promote_trajectory(run_id)
+            self._promote_trajectory(run_id, staged["stagingKey"])
+        else:
+            source = self._trajectory_dir(run_id) / staged["stagingKey"]
+            source.unlink(missing_ok=True)
+
+    def _owns(
+        self,
+        run: ConversationRun | None,
+        claim_generation: int,
+        claim_token: str | None,
+    ) -> bool:
+        return bool(
+            run is not None
+            and run.status == "running"
+            and run.lease_owner == self.worker_id
+            and run.claim_generation == claim_generation
+            and run.claim_token == claim_token
+        )
+
+    @staticmethod
+    async def _create_task_checkpoint(
+        session: AsyncSession,
+        run: ConversationRun,
+        error: dict[str, Any],
+        *,
+        status: str,
+    ) -> TaskCheckpoint:
+        events = (
+            await session.scalars(
+                select(ConversationRunEvent)
+                .where(ConversationRunEvent.conversation_run_id == run.id)
+                .order_by(ConversationRunEvent.seq)
+            )
+        ).all()
+        requested = {
+            item.payload_json.get("callId")
+            for item in events
+            if item.type == "tool.requested"
+        }
+        closed = {
+            item.payload_json.get("callId")
+            for item in events
+            if item.type == "tool.result"
+        }
+        source = {
+            "kind": "conversation_run",
+            "id": run.id,
+            "input": run.input_json,
+            "config": run.config_json or {},
+            "trajectory": run.trajectory_json or {},
+        }
+        source_digest = digest_json(source)
+        snapshot = {
+            "source": {
+                "kind": "conversation_run",
+                "id": run.id,
+                "digest": source_digest,
+            },
+            "completedSteps": [
+                {
+                    "seq": item.seq,
+                    "type": item.type,
+                    "payload": item.payload_json,
+                }
+                for item in events
+                if item.type in {"tool.result", "agent.step.completed"}
+            ],
+            "failedStep": {"error": error},
+            "pendingToolCalls": sorted(
+                str(call_id) for call_id in requested - closed if call_id
+            ),
+            "remainingPlan": {"resumeSameTask": True},
+            "locks": list(
+                (run.config_json or {}).get("allowedCapabilities", [])
+            ),
+            "committedSideEffects": [],
+            "outcomeCertainty": (
+                "unknown" if error.get("code") == "UNKNOWN_OUTCOME" else "known_failed"
+            ),
+            "userContext": {"message": run.input_json.get("message", "")},
+        }
+        checkpoint = TaskCheckpoint(
+            id=str(uuid4()),
+            source_kind="conversation_run",
+            source_id=run.id,
+            source_digest=source_digest,
+            status=status,
+            snapshot_json=snapshot,
+            digest=digest_json(snapshot),
+            claim_generation=0,
+        )
+        session.add(checkpoint)
+        await session.flush()
+        return checkpoint
 
     @staticmethod
     def _trajectory_dir(run_id: str) -> Any:
@@ -551,12 +746,17 @@ class AgentRunWorker:
 
     @classmethod
     def _stage_trajectory(
-        cls, run_id: str, raw_events: list[dict[str, Any]], output: dict[str, Any]
+        cls,
+        run_id: str,
+        raw_events: list[dict[str, Any]],
+        output: dict[str, Any],
+        claim_token: str,
     ) -> dict[str, Any]:
         from app.application.security import redact
 
         directory = cls._trajectory_dir(run_id)
-        staging = directory / ".staging"
+        staging_key = f".staging/{claim_token}/trajectory.json"
+        staging = directory / ".staging" / claim_token
         staging.mkdir(parents=True, exist_ok=True)
         # 默认 Local Demo 也不把 Secret 原值复制到磁盘：落盘的 runtime 事件与输出均脱敏。
         # 若确需原始轨迹调试价值，应经显式开关/分类/保留期限（本版本默认脱敏）。
@@ -570,12 +770,15 @@ class AgentRunWorker:
             "uri": f"artifact://conversation-agents/{run_id}/trajectory.json",
             "sha256": hashlib.sha256(content).hexdigest(),
             "bytes": len(content),
+            "stagingKey": staging_key,
         }
 
     @classmethod
-    def _promote_trajectory(cls, run_id: str) -> None:
+    def _promote_trajectory(
+        cls, run_id: str, staging_key: str = ".staging/trajectory.json"
+    ) -> None:
         directory = cls._trajectory_dir(run_id)
-        source = directory / ".staging" / "trajectory.json"
+        source = directory / staging_key
         target = directory / "trajectory.json"
         if source.exists():
             source.replace(target)

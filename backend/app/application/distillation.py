@@ -362,6 +362,121 @@ def compile_agent_trajectory(
     return definition, analysis
 
 
+def _enrich_distilled_definition(
+    definition: dict[str, Any],
+    trajectory: dict[str, Any],
+    *,
+    conversation_run_id: str,
+    distillation_id: str,
+    source_trajectory_digest: str,
+    proposal_digest: str | None,
+) -> dict[str, Any]:
+    """派生可发现、可拆取、可恢复且带完整来源的固化 metadata。"""
+
+    prompt = _clean_message(str(trajectory.get("prompt", ""))).strip()
+    actions = list(trajectory.get("actions") or [])
+    action_kinds = sorted(
+        {
+            str(action.get("kind") or "agent")
+            for action in actions
+            if isinstance(action, dict)
+        }
+    )
+    semantic_seed = prompt or "已验证的 Agent 轨迹"
+    logical_id = digest_json(
+        {
+            "inputSchema": definition["spec"]["inputSchema"],
+            "outputSchema": definition["spec"]["outputSchema"],
+            "kinds": action_kinds,
+            "summary": semantic_seed[:200],
+        }
+    )
+    display_name = semantic_seed[:80]
+    if trajectory.get("name") not in {None, "", "conversation-agent-draft"}:
+        display_name = str(trajectory["name"])[:80]
+    definition["metadata"] = {
+        **definition.get("metadata", {}),
+        "name": display_name,
+        "logicalWorkflowId": logical_id,
+        "capability": {
+            "name": display_name,
+            "summary": f"复用已验证轨迹完成：{semantic_seed[:240]}",
+            "useWhen": [semantic_seed[:300]],
+            "doNotUseWhen": ["输入不满足冻结 Schema 或需要扩大副作用权限"],
+            "tags": ["distilled", *action_kinds][:12],
+            "examples": [semantic_seed[:300]],
+        },
+        "lineage": {
+            "sourceConversationRunId": conversation_run_id,
+            "sourceTrajectoryDigest": source_trajectory_digest,
+            "distillationId": distillation_id,
+            "proposalDigest": proposal_digest,
+        },
+    }
+
+    nodes = definition["spec"]["nodes"]
+    recoverable = [
+        node
+        for node in nodes
+        if node["type"] in {"browser", "mcp", "skillx"}
+        and not node.get("sideEffect", False)
+    ]
+    recovery_id = "recovery-agent"
+    if recoverable and not any(node["id"] == recovery_id for node in nodes):
+        nodes.insert(
+            -1,
+            {
+                "id": recovery_id,
+                "type": "agent",
+                "displayName": "受限恢复 Agent",
+                "input": {},
+                "config": {
+                    "maxSteps": 4,
+                    "maxTotalTokens": 12000,
+                    "maxDurationSeconds": 60,
+                    "allowedCapabilities": [],
+                    "outputSchema": {"type": "object"},
+                },
+            },
+        )
+        for node in recoverable:
+            node["fallback"] = {
+                "on": [
+                    "DEPENDENCY_UNAVAILABLE",
+                    "TIMEOUT",
+                    "PAGE_DRIFT",
+                    "MCP_CONTRACT_DRIFT",
+                ],
+                "target": recovery_id,
+                "requireUserApproval": False,
+            }
+
+    business_nodes = [
+        node
+        for node in nodes
+        if node["type"] not in {"input", "output"}
+    ]
+    definition["metadata"]["nodeSummaries"] = [
+        {
+            "nodeId": node["id"],
+            "summary": node["displayName"],
+            "type": node["type"],
+        }
+        for node in business_nodes
+        if node["id"] != recovery_id
+    ]
+    if business_nodes and not any(node.get("sideEffect", False) for node in business_nodes):
+        definition["metadata"]["callableFragments"] = [
+            {
+                "name": "verified-task",
+                "summary": f"复用任务中的已验证动作：{semantic_seed[:160]}",
+                "useWhen": [semantic_seed[:240]],
+                "nodeIds": [node["id"] for node in business_nodes],
+            }
+        ]
+    return definition
+
+
 def _node_output_ref(node_id: str, node: dict[str, Any]) -> str:
     """给定节点，返回可映射到 workflow output 的引用表达式。"""
 
@@ -457,16 +572,50 @@ async def distill_conversation_run(
     definition, analysis = compile_agent_trajectory(
         conversation_run.trajectory_json, proposal
     )
+    source_trajectory_digest = digest_json(conversation_run.trajectory_json)
+    proposal_digest = (
+        digest_json(proposal.model_dump(by_alias=True)) if proposal else None
+    )
+    distillation_id = str(uuid4())
+    definition = _enrich_distilled_definition(
+        definition,
+        conversation_run.trajectory_json,
+        conversation_run_id=conversation_run.id,
+        distillation_id=distillation_id,
+        source_trajectory_digest=source_trajectory_digest,
+        proposal_digest=proposal_digest,
+    )
+    try:
+        compiled = WorkflowCompiler().compile(definition)
+        enrichment_diagnostics = [
+            item.model_dump() for item in compiled.diagnostics
+        ]
+    except WorkflowValidationError as exc:
+        enrichment_diagnostics = [
+            item.model_dump() for item in exc.diagnostics
+        ]
+    analysis["diagnostics"] = [
+        *analysis.get("diagnostics", []),
+        *enrichment_diagnostics,
+    ]
+    analysis["publishable"] = not any(
+        item["level"] == "error" for item in analysis["diagnostics"]
+    )
     analysis = {
         **analysis,
         "sourceRunId": conversation_run.id,
         "sourceRunType": run_type,
         "usedProposal": proposal is not None,
         "proposalSource": proposal_source,
-        "sourceTrajectoryDigest": digest_json(conversation_run.trajectory_json),
-        "proposalDigest": (
-            digest_json(proposal.model_dump(by_alias=True)) if proposal else None
-        ),
+        "sourceTrajectoryDigest": source_trajectory_digest,
+        "proposalDigest": proposal_digest,
+        "logicalWorkflowId": definition["metadata"]["logicalWorkflowId"],
+        "fragmentProposals": definition["metadata"].get("callableFragments", []),
+        "recoverableNodes": [
+            node["id"]
+            for node in definition["spec"]["nodes"]
+            if node.get("fallback")
+        ],
     }
     workflow = Workflow(
         id=str(uuid4()),
@@ -478,7 +627,7 @@ async def distill_conversation_run(
     session.add(workflow)
     await session.flush()
     result = Distillation(
-        id=str(uuid4()),
+        id=distillation_id,
         conversation_run_id=conversation_run.id,
         status="draft_created",
         draft_workflow_id=workflow.id,

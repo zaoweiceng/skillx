@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
-import socket
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from jsonschema import Draft202012Validator
 
 from app.application.agent_events import AgentEventError, AgentEventValidator
+from app.application.tool_broker import (
+    ToolAdapterRegistry,
+    ToolBrokerError,
+    ToolExecutionContext,
+    evidence_digest,
+)
 from app.config import get_settings
 from app.runtime.adapters import AdapterError, AgentRunRequest, TraeXSubprocessAdapter
 
@@ -82,8 +85,13 @@ def resolve_effective_capabilities(requested: tuple[str, ...]) -> tuple[list[str
 class AgentHost:
     """受限 Agent 执行服务。两个入口共享同一实例语义。"""
 
-    def __init__(self, adapter: TraeXSubprocessAdapter | None = None) -> None:
+    def __init__(
+        self,
+        adapter: TraeXSubprocessAdapter | None = None,
+        tool_registry: ToolAdapterRegistry | None = None,
+    ) -> None:
         self._adapter = adapter
+        self._tool_registry = tool_registry or ToolAdapterRegistry()
 
     def _resolve_adapter(self) -> TraeXSubprocessAdapter:
         if self._adapter is not None:
@@ -132,6 +140,7 @@ class AgentHost:
 
         result = AgentHostResult(output={})
         open_calls: dict[str, dict[str, Any]] = {}
+        broker_results: set[str] = set()
         output: dict[str, Any] | None = None
 
         try:
@@ -162,9 +171,47 @@ class AgentHost:
                         raw = await next_task
                     except StopAsyncIteration:
                         break
-                    raw = await self._broker_runtime_tool(
-                        raw, open_calls, request, set(effective)
-                    )
+                    if raw.get("type") == "tool.result":
+                        await self._cancel(adapter, request.run_id)
+                        raise AgentHostError(
+                            "AGENT_EVENT_INVALID",
+                            "tool.result 只能由 Host 生成，Agent 不得自报",
+                        )
+                    if raw.get("type") == "tool.requested":
+                        try:
+                            runtime_event, audit_event = validator.validate_pair(raw)
+                        except PermissionError as exc:
+                            await self._cancel(adapter, request.run_id)
+                            raise AgentHostError(
+                                "PERMISSION_DENIED",
+                                f"Agent 调用了未授权能力 {exc}",
+                            ) from exc
+                        except AgentEventError as exc:
+                            await self._cancel(adapter, request.run_id)
+                            raise AgentHostError("AGENT_EVENT_INVALID", str(exc)) from exc
+                        result.runtime_events.append(runtime_event)
+                        result.audit_events.append(audit_event)
+                        if event_sink is not None:
+                            await event_sink(runtime_event, audit_event)
+                        request_payload = runtime_event["payload"]
+                        open_calls[request_payload["callId"]] = request_payload
+                        tool_result = await self._execute_tool_request(
+                            request, request_payload
+                        )
+                        await adapter.send_tool_result(request.run_id, tool_result)
+                        runtime_result, audit_result = validator.validate_pair(tool_result)
+                        result.runtime_events.append(runtime_result)
+                        result.audit_events.append(audit_result)
+                        if event_sink is not None:
+                            await event_sink(runtime_result, audit_result)
+                        started = open_calls.pop(request_payload["callId"])
+                        result.actions.append(
+                            self._normalize_action(
+                                "tool.result", started, runtime_result["payload"]
+                            )
+                        )
+                        broker_results.add(request_payload["callId"])
+                        continue
                     try:
                         runtime_event, audit_event = validator.validate_pair(raw)
                     except PermissionError as exc:
@@ -209,6 +256,18 @@ class AgentHost:
                                 f"Agent Token 超过 Host 上限 {request.max_total_tokens}",
                             )
                     elif event_type == "agent.completed":
+                        if broker_results:
+                            provenance_ids = {
+                                str(item.get("callId"))
+                                for item in payload.get("provenance", [])
+                                if isinstance(item, dict)
+                            }
+                            if not broker_results <= provenance_ids:
+                                await self._cancel(adapter, request.run_id)
+                                raise AgentHostError(
+                                    "AGENT_EVENT_INVALID",
+                                    "最终输出 provenance 未覆盖真实 ToolResult",
+                                )
                         output = payload.get("output")
                         final_tokens = payload.get("totalTokens")
                         if final_tokens is not None:
@@ -251,134 +310,75 @@ class AgentHost:
         result.output = output
         return result
 
-    @staticmethod
-    async def _broker_runtime_tool(
-        raw: dict[str, Any],
-        open_calls: dict[str, dict[str, Any]],
+    async def _execute_tool_request(
+        self,
         request: AgentHostRequest,
-        effective_capabilities: set[str],
+        payload: dict[str, Any],
     ) -> dict[str, Any]:
-        """Execute browser.read through the host broker instead of trusting Agent fixtures."""
-
-        if raw.get("type") != "browser.action.completed":
-            return raw
-        from app.domain.workflow import NodeType, WorkflowNode
-        from app.runtime.executors import (
-            CancellationToken,
-            ExecutorRegistry,
-            RunContext,
-        )
-
-        payload = raw.get("payload") or {}
-        started = open_calls.get(payload.get("callId"), {})
-        observations = payload.get("observations") or started.get("observations") or {}
-        if (
-            payload.get("capability") != "browser.read"
-            or "browser.read" not in effective_capabilities
-            or payload.get("action") != "read"
-            or observations.get("runtime") != "playwright"
-        ):
-            return raw
-        arguments = started.get("arguments") or {}
-        url = arguments.get("url")
-        contract = observations.get("pageContract")
-        if not isinstance(url, str) or not isinstance(contract, dict):
-            raise AgentHostError(
-                "CONTRACT_VIOLATION", "browser.read 缺少 url/pageContract"
-            )
-        parsed = urlparse(url)
-        hostname = parsed.hostname or ""
-        if (
-            parsed.scheme not in {"http", "https"}
-            or parsed.username is not None
-            or parsed.password is not None
-            or not hostname
-        ):
-            raise AgentHostError("PERMISSION_DENIED", "browser.read URL 不安全")
+        capability_ref = payload["capabilityRef"]
         try:
-            address = ipaddress.ip_address(hostname)
-        except ValueError:
-            address = None
-        if (
-            address is not None
-            and (address.is_private or address.is_loopback or address.is_link_local)
-            and hostname not in get_settings().browser_allowed_hosts
-        ):
-            raise AgentHostError(
-                "PERMISSION_DENIED", "browser.read 私网目标未在 Host allowlist"
+            output = await self._tool_registry.execute(
+                capability_ref,
+                ToolExecutionContext(
+                    run_id=request.run_id,
+                    call_id=payload["callId"],
+                    working_directory=request.working_directory,
+                ),
+                payload["arguments"],
             )
-        if hostname == "localhost" and hostname not in get_settings().browser_allowed_hosts:
-            raise AgentHostError(
-                "PERMISSION_DENIED", "browser.read 本机目标未在 Host allowlist"
-            )
-        if address is None:
-            try:
-                resolved = await asyncio.to_thread(
-                    socket.getaddrinfo,
-                    hostname,
-                    parsed.port or (443 if parsed.scheme == "https" else 80),
-                    type=socket.SOCK_STREAM,
-                )
-            except socket.gaierror as exc:
-                raise AgentHostError(
-                    "DEPENDENCY_UNAVAILABLE", "browser.read 目标域名无法解析"
-                ) from exc
-            for item in resolved:
-                resolved_address = ipaddress.ip_address(item[4][0])
-                if (
-                    resolved_address.is_private
-                    or resolved_address.is_loopback
-                    or resolved_address.is_link_local
-                ) and hostname not in get_settings().browser_allowed_hosts:
-                    raise AgentHostError(
-                        "PERMISSION_DENIED",
-                        "browser.read 域名解析到未授权私网地址",
-                    )
-        output_schema = payload.get("outputSchema")
-        page_contract = {
-            **contract,
-            **(
-                {"outputSchema": output_schema}
-                if isinstance(output_schema, dict)
-                else {}
-            ),
-        }
-        node = WorkflowNode(
-            id="broker_browser_read",
-            type=NodeType.BROWSER,
-            displayName="Broker Browser Read",
-            input={"url": url},
-            config={
-                "action": "read",
-                "runtime": "playwright",
-                "pageContract": page_contract,
-            },
-        )
-        context = RunContext(
-            run_id=request.run_id,
-            run_input={"url": url},
-            node_run_id=f"{request.run_id}:browser:{payload['callId']}",
-            cancellation=CancellationToken(asyncio.Event()),
-        )
-        result = await ExecutorRegistry().get(NodeType.BROWSER).execute(
-            context, node, {"url": url}
-        )
-        if result.status != "succeeded" or result.output is None:
-            raise AgentHostError(
-                result.error.code if result.error else "EXECUTION_FAILED",
-                result.error.message if result.error else "browser.read 执行失败",
-            )
-        return {
-            **raw,
-            "payload": {
-                **payload,
-                "result": result.output,
-                "observations": {
-                    **observations,
-                    "resultSource": "browser_tool_broker",
+            evidence = {"status": "succeeded", "output": output}
+            return {
+                "type": "tool.result",
+                "payload": {
+                    "callId": payload["callId"],
+                    "capabilityRef": capability_ref,
+                    "status": "succeeded",
+                    "output": output,
+                    "evidenceDigest": evidence_digest(evidence),
+                    **self._tool_result_metadata(
+                        payload,
+                        self._tool_registry.distillation_evidence(
+                            capability_ref, output
+                        ),
+                    ),
                 },
-            },
-        }
+            }
+        except ToolBrokerError as exc:
+            error = {"code": exc.code, "message": exc.message}
+            evidence = {"status": "failed", "error": error}
+            return {
+                "type": "tool.result",
+                "payload": {
+                    "callId": payload["callId"],
+                    "capabilityRef": capability_ref,
+                    "status": "failed",
+                    "error": error,
+                    "evidenceDigest": evidence_digest(evidence),
+                    **self._tool_result_metadata(payload),
+                },
+            }
+
+    @staticmethod
+    def _tool_result_metadata(
+        payload: dict[str, Any],
+        adapter_evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        keys = (
+            "action",
+            "actionKind",
+            "argumentBindings",
+            "effect",
+            "idempotent",
+            "observations",
+            "outputSchema",
+            "replayability",
+        )
+        metadata = {key: payload[key] for key in keys if key in payload}
+        observations = dict(metadata.get("observations") or {})
+        observations.update(adapter_evidence or {})
+        observations["resultSource"] = "host_tool_broker"
+        metadata["observations"] = observations
+        return metadata
 
     @staticmethod
     def _normalize_action(
@@ -396,6 +396,9 @@ class AgentHost:
         if event_type == "browser.action.completed":
             kind = "browser"
             capability = completed.get("capability", "")
+        elif event_type == "tool.result":
+            kind = completed.get("actionKind") or "tool"
+            capability = completed.get("capabilityRef", "")
         else:
             kind = "tool"
             capability = completed.get("tool", "")
@@ -404,9 +407,14 @@ class AgentHost:
             "kind": completed.get("actionKind") or kind,
             "capability": capability,
             "action": completed.get("action") or started.get("action"),
-            "arguments": started.get("arguments", {}),
-            "result": completed.get("result", {}),
+            "arguments": dict(started.get("arguments", {})),
+            "result": completed.get("output", completed.get("result", {})),
         }
+        if event_type == "tool.result" and kind == "browser":
+            action["arguments"].pop("pageContract", None)
+        if event_type == "tool.result":
+            action["status"] = completed.get("status")
+            action["evidenceDigest"] = completed.get("evidenceDigest")
         # 透传固化证据（如果 Runtime 提供）。
         for key in ("capabilityRef", "outputSchema", "replayability", "effect", "idempotent"):
             if key in completed:

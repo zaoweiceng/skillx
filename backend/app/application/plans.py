@@ -71,8 +71,8 @@ class WorkflowSelection(BaseModel):
         if self.action == "ask_user":
             if not self.question or not self.missing_inputs:
                 raise ValueError("ask_user 需要 question 和 missingInputs")
-            if self.refs or self.plan is not None:
-                raise ValueError("ask_user 禁止 refs/plan")
+            if len(self.refs) > 1 or self.plan is not None:
+                raise ValueError("ask_user 最多保留一个已披露 ref，且禁止 plan")
         elif self.action == "continue_agent":
             if not self.reason:
                 raise ValueError("continue_agent 需要 reason")
