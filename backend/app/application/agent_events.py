@@ -87,6 +87,13 @@ class CompletedPayload(_PayloadBase):
     outputProvenance: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
+class FailedPayload(_PayloadBase):
+    code: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    retryable: bool
+    callId: str | None = Field(default=None, min_length=1)
+
+
 class ToolPayload(_PayloadBase):
     # Tool 事件必须携带 callId 与 tool，用于 started/completed 一一配对与权限核对。
     callId: str = Field(min_length=1)
@@ -134,6 +141,11 @@ class AgentCompletedEvent(BaseModel):
     payload: CompletedPayload
 
 
+class AgentFailedEvent(BaseModel):
+    type: Literal["agent.failed"]
+    payload: FailedPayload
+
+
 class ToolStartedEvent(BaseModel):
     type: Literal["tool.call.started"]
     payload: ToolPayload
@@ -173,6 +185,7 @@ AgentEvent = Annotated[
     AgentPlanEvent
     | AgentStepEvent
     | AgentCompletedEvent
+    | AgentFailedEvent
     | ToolStartedEvent
     | ToolCompletedEvent
     | BrowserActionStartedEvent
@@ -244,7 +257,7 @@ class AgentEventValidator:
             self._on_call_started(event_type, payload)
         elif event_type in _CALL_COMPLETED:
             self._on_call_completed(event_type, payload)
-        elif event_type == "agent.completed":
+        elif event_type in {"agent.completed", "agent.failed"}:
             if self._open_calls:
                 raise AgentEventError("存在未闭合的 Tool/Browser 调用，无法完成")
             self._completed = True
@@ -270,7 +283,15 @@ class AgentEventValidator:
             if "output" in payload:
                 audit["output"] = summarize_value(payload["output"])
             if "error" in payload and payload["error"] is not None:
-                audit["error"] = summarize_value(payload["error"])
+                error = payload["error"]
+                if isinstance(error, dict):
+                    audit["error"] = {
+                        "code": error.get("code"),
+                        "message": redact(error.get("message", "")),
+                        "retryable": bool(error.get("retryable", False)),
+                    }
+                else:
+                    audit["error"] = summarize_value(error)
             if "status" in payload:
                 audit["status"] = payload["status"]
             if "evidenceDigest" in payload:
@@ -287,6 +308,16 @@ class AgentEventValidator:
             if payload.get("output") is not None:
                 audit["output"] = summarize_value(payload["output"])
             return {"type": event_type, "payload": audit}
+        if event_type == "agent.failed":
+            return {
+                "type": event_type,
+                "payload": {
+                    "code": payload["code"],
+                    "message": redact(payload["message"]),
+                    "retryable": payload["retryable"],
+                    "callId": payload.get("callId"),
+                },
+            }
         if event_type == "agent.step.completed":
             return {
                 "type": event_type,

@@ -25,6 +25,7 @@ _STATE: dict[str, object] = {
     "mutated": False,
     "articleBody": "第一版正文：季度营收增长 12%。",
     "transientCount": 0,
+    "transientHealthy": False,
 }
 
 
@@ -124,6 +125,10 @@ class _Handler(BaseHTTPRequestHandler):
                 _STATE["transientCount"] = (
                     int(_STATE["transientCount"]) + 1
                 )
+                healthy = bool(_STATE["transientHealthy"])
+            if healthy:
+                self._send_html(200, _article_page("恢复后的正文"))
+                return
             if mode == "disconnect":
                 self.connection.shutdown(socket.SHUT_RDWR)
                 self.connection.close()
@@ -147,6 +152,13 @@ class _Handler(BaseHTTPRequestHandler):
             with _LOCK:
                 _STATE["articleBody"] = new_body
             self._send_json(200, {"articleBody": new_body})
+        elif path == "/__set-transient":
+            healthy = parse_qs(urlparse(self.path).query).get(
+                "healthy", ["false"]
+            )[0].lower() == "true"
+            with _LOCK:
+                _STATE["transientHealthy"] = healthy
+            self._send_json(200, {"transientHealthy": healthy})
         else:
             self._send_html(404, "<h1>not found</h1>")
 

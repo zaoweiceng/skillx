@@ -18,6 +18,7 @@ from app.application.agent_host import (
     resolve_effective_capabilities,
 )
 from app.application.compiler import digest_json
+from app.application.error_policy import error_policy
 from app.config import get_settings
 from app.infrastructure.database import (
     Artifact,
@@ -36,9 +37,21 @@ FINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
 class AgentRunError(Exception):
     """AgentRunService 归一化过程中的确定性失败。"""
 
-    def __init__(self, code: str, message: str) -> None:
-        self.code = code
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool | None = None,
+        failed_call_id: str | None = None,
+        protocol_violation: str | None = None,
+    ) -> None:
+        policy = error_policy(code)
+        self.code = policy.code
         self.message = message
+        self.retryable = policy.retryable if retryable is None else retryable
+        self.failed_call_id = failed_call_id
+        self.protocol_violation = protocol_violation
         super().__init__(message)
 
 
@@ -404,7 +417,13 @@ class AgentRunWorker:
                 request, event_sink=event_sink, cancellation=cancellation
             )
         except AgentHostError as exc:
-            terminal = AgentRunError(exc.code, exc.message)
+            terminal = AgentRunError(
+                exc.code,
+                exc.message,
+                retryable=exc.retryable,
+                failed_call_id=exc.failed_call_id,
+                protocol_violation=exc.protocol_violation,
+            )
         except asyncio.CancelledError:
             terminal = None  # 由 signal 决定 cancelled/lost
         finally:
@@ -521,14 +540,17 @@ class AgentRunWorker:
         claim_generation: int,
         claim_token: str | None,
     ) -> None:
-        if payload.get("status") != "succeeded" or payload.get("effect") != "none":
+        if payload.get("effect") != "none":
             return
         from app.application.security import redact
 
         envelope = {
             "callId": payload.get("callId"),
             "capabilityRef": payload.get("capabilityRef"),
-            "output": redact(payload.get("output", {})),
+            "status": payload.get("status"),
+            "argumentsDigest": payload.get("argumentsDigest"),
+            "output": redact(payload.get("output")),
+            "error": redact(payload.get("error")),
             "evidenceDigest": payload.get("evidenceDigest"),
             "outputSchema": payload.get("outputSchema"),
             "actionSignature": payload.get("actionSignature"),
@@ -602,10 +624,16 @@ class AgentRunWorker:
                         "callId": call_id,
                         "capabilityRef": payload.get("capabilityRef"),
                         "evidenceDigest": payload.get("evidenceDigest"),
+                        "status": payload.get("status"),
+                        "argumentsDigest": payload.get("argumentsDigest"),
                         "effect": payload.get("effect"),
                         "idempotent": payload.get("idempotent"),
                         "actionSignature": payload.get("actionSignature"),
-                        "resultDigest": digest_json(envelope["output"]),
+                        "resultDigest": digest_json(
+                            envelope["output"]
+                            if payload.get("status") == "succeeded"
+                            else envelope["error"]
+                        ),
                         "storageKey": storage_key,
                         "stagingKey": staging_key,
                         "retentionClass": "checkpoint",
@@ -647,19 +675,35 @@ class AgentRunWorker:
                 {
                     "code": error.code,
                     "message": error.message,
-                    "retryable": error.code in {"TIMEOUT", "EXECUTION_FAILED"},
+                    "retryable": error.retryable,
+                    **(
+                        {"failedCallId": error.failed_call_id}
+                        if error.failed_call_id
+                        else {}
+                    ),
+                    **(
+                        {"protocolViolation": error.protocol_violation}
+                        if error.protocol_violation
+                        else {}
+                    ),
                 },
-                status=(
-                    "pending"
-                    if error.code in {"TIMEOUT", "EXECUTION_FAILED"}
-                    else "terminal"
-                ),
+                status="pending" if error.retryable else "terminal",
             )
             error_json = {
                 "code": error.code,
                 "message": error.message,
-                "retryable": error.code in {"TIMEOUT", "EXECUTION_FAILED"},
+                "retryable": error.retryable,
                 "taskCheckpointId": checkpoint.id,
+                **(
+                    {"failedCallId": error.failed_call_id}
+                    if error.failed_call_id
+                    else {}
+                ),
+                **(
+                    {"protocolViolation": error.protocol_violation}
+                    if error.protocol_violation
+                    else {}
+                ),
             }
             claimed = await session.execute(
                 update(ConversationRun)
@@ -868,12 +912,41 @@ class AgentRunWorker:
             for item in events
             if item.type == "tool.result"
         }
+        failed_results = [
+            item
+            for item in events
+            if item.type == "tool.result"
+            and item.payload_json.get("status") == "failed"
+        ]
+        failed_call_id = error.get("failedCallId") or (
+            failed_results[-1].payload_json.get("callId")
+            if failed_results
+            else None
+        )
+        failed_artifact = artifact_by_call.get(str(failed_call_id))
+        completed_results = [
+            item
+            for item in events
+            if item.type == "tool.result"
+            and item.payload_json.get("status") == "succeeded"
+        ]
+        resume_state = {
+            "completedActionCallIds": [
+                item.payload_json.get("callId") for item in completed_results
+            ],
+            "failedActionCallId": failed_call_id,
+            "pendingToolCalls": sorted(
+                str(call_id) for call_id in requested - closed if call_id
+            ),
+            "remainingPlan": {"resumeSameTask": True},
+        }
         source = {
             "kind": "conversation_run",
             "id": run.id,
             "input": run.input_json,
             "config": run.config_json or {},
             "trajectory": run.trajectory_json or {},
+            "handoff": resume_state,
         }
         source_digest = digest_json(source)
         action_ledger = [
@@ -890,6 +963,7 @@ class AgentRunWorker:
             }
             for item in artifacts
             if item.metadata_json.get("actionSignature")
+            and item.metadata_json.get("status") == "succeeded"
         ]
         snapshot = {
             "source": {
@@ -924,13 +998,31 @@ class AgentRunWorker:
                     ),
                 }
                 for item in events
-                if item.type in {"tool.result", "agent.step.completed"}
+                if item.type == "agent.step.completed"
+                or item in completed_results
             ],
+            "failedAction": {
+                "callId": failed_call_id,
+                "error": error,
+                **(
+                    {
+                        "artifact": {
+                            "id": failed_artifact.id,
+                            "sha256": failed_artifact.sha256,
+                            "uri": failed_artifact.uri,
+                            "evidenceDigest": failed_artifact.metadata_json.get(
+                                "evidenceDigest"
+                            ),
+                        }
+                    }
+                    if failed_artifact is not None
+                    else {}
+                ),
+            },
+            # 兼容既有 API，同时显式区分 completed/failed/pending/remaining。
             "failedStep": {"error": error},
-            "pendingToolCalls": sorted(
-                str(call_id) for call_id in requested - closed if call_id
-            ),
-            "remainingPlan": {"resumeSameTask": True},
+            "pendingToolCalls": resume_state["pendingToolCalls"],
+            "remainingPlan": resume_state["remainingPlan"],
             "completedActionLedger": action_ledger,
             "locks": list(
                 (run.config_json or {}).get("allowedCapabilities", [])

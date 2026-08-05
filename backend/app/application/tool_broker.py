@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
+import httpx
 from jsonschema import Draft202012Validator
 
 from app.config import get_settings
@@ -105,6 +106,16 @@ class ToolAdapterRegistry:
             output = await adapter.execute(context, arguments)
         except ToolBrokerError:
             raise
+        except (TimeoutError, httpx.TimeoutException) as exc:
+            raise ToolBrokerError(
+                "TIMEOUT",
+                f"{capability_ref} 执行超时",
+            ) from exc
+        except (ConnectionError, OSError, httpx.TransportError) as exc:
+            raise ToolBrokerError(
+                "DEPENDENCY_UNAVAILABLE",
+                f"{capability_ref} 连接外部依赖失败",
+            ) from exc
         except Exception as exc:
             raise ToolBrokerError(
                 "TOOL_EXECUTION_FAILED",

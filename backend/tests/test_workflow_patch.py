@@ -20,6 +20,7 @@ from app.api import routes
 from app.api.routes import (
     DraftUpdate,
     PublishRequest,
+    _commit_revision_proposal,
     apply_version_workflow_patch,
     propose_failure_revision,
     publish_workflow,
@@ -578,6 +579,24 @@ async def test_external_browser_failure_fixture_patch_publish_and_reuse(
             observation.id, session
         )
     assert reused_proposal["proposalId"] == proposal["proposalId"]
+    async with SessionLocal() as session:
+        original = await session.get(
+            RevisionProposal, proposal["proposalId"]
+        )
+        concurrent = RevisionProposal(
+            id=str(uuid4()),
+            observation_id=original.observation_id,
+            base_version_id=original.base_version_id,
+            agent_run_id="concurrent-revision-agent",
+            prompt_version=original.prompt_version,
+            fixture_digest=original.fixture_digest,
+            baseline_digest=original.baseline_digest,
+            proposal_json=original.proposal_json,
+            proposal_digest=original.proposal_digest,
+            status="proposed",
+        )
+        resolved = await _commit_revision_proposal(session, concurrent)
+    assert resolved.id == proposal["proposalId"]
     tampered = deepcopy(proposal["proposal"])
     tampered["reason"] = "client changed this proposal"
     async with SessionLocal() as session:

@@ -36,6 +36,16 @@ def stack(request: pytest.FixtureRequest) -> Iterator[DemoStack]:
         stop_stack(stack, failed=failed)
 
 
+@pytest.fixture
+def isolated_stack(request: pytest.FixtureRequest) -> Iterator[DemoStack]:
+    stack = start_stack()
+    try:
+        yield stack
+    finally:
+        failed = bool(getattr(request.node, "rep_call", None) and request.node.rep_call.failed)
+        stop_stack(stack, failed=failed)
+
+
 def _component(client: httpx.Client, name: str) -> dict:
     components = client.get("/components").json()
     match = next((item for item in components if item["name"] == name), None)
@@ -464,21 +474,23 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
         ).json()
         observations = {}
         for mode in ("503", "disconnect"):
-            transient_created = client.post(
-                f"/components/{transient_component['id']}/runs",
-                json={
-                    "input": {
-                        "url": f"{stack.form_url}/transient?mode={mode}"
-                    }
-                },
-            )
-            transient_run = poll_run(
-                client, transient_created.json()["id"]
-            )
-            assert transient_run["status"] == "failed"
-            observation = transient_run["failureObservations"][0]
-            observations[observation["evidenceKind"]] = observation
-        assert observations["transport_error"]["occurrence"] == 2
+            for _ in range(5):
+                transient_created = client.post(
+                    f"/components/{transient_component['id']}/runs",
+                    json={
+                        "input": {
+                            "url": f"{stack.form_url}/transient?mode={mode}"
+                        }
+                    },
+                )
+                transient_run = poll_run(
+                    client, transient_created.json()["id"]
+                )
+                assert transient_run["status"] == "failed"
+                observation = transient_run["failureObservations"][0]
+                assert observation["evidenceKind"] == "transport_error"
+                observations[observation["evidenceKind"]] = observation
+        assert observations["transport_error"]["occurrence"] == 10
         timeout_definition = deepcopy(transient_definition)
         timeout_definition["metadata"]["name"] = "timeout-control"
         timeout_definition["spec"]["nodes"][1]["timeoutSeconds"] = 1
@@ -499,7 +511,7 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
                 "workflowVersionId": timeout_v1["id"],
             },
         ).json()
-        for _ in range(2):
+        for _ in range(5):
             timeout_created = client.post(
                 f"/components/{timeout_component['id']}/runs",
                 json={
@@ -511,10 +523,11 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
             timeout_run = poll_run(client, timeout_created.json()["id"])
             assert timeout_run["status"] == "failed"
             timeout_observation = timeout_run["failureObservations"][0]
+            assert timeout_observation["evidenceKind"] == "timeout"
             observations[timeout_observation["evidenceKind"]] = (
                 timeout_observation
             )
-        assert observations["timeout"]["occurrence"] == 2
+        assert observations["timeout"]["occurrence"] == 5
         for observation in observations.values():
             assert observation["classification"] == "transient"
             transient_proposal = client.post(
@@ -831,6 +844,122 @@ def test_agent_run_handoff_public_api_and_completed_action_ledger(
             if checkpoint["status"] == "succeeded":
                 break
             time.sleep(0.1)
+        assert checkpoint["status"] == "succeeded"
+        assert poll_conversation_run(client, source_id)["status"] == "failed"
+
+
+def test_real_tool_failure_handoff_distill_and_second_reuse(
+    isolated_stack: DemoStack,
+) -> None:
+    stack = isolated_stack
+    restart_worker(stack, crash=True, disable_task_recovery=True)
+    with stack.client() as client:
+        stack.set_transient_healthy(False)
+        transient_url = f"{stack.form_url}/transient?mode=503"
+        conversation = client.post(
+            "/conversations", json={"title": "真实失败接力"}
+        ).json()
+        created = client.post(
+            f"/conversations/{conversation['id']}/agent-runs",
+            json={
+                "content": (
+                    f"{transient_url} [[MODE:browser_failure_handoff]]"
+                ),
+                "allowedCapabilities": [
+                    "lookup.table",
+                    "browser.read",
+                    "summarize.text",
+                ],
+            },
+        )
+        assert created.status_code == 202, created.text
+        source_id = created.json()["conversationRunId"]
+        source = poll_conversation_run(client, source_id)
+        assert source["status"] == "failed"
+        assert source["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
+        assert source["error"]["code"] != "AGENT_EVENT_INVALID"
+        checkpoint_id = source["error"]["taskCheckpointId"]
+        checkpoint = client.get(
+            f"/task-checkpoints/{checkpoint_id}"
+        ).json()
+        assert checkpoint["status"] == "pending"
+        assert checkpoint["failedAction"]["callId"] == "call-browser"
+        assert checkpoint["completedActionLedger"]
+        assert stack.form_stats()["transientCount"] == 2
+
+        stack.set_transient_healthy(True)
+        restart_worker(stack, crash=True)
+        deadline = time.time() + 30
+        continuation_id = None
+        while time.time() < deadline:
+            checkpoint = client.get(
+                f"/task-checkpoints/{checkpoint_id}"
+            ).json()
+            continuation_id = checkpoint.get("continuationRunId")
+            if continuation_id:
+                break
+            time.sleep(0.1)
+        continuation = poll_conversation_run(
+            client, continuation_id, timeout=30
+        )
+        assert continuation["status"] == "succeeded"
+        assert continuation["output"] == {"reply": "恢复后的正文"}
+        assert continuation["input"]["continuationOfConversationRunId"] == source_id
+        assert continuation["input"]["continuationOfCheckpointId"] == checkpoint_id
+        assert stack.form_stats()["transientCount"] == 3
+        continuation_events = client.get(
+            f"/conversation-runs/{continuation_id}/events"
+        ).json()
+        assert any(
+            item["type"] == "tool.result"
+            and item["payload"].get("reusedFromLedger") is True
+            for item in continuation_events
+        )
+
+        distilled = client.post(
+            f"/conversation-runs/{continuation_id}/distill"
+        )
+        assert distilled.status_code == 201, distilled.text
+        published = _publish_workflow(
+            client, distilled.json()["draftWorkflowId"]
+        )
+        assert published.status_code == 201, published.text
+        version_id = published.json()["id"]
+
+        stack.set_article("接力固化后的新正文")
+        second_conversation = client.post(
+            "/conversations", json={"title": "失败恢复后复用"}
+        ).json()
+        selected = client.post(
+            f"/conversations/{second_conversation['id']}/messages",
+            json={
+                "content": (
+                    f"访问并总结这个网页：{stack.form_url}/article?handoff=1"
+                )
+            },
+        )
+        assert selected.status_code == 201, selected.text
+        assistant = selected.json()["assistant"]
+        assert assistant["workflowVersionId"] == version_id
+        assert {item["level"] for item in assistant["toolTimeline"]} == {
+            "L0",
+            "L1",
+        }
+        reused_run = poll_run(client, assistant["runId"], timeout=60)
+        assert reused_run["status"] == "succeeded", reused_run
+        assert "接力固化后的新正文" in reused_run["output"]["reply"]
+
+        described = client.post(
+            "/workflow-tools/describe",
+            json={
+                "sessionId": assistant["disclosureSessionId"],
+                "ref": assistant["refs"][0],
+            },
+        ).json()["workflow"]
+        assert described["lineage"]["sourceConversationRunId"] == continuation_id
+        checkpoint = client.get(
+            f"/task-checkpoints/{checkpoint_id}"
+        ).json()
         assert checkpoint["status"] == "succeeded"
         assert poll_conversation_run(client, source_id)["status"] == "failed"
 

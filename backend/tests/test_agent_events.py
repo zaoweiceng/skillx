@@ -83,6 +83,24 @@ def test_completed_only_once() -> None:
         validator.validate({"type": "agent.plan", "payload": {"summary": "again"}})
 
 
+def test_agent_failed_is_structured_terminal() -> None:
+    validator = _validator()
+    failed = validator.validate(
+        {
+            "type": "agent.failed",
+            "payload": {
+                "code": "DEPENDENCY_UNAVAILABLE",
+                "message": "upstream unavailable",
+                "retryable": True,
+                "callId": "call-1",
+            },
+        }
+    )
+    assert failed["payload"]["retryable"] is True
+    with pytest.raises(AgentEventError):
+        validator.validate({"type": "agent.plan", "payload": {}})
+
+
 def test_completed_requires_all_tool_calls_closed() -> None:
     validator = _validator()
     validator.validate(

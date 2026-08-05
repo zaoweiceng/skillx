@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+from types import TracebackType
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -14,6 +15,9 @@ from playwright.async_api import (
     Page,
     Playwright,
     async_playwright,
+)
+from playwright.async_api import (
+    TimeoutError as PlaywrightTimeoutError,
 )
 
 from app.config import get_settings
@@ -84,13 +88,27 @@ class PlaywrightPageSession:
             raise BrowserExecutionError("重定向后的最终 URL 不符合 PageContract")
         return self
 
-    async def __aexit__(self, *_: Any) -> None:
-        if self._context is not None:
-            await self._context.close()
-        if self._browser is not None:
-            await self._browser.close()
-        if self._playwright is not None:
-            await self._playwright.stop()
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> None:
+        cleanup_error: BaseException | None = None
+        for cleanup in (
+            self._context.close if self._context is not None else None,
+            self._browser.close if self._browser is not None else None,
+            self._playwright.stop if self._playwright is not None else None,
+        ):
+            if cleanup is None:
+                continue
+            try:
+                await cleanup()
+            except (Exception, PlaywrightTimeoutError) as error:  # noqa: PERF203
+                cleanup_error = cleanup_error or error
+        # 已有导航/动作主错误时，Context 关闭产生的次生异常不得覆盖它。
+        if exc_type is None and cleanup_error is not None:
+            raise cleanup_error
 
     def _page(self) -> Page:
         if self.page is None:

@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.compiler import digest_json
+from app.application.error_policy import error_policy, transport_error_code
 from app.application.secrets import (
     SecretResolutionError,
     contains_secret,
@@ -674,12 +675,12 @@ async def call_mcp_contract(
             tool_digest=tool_digest,
         )
     except (AdapterError, httpx.HTTPError, TimeoutError) as exc:
-        # 传输层不可用（超时、连接失败、HTTP 状态错误、进程退出）映射为可重试依赖错误。
+        policy = error_policy(transport_error_code(exc))
         return MCPCallOutcome(
             status="failed",
-            error_code="DEPENDENCY_UNAVAILABLE",
+            error_code=policy.code,
             error_message=redact_secret_text(str(exc), secret_values),
-            retryable=True,
+            retryable=policy.retryable,
             tool_name=tool_name,
             tool_digest=tool_digest,
         )

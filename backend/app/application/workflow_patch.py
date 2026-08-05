@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.application.error_policy import error_policy
 from app.infrastructure.database import FailureObservation, utcnow
 
 # 006-D/005-E：失败可复现性与受控 WorkflowPatch。
@@ -142,10 +143,9 @@ def failure_fingerprint(
 
 
 def evidence_kind_for_error(error_code: str) -> str:
-    if error_code == "TIMEOUT":
-        return "timeout"
-    if error_code == "DEPENDENCY_UNAVAILABLE":
-        return "transport_error"
+    policy = error_policy(error_code)
+    if policy.evidence_kind != "unsupported":
+        return policy.evidence_kind
     if error_code in {
         "PAGE_DRIFT",
         "MCP_CONTRACT_DRIFT",

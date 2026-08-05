@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from datetime import timedelta
@@ -11,6 +10,11 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.agent_run import AgentRunConfig, _append_event, enqueue_agent_run
+from app.application.artifact_integrity import (
+    ArtifactPathError,
+    artifact_record_matches,
+    safe_artifact_path,
+)
 from app.application.compiler import digest_json
 from app.config import get_settings
 from app.infrastructure.database import (
@@ -124,6 +128,9 @@ class TaskCheckpointDriver:
             completed = await self._load_completed_outputs(
                 session, checkpoint, source.id
             )
+            failed = await self._load_failed_output(
+                session, checkpoint, source.id
+            )
             completed_by_signature = {
                 str(item.get("actionSignature")): item
                 for item in completed
@@ -163,6 +170,7 @@ class TaskCheckpointDriver:
             )
             recovery_context = {
                 "completed": completed,
+                "failedAction": failed,
                 "completedActionLedger": completed_action_ledger,
                 "remainingPlan": checkpoint.snapshot_json.get("remainingPlan"),
                 "userAnswer": checkpoint.snapshot_json.get("userAnswer"),
@@ -294,6 +302,20 @@ class TaskCheckpointDriver:
             "input": source.input_json,
             "config": source.config_json or {},
             "trajectory": source.trajectory_json or {},
+            "handoff": {
+                "completedActionCallIds": [
+                    item.get("payload", {}).get("callId")
+                    for item in checkpoint.snapshot_json.get("completedSteps", [])
+                    if item.get("type") == "tool.result"
+                ],
+                "failedActionCallId": checkpoint.snapshot_json.get(
+                    "failedAction", {}
+                ).get("callId"),
+                "pendingToolCalls": checkpoint.snapshot_json.get(
+                    "pendingToolCalls", []
+                ),
+                "remainingPlan": checkpoint.snapshot_json.get("remainingPlan"),
+            },
         }
         if digest_json(source_payload) != checkpoint.source_digest:
             raise TaskCheckpointError("checkpoint source digest 不一致")
@@ -315,32 +337,70 @@ class TaskCheckpointDriver:
             artifact_ref = step.get("artifact")
             if not isinstance(artifact_ref, dict):
                 continue
-            artifact = await session.get(Artifact, artifact_ref.get("id"))
-            if (
-                artifact is None
-                or artifact.conversation_run_id != source_run_id
-                or artifact.kind != "tool_result"
-                or artifact.sha256 != artifact_ref.get("sha256")
-            ):
-                raise TaskCheckpointError("checkpoint ToolResult Artifact 关联错误")
-            storage_key = artifact.metadata_json.get("storageKey")
-            path = (
-                get_settings().artifact_root
-                / "conversation-agents"
-                / source_run_id
-                / str(storage_key)
-            ).resolve()
-            root = (
-                get_settings().artifact_root
-                / "conversation-agents"
-                / source_run_id
-            ).resolve()
-            if not path.is_relative_to(root) or not path.is_file():
-                raise TaskCheckpointError(
-                    "checkpoint ToolResult Artifact 路径越界或不存在"
+            completed.append(
+                await TaskCheckpointDriver._load_artifact_envelope(
+                    session, artifact_ref, source_run_id
                 )
-            content = path.read_bytes()
-            if hashlib.sha256(content).hexdigest() != artifact.sha256:
-                raise TaskCheckpointError("checkpoint ToolResult Artifact 已损坏")
-            completed.append(json.loads(content))
+            )
         return completed
+
+    @staticmethod
+    async def _load_failed_output(
+        session: AsyncSession,
+        checkpoint: TaskCheckpoint,
+        source_run_id: str,
+    ) -> dict[str, Any] | None:
+        artifact_ref = checkpoint.snapshot_json.get("failedAction", {}).get(
+            "artifact"
+        )
+        if not isinstance(artifact_ref, dict):
+            return checkpoint.snapshot_json.get("failedAction")
+        envelope = await TaskCheckpointDriver._load_artifact_envelope(
+            session, artifact_ref, source_run_id
+        )
+        return {
+            **checkpoint.snapshot_json.get("failedAction", {}),
+            "toolResult": envelope,
+        }
+
+    @staticmethod
+    async def _load_artifact_envelope(
+        session: AsyncSession,
+        artifact_ref: dict[str, Any],
+        source_run_id: str,
+    ) -> dict[str, Any]:
+        artifact = await session.get(Artifact, artifact_ref.get("id"))
+        if (
+            artifact is None
+            or artifact.conversation_run_id != source_run_id
+            or artifact.kind != "tool_result"
+            or artifact.sha256 != artifact_ref.get("sha256")
+            or artifact.metadata_json.get("evidenceDigest")
+            != artifact_ref.get("evidenceDigest")
+        ):
+            raise TaskCheckpointError("checkpoint ToolResult Artifact 关联错误")
+        root = (
+            get_settings().artifact_root
+            / "conversation-agents"
+            / source_run_id
+        ).resolve()
+        try:
+            path = safe_artifact_path(
+                root,
+                artifact.metadata_json.get("storageKey"),
+                forbidden_root=root / ".staging",
+            )
+        except ArtifactPathError as exc:
+            raise TaskCheckpointError(
+                "checkpoint ToolResult Artifact 路径越界"
+            ) from exc
+        if not artifact_record_matches(path, artifact):
+            raise TaskCheckpointError(
+                "checkpoint ToolResult Artifact 不存在或已损坏"
+            )
+        try:
+            return json.loads(path.read_bytes())
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise TaskCheckpointError(
+                "checkpoint ToolResult Artifact 内容非法"
+            ) from exc

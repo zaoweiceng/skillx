@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 from contextlib import suppress
@@ -16,8 +15,14 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.application.artifact_integrity import (
+    ArtifactPathError,
+    artifact_record_matches,
+    safe_artifact_path,
+)
 from app.application.capabilities import CapabilityResolutionError, resolve_skillx_node
 from app.application.compiler import digest_json
+from app.application.error_policy import error_policy
 from app.application.expressions import ExpressionError, resolve_mapping
 from app.application.mcp import MCPConfigurationError, MCPLockDriftError, resolve_mcp_node
 from app.application.retries import auto_retry_allowed
@@ -46,7 +51,6 @@ from app.runtime.executors import (
     ExecutorRegistry,
     RunContext,
     clear_staging,
-    list_final_files,
     promote_staged_artifact,
     write_json_artifact,
 )
@@ -1243,9 +1247,14 @@ class WorkerService:
                     "retryable": False,
                 },
             )
+        policy = error_policy(code)
         return NodeResult(
             status="cancelled" if code == "CANCELLED" else "failed",
-            error={"code": code, "message": message, "retryable": code == "TIMEOUT"},
+            error={
+                "code": policy.code,
+                "message": message,
+                "retryable": policy.retryable,
+            },
         )
 
     async def _commit_result(self, claimed: ClaimedExecution, result: NodeResult) -> None:
@@ -1493,12 +1502,14 @@ class WorkerService:
         result: NodeResult,
     ) -> None:
         error = result.error
+        policy = error_policy(error.code) if error else None
         # 统一重试策略：有副作用且非幂等禁止自动重试，结果未知不重试。
         node_effect = "write" if claimed.node.side_effect else "none"
         outcome = "unknown" if (error and error.code == "UNKNOWN_OUTCOME") else None
         if (
             not error
-            or not error.retryable
+            or policy is None
+            or not policy.retryable
             or claimed.attempt >= claimed.node.retry.max_attempts
             or not auto_retry_allowed(node_effect, claimed.node.idempotent, outcome=outcome)
         ):
@@ -1614,46 +1625,91 @@ class WorkerService:
 
 
 async def reconcile_run_artifacts(session: AsyncSession, run_id: str) -> dict[str, list[str]]:
-    """Artifact 一致性 GC：双向扫描“DB 有记录但文件缺失”和“文件无 DB 记录”。
-
-    - missingFile：数据库登记了 Artifact 但最终文件缺失（提交后落位未完成）。若暂存中
-      仍有源文件则补落位，否则报告为需人工处理的缺失。
-    - orphanFile：最终目录存在但无对应 Artifact 记录（DB 回滚后残留），删除以回收。
-    返回各类处理结果，便于审计。
-    """
-
     artifacts = (
         await session.scalars(select(Artifact).where(Artifact.run_id == run_id))
     ).all()
-    recorded_keys = {
-        (item.metadata_json or {}).get("storageKey") or item.uri.removeprefix("artifact://")
-        for item in artifacts
-    }
-    files = list_final_files(run_id)
+    root = (get_settings().artifact_root / run_id).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    staging_root = (root / ".staging").resolve()
+    recorded: set[str] = set()
     recovered: list[str] = []
     missing: list[str] = []
+    corrupt: list[str] = []
+    path_rejected: list[str] = []
     for item in artifacts:
-        storage_key = (item.metadata_json or {}).get("storageKey") or item.uri.removeprefix(
-            "artifact://"
-        )
-        if storage_key in files:
-            continue
-        # 尝试从暂存补落位；stagingKey 由执行器写入 metadata 时可能缺失。
-        staging_key = (item.metadata_json or {}).get("stagingKey")
-        if staging_key:
-            promote_staged_artifact(
-                run_id, {"storageKey": storage_key, "stagingKey": staging_key}
+        metadata = item.metadata_json or {}
+        storage_key = metadata.get("storageKey") or item.uri.removeprefix("artifact://")
+        try:
+            target = safe_artifact_path(
+                root, storage_key, forbidden_root=staging_root
             )
-        if storage_key in list_final_files(run_id):
-            recovered.append(item.id)
-        else:
+        except (ArtifactPathError, TypeError):
+            path_rejected.append(item.id)
+            continue
+        recorded.add(str(target.relative_to(root)))
+        if target.exists() and artifact_record_matches(target, item):
+            continue
+        if target.exists():
+            corrupt.append(item.id)
+            target.unlink(missing_ok=True)
+        staging_key = metadata.get("stagingKey")
+        if not isinstance(staging_key, dict):
             missing.append(item.id)
-    orphan_files = sorted(files - {key for key in recorded_keys if key})
+            continue
+        node_run_id = staging_key.get("nodeRunId")
+        filename = staging_key.get("file")
+        try:
+            source = safe_artifact_path(
+                staging_root, f"{node_run_id}/{filename}"
+            )
+        except (ArtifactPathError, TypeError):
+            path_rejected.append(item.id)
+            continue
+        if not source.exists():
+            missing.append(item.id)
+            continue
+        if not artifact_record_matches(source, item):
+            if item.id not in corrupt:
+                corrupt.append(item.id)
+            source.unlink(missing_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.replace(target)
+        recovered.append(item.id)
+
+    final_files: set[str] = set()
+    for candidate in root.rglob("*"):
+        relative = candidate.relative_to(root)
+        if ".staging" in relative.parts:
+            continue
+        resolved = candidate.resolve()
+        if not resolved.is_relative_to(root):
+            path_rejected.append(str(relative))
+        elif resolved.is_file():
+            final_files.add(str(relative))
+    orphan_files = sorted(final_files - recorded)
     for name in orphan_files:
-        target = (get_settings().artifact_root / run_id / name).resolve()
-        with suppress(FileNotFoundError):
-            target.unlink()
-    return {"recovered": recovered, "missing": missing, "orphanFilesRemoved": orphan_files}
+        safe_artifact_path(root, name, forbidden_root=staging_root).unlink(
+            missing_ok=True
+        )
+    staging_removed: list[str] = []
+    if staging_root.is_dir():
+        for candidate in staging_root.rglob("*"):
+            resolved = candidate.resolve()
+            if not resolved.is_relative_to(staging_root):
+                path_rejected.append(str(candidate.relative_to(root)))
+            elif resolved.is_file():
+                staging_removed.append(str(candidate.relative_to(root)))
+                resolved.unlink(missing_ok=True)
+    return {
+        "recovered": recovered,
+        "missing": missing,
+        "corrupt": corrupt,
+        "pathRejected": sorted(path_rejected),
+        "orphanRemoved": sorted([*orphan_files, *staging_removed]),
+        "orphanFilesRemoved": orphan_files,
+        "orphanStagingRemoved": sorted(staging_removed),
+    }
 
 
 async def reconcile_conversation_artifacts(
@@ -1679,54 +1735,40 @@ async def reconcile_conversation_artifacts(
     corrupt: list[str] = []
     path_rejected: list[str] = []
 
-    def matches_artifact(path: Any, artifact: Artifact) -> bool:
-        if not path.is_file() or path.stat().st_size != artifact.size:
-            return False
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest() == artifact.sha256
-
     for item in artifacts:
         metadata = item.metadata_json or {}
         storage_key = metadata.get("storageKey")
         if not isinstance(storage_key, str):
             missing.append(item.id)
             continue
-        target = (root / storage_key).resolve()
-        if (
-            target == root
-            or not target.is_relative_to(root)
-            or target.is_relative_to(staging_root)
-        ):
+        try:
+            target = safe_artifact_path(
+                root, storage_key, forbidden_root=staging_root
+            )
+        except ArtifactPathError:
             path_rejected.append(item.id)
             continue
         recorded.add(str(target.relative_to(root)))
         if target.exists():
-            if matches_artifact(target, item):
+            if artifact_record_matches(target, item):
                 continue
             corrupt.append(item.id)
             target.unlink(missing_ok=True)
         staging_key = metadata.get("stagingKey")
-        source = (
-            (root / staging_key).resolve()
-            if isinstance(staging_key, str)
-            else None
-        )
-        if source is None:
+        if not isinstance(staging_key, str):
             missing.append(item.id)
             continue
-        if (
-            source == root
-            or not source.is_relative_to(staging_root)
-        ):
+        try:
+            source = safe_artifact_path(
+                staging_root, staging_key.removeprefix(".staging/")
+            )
+        except ArtifactPathError:
             path_rejected.append(item.id)
             continue
         if not source.exists():
             missing.append(item.id)
             continue
-        if not matches_artifact(source, item):
+        if not artifact_record_matches(source, item):
             if item.id not in corrupt:
                 corrupt.append(item.id)
             source.unlink(missing_ok=True)

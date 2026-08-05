@@ -15,6 +15,7 @@ from app.application.agent_host import (
 from app.application.tool_broker import (
     LookupTableAdapter,
     ToolAdapterRegistry,
+    ToolBrokerError,
 )
 from app.runtime.adapters import TraeXSubprocessAdapter
 
@@ -132,3 +133,39 @@ async def test_output_provenance_rejects_fixture_constant(tmp_path: Path) -> Non
                 requested_capabilities=("lookup.table",),
             )
         )
+
+
+async def test_failed_tool_root_cause_survives_invalid_completed(
+    tmp_path: Path,
+) -> None:
+    class FailingLookup(LookupTableAdapter):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def execute(self, context, arguments):
+            self.calls += 1
+            raise ToolBrokerError(
+                "DEPENDENCY_UNAVAILABLE", "lookup transport unavailable"
+            )
+
+    lookup = FailingLookup()
+    adapter = TraeXSubprocessAdapter(
+        [sys.executable, str(STUB)], {Path(sys.executable).name}
+    )
+    with pytest.raises(AgentHostError) as exc_info:
+        await AgentHost(
+            adapter=adapter,
+            tool_registry=ToolAdapterRegistry([lookup]),
+        ).execute(
+            AgentHostRequest(
+                run_id="broker-failed-root",
+                prompt="q1 [[MODE:deterministic]]",
+                output_schema=OUTPUT_SCHEMA,
+                working_directory=tmp_path,
+                requested_capabilities=("lookup.table",),
+            )
+        )
+    assert lookup.calls == 2
+    assert exc_info.value.code == "DEPENDENCY_UNAVAILABLE"
+    assert exc_info.value.failed_call_id == "call-1"
+    assert "outputProvenance" in exc_info.value.protocol_violation

@@ -26,6 +26,7 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
 | Scale-1 Catalog 1000 | 1000 个已发布 Manifest → search | Registry 单元/集成门禁 | top-k≤8、总字节≤24KB、L0 不含 Schema/DAG |
 | Fence-1 迟到 Recovery | A 超租约 → B 重领 → A 返回 | generation/token、两个 Recovery NodeRun | 仅 B 的决定、替代输出和终态可提交 |
 | AgentRun handoff | AgentRun 只读 ToolResult → 失败 → pending TaskCheckpoint → Worker 崩溃 → 新 Worker continuation | `agent.handoff.*` | 新 Worker 领取 generation+1；claim handle 约束启动与终态；Host action ledger 复用结果且不增加外部调用 |
+| Real Tool failure handoff | 首次 Browser 503/断连 → 有限重试耗尽 → Worker 重启 → 外部恢复 → continuation → distill/publish → 新对话复用 | `tool.result(status=failed)`、`agent.failed`、`agent.handoff.*`、L0/L1 | 主错误保持 Tool 标准 code；失败 Artifact 可校验；只重试失败 action，已完成 action 不重做 |
 | AgentRun unknown | Worker 租约丢失 → awaiting_user → answer → continuation | `agent.handoff.user_answered` | 回答只能消费一次；未确认的未知副作用不得继续 |
 | Selection-5 | 五种 action → validate/execute | action 终态、diagnostics | 类型错配、未披露 ref 和超预算 fail closed |
 | Disclosure-1 | 创建 session → L0/L1/L2 → 重启读取 | disclosure call audit | refs、level、剩余预算持久且跨 session 隔离 |
@@ -61,7 +62,23 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
 - completed-action ledger 只写在提示词中，Host 仍执行相同
   capability ref + 参数 digest + effect + idempotency key。
 - `agent.completed.outputProvenance` 引用无效 path/digest，或输出值与确定性来源不一致。
+- failed ToolResult 后的非法 `agent.completed`、子进程退出或次生关闭异常覆盖原始 Tool
+  `code/message/retryable`；`protocolViolation` 只能作为附加审计信息。
 - 测试绕过 Alembic、API 或 Worker 主路径。
+
+## Agent 终态与接力
+
+- `agent.completed` 只表示成功，输出必须通过 Schema 且逐字段 provenance 指向成功
+  ToolResult；失败文本不得伪装成成功输出。
+- `agent.failed` 必须包含 `code/message/retryable/callId`。Host 已知 failed ToolResult 时，
+  Tool 标准错误是主错误；Agent 的错误或非法 completed 不能覆盖它。
+- 共享 ErrorPolicy 将 `DEPENDENCY_UNAVAILABLE`、`TIMEOUT`、`RATE_LIMITED` 视为瞬态；
+  只读或幂等 action 可按有限 budget/backoff 重试。Permission、Safety、Contract、非法事件
+  fail closed，未知副作用进入人工确认。
+- 重试耗尽后，可恢复错误创建 `pending` TaskCheckpoint；claim 后为 `running`，创建
+  continuation 后为 `continuing`，最终随 continuation 进入 `succeeded/failed`。checkpoint
+  分别保存 completed actions、failed action、pending calls 和 remaining plan，并在加载前
+  校验 source digest 与 Artifact id/size/sha256/evidence digest。
 
 ## 不可变修订 lineage
 

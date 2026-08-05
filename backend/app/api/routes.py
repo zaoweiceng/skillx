@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
@@ -303,6 +304,34 @@ async def _record_human_definition_patch(
     return item
 
 
+async def _commit_revision_proposal(
+    session: AsyncSession,
+    proposal: RevisionProposal,
+) -> RevisionProposal:
+    session.add(proposal)
+    try:
+        await session.commit()
+        return proposal
+    except IntegrityError:
+        await session.rollback()
+        existing = await session.scalar(
+            select(RevisionProposal).where(
+                RevisionProposal.observation_id == proposal.observation_id,
+                RevisionProposal.baseline_digest == proposal.baseline_digest,
+                RevisionProposal.proposal_digest == proposal.proposal_digest,
+            )
+        )
+        if existing is not None:
+            return existing
+        raise HTTPException(
+            409,
+            detail={
+                "code": "REVISION_PROPOSAL_CONFLICT",
+                "message": "并发 proposal 与当前提议不一致",
+            },
+        ) from None
+
+
 async def _mark_draft_changed(
     session: AsyncSession,
     workflow: Workflow,
@@ -506,7 +535,10 @@ async def update_draft(
         ) from exc
     current_digest = item.draft_digest or compiler.compile(item.draft_json).digest
     if compiled.digest == current_digest:
-        item.draft_digest = current_digest
+        if item.draft_digest is None:
+            item.draft_digest = current_digest
+            await session.commit()
+            await session.refresh(item)
         return workflow_view(item)
     definition, metadata = await _mark_draft_changed(
         session,
@@ -1160,8 +1192,9 @@ async def propose_failure_revision(
         proposal_digest=proposal_digest,
         status="proposed",
     )
-    session.add(proposal_record)
-    await session.commit()
+    proposal_record = await _commit_revision_proposal(
+        session, proposal_record
+    )
     return {
         "proposalId": proposal_record.id,
         "observationId": observation.id,
@@ -4087,6 +4120,9 @@ async def get_task_checkpoint(
         "continuationRunId": snapshot.get("continuationRunId"),
         "claimGeneration": checkpoint.claim_generation,
         "completedActionLedger": snapshot.get("completedActionLedger", []),
+        "failedAction": snapshot.get("failedAction"),
+        "pendingToolCalls": snapshot.get("pendingToolCalls", []),
+        "remainingPlan": snapshot.get("remainingPlan"),
     }
 
 

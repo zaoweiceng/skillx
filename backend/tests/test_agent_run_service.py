@@ -321,6 +321,50 @@ async def test_task_checkpoint_claims_and_continues_from_tool_artifact(
     assert checkpoint.status == "succeeded"
 
 
+async def test_failed_tool_result_creates_pending_checkpoint_with_original_error(
+    traex_stub: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(
+        settings,
+        "agent_host_capabilities",
+        ["browser.read", "summarize.text"],
+    )
+    conversation_id = await _conversation()
+    run_id = await _enqueue(
+        conversation_id,
+        (
+            "http://does-not-resolve.invalid/article "
+            "[[MODE:browser_invalid_completed]]"
+        ),
+        config=AgentRunConfig(
+            output_schema=AgentRunConfig.default().output_schema,
+            allowed_capabilities=("browser.read", "summarize.text"),
+        ),
+    )
+    source = await _drive(run_id)
+    assert source.status == "failed"
+    assert source.error_json["code"] == "DEPENDENCY_UNAVAILABLE"
+    assert source.error_json["code"] != "AGENT_EVENT_INVALID"
+    assert source.error_json["failedCallId"] == "call-browser"
+    assert "outputProvenance" in source.error_json["protocolViolation"]
+    async with SessionLocal() as session:
+        checkpoint = await session.scalar(
+            select(TaskCheckpoint).where(TaskCheckpoint.source_id == run_id)
+        )
+        artifact = await session.scalar(
+            select(Artifact).where(
+                Artifact.conversation_run_id == run_id,
+                Artifact.kind == "tool_result",
+            )
+        )
+    assert checkpoint.status == "pending"
+    assert checkpoint.snapshot_json["failedAction"]["callId"] == "call-browser"
+    assert checkpoint.snapshot_json["failedAction"]["artifact"]["id"] == artifact.id
+    assert artifact.metadata_json["status"] == "failed"
+
+
 async def test_task_checkpoint_late_same_owner_cannot_start_second_continuation(
     traex_stub: None,
 ) -> None:

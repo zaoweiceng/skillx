@@ -590,6 +590,69 @@ def main() -> int:
         completed = checkpoint.get("completed", [])
         latest = completed[-1].get("output", {}) if completed else {}
         provenance_result: dict[str, Any] | None = None
+        if "[[MODE:browser_failure_handoff]]" in original_task:
+            emit(
+                {
+                    "type": "tool.requested",
+                    "payload": {
+                        "callId": "recovery-preflight",
+                        "capabilityRef": "lookup.table",
+                        "action": "lookup",
+                        "actionKind": "transform",
+                        "arguments": {"key": "q1"},
+                        "effect": "none",
+                        "idempotent": True,
+                    },
+                }
+            )
+            read_tool_result("recovery-preflight")
+            url_match = re.search(r"https?://[^\s\"}]+", original_task)
+            url = url_match.group(0) if url_match else _clean_message(original_task)
+            parsed_url = urlsplit(url)
+            page_contract = {
+                "contractVersion": "1",
+                "urlPattern": f"{parsed_url.scheme}://{parsed_url.netloc}/*",
+                "bodySelector": "#main",
+                "fields": {},
+            }
+            emit(
+                {
+                    "type": "tool.requested",
+                    "payload": {
+                        "callId": "recovery-browser",
+                        "capabilityRef": "browser.read",
+                        "action": "read",
+                        "actionKind": "browser",
+                        "arguments": {
+                            "url": url,
+                            "pageContract": page_contract,
+                        },
+                        "argumentBindings": {
+                            "url": {
+                                "source": "user_input",
+                                "inputKey": "message",
+                            }
+                        },
+                        "effect": "none",
+                        "idempotent": True,
+                        "replayability": "parameterizable",
+                        "outputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"}
+                            },
+                            "required": ["content"],
+                        },
+                        "observations": {
+                            "runtime": "playwright",
+                            "action": "read",
+                            "pageContract": page_contract,
+                        },
+                    },
+                }
+            )
+            provenance_result = read_tool_result("recovery-browser")
+            latest = provenance_result.get("output", {})
         if "[[RECOVERY_REPEAT]]" in original_task:
             emit(
                 {
@@ -625,7 +688,12 @@ def main() -> int:
                             "outputProvenance": deterministic_output_provenance(
                                 "reply",
                                 provenance_result,
-                                "output.value",
+                                (
+                                    "output.content"
+                                    if "content"
+                                    in provenance_result.get("output", {})
+                                    else "output.value"
+                                ),
                             )
                         }
                         if provenance_result is not None
@@ -708,8 +776,44 @@ def main() -> int:
         )
         return 0
 
-    if mode == "browser_summary":
-        url = _clean_message(args.prompt)
+    if mode in {
+        "browser_summary",
+        "browser_failure_handoff",
+        "browser_invalid_completed",
+    }:
+        if mode == "browser_failure_handoff":
+            emit(
+                {
+                    "type": "tool.requested",
+                    "payload": {
+                        "callId": "call-preflight",
+                        "capabilityRef": "lookup.table",
+                        "action": "lookup",
+                        "actionKind": "transform",
+                        "arguments": {"key": "q1"},
+                        "effect": "none",
+                        "idempotent": True,
+                    },
+                }
+            )
+            preflight = read_tool_result("call-preflight")
+            if preflight["status"] != "succeeded":
+                emit(
+                    {
+                        "type": "agent.failed",
+                        "payload": {
+                            "code": preflight["error"]["code"],
+                            "message": preflight["error"]["message"],
+                            "retryable": preflight["error"].get(
+                                "retryable", False
+                            ),
+                            "callId": "call-preflight",
+                        },
+                    }
+                )
+                return 0
+        url_match = re.search(r"https?://[^\s\"}]+", args.prompt)
+        url = url_match.group(0) if url_match else _clean_message(args.prompt)
         parsed_url = urlsplit(url)
         browser_capability = "browser.read"
         summary_capability = "summarize.text"
@@ -749,14 +853,30 @@ def main() -> int:
         )
         tool_result = read_tool_result("call-browser")
         if tool_result["status"] != "succeeded":
+            if mode == "browser_invalid_completed":
+                emit(
+                    {
+                        "type": "agent.completed",
+                        "payload": {
+                            "steps": 1,
+                            "totalTokens": 10,
+                            "output": {
+                                "reply": tool_result["error"]["message"]
+                            },
+                        },
+                    }
+                )
+                return 0
             emit(
                 {
-                    "type": "agent.completed",
+                    "type": "agent.failed",
                     "payload": {
-                        "steps": 1,
-                        "totalTokens": 10,
-                        "output": {"reply": tool_result["error"]["message"]},
-                        "provenance": [{"callId": "call-browser", "path": "error"}],
+                        "code": tool_result["error"]["code"],
+                        "message": tool_result["error"]["message"],
+                        "retryable": tool_result["error"].get(
+                            "retryable", False
+                        ),
+                        "callId": "call-browser",
                     },
                 }
             )

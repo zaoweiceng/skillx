@@ -56,6 +56,14 @@ class DemoStack:
         response = httpx.get(f"{self.form_url}/__set-article", params={"body": body}, timeout=5)
         response.raise_for_status()
 
+    def set_transient_healthy(self, healthy: bool) -> None:
+        response = httpx.get(
+            f"{self.form_url}/__set-transient",
+            params={"healthy": str(healthy).lower()},
+            timeout=5,
+        )
+        response.raise_for_status()
+
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

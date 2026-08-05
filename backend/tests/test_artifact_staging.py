@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import pytest
 from sqlalchemy import select, update
 
 from app.application.orchestrator import Orchestrator, WorkerService, reconcile_run_artifacts
@@ -16,7 +17,7 @@ from app.infrastructure.database import (
     WorkflowVersion,
     utcnow,
 )
-from app.runtime.executors import write_json_artifact
+from app.runtime.executors import promote_staged_artifact, write_json_artifact
 
 
 def artifact_workflow() -> dict[str, Any]:
@@ -234,3 +235,81 @@ async def test_reconcile_reports_unrecoverable_missing_file() -> None:
     async with SessionLocal() as session, session.begin():
         report = await reconcile_run_artifacts(session, run_id)
     assert len(report["missing"]) == 1
+
+
+async def test_reconcile_rejects_escaped_workflow_storage_key() -> None:
+    run_id, _ = await _make_run()
+    artifact = write_json_artifact(
+        run_id, str(uuid4()), "agent", "escaped.json", "report", {"v": 1}
+    )
+    async with SessionLocal() as session, session.begin():
+        session.add(
+            Artifact(
+                id=artifact["id"],
+                run_id=run_id,
+                kind=artifact["kind"],
+                name=artifact["name"],
+                uri=artifact["uri"],
+                sha256=artifact["sha256"],
+                size=artifact["size"],
+                media_type=artifact["mediaType"],
+                metadata_json={
+                    "storageKey": "../../escaped.json",
+                    "stagingKey": artifact["stagingKey"],
+                },
+            )
+        )
+    async with SessionLocal() as session, session.begin():
+        report = await reconcile_run_artifacts(session, run_id)
+    assert artifact["id"] in report["pathRejected"]
+
+
+async def test_reconcile_repairs_corrupt_final_from_valid_staging() -> None:
+    run_id, _ = await _make_run()
+    artifact = write_json_artifact(
+        run_id, str(uuid4()), "agent", "repair.json", "report", {"v": 1}
+    )
+    root = _run_root(run_id)
+    target = root / artifact["storageKey"]
+    target.write_bytes(b"corrupt")
+    async with SessionLocal() as session, session.begin():
+        session.add(
+            Artifact(
+                id=artifact["id"],
+                run_id=run_id,
+                kind=artifact["kind"],
+                name=artifact["name"],
+                uri=artifact["uri"],
+                sha256=artifact["sha256"],
+                size=artifact["size"],
+                media_type=artifact["mediaType"],
+                metadata_json={
+                    "storageKey": artifact["storageKey"],
+                    "stagingKey": artifact["stagingKey"],
+                },
+            )
+        )
+    async with SessionLocal() as session, session.begin():
+        report = await reconcile_run_artifacts(session, run_id)
+    assert artifact["id"] in report["corrupt"]
+    assert artifact["id"] in report["recovered"]
+    assert target.read_bytes() != b"corrupt"
+
+
+async def test_promote_rejects_existing_corrupt_target_without_valid_staging() -> None:
+    run_id, _ = await _make_run()
+    artifact = write_json_artifact(
+        run_id, str(uuid4()), "agent", "target.json", "report", {"v": 1}
+    )
+    root = _run_root(run_id)
+    target = root / artifact["storageKey"]
+    target.write_bytes(b"corrupt")
+    staging = (
+        root
+        / ".staging"
+        / artifact["stagingKey"]["nodeRunId"]
+        / artifact["stagingKey"]["file"]
+    )
+    staging.unlink()
+    with pytest.raises(ValueError, match="target 已损坏"):
+        promote_staged_artifact(run_id, artifact)

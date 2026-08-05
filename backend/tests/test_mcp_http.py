@@ -219,7 +219,7 @@ async def test_http_tool_error_maps_to_dependency_unavailable(
     assert outcome.retryable is True
 
 
-async def test_http_timeout_maps_to_dependency_unavailable(
+async def test_http_timeout_maps_to_timeout(
     http_mcp: type[MCPHttpHandler],
 ) -> None:
     http_mcp.slow = True
@@ -230,7 +230,7 @@ async def test_http_timeout_maps_to_dependency_unavailable(
     async with SessionLocal() as session:
         outcome = await call_snapshot_through_contract(session, snapshot_id, {"city": "成都"})
     assert outcome.status == "failed"
-    assert outcome.error_code == "DEPENDENCY_UNAVAILABLE"
+    assert outcome.error_code == "TIMEOUT"
 
 
 async def test_http_input_validation_rejects_before_call(
@@ -355,4 +355,3 @@ async def test_http_reconnects_after_session_expiry(
     assert outcome.output == {"temperature": 21.5}
     # 触发过一次会话过期，说明重连路径被执行。
     assert MCPHttpHandler._expired is True
-

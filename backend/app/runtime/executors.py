@@ -11,8 +11,14 @@ from typing import Any, Protocol
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
+from app.application.artifact_integrity import (
+    artifact_file_matches,
+    safe_artifact_path,
+)
 from app.application.compiler import digest_json
 from app.application.mcp import call_mcp_contract
 from app.application.secrets import contains_secret
@@ -33,6 +39,7 @@ from app.runtime.models import FakeModelAdapter, OpenAICompatibleAdapter
 from app.runtime.playwright_browser import (
     BrowserExecutionError,
     BrowserSubmitUnknownOutcome,
+    BrowserTransportError,
     PlaywrightPageSession,
 )
 from app.runtime.skillx_host import execute_in_subprocess
@@ -73,8 +80,7 @@ def list_final_files(run_id: str) -> set[str]:
 def promote_staged_artifact(run_id: str, artifact: dict[str, Any]) -> None:
     """把暂存文件原子移动到 run 根下的最终 storageKey 位置。
 
-    幂等：若最终文件已存在（例如重复落位），直接跳过；若暂存源已不存在但目标已存在，
-    视为已落位。仅当源与目标都缺失时才是真正的数据缺失，由 GC/恢复流程处理。
+    幂等成功必须以 size/sha256 一致为前提；损坏 target 只能由有效 staging 修复。
     """
 
     staging_key = artifact.get("stagingKey")
@@ -82,14 +88,32 @@ def promote_staged_artifact(run_id: str, artifact: dict[str, Any]) -> None:
         return
     run_root = (get_settings().artifact_root / run_id).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
-    source = (_staging_dir(run_id, staging_key["nodeRunId"]) / staging_key["file"]).resolve()
-    target = (run_root / artifact["storageKey"]).resolve()
-    if not target.is_relative_to(run_root):
-        raise ValueError("Artifact 落位路径越界")
+    staging_root = (run_root / ".staging").resolve()
+    source = safe_artifact_path(
+        staging_root,
+        f"{staging_key['nodeRunId']}/{staging_key['file']}",
+    )
+    target = safe_artifact_path(
+        run_root,
+        artifact["storageKey"],
+        forbidden_root=staging_root,
+    )
+    expected = {
+        "size": int(artifact["size"]),
+        "sha256": str(artifact["sha256"]),
+    }
     if target.exists():
-        return
+        if artifact_file_matches(target, **expected):
+            source.unlink(missing_ok=True)
+            return
+        if not source.exists() or not artifact_file_matches(source, **expected):
+            raise ValueError("Artifact target 已损坏且无有效 staging 可恢复")
+        target.unlink()
     if not source.exists():
         return
+    if not artifact_file_matches(source, **expected):
+        raise ValueError("Artifact staging 内容与登记的 size/sha256 不一致")
+    target.parent.mkdir(parents=True, exist_ok=True)
     os.replace(source, target)
 
 
@@ -588,12 +612,19 @@ class BrowserContractExecutor:
                     ),
                 )
             try:
+                navigation_timeout_ms = min(
+                    int(node.config.get("navigationTimeoutMs", 15000)),
+                    max(100, node.timeout_seconds * 1000 - 250),
+                )
                 async with PlaywrightPageSession(
                     context.run_id,
                     node.id,
                     url,
                     contract,
-                    node.config,
+                    {
+                        **node.config,
+                        "navigationTimeoutMs": navigation_timeout_ms,
+                    },
                     context.node_run_id,
                 ) as browser:
                     context.cancellation.check()
@@ -608,6 +639,24 @@ class BrowserContractExecutor:
                         observed,
                         browser,
                     )
+            except PlaywrightTimeoutError as exc:
+                return NodeResult(
+                    status="failed",
+                    error=ExecutionError(
+                        code="TIMEOUT",
+                        message=f"Playwright 导航超时: {exc}",
+                        retryable=not node.side_effect,
+                    ),
+                )
+            except BrowserTransportError as exc:
+                return NodeResult(
+                    status="failed",
+                    error=ExecutionError(
+                        code="DEPENDENCY_UNAVAILABLE",
+                        message=f"Playwright transport 失败: {exc}",
+                        retryable=not node.side_effect,
+                    ),
+                )
             except BrowserExecutionError as exc:
                 return NodeResult(
                     status="failed",
@@ -616,7 +665,7 @@ class BrowserContractExecutor:
                         message=str(exc),
                     ),
                 )
-            except Exception as exc:
+            except PlaywrightError as exc:
                 return NodeResult(
                     status="failed",
                     error=ExecutionError(
@@ -679,13 +728,20 @@ class BrowserContractExecutor:
                 urlPattern=contract.url_pattern,
                 fields=[],
             )
+            navigation_timeout_ms = min(
+                contract.timeout_ms,
+                max(100, node.timeout_seconds * 1000 - 250),
+            )
             try:
                 async with PlaywrightPageSession(
                     context.run_id,
                     node.id,
                     url,
                     page_contract,
-                    {**node.config, "navigationTimeoutMs": contract.timeout_ms},
+                    {
+                        **node.config,
+                        "navigationTimeoutMs": navigation_timeout_ms,
+                    },
                     context.node_run_id,
                 ) as browser:
                     context.cancellation.check()
@@ -693,17 +749,36 @@ class BrowserContractExecutor:
                         contract.body_selector, contract.fields
                     )
                     artifacts = browser.artifacts
-            except BrowserExecutionError as exc:
+            except PlaywrightTimeoutError as exc:
                 return NodeResult(
                     status="failed",
-                    error=ExecutionError(code="EXECUTION_FAILED", message=str(exc)),
+                    error=ExecutionError(
+                        code="TIMEOUT",
+                        message=f"Playwright 导航超时: {exc}",
+                        retryable=True,
+                    ),
                 )
-            except Exception as exc:
+            except BrowserTransportError as exc:
                 return NodeResult(
                     status="failed",
                     error=ExecutionError(
                         code="DEPENDENCY_UNAVAILABLE",
                         message=f"Playwright 读取失败: {exc}",
+                        retryable=contract.retryable,
+                    ),
+                )
+            except BrowserExecutionError as exc:
+                return NodeResult(
+                    status="failed",
+                    output={"url": url},
+                    error=ExecutionError(code="PAGE_DRIFT", message=str(exc)),
+                )
+            except PlaywrightError as exc:
+                return NodeResult(
+                    status="failed",
+                    error=ExecutionError(
+                        code="DEPENDENCY_UNAVAILABLE",
+                        message=f"Playwright transport 失败: {exc}",
                         retryable=contract.retryable,
                     ),
                 )

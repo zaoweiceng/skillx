@@ -12,6 +12,7 @@ from typing import Any
 from jsonschema import Draft202012Validator
 
 from app.application.agent_events import AgentEventError, AgentEventValidator
+from app.application.error_policy import error_policy
 from app.application.tool_broker import (
     ToolAdapterRegistry,
     ToolBrokerError,
@@ -32,9 +33,21 @@ from app.runtime.adapters import AdapterError, AgentRunRequest, TraeXSubprocessA
 class AgentHostError(Exception):
     """AgentHost 执行过程中的确定性失败，携带稳定 error code。"""
 
-    def __init__(self, code: str, message: str) -> None:
-        self.code = code
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool | None = None,
+        failed_call_id: str | None = None,
+        protocol_violation: str | None = None,
+    ) -> None:
+        policy = error_policy(code)
+        self.code = policy.code
         self.message = message
+        self.retryable = policy.retryable if retryable is None else retryable
+        self.failed_call_id = failed_call_id
+        self.protocol_violation = protocol_violation
         super().__init__(message)
 
 
@@ -145,6 +158,7 @@ class AgentHost:
         open_calls: dict[str, dict[str, Any]] = {}
         broker_results: set[str] = set()
         broker_payloads: dict[str, dict[str, Any]] = {}
+        failed_tool_result: dict[str, Any] | None = None
         output: dict[str, Any] | None = None
 
         try:
@@ -218,6 +232,8 @@ class AgentHost:
                         broker_payloads[request_payload["callId"]] = runtime_result[
                             "payload"
                         ]
+                        if runtime_result["payload"].get("status") == "failed":
+                            failed_tool_result = runtime_result["payload"]
                         continue
                     try:
                         runtime_event, audit_event = validator.validate_pair(raw)
@@ -229,6 +245,14 @@ class AgentHost:
                         ) from exc
                     except AgentEventError as exc:
                         await self._cancel(adapter, request.run_id)
+                        if (
+                            failed_tool_result is not None
+                            and raw.get("type") == "agent.completed"
+                        ):
+                            raise self._failed_tool_error(
+                                failed_tool_result,
+                                protocol_violation=str(exc),
+                            ) from exc
                         raise AgentHostError("AGENT_EVENT_INVALID", str(exc)) from exc
 
                     result.runtime_events.append(runtime_event)
@@ -271,8 +295,13 @@ class AgentHost:
                                     payload.get("outputProvenance"),
                                     broker_payloads,
                                 )
-                            except AgentHostError:
+                            except AgentHostError as exc:
                                 await self._cancel(adapter, request.run_id)
+                                if failed_tool_result is not None:
+                                    raise self._failed_tool_error(
+                                        failed_tool_result,
+                                        protocol_violation=exc.message,
+                                    ) from exc
                                 raise
                         final_tokens = payload.get("totalTokens")
                         if final_tokens is not None:
@@ -298,12 +327,37 @@ class AgentHost:
                                     f"{request.max_total_tokens}",
                                 )
                             result.total_tokens = final_tokens
+                    elif event_type == "agent.failed":
+                        await self._cancel(adapter, request.run_id)
+                        if failed_tool_result is not None:
+                            call_id = payload.get("callId")
+                            if call_id != failed_tool_result.get("callId"):
+                                raise self._failed_tool_error(
+                                    failed_tool_result,
+                                    protocol_violation=(
+                                        "agent.failed.callId 未指向最后一个 failed ToolResult"
+                                    ),
+                                )
+                            raise self._failed_tool_error(failed_tool_result)
+                        raise AgentHostError(
+                            payload["code"],
+                            payload["message"],
+                            retryable=payload["retryable"],
+                            failed_call_id=payload.get("callId"),
+                        )
         except TimeoutError as exc:
             await self._cancel(adapter, request.run_id)
             raise AgentHostError("TIMEOUT", "Agent 运行超时，已取消") from exc
         except AdapterError as exc:
+            if failed_tool_result is not None:
+                raise self._failed_tool_error(
+                    failed_tool_result,
+                    protocol_violation=f"Agent 子进程提前退出: {exc}",
+                ) from exc
             raise AgentHostError("EXECUTION_FAILED", str(exc)) from exc
 
+        if output is None and failed_tool_result is not None:
+            raise self._failed_tool_error(failed_tool_result)
         if output is None:
             raise AgentHostError("EXECUTION_FAILED", "Agent 未返回结构化输出")
         errors = list(Draft202012Validator(request.output_schema).iter_errors(output))
@@ -314,6 +368,21 @@ class AgentHost:
             )
         result.output = output
         return result
+
+    @staticmethod
+    def _failed_tool_error(
+        payload: dict[str, Any],
+        *,
+        protocol_violation: str | None = None,
+    ) -> AgentHostError:
+        error = payload.get("error") or {}
+        return AgentHostError(
+            str(error.get("code", "EXECUTION_FAILED")),
+            str(error.get("message", "Tool 执行失败")),
+            retryable=bool(error.get("retryable", False)),
+            failed_call_id=str(payload.get("callId", "")) or None,
+            protocol_violation=protocol_violation,
+        )
 
     @staticmethod
     def _validate_output_provenance(
@@ -450,15 +519,29 @@ class AgentHost:
                         **self._tool_result_metadata(payload),
                     },
                 }
-            output = await self._tool_registry.execute(
-                capability_ref,
-                ToolExecutionContext(
-                    run_id=request.run_id,
-                    call_id=payload["callId"],
-                    working_directory=request.working_directory,
-                ),
-                payload["arguments"],
-            )
+            attempts = 0
+            while True:
+                attempts += 1
+                try:
+                    output = await self._tool_registry.execute(
+                        capability_ref,
+                        ToolExecutionContext(
+                            run_id=request.run_id,
+                            call_id=payload["callId"],
+                            working_directory=request.working_directory,
+                        ),
+                        payload["arguments"],
+                    )
+                    break
+                except ToolBrokerError as exc:
+                    policy = error_policy(exc.code)
+                    if (
+                        not policy.retryable
+                        or descriptor["effect"] != "none"
+                        or attempts >= policy.max_attempts
+                    ):
+                        raise
+                    await asyncio.sleep(policy.backoff_seconds)
             evidence = {"status": "succeeded", "output": output}
             return {
                 "type": "tool.result",
@@ -472,6 +555,7 @@ class AgentHost:
                     "idempotent": descriptor["idempotent"],
                     "fixturePolicy": descriptor["fixturePolicy"],
                     "actionSignature": signature,
+                    "attempts": attempts,
                     **self._tool_result_metadata(
                         payload,
                         self._tool_registry.distillation_evidence(
@@ -487,7 +571,12 @@ class AgentHost:
                 payload["arguments"],
                 effect=descriptor["effect"],
             )
-            error = {"code": exc.code, "message": exc.message}
+            policy = error_policy(exc.code)
+            error = {
+                "code": policy.code,
+                "message": exc.message,
+                "retryable": policy.retryable,
+            }
             evidence = {"status": "failed", "error": error}
             return {
                 "type": "tool.result",
@@ -501,6 +590,7 @@ class AgentHost:
                     "idempotent": descriptor["idempotent"],
                     "fixturePolicy": descriptor["fixturePolicy"],
                     "actionSignature": signature,
+                    "attempts": locals().get("attempts", 1),
                     **self._tool_result_metadata(payload),
                 },
             }
@@ -525,6 +615,14 @@ class AgentHost:
         observations.update(adapter_evidence or {})
         observations["resultSource"] = "host_tool_broker"
         metadata["observations"] = observations
+        metadata["argumentsDigest"] = "sha256:" + hashlib.sha256(
+            json.dumps(
+                payload.get("arguments", {}),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         return metadata
 
     @staticmethod
