@@ -10,6 +10,7 @@ const sendMessage = vi.fn()
 const startAgentRun = vi.fn()
 const getConversationRun = vi.fn()
 const listConversationRunEvents = vi.fn()
+const getRun = vi.fn()
 const createConversation = vi.fn()
 
 vi.mock('@/api/client', () => ({
@@ -21,6 +22,7 @@ vi.mock('@/api/client', () => ({
     startAgentRun: (...args: unknown[]) => startAgentRun(...args),
     getConversationRun: (...args: unknown[]) => getConversationRun(...args),
     listConversationRunEvents: (...args: unknown[]) => listConversationRunEvents(...args),
+    getRun: (...args: unknown[]) => getRun(...args),
     distillConversationRun: vi.fn(),
   },
 }))
@@ -79,6 +81,7 @@ describe('ChatPage 候选组件闭环', () => {
     startAgentRun.mockReset()
     getConversationRun.mockReset()
     listConversationRunEvents.mockReset()
+    getRun.mockReset()
     createConversation.mockReset()
     createConversation.mockResolvedValue({ id: 'conv-1', title: '新对话' })
   })
@@ -199,5 +202,123 @@ describe('ChatPage 候选组件闭环', () => {
     renderAt('conv-1')
     await waitFor(() => expect(screen.getByText(/仅 succeeded 可固化/)).toBeInTheDocument())
     expect(screen.queryByRole('button', { name: '固化为组件' })).not.toBeInTheDocument()
+  })
+
+  it('sendMessage 直接返回自动 AgentRun 时兼容缺少 runType 的历史消息', async () => {
+    const automaticAgentMessage = {
+      id: 'auto-agent',
+      role: 'assistant',
+      content: {
+        type: 'agent_run',
+        state: 'queued',
+        text: '已由通用 Agent 继续处理。',
+        conversationRunId: 'crun-auto',
+      },
+    }
+    getConversation
+      .mockResolvedValueOnce({
+        id: 'conv-1',
+        title: '新对话',
+        boundComponentId: null,
+        messages: [],
+      })
+      .mockResolvedValue({
+        id: 'conv-1',
+        title: '新对话',
+        boundComponentId: null,
+        messages: [automaticAgentMessage],
+      })
+    sendMessage.mockResolvedValue({
+      userMessageId: 'u-auto',
+      assistant: automaticAgentMessage.content,
+    })
+    getConversationRun.mockResolvedValue({
+      id: 'crun-auto',
+      conversationId: 'conv-1',
+      status: 'succeeded',
+      runType: 'agent_run',
+      input: {},
+      output: { reply: '自动探索完成' },
+      error: null,
+    })
+    listConversationRunEvents.mockResolvedValue([
+      { seq: 1, type: 'agent.run.succeeded', payload: {} },
+    ])
+
+    renderAt('conv-1')
+    await waitFor(() => expect(screen.getByLabelText('对话输入')).toBeEnabled())
+    fireEvent.change(screen.getByLabelText('对话输入'), {
+      target: { value: '读取网页并总结' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: /发送|处理中/ }))
+
+    await waitFor(() => expect(screen.getByText('自动探索完成')).toBeInTheDocument())
+    expect(screen.getByRole('button', { name: '固化为组件' })).toBeInTheDocument()
+  })
+
+  it('刷新后直接展示 Workflow succeeded 的持久输出且不重复', async () => {
+    getConversation.mockResolvedValue({
+      id: 'conv-1',
+      title: '复用结果',
+      boundComponentId: null,
+      messages: [
+        {
+          id: 'workflow-1',
+          role: 'assistant',
+          content: {
+            type: 'workflow_run',
+            state: 'workflow_run',
+            text: '选择已执行，后续由 Workflow Runtime 接管。',
+            runId: 'run-1',
+          },
+        },
+      ],
+    })
+    getRun.mockResolvedValue({
+      id: 'run-1',
+      status: 'succeeded',
+      output: { reply: '第二次复用的新摘要' },
+      error: null,
+    })
+
+    renderAt('conv-1')
+
+    await waitFor(() => expect(screen.getByText('第二次复用的新摘要')).toBeInTheDocument())
+    expect(screen.getAllByText('第二次复用的新摘要')).toHaveLength(1)
+    expect(screen.getByRole('link', { name: '查看运行' })).toHaveAttribute(
+      'href',
+      '/runs/run-1',
+    )
+  })
+
+  it('Workflow failed 显示稳定错误码和消息', async () => {
+    getConversation.mockResolvedValue({
+      id: 'conv-1',
+      title: '失败结果',
+      boundComponentId: null,
+      messages: [
+        {
+          id: 'workflow-failed',
+          role: 'assistant',
+          content: {
+            type: 'workflow_run',
+            state: 'workflow_run',
+            text: '选择已执行，后续由 Workflow Runtime 接管。',
+            runId: 'run-failed',
+          },
+        },
+      ],
+    })
+    getRun.mockResolvedValue({
+      id: 'run-failed',
+      status: 'failed',
+      output: null,
+      error: { code: 'DEPENDENCY_UNAVAILABLE', message: '上游暂不可用' },
+    })
+
+    renderAt('conv-1')
+
+    await waitFor(() => expect(screen.getByText('DEPENDENCY_UNAVAILABLE')).toBeInTheDocument())
+    expect(screen.getByText('上游暂不可用')).toBeInTheDocument()
   })
 })

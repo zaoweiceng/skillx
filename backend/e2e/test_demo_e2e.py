@@ -218,6 +218,63 @@ def test_e2e_5_agent_distillation_reuse(stack: DemoStack) -> None:
         assert "llm.call.completed" not in reuse_events
 
 
+def test_natural_message_entry_runs_read_only_browser_lookup_and_file(
+    stack: DemoStack,
+) -> None:
+    stack.set_article("自然入口网页正文")
+    tasks = [
+        (
+            (
+                f"{stack.form_url}/article "
+                "[[SELECTION:continue_agent]][[MODE:browser_summary]]"
+            ),
+            "自然入口网页正文",
+            "browser.read",
+        ),
+        (
+            "q2 [[SELECTION:continue_agent]][[MODE:deterministic]]",
+            "第二季度：营收增长 8%",
+            "lookup.table",
+        ),
+        (
+            (
+                "读取 source.txt [[SELECTION:continue_agent]]"
+                "[[MODE:local_summary]][[FILE:source.txt]]"
+                "[[CONTENT:自然入口文件正文]]"
+            ),
+            "自然入口文件正文",
+            "read.local",
+        ),
+    ]
+    with stack.client() as client:
+        for prompt, expected, capability in tasks:
+            conversation = client.post(
+                "/conversations", json={"title": f"自然入口-{capability}"}
+            ).json()
+            sent = client.post(
+                f"/conversations/{conversation['id']}/messages",
+                json={"content": prompt},
+            )
+            assert sent.status_code == 201, sent.text
+            assistant = sent.json()["assistant"]
+            assert assistant["type"] == "agent_run"
+            assert assistant["runType"] == "agent_run"
+            assert assistant["state"] == "queued"
+
+            summary = poll_conversation_run(
+                client, assistant["conversationRunId"], timeout=60
+            )
+            assert summary["status"] == "succeeded", summary
+            assert summary["output"] == {"reply": expected}
+            events = client.get(
+                f"/conversation-runs/{assistant['conversationRunId']}/events"
+            ).json()
+            created = next(
+                item for item in events if item["type"] == "agent.run.created"
+            )
+            assert capability in created["payload"]["allowedCapabilities"]
+
+
 def test_e2e_6_browser_submit_with_one_time_approval(stack: DemoStack) -> None:
     with stack.client() as client:
         component = _component(client, "费用提交（真实浏览器）")
@@ -906,6 +963,19 @@ def test_real_tool_failure_handoff_distill_and_second_reuse(
         assert continuation["output"] == {"reply": "恢复后的正文"}
         assert continuation["input"]["continuationOfConversationRunId"] == source_id
         assert continuation["input"]["continuationOfCheckpointId"] == checkpoint_id
+        browser_attempts = continuation["stepAttempts"]["browser"]
+        assert [item["attempt"] for item in browser_attempts] == [1, 2]
+        assert [item["status"] for item in browser_attempts] == [
+            "failed",
+            "succeeded",
+        ]
+        assert all(
+            item["argumentsDigest"].startswith("sha256:")
+            for item in browser_attempts
+        )
+        assert len(
+            {item["argumentsDigest"] for item in browser_attempts}
+        ) == 1
         assert stack.form_stats()["transientCount"] == 3
         continuation_events = client.get(
             f"/conversation-runs/{continuation_id}/events"
@@ -1227,6 +1297,14 @@ def test_continuation_legal_replan_creates_revision_two_artifact(
         assert (
             continuation["input"]["expectedPlanContract"]["revision"] == 1
         )
+        assert continuation["input"]["expectedPlanContract"][
+            "remainingRevisions"
+        ] == 1
+        assert continuation["replanBudget"] == {
+            "maxRevisions": 1,
+            "usedRevisions": 1,
+            "remainingRevisions": 0,
+        }
         events = client.get(
             f"/conversation-runs/{continuation_id}/events"
         ).json()
@@ -1235,6 +1313,10 @@ def test_continuation_legal_replan_creates_revision_two_artifact(
         ]
         assert [item["payload"]["newRevision"] for item in replans] == [2, 2]
         assert replans[1]["payload"]["idempotentReplay"] is True
+        assert all(
+            item["payload"]["replanBudget"]["usedRevisions"] == 1
+            for item in replans
+        )
         artifacts = client.get(
             f"/conversation-runs/{continuation_id}/artifacts"
         )
@@ -1342,6 +1424,11 @@ def test_legacy_transient_replan_requires_one_time_user_answer(
         assert checkpoint["status"] == "awaiting_user"
         assert checkpoint["remainingPlan"]["mode"] == "replan_required"
         assert checkpoint["pendingQuestion"]
+        assert checkpoint["replanBudget"] == {
+            "maxRevisions": 1,
+            "usedRevisions": 0,
+            "remainingRevisions": 1,
+        }
         answer = client.post(
             f"/task-checkpoints/{checkpoint_id}/answer",
             json={
@@ -1373,6 +1460,11 @@ def test_legacy_transient_replan_requires_one_time_user_answer(
             client, continuation_id, timeout=30
         )
         assert continuation["status"] == "succeeded", continuation
+        assert continuation["replanBudget"] == {
+            "maxRevisions": 1,
+            "usedRevisions": 1,
+            "remainingRevisions": 0,
+        }
         artifacts = client.get(
             f"/conversation-runs/{continuation_id}/artifacts"
         ).json()

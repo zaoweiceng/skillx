@@ -63,6 +63,9 @@ class WorkflowSelection(BaseModel):
     question: str | None = None
     plan: dict[str, Any] | None = None
     compiled_plan: dict[str, Any] | None = Field(default=None, alias="compiledPlan")
+    required_capabilities: list[str] = Field(
+        default_factory=list, alias="requiredCapabilities"
+    )
     session_id: str = Field(alias="sessionId")
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
@@ -79,6 +82,8 @@ class WorkflowSelection(BaseModel):
                 raise ValueError("continue_agent 需要 reason")
             if self.refs or self.plan is not None or self.compiled_plan is not None:
                 raise ValueError("continue_agent 禁止 refs/plan")
+        elif self.required_capabilities:
+            raise ValueError("requiredCapabilities 仅用于 continue_agent")
         elif self.action == "run_full":
             if len(self.refs) != 1 or not self.refs[0].startswith("workflow:"):
                 raise ValueError("run_full 需要恰好一个 workflowRef")

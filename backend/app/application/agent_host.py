@@ -37,6 +37,14 @@ from app.runtime.adapters import AdapterError, AgentRunRequest, TraeXSubprocessA
 # 联合、callId 配对、step/Token/time/payload 上限、输出 Schema 与取消。差异只在事件
 # 持久化 sink（ConversationRun 写 conversation_run_events；NodeRun 走 NodeResult.events）。
 
+LOCAL_DEMO_READ_ONLY_CAPABILITIES = (
+    "lookup.table",
+    "browser.read",
+    "read.local",
+    "summarize.text",
+)
+DEFAULT_MAX_REVISIONS = 1
+
 
 class AgentHostError(Exception):
     """AgentHost 执行过程中的确定性失败，携带稳定 error code。"""
@@ -82,6 +90,9 @@ class ExpectedPlanContract:
     step_outputs: dict[str, dict[str, Any]]
     artifact_outputs: dict[str, dict[str, Any]]
     continuation_generation: int
+    max_revisions: int = DEFAULT_MAX_REVISIONS
+    used_revisions: int = 0
+    remaining_revisions: int = DEFAULT_MAX_REVISIONS
     legacy_replan: bool = False
 
 
@@ -118,6 +129,9 @@ class AgentHostResult:
     plan_step_attempts: dict[str, list[dict[str, Any]]] = field(
         default_factory=dict
     )
+    max_revisions: int = DEFAULT_MAX_REVISIONS
+    used_revisions: int = 0
+    remaining_revisions: int = DEFAULT_MAX_REVISIONS
 
 
 # event_sink 接收 (runtime_event, audit_event)，由调用方决定如何持久化。
@@ -137,6 +151,36 @@ def resolve_effective_capabilities(requested: tuple[str, ...]) -> tuple[list[str
     host_granted = set(get_settings().agent_host_capabilities)
     effective = [item for item in requested if item in host_granted]
     denied = [item for item in requested if item not in host_granted]
+    return effective, denied
+
+
+def resolve_local_demo_capabilities(
+    requested: tuple[str, ...] | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Resolve a conversation Agent request against the read-only demo policy.
+
+    ``None`` means the server-owned exploration policy. An explicit list may
+    only narrow that policy; unknown, write-capable, or disabled capabilities
+    are returned in ``denied`` so callers can reject before enqueueing a run.
+    """
+
+    policy = set(LOCAL_DEMO_READ_ONLY_CAPABILITIES)
+    host_granted = set(get_settings().agent_host_capabilities)
+    candidates = LOCAL_DEMO_READ_ONLY_CAPABILITIES if requested is None else requested
+    effective = tuple(
+        capability
+        for capability in dict.fromkeys(candidates)
+        if capability in policy and capability in host_granted
+    )
+    denied = (
+        ()
+        if requested is None
+        else tuple(
+            capability
+            for capability in dict.fromkeys(candidates)
+            if capability not in policy or capability not in host_granted
+        )
+    )
     return effective, denied
 
 
@@ -212,8 +256,24 @@ class AgentHost:
         allowed_remaining_step_ids: set[str] | None = None
         source_checkpoint_id = ""
         accepted_replans: dict[str, AgentPlanSnapshot] = {}
+        max_revisions = DEFAULT_MAX_REVISIONS
+        used_revisions = 0
+        remaining_revisions = DEFAULT_MAX_REVISIONS
         if request.expected_plan is not None:
             expected = request.expected_plan
+            max_revisions = expected.max_revisions
+            used_revisions = expected.used_revisions
+            remaining_revisions = expected.remaining_revisions
+            if (
+                max_revisions < 0
+                or used_revisions < 0
+                or remaining_revisions < 0
+                or used_revisions + remaining_revisions != max_revisions
+            ):
+                raise AgentHostError(
+                    "EVIDENCE_CONFLICT",
+                    "expected plan revision budget 不一致",
+                )
             original_input = dict(expected.original_input)
             step_states = dict(expected.step_states)
             step_attempts = {
@@ -458,6 +518,28 @@ class AgentHost:
                                 raise AgentHostError(
                                     "AGENT_EVENT_INVALID", str(exc)
                                 ) from exc
+                            if (
+                                request.expected_plan is not None
+                                and request.expected_plan.legacy_replan
+                            ):
+                                if remaining_revisions <= 0:
+                                    raise AgentHostError(
+                                        "REPLAN_BUDGET_EXHAUSTED",
+                                        "legacy revision 1 已达到修订预算上限",
+                                    )
+                                used_revisions += 1
+                                remaining_revisions -= 1
+                                audit_event = {
+                                    **audit_event,
+                                    "payload": {
+                                        **audit_event["payload"],
+                                        "replanBudget": {
+                                            "maxRevisions": max_revisions,
+                                            "usedRevisions": used_revisions,
+                                            "remainingRevisions": remaining_revisions,
+                                        },
+                                    },
+                                }
                             plan_reported = True
                             step_states = {
                                 step.id: "remaining" for step in plan.steps
@@ -488,6 +570,11 @@ class AgentHost:
                         if accepted is not None:
                             plan = accepted
                         else:
+                            if remaining_revisions <= 0:
+                                raise AgentHostError(
+                                    "REPLAN_BUDGET_EXHAUSTED",
+                                    "计划修订预算已耗尽",
+                                )
                             try:
                                 current_state_digest = digest_json(step_states)
                                 plan = validate_agent_plan(
@@ -531,6 +618,8 @@ class AgentHost:
                                     "AGENT_EVENT_INVALID", str(exc)
                                 ) from exc
                             self._validate_plan_effects(plan)
+                            used_revisions += 1
+                            remaining_revisions -= 1
                             accepted_replans[patch_digest] = plan
                             revised_ids = {step.id for step in plan.steps}
                             step_states = {
@@ -563,6 +652,11 @@ class AgentHost:
                                 "newRevision": plan.revision,
                                 "patchDigest": patch_digest,
                                 "idempotentReplay": accepted is not None,
+                                "replanBudget": {
+                                    "maxRevisions": max_revisions,
+                                    "usedRevisions": used_revisions,
+                                    "remainingRevisions": remaining_revisions,
+                                },
                             },
                         }
                         result.plan_snapshot = plan.canonical()
@@ -706,6 +800,9 @@ class AgentHost:
         result.output = output
         result.plan_step_states = step_states
         result.plan_step_attempts = step_attempts
+        result.max_revisions = max_revisions
+        result.used_revisions = used_revisions
+        result.remaining_revisions = remaining_revisions
         if plan is not None:
             result.accepted_plan_digest = plan.digest
             result.accepted_plan_revision = plan.revision

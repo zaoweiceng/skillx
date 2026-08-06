@@ -1,4 +1,4 @@
-.PHONY: demo-check quality-check backend-check browser-install frontend-check migration-check e2e-check
+.PHONY: demo-check quality-check backend-check browser-install frontend-check migration-check e2e-check browser-ui-check
 
 # 完整验收：质量门禁 + docs/demo-acceptance.md 定义的真实黑盒 E2E。
 demo-check: quality-check e2e-check
@@ -20,6 +20,10 @@ migration-check:
 # 真实 API + 独立 Worker 子进程黑盒 E2E。浏览器安装独立执行，避免每次门禁重复下载。
 e2e-check: browser-install
 	cd backend && uv run pytest e2e -q -p no:cacheprovider
+
+browser-ui-check: browser-install
+	cd backend && uv run ruff check browser_e2e
+	cd backend && uv run pytest browser_e2e -q -p no:cacheprovider
 
 frontend-check:
 	cd frontend && npm run check

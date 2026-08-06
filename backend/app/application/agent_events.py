@@ -141,6 +141,9 @@ class ToolResultPayload(_PayloadBase):
     output: dict[str, Any] | None = None
     error: dict[str, Any] | None = None
     evidenceDigest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    argumentsDigest: str | None = Field(
+        default=None, pattern=r"^sha256:[0-9a-f]{64}$"
+    )
 
 
 class LogPayload(_PayloadBase):
@@ -323,6 +326,8 @@ class AgentEventValidator:
                 audit["status"] = payload["status"]
             if "evidenceDigest" in payload:
                 audit["evidenceDigest"] = payload["evidenceDigest"]
+            if payload.get("argumentsDigest"):
+                audit["argumentsDigest"] = payload["argumentsDigest"]
             if payload.get("reusedFromLedger") is True:
                 audit["reusedFromLedger"] = True
             if payload.get("planStepId"):

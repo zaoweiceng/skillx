@@ -17,6 +17,7 @@ from app.application.agent_host import (
     AgentHostRequest,
     ExpectedPlanContract,
     resolve_effective_capabilities,
+    resolve_local_demo_capabilities,
 )
 from app.application.artifact_integrity import (
     ArtifactPathError,
@@ -86,6 +87,7 @@ class AgentRunConfig:
     @staticmethod
     def default() -> AgentRunConfig:
         settings = get_settings()
+        allowed_capabilities, _ = resolve_local_demo_capabilities(None)
         return AgentRunConfig(
             output_schema={
                 "type": "object",
@@ -95,7 +97,7 @@ class AgentRunConfig:
             },
             max_steps=settings.agent_max_steps,
             max_total_tokens=settings.agent_max_total_tokens,
-            allowed_capabilities=("search.web",),
+            allowed_capabilities=allowed_capabilities,
             max_duration_seconds=settings.agent_max_duration_seconds,
         )
 
@@ -185,7 +187,12 @@ async def enqueue_agent_run(
         session,
         conversation_run.id,
         "agent.run.created",
-        {"conversationRunId": conversation_run.id, "input": {"message": content}},
+        {
+            "conversationRunId": conversation_run.id,
+            "input": {"message": content},
+            "capabilityPolicy": "local_demo_read_only",
+            "allowedCapabilities": list(config.allowed_capabilities),
+        },
     )
     return conversation_run
 
@@ -451,6 +458,15 @@ class AgentRunWorker:
                 continuation_generation=int(
                     expected_plan_data.get("continuationGeneration", 0)
                 ),
+                max_revisions=int(
+                    expected_plan_data.get("maxRevisions", 1)
+                ),
+                used_revisions=int(
+                    expected_plan_data.get("usedRevisions", 0)
+                ),
+                remaining_revisions=int(
+                    expected_plan_data.get("remainingRevisions", 1)
+                ),
                 legacy_replan=bool(
                     expected_plan_data.get("legacyReplan", False)
                 ),
@@ -530,6 +546,9 @@ class AgentRunWorker:
             accepted_plan_revision=result.accepted_plan_revision,
             plan_step_states=result.plan_step_states,
             plan_step_attempts=result.plan_step_attempts,
+            max_revisions=result.max_revisions,
+            used_revisions=result.used_revisions,
+            remaining_revisions=result.remaining_revisions,
         )
 
     async def _watch(
@@ -969,6 +988,9 @@ class AgentRunWorker:
         accepted_plan_revision: int | None = None,
         plan_step_states: dict[str, str] | None = None,
         plan_step_attempts: dict[str, list[dict[str, Any]]] | None = None,
+        max_revisions: int = 1,
+        used_revisions: int = 0,
+        remaining_revisions: int = 1,
     ) -> None:
         # 先把原始轨迹写入 staging（不落最终目录），DB 只保存受控 artifact:// 引用与 hash。
         staged = self._stage_trajectory(
@@ -980,6 +1002,11 @@ class AgentRunWorker:
             "acceptedPlanRevision": accepted_plan_revision,
             "stepStates": plan_step_states or {},
             "stepAttempts": plan_step_attempts or {},
+            "replanBudget": {
+                "maxRevisions": max_revisions,
+                "usedRevisions": used_revisions,
+                "remainingRevisions": remaining_revisions,
+            },
         }
         summary = {
             "totalTokens": total_tokens,
@@ -1093,6 +1120,40 @@ class AgentRunWorker:
         tool_artifacts = [
             item for item in artifacts if item.kind == "tool_result"
         ]
+        expected_contract = run.input_json.get("expectedPlanContract")
+        replan_budget = {
+            "maxRevisions": int(
+                (expected_contract or {}).get("maxRevisions", 1)
+            ),
+            "usedRevisions": int(
+                (expected_contract or {}).get("usedRevisions", 0)
+            ),
+            "remainingRevisions": int(
+                (expected_contract or {}).get("remainingRevisions", 1)
+            ),
+        }
+        for item in events:
+            persisted_budget = item.payload_json.get("replanBudget")
+            if isinstance(persisted_budget, dict):
+                replan_budget = {
+                    "maxRevisions": int(
+                        persisted_budget.get("maxRevisions", -1)
+                    ),
+                    "usedRevisions": int(
+                        persisted_budget.get("usedRevisions", -1)
+                    ),
+                    "remainingRevisions": int(
+                        persisted_budget.get("remainingRevisions", -1)
+                    ),
+                }
+        budget_integrity_error = None
+        if (
+            min(replan_budget.values()) < 0
+            or replan_budget["usedRevisions"]
+            + replan_budget["remainingRevisions"]
+            != replan_budget["maxRevisions"]
+        ):
+            budget_integrity_error = "replan revision budget 不一致"
         artifact_by_call = {
             str(item.metadata_json.get("callId")): item
             for item in tool_artifacts
@@ -1183,6 +1244,7 @@ class AgentRunWorker:
         remaining_steps: list[dict[str, Any]] = []
         step_states: dict[str, str] = {}
         step_attempts: dict[str, list[dict[str, Any]]] = {}
+        attempt_integrity_error: str | None = None
         if plan_snapshot is not None:
             for plan_step in plan_snapshot.get("steps", []):
                 step_id = str(plan_step.get("id"))
@@ -1193,26 +1255,105 @@ class AgentRunWorker:
                     if result_event is not None
                     else None
                 )
-                attempts = [
-                    {
-                        "planDigest": item.payload_json.get("planDigest")
-                        or plan_ref["digest"],
-                        "stepId": step_id,
-                        "attempt": item.payload_json.get("stepAttempt")
-                        or index,
-                        "callId": item.payload_json.get("callId"),
+                attempts = []
+                for item in result_events:
+                    call_id = str(item.payload_json.get("callId", ""))
+                    artifact = artifact_by_call.get(call_id)
+                    event_attempt = {
+                        "planDigest": item.payload_json.get("planDigest"),
+                        "stepId": item.payload_json.get("planStepId"),
+                        "attempt": item.payload_json.get("stepAttempt"),
+                        "callId": call_id,
                         "status": item.payload_json.get("status"),
                         "argumentsDigest": item.payload_json.get(
                             "argumentsDigest"
                         ),
-                        **(
-                            {"error": item.payload_json.get("error")}
-                            if item.payload_json.get("status") == "failed"
-                            else {}
-                        ),
                     }
-                    for index, item in enumerate(result_events, start=1)
-                ]
+                    artifact_attempt = (
+                        {
+                            "planDigest": artifact.metadata_json.get(
+                                "planDigest"
+                            ),
+                            "stepId": artifact.metadata_json.get(
+                                "planStepId"
+                            ),
+                            "attempt": artifact.metadata_json.get(
+                                "stepAttempt"
+                            ),
+                            "callId": str(
+                                artifact.metadata_json.get("callId", "")
+                            ),
+                            "status": artifact.metadata_json.get("status"),
+                            "argumentsDigest": artifact.metadata_json.get(
+                                "argumentsDigest"
+                            ),
+                        }
+                        if artifact is not None
+                        else None
+                    )
+                    if artifact is None or artifact_attempt != event_attempt:
+                        attempt_integrity_error = (
+                            f"step {step_id} call {call_id} 的 attempt "
+                            "事件与 ToolResult Artifact metadata 冲突"
+                        )
+                    elif not isinstance(
+                        event_attempt["argumentsDigest"], str
+                    ) or not str(event_attempt["argumentsDigest"]).startswith(
+                        "sha256:"
+                    ):
+                        attempt_integrity_error = (
+                            f"step {step_id} call {call_id} 缺少 argumentsDigest"
+                        )
+                    else:
+                        root = AgentRunWorker._trajectory_dir(run.id)
+                        try:
+                            artifact_path = safe_artifact_path(
+                                root,
+                                artifact.metadata_json.get("storageKey"),
+                                forbidden_root=root / ".staging",
+                            )
+                            if not artifact_record_matches(
+                                artifact_path, artifact
+                            ):
+                                raise ValueError(
+                                    "ToolResult Artifact 不存在或已损坏"
+                                )
+                            envelope = json.loads(
+                                artifact_path.read_bytes()
+                            )
+                            envelope_attempt = {
+                                "planDigest": envelope.get("planDigest"),
+                                "stepId": envelope.get("planStepId"),
+                                "attempt": envelope.get("stepAttempt"),
+                                "callId": str(envelope.get("callId", "")),
+                                "status": envelope.get("status"),
+                                "argumentsDigest": envelope.get(
+                                    "argumentsDigest"
+                                ),
+                            }
+                            if envelope_attempt != event_attempt:
+                                raise ValueError(
+                                    "ToolResult Artifact envelope 与事件冲突"
+                                )
+                        except (
+                            ArtifactPathError,
+                            ValueError,
+                            json.JSONDecodeError,
+                            UnicodeDecodeError,
+                        ) as exc:
+                            attempt_integrity_error = (
+                                f"step {step_id} call {call_id}: {exc}"
+                            )
+                    attempts.append(
+                        {
+                            **event_attempt,
+                            **(
+                                {"error": item.payload_json.get("error")}
+                                if item.payload_json.get("status") == "failed"
+                                else {}
+                            ),
+                        }
+                    )
                 step_attempts[step_id] = attempts
                 artifact = (
                     artifact_by_call.get(
@@ -1269,13 +1410,18 @@ class AgentRunWorker:
         pending_calls = sorted(
             str(call_id) for call_id in requested - closed if call_id
         )
+        integrity_error = (
+            plan_integrity_error
+            or budget_integrity_error
+            or attempt_integrity_error
+        )
         remaining_plan = (
             {
                 "mode": "integrity_failed",
-                "reason": plan_integrity_error,
+                "reason": integrity_error,
                 "steps": [],
             }
-            if plan_integrity_error
+            if integrity_error
             else {
                 "mode": "execute_remaining",
                 "planDigest": plan_ref["digest"],
@@ -1322,6 +1468,7 @@ class AgentRunWorker:
             "planSnapshot": plan_ref,
             "stepStates": step_states,
             "stepAttempts": step_attempts,
+            "replanBudget": replan_budget,
             "artifactRefs": artifact_refs,
             "continuationGeneration": int(
                 run.input_json.get("continuationGeneration", 0)
@@ -1365,6 +1512,7 @@ class AgentRunWorker:
             "stepStates": step_states,
             "stepAttempts": step_attempts,
             "stepStateDigest": digest_json(step_states),
+            "replanBudget": replan_budget,
             "continuationGeneration": int(
                 run.input_json.get("continuationGeneration", 0)
             ),
@@ -1390,12 +1538,8 @@ class AgentRunWorker:
                         "源运行没有结构化计划。确认允许 Host 在原能力锁和预算内"
                         "生成受限 PlanSnapshot revision 1？"
                     ),
-                    "replanBudget": {
-                        "maxRevisions": 1,
-                        "remainingRevisions": 1,
-                    },
                 }
-                if plan_ref is None and plan_integrity_error is None
+                if plan_ref is None and integrity_error is None
                 else {}
             ),
             "userContext": {"message": run.input_json.get("message", "")},
@@ -1407,7 +1551,7 @@ class AgentRunWorker:
             source_digest=source_digest,
             status=(
                 "terminal"
-                if plan_integrity_error
+                if integrity_error
                 else "awaiting_user"
                 if plan_ref is None and status == "pending"
                 else status
@@ -1546,9 +1690,29 @@ def build_trajectory(
     }
 
 
+def build_agent_run_message(
+    conversation_run: ConversationRun,
+    text: str,
+    **context: Any,
+) -> dict[str, Any]:
+    """Build the persisted assistant contract shared by every AgentRun entry."""
+
+    return {
+        "type": "agent_run",
+        "state": conversation_run.status,
+        "conversationRunId": conversation_run.id,
+        "runType": "agent_run",
+        "text": text,
+        **context,
+    }
+
+
 def summarize_run(conversation_run: ConversationRun) -> dict[str, Any]:
     """对话运行的 API 摘要视图（包含可恢复的长任务 handle 状态）。"""
 
+    plan_lineage = (conversation_run.trajectory_json or {}).get(
+        "planLineage", {}
+    )
     browser_evidence = []
     for action in (conversation_run.trajectory_json or {}).get("actions", []):
         observations = action.get("observations") or {}
@@ -1574,4 +1738,6 @@ def summarize_run(conversation_run: ConversationRun) -> dict[str, Any]:
         "attempt": conversation_run.attempt,
         "cancellationRequested": conversation_run.cancellation_requested_at is not None,
         "browserEvidence": browser_evidence,
+        "stepAttempts": plan_lineage.get("stepAttempts", {}),
+        "replanBudget": plan_lineage.get("replanBudget"),
     }

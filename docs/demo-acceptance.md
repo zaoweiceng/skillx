@@ -35,6 +35,9 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
 | Plan lifecycle | 过期前创建 Run → Plan 过期 → Worker 恢复 | plan status/source map | 禁止新 Run/固化，既有 Run 继续完成 |
 | Catalog active | 发布 v2 → search v2 → resolve v1 ref | Manifest status | v1 不占 top-k，但精确 ref 仍可运行 |
 | Real first browser | Agent browser.read → Browser Tool Broker | `tool.requested`、`tool.result` | Agent 输出逐字段 provenance 指向真实 ToolResult，正文非 TraeX fixture 常量 |
+| Natural read-only entry | `/chat` message → continue_agent → Browser/lookup/file | `agent.run.created`、`tool.*` | 不传 `allowedCapabilities`；服务端只授予已启用的受控只读 Broker |
+| Conversation result delivery | 新 Conversation → L0/L1 → Workflow Run terminal | `run.*`、持久 `runId` | succeeded output 或 failed code/message 直接显示在对话，刷新不丢失、不重复 |
+| Real UI main flow | Chat → distill/check/publish → reuse → RunDetail | DOM、SSE、console | Vite/Chromium 真实交互；成功/失败详情不白屏，console 无未捕获异常 |
 
 ## 通用失败判定
 
@@ -113,6 +116,10 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
   确认。总 continuation generation 默认上限为 3。
 - Host 为每个 revision 保存 remaining/running/succeeded/failed/unknown/skipped 状态和全部 attempts；
   唯一键是 plan digest + step id + attempt，callId 只承担传输配对。succeeded step 禁止重发。
+- revision 1 初始结构化计划不消耗 patch budget；legacy 首次生成 revision 1 消耗一次。
+  相同 patch digest 幂等重放不重复扣减，不同 patch 超限返回 `REPLAN_BUDGET_EXHAUSTED`。
+- 每个有 ToolResult Artifact 的 attempt 必须保存非空 `argumentsDigest`，且 event、Artifact metadata
+  与 Artifact envelope 三方一致；缺失或冲突进入 `integrity_failed/terminal`。
 - `claimGeneration` 是同一 checkpoint 的 lease fencing 代数；`continuationGeneration` 是业务接力链
   代数。Worker crash/reclaim 只增长前者，连续 continuation 失败才增长后者。
 - legacy `replan_required` 必须先进入 `awaiting_user`；snapshot digest CAS 一次性确认后，Host 才允许
@@ -133,6 +140,8 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
 
 ```bash
 make demo-check
+make browser-ui-check
 ```
 
-该命令必须完成空库迁移、后端检查与测试、前端检查与构建，以及本文件全部 E2E。
+两个命令必须分别完成空库迁移、后端/前端门禁、进程级 E2E，以及真实
+Vite/Chromium 用户主流程。Chromium 无权限时只能明确 skip 原因，不能用 mock 记为通过。

@@ -15,6 +15,8 @@ import { api, type Approval, type Run } from '@/api/client'
 import { StatusBadge } from '@/components/StatusBadge'
 import { useRunEvents, useRunStream } from '@/hooks/useRunStream'
 
+const EMPTY_EVENTS: never[] = []
+
 function JsonBlock({ value }: { value: unknown }) {
   return <pre className="json-block">{JSON.stringify(value, null, 2)}</pre>
 }
@@ -23,7 +25,8 @@ export default function RunDetailPage() {
   const { id } = useParams()
   const [run, setRun] = useState<Run>()
   const [error, setError] = useState('')
-  const events = useRunEvents((state) => (id ? state.events[id] ?? [] : []))
+  const selectedEvents = useRunEvents((state) => (id ? state.events[id] : undefined))
+  const events = selectedEvents ?? EMPTY_EVENTS
   // WorkflowPatch 治理：应用受控补丁 → 展示 replay diagnostics → 打开生成的 draft。
   const [patchDraft, setPatchDraft] = useState<{
     draftWorkflowId: string

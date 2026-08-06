@@ -1354,7 +1354,8 @@ def main() -> int:
         "deterministic_fail_after_tool",
     }:
         # Agent 只提交 key；整表、选值与固化 evidence 均由 Host Adapter 返回。
-        key = _clean_message(args.prompt)
+        key_match = re.search(r"\bq[1-4]\b", args.prompt)
+        key = key_match.group(0) if key_match else _clean_message(args.prompt)
         tool_name = allowed[0] if allowed else "lookup.table"
         emit(
             {
@@ -1601,6 +1602,9 @@ def main() -> int:
 
     if mode == "local_summary":
         path = _directive(args.prompt, "FILE", "source.txt")
+        fixture_content = _directive(args.prompt, "CONTENT", "")
+        if fixture_content:
+            Path(path).write_text(fixture_content, encoding="utf-8")
         emit(
             {
                 "type": "tool.requested",

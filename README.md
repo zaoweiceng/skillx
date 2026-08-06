@@ -15,13 +15,13 @@ SkillX Workflow 是一个契约驱动的可视化工作流平台。首次任务�
 | LLM 节点 | `available` | Executor 已接通；真实运行需环境配置，测试用 Fake Adapter |
 | Agent/TraeX | `available` | 唯一 `AgentHost` 信任边界（ConversationRun 与 Workflow Agent 共用）：requested∩host_granted、判别联合事件契约、callId 配对、step/Token/time/payload 上限、输出 Schema 与取消；事件双投影，审计只存脱敏摘要与 Artifact 引用，Secret 不落库 |
 | 通用对话调用组件 | `available` | 结构化意图候选、锁定版本快照摘要、补参确认启动 Workflow；单次模型答记为 `llm_response`；conversationId 写入 `/chat/:id` 路由可刷新恢复，候选卡片绑定来源用户消息 |
-| 通用 Agent 探索与固化 | `available` | Action group 必须连续且拓扑闭合，保留全部 capability digest；首次 Browser 正文由 Host 内真实 Browser Tool Broker 获取，轨迹登记为标准 Artifact |
-| 通用失败接力 | `available` | Host accepted PlanSnapshot 是 continuation execution source of truth；Host 物化并核对 step 参数，保存全部 attempts；Browser、lookup、file 共用 ContinuationRequest；claimGeneration 与 continuationGeneration 分离并有界终止 |
+| 通用 Agent 探索与固化 | `available` | 自然入口与显式入口共用 Local Demo 受控只读策略（Browser/lookup/file/summarize）和消息契约；首次 Browser 正文由 Host Broker 获取，刷新后仍可观察并固化 |
+| 通用失败接力 | `available` | Host accepted PlanSnapshot 是 continuation execution source of truth；Host 物化并核对参数，强制 revision budget，attempt arguments digest 与 Artifact 一致；Browser、lookup、file 共用有界 ContinuationRequest |
 | 失败可复现性与受控修订 | `available` | WorkflowVersion/PlanSnapshot 失败使用判别联合归因；Runtime/Replay 共用边选择与 Output Schema 终态，外部和副作用 replay 只接受捕获 fixture |
 | Workflow 能力目录与临时组合 | `available` | 持久 disclosure session 审计 L0/L1/L2 与预算；Selection-5 严格互斥；FragmentPort、Plan source map、TTL 恢复和 active-version catalog 已接通 |
 | MCP 副作用与幂等分类 | `available` | annotations 仅作提示且始终 `unreviewed`，分类创建**新的不可变快照**（旧快照/历史版本不变）；多 Tool Server 分类某 Tool 时克隆完整版本、分离远端 contract digest 与本地审核 digest，重复 discovery 稳定；0009 迁移用运行时 canonical 算法从行字段重算 remote-only contract_digest，非空 0008 升级后首次 discovery 不伪漂移；发布保存完整 lock，运行前逐项核对 digest/effect/idempotent/timeout，漂移即 `MCP_CONTRACT_DRIFT` fail closed |
 | 浏览器契约与一次性授权 | `available` | Playwright 隔离 Context、L2 漂移一次性授权重放、提交确认、L3 ContractPatch 草稿；Browser Read/Extract 作为只读 Adapter 用 `BrowserReadContract` 导航并抽取正文/结构化字段作为节点输出（URL 来自输入，第二次以新输入重新取数，不缓存首次结果）；人工审核补丁可应用到草稿（仅字段契约，L4 安全域不可改） |
-| 通配黑盒 E2E | `available` | `docs/demo-acceptance.md` 的 Runtime、Recovery、Catalog、Fragment、Plan、Replay 与真实 Browser 场景均纳入 `make demo-check` |
+| 通配黑盒 E2E | `available` | Runtime/Recovery/Catalog/Plan/Replay 纳入 `make demo-check`；自然探索→固化发布→复用结果→成功/失败详情由 `make browser-ui-check` 驱动真实 Vite/Chromium 验收 |
 | 可视化拖放编辑器 | `available` | 结构化 state 为唯一真相（JSON 降级为导入/导出视图），调色板新增节点、画布连线/删除、环检测、可编辑 Inspector 与 VariablePicker 写入映射、fallback 配置、发布治理；运行详情提供检查点接力视图（fallback target/审批状态/唯一 Recovery NodeRun）与受控 WorkflowPatch eligibility/replay 入口 |
 
 `available` 表示已接入主路径并有自动化测试；`partial` 表示主路径部分实现、仍有已知缺口；
@@ -109,6 +109,8 @@ npm run build
 - `make quality-check`：较快的静态/单元/进程内集成检查与前端构建。
 - `make demo-check`：在 `quality-check` 之上执行真实 API + 独立 Worker 子进程黑盒 E2E；
   场景数量和完成状态以 `docs/demo-acceptance.md` 为准。
+- `make browser-ui-check`：启动全新数据库、API、Worker、Vite、动态站点和 Chromium，
+  验证自然探索、固化发布、渐进复用、terminal output 与成功/失败运行详情。
 
 测试覆盖双 Worker fencing/CAS、原子并发配额、取消、超时、并行汇聚、SkillX 版本锁定、
 MCP STDIO/HTTP 与契约漂移、Hybrid/真实 TraeX Agent、轨迹固化与发布复用、浏览器一次性

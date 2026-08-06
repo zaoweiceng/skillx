@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { useRunEvents } from '@/hooks/useRunStream'
 import RunDetailPage from '@/pages/RunDetailPage'
 
 const getRun = vi.fn()
@@ -9,6 +10,28 @@ const approve = vi.fn()
 const reject = vi.fn()
 const applyWorkflowPatch = vi.fn()
 const proposeRevision = vi.fn()
+const eventSources: FakeEventSource[] = []
+
+class FakeEventSource {
+  listeners = new Map<string, EventListener>()
+  closed = false
+
+  constructor(public readonly url: string) {
+    eventSources.push(this)
+  }
+
+  addEventListener(type: string, listener: EventListener) {
+    this.listeners.set(type, listener)
+  }
+
+  removeEventListener(type: string) {
+    this.listeners.delete(type)
+  }
+
+  close() {
+    this.closed = true
+  }
+}
 
 vi.mock('@/api/client', () => ({
   api: {
@@ -20,13 +43,6 @@ vi.mock('@/api/client', () => ({
     cancelRun: vi.fn(),
   },
   eventStreamUrl: () => 'http://localhost/stream',
-}))
-
-// EventSource 在 jsdom 中不存在，且流不是本测试关注点。
-vi.mock('@/hooks/useRunStream', () => ({
-  useRunStream: () => undefined,
-  useRunEvents: (selector: (state: { events: Record<string, unknown[]> }) => unknown) =>
-    selector({ events: {} }),
 }))
 
 const baseRun = {
@@ -82,9 +98,33 @@ describe('RunDetailPage 可观测性与审批', () => {
     reject.mockReset()
     applyWorkflowPatch.mockReset()
     proposeRevision.mockReset()
+    eventSources.splice(0)
+    useRunEvents.setState({ events: {} })
+    vi.stubGlobal('EventSource', FakeEventSource)
   })
 
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    vi.unstubAllGlobals()
+  })
+
+  it('使用真实 Zustand store 时空事件快照稳定且 EventSource 不重复创建', async () => {
+    getRun.mockResolvedValue(baseRun)
+    renderPage()
+
+    await waitFor(() => expect(screen.getByText('等待新事件')).toBeInTheDocument())
+    expect(eventSources).toHaveLength(1)
+
+    useRunEvents.getState().add('run-1', {
+      runId: 'run-1',
+      seq: 1,
+      type: 'run.completed',
+      payload: { status: 'succeeded' },
+    })
+
+    await waitFor(() => expect(screen.getByText('run.completed')).toBeInTheDocument())
+    expect(eventSources).toHaveLength(1)
+  })
 
   it('展示节点耗时、指标与依赖版本', async () => {
     getRun.mockResolvedValue(baseRun)

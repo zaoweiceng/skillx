@@ -30,8 +30,10 @@ class Settings(BaseSettings):
     # 不能扩大。步数/Token/时长上限由 Host 独立强制，畸形事件 fail closed。
     agent_host_capabilities: list[str] = [
         "search.web",
+        "browser.read",
         "read.local",
         "lookup.table",
+        "summarize.text",
         "workflow.search",
         "workflow.describe",
         "workflow.describe_fragment",

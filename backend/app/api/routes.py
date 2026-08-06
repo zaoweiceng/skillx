@@ -14,9 +14,15 @@ from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
+from app.application.agent_host import (
+    AgentHost,
+    AgentHostError,
+    AgentHostRequest,
+    resolve_local_demo_capabilities,
+)
 from app.application.agent_run import (
     AgentRunConfig,
+    build_agent_run_message,
     enqueue_agent_run,
     request_cancellation,
     summarize_run,
@@ -232,6 +238,32 @@ class AgentRunCreate(BaseModel):
     content: str = Field(min_length=1)
     allowed_capabilities: list[str] | None = Field(default=None, alias="allowedCapabilities")
     max_steps: int | None = Field(default=None, alias="maxSteps", ge=1, le=32)
+
+
+def _resolve_agent_capabilities(
+    requested: list[str] | tuple[str, ...] | None,
+) -> tuple[str, ...]:
+    normalized = tuple(requested) if requested is not None else None
+    effective, denied = resolve_local_demo_capabilities(normalized)
+    if denied:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "AGENT_CAPABILITY_DENIED",
+                "message": "请求包含 Local Demo 只读探索策略未授予的能力",
+                "deniedCapabilities": list(denied),
+                "effectiveCapabilities": list(effective),
+            },
+        )
+    if not effective:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "AGENT_CAPABILITY_UNAVAILABLE",
+                "message": "当前 Host 未启用任何受控只读探索能力",
+            },
+        )
+    return effective
 
 
 class WorkflowSearchRequest(BaseModel):
@@ -3545,6 +3577,9 @@ async def _unbound_conversation_message(
             item.get("type") == "tool.requested" for item in tool_timeline
         )
         config = AgentRunConfig.default()
+        config.allowed_capabilities = _resolve_agent_capabilities(
+            selection.required_capabilities or None
+        )
         config.max_steps = max(1, config.max_steps - used_steps)
         continuation_context = [
             {
@@ -3582,12 +3617,10 @@ async def _unbound_conversation_message(
             "disclosureContext": continuation_context,
             "remainingBudget": remaining_budget,
         }
-        content = {
-            "type": "agent_run",
-            "state": "queued",
-            "conversationRunId": run.id,
-            "text": "目录中没有适合的已发布能力，已由通用 Agent 继续处理。",
-        }
+        content = build_agent_run_message(
+            run,
+            "目录中没有适合的已发布能力，已由通用 Agent 继续处理。",
+        )
         return (
             {
                 **content,
@@ -4042,11 +4075,7 @@ async def start_agent_run(
         output_schema=default_config.output_schema,
         max_steps=min(body.max_steps or default_config.max_steps, default_config.max_steps),
         max_total_tokens=default_config.max_total_tokens,
-        allowed_capabilities=tuple(
-            body.allowed_capabilities
-            if body.allowed_capabilities is not None
-            else default_config.allowed_capabilities
-        ),
+        allowed_capabilities=_resolve_agent_capabilities(body.allowed_capabilities),
         max_duration_seconds=default_config.max_duration_seconds,
     )
     conversation_run = await enqueue_agent_run(
@@ -4055,13 +4084,10 @@ async def start_agent_run(
         body.content,
         config=config,
     )
-    assistant_content = {
-        "type": "agent_run",
-        "state": "agent_run",
-        "text": "通用 Agent 已进入队列，运行事件将实时更新。",
-        "conversationRunId": conversation_run.id,
-        "runType": "agent_run",
-    }
+    assistant_content = build_agent_run_message(
+        conversation_run,
+        "通用 Agent 已进入队列，运行事件将实时更新。",
+    )
     assistant_message = Message(
         id=str(uuid4()),
         conversation_id=conversation.id,
@@ -4196,6 +4222,7 @@ async def get_task_checkpoint(
         "stepStates": snapshot.get("stepStates", {}),
         "stepAttempts": snapshot.get("stepAttempts", {}),
         "stepStateDigest": snapshot.get("stepStateDigest"),
+        "replanBudget": snapshot.get("replanBudget"),
         "budgetExhausted": snapshot.get("budgetExhausted"),
         "continuationError": snapshot.get("continuationError"),
         "completedActionLedger": snapshot.get("completedActionLedger", []),

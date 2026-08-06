@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.routes import (
     AgentRunCreate,
@@ -88,6 +88,31 @@ def test_effective_capabilities_is_intersection(monkeypatch: pytest.MonkeyPatch)
     effective, denied = resolve_effective_capabilities(("search.web", "banned.tool"))
     assert effective == ["search.web"]
     assert denied == ["banned.tool"]
+
+
+async def test_agent_endpoint_rejects_policy_violation_before_enqueue() -> None:
+    conversation_id = await _conversation()
+
+    async with SessionLocal() as session:
+        with pytest.raises(HTTPException) as exc_info:
+            await start_agent_run(
+                conversation_id,
+                AgentRunCreate(
+                    content="尝试写入",
+                    allowedCapabilities=["net.write"],
+                ),
+                session,
+            )
+    assert exc_info.value.status_code == 422
+    assert exc_info.value.detail["code"] == "AGENT_CAPABILITY_DENIED"
+
+    async with SessionLocal() as session:
+        run_count = await session.scalar(
+            select(func.count())
+            .select_from(ConversationRun)
+            .where(ConversationRun.conversation_id == conversation_id)
+        )
+    assert run_count == 0
 
 
 async def test_enqueue_creates_queued_run_without_executing(traex_stub: None) -> None:
@@ -306,6 +331,18 @@ async def test_task_checkpoint_claims_and_continues_from_tool_artifact(
     assert checkpoint.snapshot_json["completedSteps"][-1]["artifact"]["id"] == (
         artifacts[0].id
     )
+    attempt = checkpoint.snapshot_json["stepAttempts"]["lookup"][0]
+    assert attempt["argumentsDigest"].startswith("sha256:")
+    assert attempt["argumentsDigest"] == artifacts[0].metadata_json[
+        "argumentsDigest"
+    ]
+    assert attempt["planDigest"] == artifacts[0].metadata_json["planDigest"]
+    assert attempt["attempt"] == artifacts[0].metadata_json["stepAttempt"]
+    assert checkpoint.snapshot_json["replanBudget"] == {
+        "maxRevisions": 1,
+        "usedRevisions": 0,
+        "remainingRevisions": 1,
+    }
 
     driver = TaskCheckpointDriver("test-task-recovery")
     assert await driver.poll_once()
@@ -324,6 +361,55 @@ async def test_task_checkpoint_claims_and_continues_from_tool_artifact(
     assert continuation.output_json == {"reply": "第一季度：营收增长 12%"}
     assert continuation.input_json["continuationOfCheckpointId"] == checkpoint.id
     assert checkpoint.status == "succeeded"
+
+
+async def test_checkpoint_attempt_digest_conflict_is_terminal(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _conversation()
+    run_id = await _enqueue(
+        conversation_id,
+        "q1 [[MODE:deterministic_fail_after_tool]]",
+        config=AgentRunConfig(
+            output_schema=AgentRunConfig.default().output_schema,
+            allowed_capabilities=("lookup.table",),
+        ),
+    )
+    source = await _drive(run_id)
+    assert source.status == "failed"
+
+    async with SessionLocal() as session, session.begin():
+        previous = await session.scalar(
+            select(TaskCheckpoint).where(TaskCheckpoint.source_id == run_id)
+        )
+        artifact = await session.scalar(
+            select(Artifact).where(
+                Artifact.conversation_run_id == run_id,
+                Artifact.kind == "tool_result",
+            )
+        )
+        assert previous is not None and artifact is not None
+        await session.delete(previous)
+        await session.flush()
+        artifact.metadata_json = {
+            **artifact.metadata_json,
+            "argumentsDigest": "sha256:" + "0" * 64,
+        }
+        run = await session.get(ConversationRun, run_id)
+        checkpoint = await AgentRunWorker._create_task_checkpoint(
+            session,
+            run,
+            run.error_json,
+            status="pending",
+        )
+
+    assert checkpoint.status == "terminal"
+    assert checkpoint.snapshot_json["remainingPlan"]["mode"] == (
+        "integrity_failed"
+    )
+    assert "Artifact metadata 冲突" in checkpoint.snapshot_json[
+        "remainingPlan"
+    ]["reason"]
 
 
 @pytest.mark.parametrize(
@@ -395,10 +481,22 @@ async def test_generic_continuation_executes_frozen_remaining_plan(
     async with SessionLocal() as session:
         continuation = await session.get(ConversationRun, continuation_id)
         checkpoint = await session.get(TaskCheckpoint, checkpoint.id)
+        continuation_summary = await get_conversation_run(
+            continuation_id, session
+        )
     assert continuation.status == "succeeded"
     assert continuation.output_json == {"reply": expected_reply}
     assert continuation.input_json["continuationGeneration"] == 1
     assert checkpoint.status == "succeeded"
+    completed_attempts = continuation_summary["stepAttempts"][completed_id]
+    assert [item["attempt"] for item in completed_attempts] == [1]
+    attempts = continuation_summary["stepAttempts"]["transform"]
+    assert [item["attempt"] for item in attempts] == [1]
+    assert [item["status"] for item in attempts] == ["succeeded"]
+    assert all(
+        item["argumentsDigest"].startswith("sha256:")
+        for item in [*completed_attempts, *attempts]
+    )
 
 
 async def test_continuation_generation_budget_stops_retry_chain(

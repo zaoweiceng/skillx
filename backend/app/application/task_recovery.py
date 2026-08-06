@@ -252,6 +252,21 @@ class TaskCheckpointDriver:
                 for item in completed
                 if item.get("artifactId")
             }
+            replan_budget = dict(
+                checkpoint.snapshot_json.get("replanBudget") or {}
+            )
+            max_revisions = int(replan_budget.get("maxRevisions", 1))
+            used_revisions = int(replan_budget.get("usedRevisions", 0))
+            remaining_revisions = int(
+                replan_budget.get("remainingRevisions", 1)
+            )
+            if (
+                min(max_revisions, used_revisions, remaining_revisions) < 0
+                or used_revisions + remaining_revisions != max_revisions
+            ):
+                raise TaskCheckpointError(
+                    "checkpoint replan revision budget 不一致"
+                )
             expected_plan_contract = {
                 "planSnapshot": plan_snapshot,
                 "planDigest": (
@@ -271,6 +286,9 @@ class TaskCheckpointDriver:
                 "stepOutputs": step_outputs,
                 "artifactOutputs": artifact_outputs,
                 "continuationGeneration": source_generation + 1,
+                "maxRevisions": max_revisions,
+                "usedRevisions": used_revisions,
+                "remainingRevisions": remaining_revisions,
                 "legacyReplan": plan_snapshot is None,
             }
             recovery_context = {
@@ -299,6 +317,9 @@ class TaskCheckpointDriver:
                     "maxGenerations": max_generations,
                     "maxSteps": config.max_steps,
                     "maxTotalTokens": config.max_total_tokens,
+                    "maxRevisions": max_revisions,
+                    "usedRevisions": used_revisions,
+                    "remainingRevisions": remaining_revisions,
                 },
                 "userAnswer": checkpoint.snapshot_json.get("userAnswer"),
             }

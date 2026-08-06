@@ -4,7 +4,13 @@ import { Bot, CornerDownLeft, Link2Off, MessageSquareText } from 'lucide-react'
 import { FormEvent, useCallback, useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 
-import { api, ChatMessageContent, ConversationRunEvent } from '@/api/client'
+import {
+  api,
+  ChatMessageContent,
+  ConversationRunEvent,
+  type ConversationRunSummary,
+  type Run,
+} from '@/api/client'
 
 type Message = {
   id: string
@@ -30,7 +36,9 @@ export default function ChatPage() {
   const [runStatus, setRunStatus] = useState('')
   const [traceEvents, setTraceEvents] = useState<ConversationRunEvent[]>([])
   // 每个 ConversationRun 的实时终态，供展示层判断“只有 succeeded 可固化”。
-  const [runStatuses, setRunStatuses] = useState<Record<string, string>>({})
+  const [agentRuns, setAgentRuns] = useState<Record<string, ConversationRunSummary>>({})
+  const [workflowRuns, setWorkflowRuns] = useState<Record<string, Run>>({})
+  const [activeWorkflowRunIds, setActiveWorkflowRunIds] = useState('')
 
   // conversationId 写入路由：新对话创建后导航到 /chat/:id，刷新可恢复同一会话。
   useEffect(() => {
@@ -48,21 +56,44 @@ export default function ChatPage() {
     if (!conversationId) return
     const conversation = await api.getConversation(conversationId)
     setMessages(conversation.messages)
-    // 拉取所有 Agent 运行消息的当前终态，展示层据此仅对 succeeded 开放固化。
-    const agentRunIds = conversation.messages
-      .filter((message) => message.content.conversationRunId && message.content.runType === 'agent_run')
-      .map((message) => message.content.conversationRunId as string)
+    const agentRunIds = Array.from(
+      new Set(
+        conversation.messages
+          .filter(
+            (message) =>
+              message.content.conversationRunId &&
+              (message.content.type === 'agent_run' || message.content.runType === 'agent_run'),
+          )
+          .map((message) => message.content.conversationRunId as string),
+      ),
+    )
+    const workflowRunIds = Array.from(
+      new Set(
+        conversation.messages
+          .filter((message) => message.content.runId)
+          .map((message) => message.content.runId as string),
+      ),
+    )
+    const [agentSummaries, runSummaries] = await Promise.all([
+      Promise.all(agentRunIds.map((runId) => api.getConversationRun(runId).catch(() => null))),
+      Promise.all(workflowRunIds.map((runId) => api.getRun(runId).catch(() => null))),
+    ])
+    setAgentRuns(
+      Object.fromEntries(
+        agentSummaries
+          .filter((summary): summary is ConversationRunSummary => summary !== null)
+          .map((summary) => [summary.id, summary]),
+      ),
+    )
+    const loadedRuns = runSummaries.filter((run): run is Run => run !== null)
+    setWorkflowRuns(Object.fromEntries(loadedRuns.map((run) => [run.id, run])))
+    setActiveWorkflowRunIds(
+      loadedRuns
+        .filter((run) => run.status === 'queued' || run.status === 'running')
+        .map((run) => run.id)
+        .join(','),
+    )
     if (agentRunIds.length > 0) {
-      const summaries = await Promise.all(
-        agentRunIds.map((runId) => api.getConversationRun(runId).catch(() => null)),
-      )
-      setRunStatuses((current) => {
-        const next = { ...current }
-        summaries.forEach((summary) => {
-          if (summary) next[summary.id] = summary.status
-        })
-        return next
-      })
       // 从服务端消息恢复最近一次 Agent 运行，刷新后仍可展示轨迹，不依赖本地 state。
       setActiveRunId(agentRunIds[agentRunIds.length - 1])
     }
@@ -84,7 +115,7 @@ export default function ChatPage() {
         ])
         if (cancelled) return
         setRunStatus(summary.status)
-        setRunStatuses((current) => ({ ...current, [summary.id]: summary.status }))
+        setAgentRuns((current) => ({ ...current, [summary.id]: summary }))
         setTraceEvents(events)
         // queued/running 均为非终态：长任务由独立 Worker 执行，持续轮询直到终态。
         if (summary.status === 'queued' || summary.status === 'running') {
@@ -100,6 +131,32 @@ export default function ChatPage() {
     }
   }, [activeRunId])
 
+  useEffect(() => {
+    if (!activeWorkflowRunIds) return
+    let cancelled = false
+    const runIds = activeWorkflowRunIds.split(',').filter(Boolean)
+    async function poll() {
+      try {
+        const runs = await Promise.all(runIds.map((runId) => api.getRun(runId)))
+        if (cancelled) return
+        setWorkflowRuns((current) => ({
+          ...current,
+          ...Object.fromEntries(runs.map((run) => [run.id, run])),
+        }))
+        const pending = runs.filter(
+          (run) => run.status === 'queued' || run.status === 'running',
+        )
+        if (pending.length > 0) window.setTimeout(poll, 800)
+      } catch (reason) {
+        if (!cancelled) setError(reason instanceof Error ? reason.message : '加载运行结果失败')
+      }
+    }
+    poll()
+    return () => {
+      cancelled = true
+    }
+  }, [activeWorkflowRunIds])
+
   async function send(event: FormEvent) {
     event.preventDefault()
     if (!input.trim() || !conversationId) return
@@ -113,7 +170,13 @@ export default function ChatPage() {
     }
     setMessages((current) => [...current, optimistic])
     try {
-      await api.sendMessage(conversationId, text)
+      const result = await api.sendMessage(conversationId, text)
+      if (
+        result.assistant.conversationRunId &&
+        (result.assistant.type === 'agent_run' || result.assistant.runType === 'agent_run')
+      ) {
+        setActiveRunId(result.assistant.conversationRunId)
+      }
       await refresh()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '发送失败')
@@ -272,7 +335,8 @@ export default function ChatPage() {
 
   // Agent 运行动作：只有 succeeded 才展示“固化为组件”，其它状态显式提示不可固化。
   function renderAgentRunActions(conversationRunId: string) {
-    const status = runStatuses[conversationRunId]
+    const run = agentRuns[conversationRunId]
+    const status = run?.status
     if (drafts[conversationRunId]) {
       return (
         <Link className="button ghost" to={`/workflows/${drafts[conversationRunId]}/edit`}>
@@ -282,15 +346,55 @@ export default function ChatPage() {
     }
     if (status === 'succeeded') {
       return (
-        <button className="button ghost" onClick={() => distill(conversationRunId)}>
-          固化为组件
-        </button>
+        <>
+          {run.output?.reply && (
+            <div className="result-panel" role="status">
+              {String(run.output.reply)}
+            </div>
+          )}
+          <button className="button ghost" onClick={() => distill(conversationRunId)}>
+            固化为组件
+          </button>
+        </>
+      )
+    }
+    if ((status === 'failed' || status === 'cancelled') && run.error) {
+      return (
+        <div className="error-panel" role="alert">
+          <strong>{String(run.error.code ?? status)}</strong>
+          <span>{String(run.error.message ?? '运行未完成')}</span>
+        </div>
       )
     }
     return (
       <span className="hint">
         {status ? `运行状态 ${status}，仅 succeeded 可固化` : '运行未完成，暂不可固化'}
       </span>
+    )
+  }
+
+  function renderWorkflowRun(runId: string) {
+    const run = workflowRuns[runId]
+    if (!run) return <span className="hint">正在读取运行状态...</span>
+    if (run.status === 'queued' || run.status === 'running') {
+      return <span className={`status-badge ${run.status}`}>{run.status}</span>
+    }
+    if (run.status === 'succeeded') {
+      const reply =
+        run.output && typeof run.output.reply === 'string' ? run.output.reply : undefined
+      return (
+        <div className="result-panel" role="status" aria-label="Workflow 运行结果">
+          {reply ?? JSON.stringify(run.output)}
+        </div>
+      )
+    }
+    const code = run.error?.code ?? run.status
+    const message = run.error?.message ?? '运行未完成'
+    return (
+      <div className="error-panel" role="alert" aria-label="Workflow 运行错误">
+        <strong>{String(code)}</strong>
+        <span>{String(message)}</span>
+      </div>
     )
   }
 
@@ -436,12 +540,16 @@ export default function ChatPage() {
                   </button>
                 )}
                 {message.content.runId && (
-                  <Link className="button ghost" to={`/runs/${message.content.runId}`}>
-                    查看运行
-                  </Link>
+                  <>
+                    {renderWorkflowRun(message.content.runId)}
+                    <Link className="button ghost" to={`/runs/${message.content.runId}`}>
+                      查看运行
+                    </Link>
+                  </>
                 )}
                 {message.content.conversationRunId &&
-                  message.content.runType === 'agent_run' &&
+                  (message.content.type === 'agent_run' ||
+                    message.content.runType === 'agent_run') &&
                   renderAgentRunActions(message.content.conversationRunId)}
               </div>
             </article>

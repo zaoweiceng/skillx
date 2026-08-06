@@ -8,6 +8,7 @@ from app.api.routes import (
     confirm_component,
     create_message,
 )
+from app.application.agent_host import LOCAL_DEMO_READ_ONLY_CAPABILITIES
 from app.application.compiler import WorkflowCompiler
 from app.application.conversation import candidate_snapshot_digest
 from app.application.orchestrator import WorkerService
@@ -89,6 +90,7 @@ async def test_unbound_conversation_continues_with_persistent_agent_run() -> Non
         )
     assert response["assistant"]["type"] == "agent_run"
     assert response["assistant"]["state"] == "queued"
+    assert response["assistant"]["runType"] == "agent_run"
     assert response["assistant"]["agentAction"] == "continue_agent"
     async with SessionLocal() as session:
         run = await session.get(
@@ -98,6 +100,9 @@ async def test_unbound_conversation_continues_with_persistent_agent_run() -> Non
     assert run is not None
     assert run.run_type == "agent_run"
     assert run.status == "queued"
+    assert tuple(run.config_json["allowedCapabilities"]) == (
+        LOCAL_DEMO_READ_ONLY_CAPABILITIES
+    )
 
 
 async def _seed_greeting_component(name: str, description: str) -> tuple[str, str]:
