@@ -496,9 +496,19 @@ class AgentRuntime(Protocol):
 后续 `tool.requested` 必须携带对应 `planStepId`。Host 校验能力、DAG、effect 和预算后，
 将计划保存为不可变 PlanSnapshot Artifact；Agent 自报的 `retryable` 不能控制重试或接力。
 
+在 continuation 中，Host accepted PlanSnapshot 是执行事实，不是提示词建议。Adapter 首个
+`agent.plan` 必须与 Host 提供的 expected digest/revision/steps 完全一致；Tool request 还必须携带
+plan digest、revision、step id 和 attempt。Host 根据严格 `argumentRefs`（literal、user_input、
+step_output、artifact）物化参数，并核对 action、capability、effect、idempotency 与 arguments 后才调用
+Adapter。
+
 恢复入口只消费统一 `ContinuationRequest`，按冻结的 remaining DAG 执行。没有结构化计划时必须
 返回 `replan_required`，不得从原始 prompt 静默重做并称为断点继续。改变 remaining plan 时必须
-返回受类型约束的 ReplanPatch，并生成新的 PlanSnapshot revision。
+返回受类型约束的 ReplanPatch，绑定 source checkpoint、base plan digest/revision 和 step-state digest，
+且只能替换 remaining closure；Host 在新步骤执行前持久化新的 PlanSnapshot revision。
+
+`claimGeneration` 仅用于 checkpoint lease fencing，Worker reclaim 会增长该值；
+`continuationGeneration` 是跨 ConversationRun 的业务接力链预算，只在创建下一代 continuation 时增长。
 
 # 11. 浏览器运行时与页面契约
 

@@ -5,6 +5,7 @@ from app.application.agent_plans import (
     apply_replan_patch,
     validate_agent_plan,
 )
+from app.application.compiler import digest_json
 
 
 def _step(
@@ -76,16 +77,23 @@ def test_replan_patch_replaces_only_remaining_steps_and_increments_revision() ->
         max_steps=3,
     )
     replacement = _step("c", depends_on=["a"])
+    states = {"a": "succeeded", "b": "remaining"}
     revised = apply_replan_patch(
         plan,
         {
             "schemaVersion": "1",
             "basePlanDigest": plan.digest,
             "baseRevision": 1,
+            "baseStepStateDigest": digest_json(states),
+            "sourceCheckpointId": "checkpoint-1",
+            "replaceStepIds": ["b"],
             "replacementSteps": [replacement],
             "reason": "替换未执行步骤",
         },
         completed_step_ids={"a"},
+        replaceable_step_ids={"b"},
+        current_step_state_digest=digest_json(states),
+        source_checkpoint_id="checkpoint-1",
         allowed_capabilities={"lookup.table"},
         max_steps=3,
     )
@@ -101,16 +109,23 @@ def test_replan_patch_rejects_completed_step_replacement() -> None:
         max_steps=2,
     )
     with pytest.raises(AgentPlanError, match="已完成"):
+        states = {"a": "succeeded", "b": "remaining"}
         apply_replan_patch(
             plan,
             {
                 "schemaVersion": "1",
                 "basePlanDigest": plan.digest,
                 "baseRevision": 1,
+                "baseStepStateDigest": digest_json(states),
+                "sourceCheckpointId": "checkpoint-1",
+                "replaceStepIds": ["b"],
                 "replacementSteps": [_step("a")],
                 "reason": "非法替换",
             },
             completed_step_ids={"a"},
+            replaceable_step_ids={"b"},
+            current_step_state_digest=digest_json(states),
+            source_checkpoint_id="checkpoint-1",
             allowed_capabilities={"lookup.table"},
             max_steps=2,
         )

@@ -17,6 +17,7 @@ Agent 用 key 选出结果。固化后确定节点用 ${input.message} 作为 ke
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -130,6 +131,33 @@ def _structured_plan(
             "steps": steps,
             "replanBoundary": "remaining_only",
         },
+    }
+
+
+def _plan_digest(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+
+def _planned_request_meta(
+    plan: dict[str, Any] | None, step_id: str, *, attempt: int = 1
+) -> dict[str, Any]:
+    if plan is None:
+        return {}
+    step = next(
+        item for item in plan.get("steps", []) if item.get("id") == step_id
+    )
+    return {
+        "planStepId": step_id,
+        "planDigest": _plan_digest(plan),
+        "planRevision": plan.get("revision", 1),
+        "stepAttempt": attempt,
+        "idempotencyKey": step.get("idempotencyKey"),
     }
 
 
@@ -656,6 +684,35 @@ def main() -> int:
         completed_plan_steps = continuation.get("completedPlanSteps", [])
         remaining_plan = continuation.get("remainingPlan") or {}
         remaining_steps = remaining_plan.get("steps", [])
+        source_plan = continuation.get("sourcePlan")
+        source_attempts = continuation.get("stepAttempts", {})
+        if (
+            not isinstance(source_plan, dict)
+            and not remaining_steps
+            and continuation.get("userAnswer", {}).get("continue") is True
+            and "lookup.table" in continuation.get("capabilityLocks", [])
+        ):
+            legacy_key = _clean_message(original_input) or "q1"
+            source_plan = _structured_plan(
+                "legacy-replan",
+                "人工确认后的受限 legacy replan",
+                [
+                    _plan_step(
+                        "legacy-lookup",
+                        "lookup.table",
+                        action="lookup",
+                        argument_refs={
+                            "key": {
+                                "source": "literal",
+                                "value": legacy_key,
+                            }
+                        },
+                        output_name="reply",
+                        fallback="retry",
+                    )
+                ],
+            )["payload"]
+            remaining_steps = source_plan["steps"]
         if remaining_plan.get("mode") == "integrity_failed":
             emit(
                 {
@@ -671,57 +728,168 @@ def main() -> int:
             return 0
         outputs: dict[str, dict[str, Any]] = {}
         latest: dict[str, Any] = {}
-        source_steps = [
-            {
-                key: value
-                for key, value in item.items()
-                if key
-                in {
-                    "id",
-                    "action",
-                    "capabilityRef",
-                    "dependsOn",
-                    "argumentRefs",
-                    "effect",
-                    "idempotencyKey",
-                    "outputName",
-                    "fallback",
+        source_steps = (
+            source_plan.get("steps", [])
+            if isinstance(source_plan, dict)
+            else [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key
+                    in {
+                        "id",
+                        "action",
+                        "capabilityRef",
+                        "dependsOn",
+                        "argumentRefs",
+                        "effect",
+                        "idempotencyKey",
+                        "outputName",
+                        "fallback",
+                    }
                 }
-            }
-            for item in [*completed_plan_steps, *remaining_steps]
-            if isinstance(item, dict)
-        ]
-        if source_steps:
-            step_ids = {str(item["id"]) for item in source_steps}
-            for step in source_steps:
-                step["dependsOn"] = [
-                    dependency
-                    for dependency in step.get("dependsOn", [])
-                    if dependency in step_ids
-                ]
-            emit(
-                _structured_plan(
-                    f"continuation-{continuation.get('budget', {}).get('generation', 1)}",
-                    "按已验证的 remaining DAG 继续",
-                    source_steps,
-                )
-            )
+                for item in [*completed_plan_steps, *remaining_steps]
+                if isinstance(item, dict)
+            ]
+        )
+        if isinstance(source_plan, dict):
+            accepted_plan = source_plan
+            if "[[RECOVERY_NEW_PLAN]]" in original_input:
+                changed_plan = {
+                    **source_plan,
+                    "planId": "untrusted-replacement",
+                    "steps": list(reversed(source_plan["steps"])),
+                }
+                emit({"type": "agent.plan", "payload": changed_plan})
+            else:
+                emit({"type": "agent.plan", "payload": source_plan})
+        elif source_steps:
+            accepted_plan = _structured_plan(
+                "legacy-replan",
+                "人工确认后的受限 legacy replan",
+                source_steps,
+            )["payload"]
+            emit({"type": "agent.plan", "payload": accepted_plan})
         else:
+            accepted_plan = None
             emit(
                 {
                     "type": "agent.plan",
                     "payload": {"summary": "复用已完成输出，无剩余 Tool 步骤"},
                 }
             )
+        if "[[RECOVERY_ALWAYS_FAIL]]" in original_input:
+            emit(
+                {
+                    "type": "agent.failed",
+                    "payload": {
+                        "code": "DEPENDENCY_UNAVAILABLE",
+                        "message": "模拟 continuation 持续失败",
+                        "retryable": False,
+                        "callId": None,
+                    },
+                }
+            )
+            return 0
         for item in completed:
             if isinstance(item, dict) and isinstance(item.get("output"), dict):
                 latest = item["output"]
                 if item.get("planStepId"):
                     outputs[str(item["planStepId"])] = latest
         provenance_result: dict[str, Any] | None = None
-        for index, step in enumerate(source_steps, start=1):
+        executable_ids = {
+            str(item.get("id"))
+            for item in remaining_steps
+            if isinstance(item, dict)
+        }
+        executable_steps = [
+            step for step in source_steps if str(step.get("id")) in executable_ids
+        ]
+        if "[[RECOVERY_REPEAT_SUCCEEDED]]" in original_input:
+            succeeded_ids = {
+                str(item.get("id"))
+                for item in completed_plan_steps
+                if isinstance(item, dict)
+            }
+            executable_steps = [
+                step
+                for step in source_steps
+                if str(step.get("id")) in succeeded_ids
+            ] + executable_steps
+        if (
+            "[[RECOVERY_SKIP_DEPENDENCY]]" in original_input
+            and len(executable_steps) > 1
+        ):
+            executable_steps = executable_steps[1:]
+        if (
+            "[[RECOVERY_REPLAN]]" in original_input
+            and isinstance(source_plan, dict)
+            and executable_steps
+        ):
+            replaced = executable_steps[0]
+            replacement = {
+                **replaced,
+                "id": f"{replaced['id']}-replanned",
+                "dependsOn": list(replaced.get("dependsOn", [])),
+            }
+            patch = {
+                "schemaVersion": "1",
+                "basePlanDigest": continuation["sourcePlanDigest"],
+                "baseRevision": continuation["sourcePlanRevision"],
+                "baseStepStateDigest": continuation["stepStateDigest"],
+                "sourceCheckpointId": continuation["sourceCheckpointId"],
+                "replaceStepIds": [
+                    str(item["id"]) for item in executable_steps
+                ],
+                "replacementSteps": [replacement],
+                "reason": "受限替换 remaining closure",
+            }
+            emit({"type": "agent.replan", "payload": patch})
+            if "[[RECOVERY_REPLAN_REPEAT]]" in original_input:
+                emit({"type": "agent.replan", "payload": patch})
+            succeeded_ids = {
+                str(item.get("id"))
+                for item in completed_plan_steps
+                if isinstance(item, dict)
+            }
+            revised_steps = [
+                step
+                for step in source_plan["steps"]
+                if str(step.get("id")) in succeeded_ids
+            ] + [replacement]
+            accepted_plan = {
+                **source_plan,
+                "revision": int(source_plan["revision"]) + 1,
+                "summary": patch["reason"],
+                "steps": revised_steps,
+            }
+            source_steps = revised_steps
+            executable_steps = [replacement]
+        for index, step in enumerate(executable_steps, start=1):
             capability = str(step["capabilityRef"])
             arguments = _tool_arguments(step, original_input, outputs)
+            changed_url = _directive(original_input, "RECOVERY_URL", "")
+            changed_path = _directive(original_input, "RECOVERY_PATH", "")
+            changed_key = _directive(original_input, "RECOVERY_KEY", "")
+            if changed_url and "url" in arguments:
+                arguments["url"] = changed_url
+                parsed_changed = urlsplit(changed_url)
+                arguments["pageContract"] = {
+                    "contractVersion": "1",
+                    "urlPattern": (
+                        f"{parsed_changed.scheme}://"
+                        f"{parsed_changed.netloc}/*"
+                    ),
+                    "bodySelector": "#main",
+                    "fields": {},
+                }
+            if changed_path and "path" in arguments:
+                Path(changed_path).write_text(
+                    "不应被 Host 读取", encoding="utf-8"
+                )
+                arguments["path"] = changed_path
+            if changed_key and "key" in arguments:
+                arguments["key"] = changed_key
             if capability == "browser.read":
                 url = str(arguments.get("url", ""))
                 parsed_url = urlsplit(url)
@@ -736,6 +904,20 @@ def main() -> int:
             request_payload: dict[str, Any] = {
                 "callId": call_id,
                 "planStepId": step["id"],
+                "planDigest": (
+                    _plan_digest(accepted_plan)
+                    if accepted_plan is not None
+                    else continuation.get("sourcePlanDigest")
+                ),
+                "planRevision": (
+                    accepted_plan.get("revision", 1)
+                    if accepted_plan is not None
+                    else continuation.get("sourcePlanRevision", 1)
+                ),
+                "stepAttempt": len(
+                    source_attempts.get(str(step["id"]), [])
+                )
+                + 1,
                 "capabilityRef": capability,
                 "action": step["action"],
                 "actionKind": (
@@ -746,6 +928,7 @@ def main() -> int:
                 "arguments": arguments,
                 "effect": "none",
                 "idempotent": True,
+                "idempotencyKey": step.get("idempotencyKey"),
             }
             if capability == "browser.read":
                 request_payload.update(
@@ -927,9 +1110,9 @@ def main() -> int:
         time.sleep(30)
         return 0
 
+    active_plan: dict[str, Any] | None = None
     if mode == "deterministic_fail_after_tool":
-        emit(
-            _structured_plan(
+        active_plan = _structured_plan(
                 "deterministic-lookup",
                 "查表后生成结果",
                 [
@@ -938,17 +1121,35 @@ def main() -> int:
                         "lookup.table",
                         action="lookup",
                         argument_refs={
-                            "key": {"source": "user_input"}
+                            "key": {
+                                "source": "literal",
+                                "value": _clean_message(args.prompt),
+                            }
                         },
                         output_name="lookupResult",
                         fallback="retry",
                     )
                 ],
-            )
-        )
+            )["payload"]
+        emit({"type": "agent.plan", "payload": active_plan})
     elif mode == "planned_browser_summary":
-        emit(
-            _structured_plan(
+        planned_url_match = re.search(r"https?://[^\s\"}]+", args.prompt)
+        planned_url = (
+            planned_url_match.group(0)
+            if planned_url_match
+            else _clean_message(args.prompt)
+        )
+        planned_parsed_url = urlsplit(planned_url)
+        planned_page_contract = {
+            "contractVersion": "1",
+            "urlPattern": (
+                f"{planned_parsed_url.scheme}://"
+                f"{planned_parsed_url.netloc}/*"
+            ),
+            "bodySelector": "#main",
+            "fields": {},
+        }
+        active_plan = _structured_plan(
                 "browser-summary",
                 "预检、读取网页并总结",
                 [
@@ -970,8 +1171,13 @@ def main() -> int:
                         argument_refs={
                             "url": {
                                 "source": "user_input",
+                                "inputKey": "message",
                                 "extract": "url",
-                            }
+                            },
+                            "pageContract": {
+                                "source": "literal",
+                                "value": planned_page_contract,
+                            },
                         },
                         output_name="page",
                         fallback="retry",
@@ -991,11 +1197,10 @@ def main() -> int:
                         output_name="reply",
                     ),
                 ],
-            )
-        )
+            )["payload"]
+        emit({"type": "agent.plan", "payload": active_plan})
     elif mode == "planned_lookup_transform":
-        emit(
-            _structured_plan(
+        active_plan = _structured_plan(
                 "lookup-transform",
                 "查找、转换并输出",
                 [
@@ -1031,11 +1236,10 @@ def main() -> int:
                         output_name="reply",
                     ),
                 ],
-            )
-        )
+            )["payload"]
+        emit({"type": "agent.plan", "payload": active_plan})
     elif mode == "planned_file_transform":
-        emit(
-            _structured_plan(
+        active_plan = _structured_plan(
                 "file-transform",
                 "读取文件、转换并输出",
                 [
@@ -1067,8 +1271,8 @@ def main() -> int:
                         output_name="reply",
                     ),
                 ],
-            )
-        )
+            )["payload"]
+        emit({"type": "agent.plan", "payload": active_plan})
     else:
         emit(
             {
@@ -1086,7 +1290,7 @@ def main() -> int:
                 "type": "tool.requested",
                 "payload": {
                     "callId": "call-lookup-source",
-                    "planStepId": "lookup",
+                    **_planned_request_meta(active_plan, "lookup"),
                     "capabilityRef": "lookup.table",
                     "action": "lookup",
                     "actionKind": "transform",
@@ -1120,7 +1324,7 @@ def main() -> int:
                 "type": "tool.requested",
                 "payload": {
                     "callId": "call-file-source",
-                    "planStepId": "read",
+                    **_planned_request_meta(active_plan, "read"),
                     "capabilityRef": "read.local",
                     "action": "read",
                     "actionKind": "file",
@@ -1158,11 +1362,16 @@ def main() -> int:
                 "payload": {
                     "callId": "call-1",
                     **(
-                        {"planStepId": "lookup"}
+                        _planned_request_meta(active_plan, "lookup")
                         if mode == "deterministic_fail_after_tool"
                         else {}
                     ),
                     "capabilityRef": tool_name,
+                    **(
+                        {"action": "lookup"}
+                        if mode == "deterministic_fail_after_tool"
+                        else {}
+                    ),
                     "arguments": {"key": key},
                     "argumentBindings": {
                         "key": {"source": "user_input", "inputKey": "message"}
@@ -1225,7 +1434,7 @@ def main() -> int:
                     "type": "tool.requested",
                     "payload": {
                         "callId": "call-preflight",
-                        "planStepId": "preflight",
+                        **_planned_request_meta(active_plan, "preflight"),
                         "capabilityRef": "lookup.table",
                         "action": "lookup",
                         "actionKind": "transform",
@@ -1268,7 +1477,7 @@ def main() -> int:
                 "payload": {
                     "callId": "call-browser",
                     **(
-                        {"planStepId": "browser"}
+                        _planned_request_meta(active_plan, "browser")
                         if mode == "planned_browser_summary"
                         else {}
                     ),

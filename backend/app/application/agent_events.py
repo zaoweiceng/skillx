@@ -102,6 +102,9 @@ class ReplanPayload(_PayloadBase):
     schemaVersion: Literal["1"]
     basePlanDigest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     baseRevision: StrictInt = Field(ge=1)
+    baseStepStateDigest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    sourceCheckpointId: str = Field(min_length=1)
+    replaceStepIds: list[str] = Field(min_length=1)
     replacementSteps: list[dict[str, Any]] = Field(min_length=1)
     reason: str = Field(min_length=1)
 
@@ -124,6 +127,11 @@ class ToolRequestPayload(_PayloadBase):
     capabilityRef: str = Field(min_length=1)
     arguments: dict[str, Any]
     planStepId: str | None = Field(default=None, min_length=1)
+    planDigest: str | None = Field(
+        default=None, pattern=r"^sha256:[0-9a-f]{64}$"
+    )
+    planRevision: StrictInt | None = Field(default=None, ge=1)
+    stepAttempt: StrictInt | None = Field(default=None, ge=1)
 
 
 class ToolResultPayload(_PayloadBase):
@@ -319,6 +327,12 @@ class AgentEventValidator:
                 audit["reusedFromLedger"] = True
             if payload.get("planStepId"):
                 audit["planStepId"] = payload["planStepId"]
+            if payload.get("planDigest"):
+                audit["planDigest"] = payload["planDigest"]
+            if payload.get("planRevision"):
+                audit["planRevision"] = payload["planRevision"]
+            if payload.get("stepAttempt"):
+                audit["stepAttempt"] = payload["stepAttempt"]
             return {"type": event_type, "payload": audit}
         if event_type == "agent.completed":
             # 完成事件只保留步数/Token 与输出摘要，不落原始 output。
@@ -372,6 +386,9 @@ class AgentEventValidator:
                     "schemaVersion": payload["schemaVersion"],
                     "basePlanDigest": payload["basePlanDigest"],
                     "baseRevision": payload["baseRevision"],
+                    "baseStepStateDigest": payload["baseStepStateDigest"],
+                    "sourceCheckpointId": payload["sourceCheckpointId"],
+                    "replaceStepIds": payload["replaceStepIds"],
                     "replacementStepIds": [
                         item.get("id")
                         for item in payload["replacementSteps"]

@@ -25,6 +25,7 @@ _STATE: dict[str, object] = {
     "mutated": False,
     "articleBody": "第一版正文：季度营收增长 12%。",
     "transientCount": 0,
+    "alternateCount": 0,
     "transientHealthy": False,
 }
 
@@ -139,6 +140,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_html(503, "<h1>temporarily unavailable</h1>")
                 return
             self._send_html(200, _article_page("恢复后的正文"))
+        elif path == "/alternate":
+            with _LOCK:
+                _STATE["alternateCount"] = int(_STATE["alternateCount"]) + 1
+            self._send_html(200, _article_page("不应访问的正文"))
         elif path == "/__stats":
             with _LOCK:
                 self._send_json(200, dict(_STATE))

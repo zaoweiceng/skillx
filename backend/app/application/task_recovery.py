@@ -59,7 +59,11 @@ class TaskCheckpointDriver:
             handle = await self.claim(session)
         if handle is None:
             return False
-        return await self.start_continuation(handle)
+        try:
+            return await self.start_continuation(handle)
+        except TaskCheckpointError as exc:
+            await self._record_claim_error(handle, exc)
+            return True
 
     async def claim(
         self, session: AsyncSession
@@ -82,17 +86,47 @@ class TaskCheckpointDriver:
         )
         if candidate is None:
             return None
+        chain_generation = int(
+            candidate.snapshot_json.get("continuationGeneration", 0)
+        )
         max_generations = get_settings().agent_max_continuation_generations
-        if candidate.claim_generation >= max_generations:
-            candidate.status = "terminal"
-            candidate.snapshot_json = {
+        if chain_generation >= max_generations:
+            next_snapshot = {
                 **candidate.snapshot_json,
                 "budgetExhausted": {
                     "maxGenerations": max_generations,
-                    "actualGenerations": candidate.claim_generation,
+                    "actualGenerations": chain_generation,
                 },
             }
-            candidate.digest = digest_json(candidate.snapshot_json)
+            exhausted = await session.execute(
+                update(TaskCheckpoint)
+                .where(
+                    TaskCheckpoint.id == candidate.id,
+                    TaskCheckpoint.status == candidate.status,
+                    TaskCheckpoint.claim_generation
+                    == candidate.claim_generation,
+                )
+                .values(
+                    status="terminal",
+                    snapshot_json=next_snapshot,
+                    digest=digest_json(next_snapshot),
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    claim_token=None,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if exhausted.rowcount == 1:
+                await _append_event(
+                    session,
+                    candidate.source_id,
+                    "agent.handoff.budget_exhausted",
+                    {
+                        "taskCheckpointId": candidate.id,
+                        "continuationGeneration": chain_generation,
+                        "maxGenerations": max_generations,
+                    },
+                )
             return None
         token = str(uuid4())
         generation = candidate.claim_generation + 1
@@ -138,7 +172,9 @@ class TaskCheckpointDriver:
             if source is None:
                 raise TaskCheckpointError("checkpoint source ConversationRun 不存在")
             self._verify_checkpoint(checkpoint, source)
-            await self._load_plan_snapshot(session, checkpoint, source.id)
+            plan_snapshot = await self._load_plan_snapshot(
+                session, checkpoint, source.id
+            )
             completed = await self._load_completed_outputs(
                 session, checkpoint, source.id
             )
@@ -183,11 +219,60 @@ class TaskCheckpointDriver:
                 max_duration_seconds=source_config.max_duration_seconds,
             )
             source_generation = int(
-                source.input_json.get("continuationGeneration", 0)
+                checkpoint.snapshot_json.get("continuationGeneration", 0)
             )
             max_generations = get_settings().agent_max_continuation_generations
             if source_generation >= max_generations:
-                raise TaskCheckpointError("continuation generation budget 已耗尽")
+                raise TaskCheckpointError(
+                    "continuation generation budget 已耗尽"
+                )
+            step_states = dict(
+                checkpoint.snapshot_json.get("stepStates", {})
+            )
+            step_attempts = dict(
+                checkpoint.snapshot_json.get("stepAttempts", {})
+            )
+            remaining_step_ids = [
+                str(item.get("id"))
+                for item in (
+                    checkpoint.snapshot_json.get("remainingPlan", {}).get(
+                        "steps", []
+                    )
+                )
+                if item.get("id")
+            ]
+            step_outputs = {
+                str(item["planStepId"]): dict(item["output"])
+                for item in completed
+                if item.get("planStepId")
+                and isinstance(item.get("output"), dict)
+            }
+            artifact_outputs = {
+                str(item["artifactId"]): item
+                for item in completed
+                if item.get("artifactId")
+            }
+            expected_plan_contract = {
+                "planSnapshot": plan_snapshot,
+                "planDigest": (
+                    checkpoint.snapshot_json.get("planSnapshot") or {}
+                ).get("digest"),
+                "revision": (
+                    checkpoint.snapshot_json.get("planSnapshot") or {}
+                ).get("revision"),
+                "allowedRemainingStepIds": remaining_step_ids,
+                "sourceCheckpointId": checkpoint.id,
+                "stepStates": step_states,
+                "stepAttempts": step_attempts,
+                "stepStateDigest": digest_json(step_states),
+                "originalInput": {
+                    "message": source.input_json.get("message", "")
+                },
+                "stepOutputs": step_outputs,
+                "artifactOutputs": artifact_outputs,
+                "continuationGeneration": source_generation + 1,
+                "legacyReplan": plan_snapshot is None,
+            }
             recovery_context = {
                 "schemaVersion": "1",
                 "originalInput": source.input_json.get("message", ""),
@@ -200,6 +285,13 @@ class TaskCheckpointDriver:
                 "failedOutput": failed,
                 "completedActionLedger": completed_action_ledger,
                 "remainingPlan": checkpoint.snapshot_json.get("remainingPlan"),
+                "sourcePlan": plan_snapshot,
+                "sourcePlanDigest": expected_plan_contract["planDigest"],
+                "sourcePlanRevision": expected_plan_contract["revision"],
+                "sourceCheckpointId": checkpoint.id,
+                "stepStates": step_states,
+                "stepAttempts": step_attempts,
+                "stepStateDigest": expected_plan_contract["stepStateDigest"],
                 "capabilityLocks": list(allowed),
                 "budget": {
                     "attempt": handle.generation,
@@ -233,6 +325,7 @@ class TaskCheckpointDriver:
                 "sourcePlanSnapshot": checkpoint.snapshot_json.get(
                     "planSnapshot"
                 ),
+                "expectedPlanContract": expected_plan_contract,
             }
             next_snapshot = {
                 **checkpoint.snapshot_json,
@@ -269,6 +362,59 @@ class TaskCheckpointDriver:
                 },
             )
             return True
+
+    async def _record_claim_error(
+        self,
+        handle: ClaimedTaskCheckpoint,
+        error: TaskCheckpointError,
+    ) -> None:
+        async with SessionLocal() as session, session.begin():
+            checkpoint = await session.get(TaskCheckpoint, handle.id)
+            if (
+                checkpoint is None
+                or checkpoint.status != "running"
+                or checkpoint.lease_owner != handle.owner
+                or checkpoint.claim_generation != handle.generation
+                or checkpoint.claim_token != handle.token
+            ):
+                return
+            next_snapshot = {
+                **checkpoint.snapshot_json,
+                "continuationError": {
+                    "code": "CONTINUATION_CONTRACT_INVALID",
+                    "message": str(error),
+                },
+            }
+            failed = await session.execute(
+                update(TaskCheckpoint)
+                .where(
+                    TaskCheckpoint.id == handle.id,
+                    TaskCheckpoint.status == "running",
+                    TaskCheckpoint.lease_owner == handle.owner,
+                    TaskCheckpoint.claim_generation == handle.generation,
+                    TaskCheckpoint.claim_token == handle.token,
+                )
+                .values(
+                    status="terminal",
+                    snapshot_json=next_snapshot,
+                    digest=digest_json(next_snapshot),
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    claim_token=None,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if failed.rowcount == 1:
+                await _append_event(
+                    session,
+                    checkpoint.source_id,
+                    "agent.handoff.rejected",
+                    {
+                        "taskCheckpointId": checkpoint.id,
+                        "code": "CONTINUATION_CONTRACT_INVALID",
+                        "message": str(error),
+                    },
+                )
 
     async def _reconcile_continuation(self, session: AsyncSession) -> bool:
         checkpoint = await session.scalar(
@@ -328,6 +474,26 @@ class TaskCheckpointDriver:
                 "continuationRunId": continuation.id,
             },
         )
+        if continuation.status == "failed":
+            child_checkpoint = await session.scalar(
+                select(TaskCheckpoint).where(
+                    TaskCheckpoint.source_kind == "conversation_run",
+                    TaskCheckpoint.source_id == continuation.id,
+                )
+            )
+            if child_checkpoint is not None:
+                next_generation = int(
+                    continuation.input_json.get(
+                        "continuationGeneration", 0
+                    )
+                )
+                child_snapshot = {
+                    **child_checkpoint.snapshot_json,
+                    "continuationGeneration": next_generation,
+                    "sourceCheckpointId": checkpoint.id,
+                }
+                child_checkpoint.snapshot_json = child_snapshot
+                child_checkpoint.digest = digest_json(child_snapshot)
         return True
 
     @staticmethod
@@ -428,9 +594,14 @@ class TaskCheckpointDriver:
             if not isinstance(artifact_ref, dict):
                 continue
             completed.append(
-                await TaskCheckpointDriver._load_artifact_envelope(
-                    session, artifact_ref, source_run_id
-                )
+                {
+                    **(
+                        await TaskCheckpointDriver._load_artifact_envelope(
+                            session, artifact_ref, source_run_id
+                        )
+                    ),
+                    "artifactId": artifact_ref.get("id"),
+                }
             )
         return completed
 

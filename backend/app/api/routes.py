@@ -4136,6 +4136,35 @@ async def list_conversation_run_events(
     ]
 
 
+@router.get("/conversation-runs/{conversation_run_id}/artifacts")
+async def list_conversation_run_artifacts(
+    conversation_run_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    if await session.get(ConversationRun, conversation_run_id) is None:
+        raise HTTPException(404, "ConversationRun 不存在")
+    artifacts = (
+        await session.scalars(
+            select(Artifact)
+            .where(Artifact.conversation_run_id == conversation_run_id)
+            .order_by(Artifact.created_at)
+        )
+    ).all()
+    return [
+        {
+            "id": item.id,
+            "kind": item.kind,
+            "name": item.name,
+            "uri": item.uri,
+            "sha256": item.sha256,
+            "bytes": item.size,
+            "mediaType": item.media_type,
+            "metadata": redact(item.metadata_json),
+        }
+        for item in artifacts
+    ]
+
+
 @router.get("/task-checkpoints/{checkpoint_id}")
 async def get_task_checkpoint(
     checkpoint_id: str,
@@ -4156,11 +4185,19 @@ async def get_task_checkpoint(
         "pendingQuestion": snapshot.get("pendingQuestion"),
         "continuationRunId": snapshot.get("continuationRunId"),
         "claimGeneration": checkpoint.claim_generation,
+        "continuationGeneration": snapshot.get(
+            "continuationGeneration", 0
+        ),
         "planSnapshot": snapshot.get("planSnapshot"),
         "reportedError": snapshot.get("reportedError"),
         "effectiveError": snapshot.get("effectiveError"),
         "completedSteps": snapshot.get("completedSteps", []),
         "failedStep": snapshot.get("failedStep"),
+        "stepStates": snapshot.get("stepStates", {}),
+        "stepAttempts": snapshot.get("stepAttempts", {}),
+        "stepStateDigest": snapshot.get("stepStateDigest"),
+        "budgetExhausted": snapshot.get("budgetExhausted"),
+        "continuationError": snapshot.get("continuationError"),
         "completedActionLedger": snapshot.get("completedActionLedger", []),
         "failedAction": snapshot.get("failedAction"),
         "pendingToolCalls": snapshot.get("pendingToolCalls", []),

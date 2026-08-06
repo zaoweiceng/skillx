@@ -324,13 +324,16 @@ class LookupTableAdapter:
         "q3": "第三季度：营收持平",
         "q4": "第四季度：营收增长 15%",
     }
+    calls_by_key: dict[str, int] = {}
 
     async def execute(
         self, _context: ToolExecutionContext, arguments: dict[str, Any]
     ) -> dict[str, Any]:
+        key = arguments["key"]
+        self.calls_by_key[key] = self.calls_by_key.get(key, 0) + 1
         return {
             "table": dict(self.table),
-            "value": self.table.get(arguments["key"], "未知季度"),
+            "value": self.table.get(key, "未知季度"),
         }
 
     @staticmethod

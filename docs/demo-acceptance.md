@@ -92,10 +92,18 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
 
 ## Agent PlanSnapshot 与 Continuation
 
+- Host accepted PlanSnapshot 是 continuation 的 execution source of truth。Agent proposal plan 只有通过
+  capability/DAG/effect/budget 校验并持久化后才成为 accepted plan；checkpoint 只绑定 accepted digest。
 - 结构化 `agent.plan` 使用 schema version、plan id、revision 和稳定 step id。每个 step 包含
   action/capability、依赖、参数引用、effect、idempotency key、输出名和 fallback。
 - Host 校验能力锁、DAG、effect 和 step budget；结构化计划下每个 `tool.requested` 必须携带
   `planStepId`。计划作为不可变 `agent_plan_snapshot` Artifact 持久化。
+- continuation HostRequest 必须携带 expected plan digest/revision、source checkpoint、允许的 remaining
+  step set 与 step-state digest。首个 `agent.plan` 必须与 expected plan 完全相同；任何变化只能经
+  绑定 source checkpoint/plan/state digest 的 typed ReplanPatch。
+- `argumentRefs` 只允许 literal、user_input、step_output、artifact。Host 从 original input 和已验证
+  ToolResult/Artifact 物化实参，并逐字段核对 action/capability/effect/idempotency/arguments；
+  URL、路径、lookup key 或 prior output path 偏离均在 Adapter 前 fail closed。
 - checkpoint 只从 PlanSnapshot 与 Host ToolResult 计算 `completed/failed/remaining`。无结构化
   计划的旧运行进入 `replan_required`；损坏计划进入 `integrity_failed`。
 - `ContinuationRequest` 固定包含 original input、reported/effective error、已完成/失败输出、
@@ -103,6 +111,12 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
   replan 只能提交 typed patch 并产生新 revision。
 - completed step 只能命中 Host ledger；effect=none 的 failed step 可重试；未知副作用必须先由用户
   确认。总 continuation generation 默认上限为 3。
+- Host 为每个 revision 保存 remaining/running/succeeded/failed/unknown/skipped 状态和全部 attempts；
+  唯一键是 plan digest + step id + attempt，callId 只承担传输配对。succeeded step 禁止重发。
+- `claimGeneration` 是同一 checkpoint 的 lease fencing 代数；`continuationGeneration` 是业务接力链
+  代数。Worker crash/reclaim 只增长前者，连续 continuation 失败才增长后者。
+- legacy `replan_required` 必须先进入 `awaiting_user`；snapshot digest CAS 一次性确认后，Host 才允许
+  在原 capability locks/replan budget 内生成 revision 1。
 - 从原始 prompt 重新规划不是从断点继续，不得记录为 continuation 成功证据。
 
 ## 不可变修订 lineage

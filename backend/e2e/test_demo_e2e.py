@@ -828,13 +828,13 @@ def test_agent_run_handoff_public_api_and_completed_action_ledger(
         events = client.get(
             f"/conversation-runs/{continuation_id}/events"
         ).json()
-        reused = [
+        repeated_completed = [
             item
             for item in events
-            if item["type"] == "tool.result"
-            and item["payload"].get("reusedFromLedger") is True
+            if item["type"] == "tool.requested"
+            and item["payload"].get("planStepId") == "lookup"
         ]
-        assert len(reused) == 1
+        assert repeated_completed == []
 
         deadline = time.time() + 30
         while time.time() < deadline:
@@ -910,9 +910,9 @@ def test_real_tool_failure_handoff_distill_and_second_reuse(
         continuation_events = client.get(
             f"/conversation-runs/{continuation_id}/events"
         ).json()
-        assert any(
-            item["type"] == "tool.result"
-            and item["payload"].get("reusedFromLedger") is True
+        assert not any(
+            item["type"] == "tool.requested"
+            and item["payload"].get("planStepId") == "preflight"
             for item in continuation_events
         )
 
@@ -1043,6 +1043,209 @@ def test_generic_non_browser_failure_continuation(
         assert continuation["input"]["continuationGeneration"] == 1
 
 
+@pytest.mark.parametrize(
+    ("mode", "directive", "capabilities", "expected_step"),
+    [
+        (
+            "planned_browser_summary",
+            "[[RECOVERY_URL:{alternate_url}]]",
+            ["lookup.table", "browser.read", "summarize.text"],
+            "browser",
+        ),
+        (
+            "planned_file_transform",
+            (
+                "[[RECOVERY_REPEAT_SUCCEEDED]]"
+                "[[RECOVERY_PATH:different.txt]][[CONTENT:safe-content]]"
+            ),
+            ["read.local", "summarize.text"],
+            "read",
+        ),
+        (
+            "planned_lookup_transform",
+            "[[RECOVERY_KEY:q4]]",
+            ["lookup.table"],
+            "transform",
+        ),
+    ],
+)
+def test_continuation_argument_deviation_fails_before_adapter(
+    isolated_stack: DemoStack,
+    mode: str,
+    directive: str,
+    capabilities: list[str],
+    expected_step: str,
+) -> None:
+    stack = isolated_stack
+    restart_worker(stack, crash=True, disable_task_recovery=True)
+    with stack.client() as client:
+        stack.set_transient_healthy(False)
+        alternate_url = f"{stack.form_url}/alternate"
+        task_prefix = (
+            f"{stack.form_url}/transient?mode=503 "
+            if mode == "planned_browser_summary"
+            else "任务 "
+        )
+        content = (
+            f"{task_prefix}[[MODE:{mode}]]"
+            f"{directive.format(alternate_url=alternate_url)}"
+        )
+        conversation = client.post(
+            "/conversations", json={"title": f"参数偏离-{mode}"}
+        ).json()
+        created = client.post(
+            f"/conversations/{conversation['id']}/agent-runs",
+            json={
+                "content": content,
+                "allowedCapabilities": capabilities,
+            },
+        )
+        source = poll_conversation_run(
+            client, created.json()["conversationRunId"]
+        )
+        assert source["status"] == "failed"
+        checkpoint_id = source["error"]["taskCheckpointId"]
+        if mode == "planned_browser_summary":
+            stack.set_transient_healthy(True)
+        restart_worker(stack, crash=True)
+        deadline = time.time() + 30
+        continuation_id = None
+        while time.time() < deadline:
+            checkpoint = client.get(
+                f"/task-checkpoints/{checkpoint_id}"
+            ).json()
+            continuation_id = checkpoint.get("continuationRunId")
+            if continuation_id:
+                break
+            time.sleep(0.1)
+        continuation = poll_conversation_run(
+            client, continuation_id, timeout=30
+        )
+        assert continuation["status"] == "failed"
+        assert continuation["error"]["code"] == "PLAN_ARGUMENT_MISMATCH"
+        events = client.get(
+            f"/conversation-runs/{continuation_id}/events"
+        ).json()
+        assert not any(
+            item["type"] == "tool.result"
+            and item["payload"].get("planStepId") == expected_step
+            for item in events
+        )
+        if mode == "planned_browser_summary":
+            assert stack.form_stats()["alternateCount"] == 0
+
+
+@pytest.mark.parametrize(
+    ("directive", "expected_code"),
+    [
+        ("[[RECOVERY_NEW_PLAN]]", "AGENT_EVENT_INVALID"),
+        ("[[RECOVERY_SKIP_DEPENDENCY]]", "AGENT_EVENT_INVALID"),
+        ("[[RECOVERY_REPEAT_SUCCEEDED]]", "PLAN_STEP_ALREADY_SUCCEEDED"),
+    ],
+)
+def test_continuation_plan_or_step_deviation_fails_closed(
+    isolated_stack: DemoStack,
+    directive: str,
+    expected_code: str,
+) -> None:
+    stack = isolated_stack
+    restart_worker(stack, crash=True, disable_task_recovery=True)
+    with stack.client() as client:
+        conversation = client.post(
+            "/conversations", json={"title": "计划偏离"}
+        ).json()
+        created = client.post(
+            f"/conversations/{conversation['id']}/agent-runs",
+            json={
+                "content": (
+                    "任务 [[MODE:planned_lookup_transform]]"
+                    f"{directive}"
+                ),
+                "allowedCapabilities": ["lookup.table"],
+            },
+        )
+        source = poll_conversation_run(
+            client, created.json()["conversationRunId"]
+        )
+        checkpoint_id = source["error"]["taskCheckpointId"]
+        restart_worker(stack, crash=True)
+        deadline = time.time() + 30
+        continuation_id = None
+        while time.time() < deadline:
+            checkpoint = client.get(
+                f"/task-checkpoints/{checkpoint_id}"
+            ).json()
+            continuation_id = checkpoint.get("continuationRunId")
+            if continuation_id:
+                break
+            time.sleep(0.1)
+        continuation = poll_conversation_run(
+            client, continuation_id, timeout=30
+        )
+        assert continuation["status"] == "failed"
+        assert continuation["error"]["code"] == expected_code
+
+
+def test_continuation_legal_replan_creates_revision_two_artifact(
+    isolated_stack: DemoStack,
+) -> None:
+    stack = isolated_stack
+    restart_worker(stack, crash=True, disable_task_recovery=True)
+    with stack.client() as client:
+        conversation = client.post(
+            "/conversations", json={"title": "合法 replan"}
+        ).json()
+        created = client.post(
+            f"/conversations/{conversation['id']}/agent-runs",
+            json={
+                "content": (
+                    "任务 [[MODE:planned_lookup_transform]]"
+                    "[[RECOVERY_REPLAN]][[RECOVERY_REPLAN_REPEAT]]"
+                ),
+                "allowedCapabilities": ["lookup.table"],
+            },
+        )
+        source = poll_conversation_run(
+            client, created.json()["conversationRunId"]
+        )
+        checkpoint_id = source["error"]["taskCheckpointId"]
+        restart_worker(stack, crash=True)
+        deadline = time.time() + 30
+        continuation_id = None
+        while time.time() < deadline:
+            checkpoint = client.get(
+                f"/task-checkpoints/{checkpoint_id}"
+            ).json()
+            continuation_id = checkpoint.get("continuationRunId")
+            if continuation_id:
+                break
+            time.sleep(0.1)
+        continuation = poll_conversation_run(
+            client, continuation_id, timeout=30
+        )
+        assert continuation["status"] == "succeeded", continuation
+        assert (
+            continuation["input"]["expectedPlanContract"]["revision"] == 1
+        )
+        events = client.get(
+            f"/conversation-runs/{continuation_id}/events"
+        ).json()
+        replans = [
+            item for item in events if item["type"] == "agent.replan"
+        ]
+        assert [item["payload"]["newRevision"] for item in replans] == [2, 2]
+        assert replans[1]["payload"]["idempotentReplay"] is True
+        artifacts = client.get(
+            f"/conversation-runs/{continuation_id}/artifacts"
+        )
+        assert artifacts.status_code == 200, artifacts.text
+        assert any(
+            item["kind"] == "agent_plan_snapshot"
+            and item["metadata"].get("revision") == 2
+            for item in artifacts.json()
+        )
+
+
 def test_agent_run_unknown_outcome_answer_consumed_once(
     stack: DemoStack,
 ) -> None:
@@ -1108,6 +1311,142 @@ def test_agent_run_unknown_outcome_answer_consumed_once(
             client, continuation_id, timeout=30
         )
         assert continuation["status"] == "succeeded"
+
+
+def test_legacy_transient_replan_requires_one_time_user_answer(
+    isolated_stack: DemoStack,
+) -> None:
+    stack = isolated_stack
+    restart_worker(stack, crash=True, disable_task_recovery=True)
+    with stack.client() as client:
+        conversation = client.post(
+            "/conversations", json={"title": "legacy replan"}
+        ).json()
+        created = client.post(
+            f"/conversations/{conversation['id']}/agent-runs",
+            json={
+                "content": (
+                    "q1 [[MODE:reported_failure]]"
+                    "[[ERROR:DEPENDENCY_UNAVAILABLE]]"
+                ),
+                "allowedCapabilities": ["lookup.table"],
+            },
+        )
+        source = poll_conversation_run(
+            client, created.json()["conversationRunId"]
+        )
+        checkpoint_id = source["error"]["taskCheckpointId"]
+        checkpoint = client.get(
+            f"/task-checkpoints/{checkpoint_id}"
+        ).json()
+        assert checkpoint["status"] == "awaiting_user"
+        assert checkpoint["remainingPlan"]["mode"] == "replan_required"
+        assert checkpoint["pendingQuestion"]
+        answer = client.post(
+            f"/task-checkpoints/{checkpoint_id}/answer",
+            json={
+                "snapshotDigest": checkpoint["digest"],
+                "answer": {"continue": True},
+            },
+        )
+        assert answer.status_code == 200, answer.text
+        duplicate = client.post(
+            f"/task-checkpoints/{checkpoint_id}/answer",
+            json={
+                "snapshotDigest": checkpoint["digest"],
+                "answer": {"continue": True},
+            },
+        )
+        assert duplicate.status_code == 409
+        restart_worker(stack, crash=True)
+        deadline = time.time() + 30
+        continuation_id = None
+        while time.time() < deadline:
+            checkpoint = client.get(
+                f"/task-checkpoints/{checkpoint_id}"
+            ).json()
+            continuation_id = checkpoint.get("continuationRunId")
+            if continuation_id:
+                break
+            time.sleep(0.1)
+        continuation = poll_conversation_run(
+            client, continuation_id, timeout=30
+        )
+        assert continuation["status"] == "succeeded", continuation
+        artifacts = client.get(
+            f"/conversation-runs/{continuation_id}/artifacts"
+        ).json()
+        assert any(
+            item["kind"] == "agent_plan_snapshot"
+            and item["metadata"].get("revision") == 1
+            for item in artifacts
+        )
+
+
+def test_three_failed_continuation_generations_terminate(
+    isolated_stack: DemoStack,
+) -> None:
+    stack = isolated_stack
+    restart_worker(stack, crash=True, disable_task_recovery=True)
+    with stack.client() as client:
+        conversation = client.post(
+            "/conversations", json={"title": "接力预算"}
+        ).json()
+        created = client.post(
+            f"/conversations/{conversation['id']}/agent-runs",
+            json={
+                "content": (
+                    "任务 [[MODE:planned_lookup_transform]]"
+                    "[[RECOVERY_ALWAYS_FAIL]]"
+                ),
+                "allowedCapabilities": ["lookup.table"],
+            },
+        )
+        source = poll_conversation_run(
+            client, created.json()["conversationRunId"]
+        )
+        checkpoint_id = source["error"]["taskCheckpointId"]
+        restart_worker(stack, crash=True)
+        deadline = time.time() + 45
+        exhausted = None
+        while time.time() < deadline:
+            checkpoints = []
+            current_id = checkpoint_id
+            for _ in range(4):
+                response = client.get(
+                    f"/task-checkpoints/{current_id}"
+                )
+                if response.status_code != 200:
+                    break
+                item = response.json()
+                checkpoints.append(item)
+                continuation_id = item.get("continuationRunId")
+                if not continuation_id:
+                    break
+                continuation = client.get(
+                    f"/conversation-runs/{continuation_id}"
+                ).json()
+                child_id = (continuation.get("error") or {}).get(
+                    "taskCheckpointId"
+                )
+                if not child_id:
+                    break
+                current_id = child_id
+            exhausted = next(
+                (
+                    item
+                    for item in checkpoints
+                    if item["status"] == "terminal"
+                    and item.get("budgetExhausted")
+                ),
+                None,
+            )
+            if exhausted is not None:
+                break
+            time.sleep(0.2)
+        assert exhausted is not None
+        assert exhausted["continuationGeneration"] == 3
+        assert exhausted["budgetExhausted"]["actualGenerations"] == 3
 
 
 def test_e2e_10_progressive_catalog_composition_and_version_pinning(

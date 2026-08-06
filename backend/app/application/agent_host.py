@@ -16,8 +16,10 @@ from app.application.agent_plans import (
     AgentPlanError,
     AgentPlanSnapshot,
     apply_replan_patch,
+    materialize_step_arguments,
     validate_agent_plan,
 )
+from app.application.compiler import digest_json
 from app.application.error_policy import error_policy
 from app.application.tool_broker import (
     ToolAdapterRegistry,
@@ -67,6 +69,23 @@ class AgentHostError(Exception):
 
 
 @dataclass
+class ExpectedPlanContract:
+    plan_snapshot: dict[str, Any] | None
+    plan_digest: str | None
+    revision: int | None
+    allowed_remaining_step_ids: tuple[str, ...]
+    source_checkpoint_id: str
+    step_states: dict[str, str]
+    step_attempts: dict[str, list[dict[str, Any]]]
+    step_state_digest: str
+    original_input: dict[str, Any]
+    step_outputs: dict[str, dict[str, Any]]
+    artifact_outputs: dict[str, dict[str, Any]]
+    continuation_generation: int
+    legacy_replan: bool = False
+
+
+@dataclass
 class AgentHostRequest:
     """一次受限 Agent 运行的完整请求。"""
 
@@ -79,6 +98,7 @@ class AgentHostRequest:
     max_total_tokens: int = 30000
     max_duration_seconds: int = 120
     completed_actions: tuple[dict[str, Any], ...] = ()
+    expected_plan: ExpectedPlanContract | None = None
 
 
 @dataclass
@@ -92,6 +112,12 @@ class AgentHostResult:
     step_count: int = 0
     total_tokens: int = 0
     plan_snapshot: dict[str, Any] | None = None
+    accepted_plan_digest: str | None = None
+    accepted_plan_revision: int | None = None
+    plan_step_states: dict[str, str] = field(default_factory=dict)
+    plan_step_attempts: dict[str, list[dict[str, Any]]] = field(
+        default_factory=dict
+    )
 
 
 # event_sink 接收 (runtime_event, audit_event)，由调用方决定如何持久化。
@@ -177,7 +203,67 @@ class AgentHost:
         failed_tool_result: dict[str, Any] | None = None
         output: dict[str, Any] | None = None
         plan: AgentPlanSnapshot | None = None
-        completed_plan_steps: set[str] = set()
+        plan_reported = False
+        step_states: dict[str, str] = {}
+        step_attempts: dict[str, list[dict[str, Any]]] = {}
+        step_outputs: dict[str, dict[str, Any]] = {}
+        artifact_outputs: dict[str, dict[str, Any]] = {}
+        original_input = {"message": request.prompt}
+        allowed_remaining_step_ids: set[str] | None = None
+        source_checkpoint_id = ""
+        accepted_replans: dict[str, AgentPlanSnapshot] = {}
+        if request.expected_plan is not None:
+            expected = request.expected_plan
+            original_input = dict(expected.original_input)
+            step_states = dict(expected.step_states)
+            step_attempts = {
+                key: [dict(item) for item in value]
+                for key, value in expected.step_attempts.items()
+            }
+            step_outputs = {
+                key: dict(value)
+                for key, value in expected.step_outputs.items()
+            }
+            artifact_outputs = {
+                key: dict(value)
+                for key, value in expected.artifact_outputs.items()
+            }
+            allowed_remaining_step_ids = set(
+                expected.allowed_remaining_step_ids
+            )
+            source_checkpoint_id = expected.source_checkpoint_id
+            if digest_json(step_states) != expected.step_state_digest:
+                raise AgentHostError(
+                    "EVIDENCE_CONFLICT",
+                    "expected plan step-state digest 不一致",
+                )
+            if expected.plan_snapshot is not None:
+                try:
+                    plan = validate_agent_plan(
+                        expected.plan_snapshot,
+                        allowed_capabilities=set(effective),
+                        max_steps=request.max_steps
+                        + len(
+                            [
+                                status
+                                for status in step_states.values()
+                                if status == "succeeded"
+                            ]
+                        ),
+                    )
+                except AgentPlanError as exc:
+                    raise AgentHostError(
+                        "EVIDENCE_CONFLICT",
+                        f"expected PlanSnapshot 非法: {exc}",
+                    ) from exc
+                if (
+                    plan.digest != expected.plan_digest
+                    or plan.revision != expected.revision
+                ):
+                    raise AgentHostError(
+                        "EVIDENCE_CONFLICT",
+                        "expected PlanSnapshot digest/revision 不一致",
+                    )
 
         try:
             async with asyncio.timeout(request.max_duration_seconds):
@@ -225,17 +311,36 @@ class AgentHost:
                         except AgentEventError as exc:
                             await self._cancel(adapter, request.run_id)
                             raise AgentHostError("AGENT_EVENT_INVALID", str(exc)) from exc
-                        result.runtime_events.append(runtime_event)
-                        result.audit_events.append(audit_event)
-                        if event_sink is not None:
-                            await event_sink(runtime_event, audit_event)
                         request_payload = runtime_event["payload"]
                         if plan is not None:
                             self._validate_planned_tool_request(
                                 plan,
                                 request_payload,
-                                completed_plan_steps,
+                                step_states=step_states,
+                                step_attempts=step_attempts,
+                                step_outputs=step_outputs,
+                                artifact_outputs=artifact_outputs,
+                                original_input=original_input,
+                                allowed_remaining_step_ids=allowed_remaining_step_ids,
                             )
+                            step_id = str(request_payload["planStepId"])
+                            step_states[step_id] = "running"
+                            step_attempts.setdefault(step_id, []).append(
+                                {
+                                    "planDigest": plan.digest,
+                                    "stepId": step_id,
+                                    "attempt": request_payload["stepAttempt"],
+                                    "callId": request_payload["callId"],
+                                    "status": "running",
+                                    "argumentsDigest": digest_json(
+                                        request_payload["arguments"]
+                                    ),
+                                }
+                            )
+                        result.runtime_events.append(runtime_event)
+                        result.audit_events.append(audit_event)
+                        if event_sink is not None:
+                            await event_sink(runtime_event, audit_event)
                         open_calls[request_payload["callId"]] = request_payload
                         tool_result = await self._execute_tool_request(
                             request, request_payload
@@ -258,8 +363,25 @@ class AgentHost:
                         ]
                         if runtime_result["payload"].get("status") == "failed":
                             failed_tool_result = runtime_result["payload"]
+                            if request_payload.get("planStepId"):
+                                step_id = str(request_payload["planStepId"])
+                                step_states[step_id] = "failed"
+                                step_attempts[step_id][-1].update(
+                                    {
+                                        "status": "failed",
+                                        "error": runtime_result["payload"].get(
+                                            "error"
+                                        ),
+                                    }
+                                )
                         elif request_payload.get("planStepId"):
-                            completed_plan_steps.add(request_payload["planStepId"])
+                            step_id = str(request_payload["planStepId"])
+                            step_states[step_id] = "succeeded"
+                            step_attempts[step_id][-1]["status"] = "succeeded"
+                            output_value = runtime_result["payload"].get("output")
+                            if isinstance(output_value, dict):
+                                step_outputs[step_id] = output_value
+                            failed_tool_result = None
                         continue
                     try:
                         runtime_event, audit_event = validator.validate_pair(raw)
@@ -286,34 +408,74 @@ class AgentHost:
                     if event_type == "agent.plan" and isinstance(
                         payload.get("steps"), list
                     ):
-                        if plan is not None:
+                        if (
+                            request.expected_plan is not None
+                            and plan is not None
+                            and not plan_reported
+                        ):
+                            try:
+                                reported_plan = validate_agent_plan(
+                                    payload,
+                                    allowed_capabilities=set(effective),
+                                    max_steps=len(plan.steps),
+                                )
+                            except AgentPlanError as exc:
+                                raise AgentHostError(
+                                    "AGENT_EVENT_INVALID", str(exc)
+                                ) from exc
+                            if reported_plan.canonical() != plan.canonical():
+                                raise AgentHostError(
+                                    "AGENT_EVENT_INVALID",
+                                    "continuation agent.plan 与 expected PlanSnapshot 不一致",
+                                )
+                            plan_reported = True
+                            runtime_event = {
+                                "type": "agent.plan",
+                                "payload": plan.canonical(),
+                            }
+                        elif plan is not None:
                             raise AgentHostError(
                                 "AGENT_EVENT_INVALID",
                                 "同一 AgentRun 不得直接替换计划；必须提交 ReplanPatch",
                             )
+                        else:
+                            if (
+                                request.expected_plan is not None
+                                and not request.expected_plan.legacy_replan
+                            ):
+                                raise AgentHostError(
+                                    "AGENT_EVENT_INVALID",
+                                    "continuation 缺少 expected PlanSnapshot",
+                                )
+                            try:
+                                plan = validate_agent_plan(
+                                    payload,
+                                    allowed_capabilities=set(effective),
+                                    max_steps=request.max_steps,
+                                )
+                            except AgentPlanError as exc:
+                                await self._cancel(adapter, request.run_id)
+                                raise AgentHostError(
+                                    "AGENT_EVENT_INVALID", str(exc)
+                                ) from exc
+                            plan_reported = True
+                            step_states = {
+                                step.id: "remaining" for step in plan.steps
+                            }
+                            step_attempts = {
+                                step.id: [] for step in plan.steps
+                            }
+                            allowed_remaining_step_ids = {
+                                step.id for step in plan.steps
+                            }
                         try:
-                            plan = validate_agent_plan(
-                                payload,
-                                allowed_capabilities=set(effective),
-                                max_steps=request.max_steps,
-                            )
+                            assert plan is not None
+                            self._validate_plan_effects(plan)
                         except AgentPlanError as exc:
                             await self._cancel(adapter, request.run_id)
                             raise AgentHostError(
                                 "AGENT_EVENT_INVALID", str(exc)
                             ) from exc
-                        for planned_step in plan.steps:
-                            try:
-                                descriptor = self._tool_registry.describe(
-                                    planned_step.capabilityRef
-                                )
-                            except ToolBrokerError:
-                                continue
-                            if descriptor["effect"] != planned_step.effect:
-                                raise AgentHostError(
-                                    "AGENT_EVENT_INVALID",
-                                    f"计划步骤 {planned_step.id} 的 effect 与 Host 能力契约不一致",
-                                )
                         result.plan_snapshot = plan.canonical()
                     elif event_type == "agent.replan":
                         if plan is None:
@@ -321,18 +483,72 @@ class AgentHost:
                                 "AGENT_EVENT_INVALID",
                                 "agent.replan 必须引用已验证的 PlanSnapshot",
                             )
-                        try:
-                            plan = apply_replan_patch(
-                                plan,
-                                payload,
-                                completed_step_ids=completed_plan_steps,
-                                allowed_capabilities=set(effective),
-                                max_steps=request.max_steps,
-                            )
-                        except AgentPlanError as exc:
-                            raise AgentHostError(
-                                "AGENT_EVENT_INVALID", str(exc)
-                            ) from exc
+                        patch_digest = digest_json(payload)
+                        accepted = accepted_replans.get(patch_digest)
+                        if accepted is not None:
+                            plan = accepted
+                        else:
+                            try:
+                                current_state_digest = digest_json(step_states)
+                                plan = validate_agent_plan(
+                                    apply_replan_patch(
+                                        plan,
+                                        payload,
+                                        completed_step_ids={
+                                            step_id
+                                            for step_id, status in step_states.items()
+                                            if status == "succeeded"
+                                        },
+                                        replaceable_step_ids={
+                                            step_id
+                                            for step_id, status in step_states.items()
+                                            if status in {"remaining", "failed"}
+                                        },
+                                        current_step_state_digest=current_state_digest,
+                                        source_checkpoint_id=source_checkpoint_id,
+                                        allowed_capabilities=set(effective),
+                                        max_steps=request.max_steps
+                                        + len(
+                                            [
+                                                status
+                                                for status in step_states.values()
+                                                if status == "succeeded"
+                                            ]
+                                        ),
+                                    ).canonical(),
+                                    allowed_capabilities=set(effective),
+                                    max_steps=request.max_steps
+                                    + len(
+                                        [
+                                            status
+                                            for status in step_states.values()
+                                            if status == "succeeded"
+                                        ]
+                                    ),
+                                )
+                            except AgentPlanError as exc:
+                                raise AgentHostError(
+                                    "AGENT_EVENT_INVALID", str(exc)
+                                ) from exc
+                            self._validate_plan_effects(plan)
+                            accepted_replans[patch_digest] = plan
+                            revised_ids = {step.id for step in plan.steps}
+                            step_states = {
+                                step_id: (
+                                    status
+                                    if step_id in revised_ids
+                                    else "skipped"
+                                )
+                                for step_id, status in step_states.items()
+                            }
+                            for step in plan.steps:
+                                step_states.setdefault(step.id, "remaining")
+                                step_attempts.setdefault(step.id, [])
+                            allowed_remaining_step_ids = {
+                                step_id
+                                for step_id, status in step_states.items()
+                                if status in {"remaining", "failed"}
+                            }
                         # Persist the immutable replacement revision rather than
                         # the patch envelope as the executable source of truth.
                         runtime_event = {
@@ -345,6 +561,8 @@ class AgentHost:
                                 **audit_event["payload"],
                                 "newPlanDigest": plan.digest,
                                 "newRevision": plan.revision,
+                                "patchDigest": patch_digest,
+                                "idempotentReplay": accepted is not None,
                             },
                         }
                         result.plan_snapshot = plan.canonical()
@@ -486,6 +704,11 @@ class AgentHost:
                 f"Agent 输出不符合 outputSchema: {errors[0].message}",
             )
         result.output = output
+        result.plan_step_states = step_states
+        result.plan_step_attempts = step_attempts
+        if plan is not None:
+            result.accepted_plan_digest = plan.digest
+            result.accepted_plan_revision = plan.revision
         return result
 
     @staticmethod
@@ -504,11 +727,30 @@ class AgentHost:
             reported_error=reported_error,
         )
 
-    @staticmethod
+    def _validate_plan_effects(self, plan: AgentPlanSnapshot) -> None:
+        for step in plan.steps:
+            try:
+                descriptor = self._tool_registry.describe(
+                    step.capabilityRef
+                )
+            except ToolBrokerError as exc:
+                raise AgentPlanError(str(exc)) from exc
+            if descriptor["effect"] != step.effect:
+                raise AgentPlanError(
+                    f"计划步骤 {step.id} 的 effect 与 Host 能力契约不一致"
+                )
+
     def _validate_planned_tool_request(
+        self,
         plan: AgentPlanSnapshot,
         payload: dict[str, Any],
-        completed_plan_steps: set[str],
+        *,
+        step_states: dict[str, str],
+        step_attempts: dict[str, list[dict[str, Any]]],
+        step_outputs: dict[str, dict[str, Any]],
+        artifact_outputs: dict[str, dict[str, Any]],
+        original_input: dict[str, Any],
+        allowed_remaining_step_ids: set[str] | None,
     ) -> None:
         step_id = payload.get("planStepId")
         if not step_id:
@@ -527,7 +769,103 @@ class AgentHost:
                 "AGENT_EVENT_INVALID",
                 f"计划步骤 {step_id} 的 capabilityRef 不一致",
             )
-        missing = set(step.dependsOn) - completed_plan_steps
+        if payload.get("planDigest") != plan.digest:
+            raise AgentHostError(
+                "AGENT_EVENT_INVALID",
+                f"计划步骤 {step_id} 的 planDigest 不一致",
+            )
+        if payload.get("planRevision") != plan.revision:
+            raise AgentHostError(
+                "AGENT_EVENT_INVALID",
+                f"计划步骤 {step_id} 的 planRevision 不一致",
+            )
+        descriptor = self._tool_registry.describe(step.capabilityRef)
+        if payload.get("action") != step.action:
+            raise AgentHostError(
+                "PLAN_ARGUMENT_MISMATCH",
+                f"计划步骤 {step_id} 的 action 偏离冻结计划",
+            )
+        if payload.get("effect", descriptor["effect"]) != step.effect:
+            raise AgentHostError(
+                "PLAN_ARGUMENT_MISMATCH",
+                f"计划步骤 {step_id} 的 effect 偏离冻结计划",
+            )
+        if payload.get("idempotencyKey") != step.idempotencyKey:
+            raise AgentHostError(
+                "PLAN_ARGUMENT_MISMATCH",
+                f"计划步骤 {step_id} 的 idempotencyKey 偏离冻结计划",
+            )
+        if payload.get("idempotent", descriptor["idempotent"]) != descriptor[
+            "idempotent"
+        ]:
+            raise AgentHostError(
+                "PLAN_ARGUMENT_MISMATCH",
+                f"计划步骤 {step_id} 的 idempotent 偏离 Host 契约",
+            )
+        try:
+            expected_arguments = materialize_step_arguments(
+                step,
+                original_input=original_input,
+                step_outputs=step_outputs,
+                artifact_outputs=artifact_outputs,
+            )
+        except AgentPlanError as exc:
+            raise AgentHostError(
+                "EVIDENCE_CONFLICT", str(exc)
+            ) from exc
+        if payload.get("arguments") != expected_arguments:
+            raise AgentHostError(
+                "PLAN_ARGUMENT_MISMATCH",
+                f"计划步骤 {step_id} 的 arguments 偏离冻结计划",
+            )
+        state = step_states.get(step_id, "remaining")
+        if state == "succeeded":
+            raise AgentHostError(
+                "PLAN_STEP_ALREADY_SUCCEEDED",
+                f"计划步骤 {step_id} 已成功，不得重复执行",
+            )
+        if state == "running":
+            raise AgentHostError(
+                "PLAN_STEP_ALREADY_RUNNING",
+                f"计划步骤 {step_id} 已在执行",
+            )
+        if (
+            allowed_remaining_step_ids is not None
+            and step_id not in allowed_remaining_step_ids
+        ):
+            raise AgentHostError(
+                "PLAN_STEP_NOT_ALLOWED",
+                f"计划步骤 {step_id} 不在 checkpoint remaining set",
+            )
+        attempts = step_attempts.get(step_id, [])
+        expected_attempt = len(attempts) + 1
+        if payload.get("stepAttempt") != expected_attempt:
+            raise AgentHostError(
+                "AGENT_EVENT_INVALID",
+                f"计划步骤 {step_id} attempt 应为 {expected_attempt}",
+            )
+        if state == "failed":
+            last_error = (
+                attempts[-1].get("error") if attempts else {}
+            ) or {}
+            policy = error_policy(str(last_error.get("code", "")))
+            descriptor = self._tool_registry.describe(step.capabilityRef)
+            if (
+                step.fallback != "retry"
+                or not policy.retryable
+                or expected_attempt > policy.max_attempts
+                or descriptor["effect"] != "none"
+                or not descriptor["idempotent"]
+            ):
+                raise AgentHostError(
+                    "PLAN_STEP_RETRY_EXHAUSTED",
+                    f"计划步骤 {step_id} 不满足安全重试条件",
+                )
+        missing = {
+            dependency
+            for dependency in step.dependsOn
+            if step_states.get(dependency) != "succeeded"
+        }
         if missing:
             raise AgentHostError(
                 "AGENT_EVENT_INVALID",
@@ -758,8 +1096,12 @@ class AgentHost:
             "idempotent",
             "observations",
             "outputSchema",
+            "planDigest",
+            "planRevision",
             "planStepId",
             "replayability",
+            "stepAttempt",
+            "idempotencyKey",
         )
         metadata = {key: payload[key] for key in keys if key in payload}
         observations = dict(metadata.get("observations") or {})

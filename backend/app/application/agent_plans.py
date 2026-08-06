@@ -1,14 +1,56 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+import re
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from app.application.compiler import digest_json
 
 
 class AgentPlanError(ValueError):
     pass
+
+
+class LiteralArgumentRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["literal"]
+    value: Any
+
+
+class UserInputArgumentRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["user_input"]
+    inputKey: str = Field(default="message", min_length=1, max_length=120)
+    extract: Literal["url"] | None = None
+
+
+class StepOutputArgumentRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["step_output"]
+    stepId: str = Field(min_length=1, max_length=120)
+    path: str = Field(min_length=1, max_length=500)
+
+
+class ArtifactArgumentRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["artifact"]
+    artifactId: str = Field(min_length=1, max_length=120)
+    path: str = Field(min_length=1, max_length=500)
+
+
+ArgumentRef = Annotated[
+    LiteralArgumentRef
+    | UserInputArgumentRef
+    | StepOutputArgumentRef
+    | ArtifactArgumentRef,
+    Field(discriminator="source"),
+]
+_ARGUMENT_REF_ADAPTER: TypeAdapter[ArgumentRef] = TypeAdapter(ArgumentRef)
 
 
 class AgentPlanStep(BaseModel):
@@ -18,7 +60,7 @@ class AgentPlanStep(BaseModel):
     action: str = Field(min_length=1, max_length=120)
     capabilityRef: str = Field(min_length=1, max_length=240)
     dependsOn: list[str] = Field(default_factory=list)
-    argumentRefs: dict[str, Any] = Field(default_factory=dict)
+    argumentRefs: dict[str, ArgumentRef] = Field(default_factory=dict)
     effect: Literal["none", "read", "write", "unknown"] = "none"
     idempotencyKey: str | None = Field(default=None, max_length=240)
     outputName: str = Field(min_length=1, max_length=120)
@@ -49,8 +91,76 @@ class ReplanPatch(BaseModel):
     schemaVersion: Literal["1"] = "1"
     basePlanDigest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     baseRevision: int = Field(ge=1)
+    baseStepStateDigest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    sourceCheckpointId: str = Field(min_length=1, max_length=120)
+    replaceStepIds: list[str] = Field(min_length=1)
     replacementSteps: list[AgentPlanStep] = Field(min_length=1)
     reason: str = Field(min_length=1, max_length=1000)
+
+
+def parse_argument_ref(value: Any) -> ArgumentRef:
+    try:
+        return _ARGUMENT_REF_ADAPTER.validate_python(value)
+    except ValidationError as exc:
+        raise AgentPlanError(f"argumentRef 结构非法: {exc}") from exc
+
+
+def _read_path(value: Any, path: str) -> Any:
+    current = value
+    for segment in path.split("."):
+        if not segment:
+            raise AgentPlanError(f"参数引用 path 非法: {path}")
+        if isinstance(current, dict) and segment in current:
+            current = current[segment]
+        else:
+            raise AgentPlanError(f"参数引用 path 不存在: {path}")
+    return current
+
+
+def materialize_step_arguments(
+    step: AgentPlanStep,
+    *,
+    original_input: dict[str, Any],
+    step_outputs: dict[str, dict[str, Any]],
+    artifact_outputs: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    arguments: dict[str, Any] = {}
+    for name, reference in step.argumentRefs.items():
+        if isinstance(reference, LiteralArgumentRef):
+            arguments[name] = reference.value
+        elif isinstance(reference, UserInputArgumentRef):
+            if reference.inputKey not in original_input:
+                raise AgentPlanError(
+                    f"计划步骤 {step.id} 缺少输入 {reference.inputKey}"
+                )
+            value = original_input[reference.inputKey]
+            if reference.extract == "url":
+                if not isinstance(value, str):
+                    raise AgentPlanError(
+                        f"计划步骤 {step.id} 的 URL 输入不是字符串"
+                    )
+                match = re.search(r"https?://[^\s\"}]+", value)
+                if match is None:
+                    raise AgentPlanError(
+                        f"计划步骤 {step.id} 无法从输入解析 URL"
+                    )
+                value = match.group(0)
+            arguments[name] = value
+        elif isinstance(reference, StepOutputArgumentRef):
+            source = step_outputs.get(reference.stepId)
+            if source is None:
+                raise AgentPlanError(
+                    f"计划步骤 {step.id} 缺少前序输出 {reference.stepId}"
+                )
+            arguments[name] = _read_path(source, reference.path)
+        elif isinstance(reference, ArtifactArgumentRef):
+            source = artifact_outputs.get(reference.artifactId)
+            if source is None:
+                raise AgentPlanError(
+                    f"计划步骤 {step.id} 缺少 Artifact {reference.artifactId}"
+                )
+            arguments[name] = _read_path(source, reference.path)
+    return arguments
 
 
 def validate_agent_plan(
@@ -106,6 +216,9 @@ def apply_replan_patch(
     payload: dict[str, Any],
     *,
     completed_step_ids: set[str],
+    replaceable_step_ids: set[str],
+    current_step_state_digest: str,
+    source_checkpoint_id: str,
     allowed_capabilities: set[str],
     max_steps: int,
 ) -> AgentPlanSnapshot:
@@ -118,8 +231,18 @@ def apply_replan_patch(
         or patch.baseRevision != plan.revision
     ):
         raise AgentPlanError("ReplanPatch base digest/revision 已过期")
+    if (
+        patch.baseStepStateDigest != current_step_state_digest
+        or patch.sourceCheckpointId != source_checkpoint_id
+    ):
+        raise AgentPlanError("ReplanPatch checkpoint/step state 已过期")
     if plan.replanBoundary != "remaining_only":
         raise AgentPlanError("当前 PlanSnapshot 不允许 replan")
+    replace_ids = set(patch.replaceStepIds)
+    if len(replace_ids) != len(patch.replaceStepIds):
+        raise AgentPlanError("ReplanPatch replaceStepIds 必须唯一")
+    if not replace_ids <= replaceable_step_ids:
+        raise AgentPlanError("ReplanPatch 只能替换 remaining closure")
     replacement_ids = {step.id for step in patch.replacementSteps}
     if replacement_ids & completed_step_ids:
         raise AgentPlanError("ReplanPatch 不得替换已完成步骤")
@@ -128,6 +251,11 @@ def apply_replan_patch(
         for step in plan.steps
         if step.id in completed_step_ids
     ]
+    retained_steps = [
+        step.model_dump(mode="json")
+        for step in plan.steps
+        if step.id not in replace_ids and step.id not in completed_step_ids
+    ]
     candidate = {
         "schemaVersion": plan.schemaVersion,
         "planId": plan.planId,
@@ -135,6 +263,7 @@ def apply_replan_patch(
         "summary": patch.reason,
         "steps": [
             *completed_steps,
+            *retained_steps,
             *[
                 step.model_dump(mode="json")
                 for step in patch.replacementSteps

@@ -27,6 +27,7 @@ from app.application.agent_run import (
     enqueue_agent_run,
     resolve_effective_capabilities,
 )
+from app.application.compiler import digest_json
 from app.application.orchestrator import reconcile_conversation_artifacts
 from app.application.task_recovery import TaskCheckpointDriver
 from app.config import get_settings
@@ -421,7 +422,11 @@ async def test_continuation_generation_budget_stops_retry_chain(
         checkpoint = await session.scalar(
             select(TaskCheckpoint).where(TaskCheckpoint.source_id == run_id)
         )
-        checkpoint.claim_generation = 1
+        checkpoint.snapshot_json = {
+            **checkpoint.snapshot_json,
+            "continuationGeneration": 1,
+        }
+        checkpoint.digest = digest_json(checkpoint.snapshot_json)
         checkpoint_id = checkpoint.id
     assert await driver.poll_once() is False
     async with SessionLocal() as session:
@@ -431,6 +436,35 @@ async def test_continuation_generation_budget_stops_retry_chain(
         "maxGenerations": 1,
         "actualGenerations": 1,
     }
+
+
+async def test_checkpoint_reclaims_do_not_consume_continuation_generation(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _conversation()
+    run_id = await _enqueue(
+        conversation_id,
+        "q1 [[MODE:deterministic_fail_after_tool]]",
+        config=AgentRunConfig(
+            output_schema=AgentRunConfig.default().output_schema,
+            allowed_capabilities=("lookup.table",),
+        ),
+    )
+    await _drive(run_id)
+    driver = TaskCheckpointDriver("reclaim-owner", lease_seconds=1)
+    handles = []
+    for _ in range(3):
+        async with SessionLocal() as session, session.begin():
+            handle = await driver.claim(session)
+            assert handle is not None
+            handles.append(handle)
+            checkpoint = await session.get(TaskCheckpoint, handle.id)
+            checkpoint.lease_expires_at = utcnow() - timedelta(seconds=1)
+    async with SessionLocal() as session:
+        checkpoint = await session.get(TaskCheckpoint, handles[-1].id)
+    assert checkpoint.claim_generation == 3
+    assert checkpoint.snapshot_json["continuationGeneration"] == 0
+    assert await driver.start_continuation(handles[-1]) is True
 
 
 async def test_failed_tool_result_creates_pending_checkpoint_with_original_error(
@@ -471,7 +505,7 @@ async def test_failed_tool_result_creates_pending_checkpoint_with_original_error
                 Artifact.kind == "tool_result",
             )
         )
-    assert checkpoint.status == "pending"
+    assert checkpoint.status == "awaiting_user"
     assert checkpoint.snapshot_json["failedAction"]["callId"] == "call-browser"
     assert checkpoint.snapshot_json["failedAction"]["artifact"]["id"] == artifact.id
     assert artifact.metadata_json["status"] == "failed"
