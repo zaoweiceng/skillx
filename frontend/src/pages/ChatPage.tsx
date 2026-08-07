@@ -7,9 +7,12 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
   api,
   ChatMessageContent,
+  conversationRunUrl,
   ConversationRunEvent,
   type ConversationRunSummary,
   type Run,
+  taskCheckpointUrl,
+  type TaskCheckpointSummary,
 } from '@/api/client'
 
 type Message = {
@@ -37,6 +40,10 @@ export default function ChatPage() {
   const [traceEvents, setTraceEvents] = useState<ConversationRunEvent[]>([])
   // 每个 ConversationRun 的实时终态，供展示层判断“只有 succeeded 可固化”。
   const [agentRuns, setAgentRuns] = useState<Record<string, ConversationRunSummary>>({})
+  const [taskCheckpoints, setTaskCheckpoints] = useState<Record<string, TaskCheckpointSummary>>(
+    {},
+  )
+  const [activeCheckpointIds, setActiveCheckpointIds] = useState('')
   const [workflowRuns, setWorkflowRuns] = useState<Record<string, Run>>({})
   const [activeWorkflowRunIds, setActiveWorkflowRunIds] = useState('')
 
@@ -78,12 +85,39 @@ export default function ChatPage() {
       Promise.all(agentRunIds.map((runId) => api.getConversationRun(runId).catch(() => null))),
       Promise.all(workflowRunIds.map((runId) => api.getRun(runId).catch(() => null))),
     ])
+    const checkpointIds = new Set(
+      conversation.messages
+        .map((message) => message.content.taskCheckpointId)
+        .filter((id): id is string => typeof id === 'string'),
+    )
+    for (const summary of agentSummaries) {
+      const checkpointId = summary?.error?.taskCheckpointId
+      if (typeof checkpointId === 'string') checkpointIds.add(checkpointId)
+    }
+    const checkpointSummaries = await Promise.all(
+      Array.from(checkpointIds).map((checkpointId) =>
+        api.getTaskCheckpoint(checkpointId).catch(() => null),
+      ),
+    )
     setAgentRuns(
       Object.fromEntries(
         agentSummaries
           .filter((summary): summary is ConversationRunSummary => summary !== null)
           .map((summary) => [summary.id, summary]),
       ),
+    )
+    const loadedCheckpoints = checkpointSummaries.filter(
+      (checkpoint): checkpoint is TaskCheckpointSummary => checkpoint !== null,
+    )
+    setTaskCheckpoints(
+      Object.fromEntries(loadedCheckpoints.map((checkpoint) => [checkpoint.id, checkpoint])),
+    )
+    setActiveCheckpointIds(
+      loadedCheckpoints
+        .filter((checkpoint) => checkpoint.chainStatus === 'continuing')
+        .map((checkpoint) => checkpoint.id)
+        .sort()
+        .join(','),
     )
     const loadedRuns = runSummaries.filter((run): run is Run => run !== null)
     setWorkflowRuns(Object.fromEntries(loadedRuns.map((run) => [run.id, run])))
@@ -120,6 +154,11 @@ export default function ChatPage() {
         // queued/running 均为非终态：长任务由独立 Worker 执行，持续轮询直到终态。
         if (summary.status === 'queued' || summary.status === 'running') {
           window.setTimeout(poll, 800)
+        } else if (
+          summary.status === 'failed' &&
+          typeof summary.error?.taskCheckpointId === 'string'
+        ) {
+          await refresh()
         }
       } catch (reason) {
         if (!cancelled) setError(reason instanceof Error ? reason.message : '加载轨迹失败')
@@ -129,7 +168,38 @@ export default function ChatPage() {
     return () => {
       cancelled = true
     }
-  }, [activeRunId])
+  }, [activeRunId, refresh])
+
+  // source failed 已是 AgentRun 终态，后续改由持久 checkpoint 链驱动 Conversation 刷新。
+  useEffect(() => {
+    if (!activeCheckpointIds) return
+    let cancelled = false
+    let timer = 0
+    let attempts = 0
+    async function poll() {
+      try {
+        await refresh()
+        if (cancelled) return
+        attempts += 1
+        if (attempts >= 375) {
+          setError('失败接力状态刷新超时；服务端仍会继续，可刷新页面恢复跟踪。')
+          return
+        }
+        timer = window.setTimeout(poll, 800)
+      } catch (reason) {
+        if (!cancelled) {
+          setError(reason instanceof Error ? reason.message : '加载失败接力状态失败')
+          attempts += 1
+          if (attempts < 375) timer = window.setTimeout(poll, 800)
+        }
+      }
+    }
+    timer = window.setTimeout(poll, 800)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [activeCheckpointIds, refresh])
 
   useEffect(() => {
     if (!activeWorkflowRunIds) return
@@ -333,10 +403,48 @@ export default function ChatPage() {
     )
   }
 
-  // Agent 运行动作：只有 succeeded 才展示“固化为组件”，其它状态显式提示不可固化。
-  function renderAgentRunActions(conversationRunId: string) {
+  function renderContinuationLineage(checkpoint: TaskCheckpointSummary) {
+    return (
+      <div className="current-mapping" aria-label="失败接力 lineage">
+        {checkpoint.lineage.map((item) => (
+          <span className="metric-chip" key={item.checkpointId}>
+            {item.generation > 0 ? `第 ${item.generation} 代` : '等待接力'} · {item.status}
+            {' · '}
+            <a
+              href={taskCheckpointUrl(item.checkpointId)}
+              target="_blank"
+              rel="noreferrer"
+            >
+              checkpoint {item.checkpointId.slice(0, 8)}
+            </a>
+            {item.continuationRunId && (
+              <>
+                {' · '}
+                <a
+                  href={conversationRunUrl(item.continuationRunId)}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  run {item.continuationRunId.slice(0, 8)}
+                </a>
+              </>
+            )}
+          </span>
+        ))}
+      </div>
+    )
+  }
+
+  // succeeded 才可固化；可恢复失败以 checkpoint 链终态为准，不提前显示源错误。
+  function renderAgentRunActions(conversationRunId: string, messageCheckpointId?: string) {
     const run = agentRuns[conversationRunId]
     const status = run?.status
+    const errorCheckpointId =
+      typeof run?.error?.taskCheckpointId === 'string'
+        ? run.error.taskCheckpointId
+        : undefined
+    const checkpoint = taskCheckpoints[errorCheckpointId ?? messageCheckpointId ?? '']
+    const terminalOwnerRunId = checkpoint?.lineage.at(-1)?.sourceRunId
     if (drafts[conversationRunId]) {
       return (
         <Link className="button ghost" to={`/workflows/${drafts[conversationRunId]}/edit`}>
@@ -352,10 +460,76 @@ export default function ChatPage() {
               {String(run.output.reply)}
             </div>
           )}
+          {checkpoint && renderContinuationLineage(checkpoint)}
           <button className="button ghost" onClick={() => distill(conversationRunId)}>
             固化为组件
           </button>
         </>
+      )
+    }
+    if (checkpoint?.chainStatus === 'continuing') {
+      return (
+        <div className="result-panel" role="status">
+          <strong>{checkpoint.continuationRunId ? '接力中' : '等待接力'}</strong>
+          <span>源失败证据已保留，Worker 将从冻结的剩余计划继续。</span>
+          {renderContinuationLineage(checkpoint)}
+        </div>
+      )
+    }
+    if (checkpoint?.chainStatus === 'succeeded') {
+      return (
+        <div className="hint" role="status">
+          源运行失败；接力链已成功完成，最终结果见后续消息。
+          {renderContinuationLineage(checkpoint)}
+        </div>
+      )
+    }
+    if (checkpoint?.chainStatus === 'awaiting_user') {
+      if (terminalOwnerRunId !== conversationRunId) {
+        return (
+          <div className="hint" role="status">
+            本代接力未完成；接力链末端正在等待人工确认。
+            {renderContinuationLineage(checkpoint)}
+          </div>
+        )
+      }
+      return (
+        <div className="error-panel" role="alert">
+          <strong>{checkpoint.chainError?.code ?? 'CONTINUATION_AWAITING_USER'}</strong>
+          <span>{checkpoint.chainError?.message ?? checkpoint.pendingQuestion}</span>
+          {renderContinuationLineage(checkpoint)}
+        </div>
+      )
+    }
+    if (checkpoint && ['failed', 'cancelled'].includes(checkpoint.chainStatus)) {
+      if (terminalOwnerRunId !== conversationRunId) {
+        return (
+          <div className="hint" role="status">
+            本代接力未完成；最终终态见接力链末端消息。
+            {renderContinuationLineage(checkpoint)}
+          </div>
+        )
+      }
+      return (
+        <div className="error-panel" role="alert">
+          <strong>{checkpoint.chainError?.code ?? 'CONTINUATION_FAILED'}</strong>
+          <span>{checkpoint.chainError?.message ?? '失败接力未能完成'}</span>
+          {run?.error && (
+            <span>
+              源错误：{String(run.error.code ?? status)} ·{' '}
+              {String(run.error.message ?? '运行未完成')}
+            </span>
+          )}
+          {renderContinuationLineage(checkpoint)}
+        </div>
+      )
+    }
+    if (status === 'failed' && errorCheckpointId && !checkpoint) {
+      return (
+        <div className="result-panel" role="status">
+          <strong>正在确认失败接力</strong>
+          <span>源失败证据已保存，正在读取 checkpoint 链状态。</span>
+        </div>
       )
     }
     if ((status === 'failed' || status === 'cancelled') && run.error) {
@@ -550,7 +724,10 @@ export default function ChatPage() {
                 {message.content.conversationRunId &&
                   (message.content.type === 'agent_run' ||
                     message.content.runType === 'agent_run') &&
-                  renderAgentRunActions(message.content.conversationRunId)}
+                  renderAgentRunActions(
+                    message.content.conversationRunId,
+                    message.content.taskCheckpointId,
+                  )}
               </div>
             </article>
           ))}

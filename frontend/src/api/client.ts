@@ -199,6 +199,11 @@ export type ChatMessageContent = {
   runId?: string
   conversationRunId?: string
   runType?: string
+  sourceRunId?: string
+  rootSourceRunId?: string
+  continuationOfConversationRunId?: string
+  taskCheckpointId?: string
+  continuationGeneration?: number
   required?: string[]
   confidence?: number
   reason?: string
@@ -261,6 +266,31 @@ export type ConversationRunSummary = {
   input: Record<string, unknown>
   output: Record<string, unknown>
   error: Record<string, unknown> | null
+}
+
+export type TaskCheckpointSummary = {
+  id: string
+  sourceId: string
+  status: string
+  continuationRunId: string | null
+  continuationStatus: string | null
+  continuationOutputDigest: string | null
+  continuationGeneration: number
+  sourceCheckpointId: string | null
+  childCheckpointId: string | null
+  nextContinuationRunId: string | null
+  chainStatus: string
+  chainError: { code?: string; message?: string } | null
+  pendingQuestion: string | null
+  lineage: Array<{
+    checkpointId: string
+    sourceRunId: string
+    continuationRunId: string | null
+    generation: number
+    status: string
+    continuationStatus: string | null
+    childCheckpointId: string | null
+  }>
 }
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? '/api'
@@ -474,6 +504,8 @@ export const api = {
     ),
   getConversationRun: (id: string) =>
     request<ConversationRunSummary>(`/conversation-runs/${id}`),
+  getTaskCheckpoint: (id: string) =>
+    request<TaskCheckpointSummary>(`/task-checkpoints/${id}`),
   cancelConversationRun: (id: string) =>
     request<{ conversationRunId: string; status: string }>(
       `/conversation-runs/${id}/cancel`,
@@ -501,4 +533,12 @@ export const api = {
 
 export function eventStreamUrl(runId: string): string {
   return `${API_BASE}/runs/${runId}/events/stream`
+}
+
+export function conversationRunUrl(runId: string): string {
+  return `${API_BASE}/conversation-runs/${runId}`
+}
+
+export function taskCheckpointUrl(checkpointId: string): string {
+  return `${API_BASE}/task-checkpoints/${checkpointId}`
 }

@@ -22,6 +22,7 @@ from app.infrastructure.database import (
     Artifact,
     Conversation,
     ConversationRun,
+    Message,
     SessionLocal,
     TaskCheckpoint,
     utcnow,
@@ -341,6 +342,9 @@ class TaskCheckpointDriver:
                 **continuation.input_json,
                 "continuationOfCheckpointId": checkpoint.id,
                 "continuationOfConversationRunId": source.id,
+                "rootSourceConversationRunId": source.input_json.get(
+                    "rootSourceConversationRunId", source.id
+                ),
                 "completedActionLedger": completed_action_ledger,
                 "continuationGeneration": source_generation + 1,
                 "sourcePlanSnapshot": checkpoint.snapshot_json.get(
@@ -348,9 +352,34 @@ class TaskCheckpointDriver:
                 ),
                 "expectedPlanContract": expected_plan_contract,
             }
+            continuation_message = Message(
+                id=str(uuid4()),
+                conversation_id=conversation.id,
+                role="assistant",
+                content_json={
+                    "type": "agent_run",
+                    "state": continuation.status,
+                    "conversationRunId": continuation.id,
+                    "runType": "agent_run",
+                    "text": (
+                        f"已创建第 {source_generation + 1} 代失败接力，"
+                        "将从已冻结的剩余计划继续。"
+                    ),
+                    "sourceRunId": source.id,
+                    "rootSourceRunId": source.input_json.get(
+                        "rootSourceConversationRunId", source.id
+                    ),
+                    "continuationOfConversationRunId": source.id,
+                    "taskCheckpointId": checkpoint.id,
+                    "continuationGeneration": source_generation + 1,
+                },
+            )
+            session.add(continuation_message)
             next_snapshot = {
                 **checkpoint.snapshot_json,
                 "continuationRunId": continuation.id,
+                "continuationGeneration": source_generation + 1,
+                "continuationStatus": continuation.status,
             }
             claimed = await session.execute(
                 update(TaskCheckpoint)
@@ -370,6 +399,7 @@ class TaskCheckpointDriver:
                 .execution_options(synchronize_session=False)
             )
             if claimed.rowcount != 1:
+                await session.delete(continuation_message)
                 await session.delete(continuation)
                 return False
             await _append_event(
@@ -454,13 +484,42 @@ class TaskCheckpointDriver:
             "cancelled",
         }:
             return False
+        child_checkpoint = None
+        if continuation.status == "failed":
+            child_checkpoint = await session.scalar(
+                select(TaskCheckpoint).where(
+                    TaskCheckpoint.source_kind == "conversation_run",
+                    TaskCheckpoint.source_id == continuation.id,
+                )
+            )
         next_status = (
             "succeeded" if continuation.status == "succeeded" else "failed"
+        )
+        continuation_error = (
+            continuation.error_json
+            if continuation.status == "failed"
+            else {
+                "code": "CONTINUATION_CANCELLED",
+                "message": "失败接力已取消",
+                "retryable": False,
+            }
+            if continuation.status == "cancelled"
+            else None
         )
         next_snapshot = {
             **checkpoint.snapshot_json,
             "continuationStatus": continuation.status,
             "continuationOutputDigest": digest_json(continuation.output_json),
+            **(
+                {"continuationError": continuation_error}
+                if continuation_error is not None
+                else {}
+            ),
+            **(
+                {"childCheckpointId": child_checkpoint.id}
+                if child_checkpoint is not None
+                else {}
+            ),
         }
         reconciled = await session.execute(
             update(TaskCheckpoint)
@@ -495,26 +554,22 @@ class TaskCheckpointDriver:
                 "continuationRunId": continuation.id,
             },
         )
-        if continuation.status == "failed":
-            child_checkpoint = await session.scalar(
-                select(TaskCheckpoint).where(
-                    TaskCheckpoint.source_kind == "conversation_run",
-                    TaskCheckpoint.source_id == continuation.id,
+        if child_checkpoint is not None:
+            next_generation = int(
+                continuation.input_json.get(
+                    "continuationGeneration", 0
                 )
             )
-            if child_checkpoint is not None:
-                next_generation = int(
-                    continuation.input_json.get(
-                        "continuationGeneration", 0
-                    )
-                )
-                child_snapshot = {
-                    **child_checkpoint.snapshot_json,
-                    "continuationGeneration": next_generation,
-                    "sourceCheckpointId": checkpoint.id,
-                }
-                child_checkpoint.snapshot_json = child_snapshot
-                child_checkpoint.digest = digest_json(child_snapshot)
+            child_snapshot = {
+                **child_checkpoint.snapshot_json,
+                "continuationGeneration": next_generation,
+                "sourceCheckpointId": checkpoint.id,
+                "rootSourceRunId": checkpoint.snapshot_json.get(
+                    "rootSourceRunId", checkpoint.source_id
+                ),
+            }
+            child_checkpoint.snapshot_json = child_snapshot
+            child_checkpoint.digest = digest_json(child_snapshot)
         return True
 
     @staticmethod

@@ -17,6 +17,7 @@ from app.api.routes import (
     distill_run,
     download_artifact,
     get_conversation_run,
+    get_task_checkpoint,
     list_conversation_run_events,
     start_agent_run,
 )
@@ -36,6 +37,7 @@ from app.infrastructure.database import (
     Conversation,
     ConversationRun,
     ConversationRunEvent,
+    Message,
     SessionLocal,
     TaskCheckpoint,
     utcnow,
@@ -343,12 +345,33 @@ async def test_task_checkpoint_claims_and_continues_from_tool_artifact(
         "usedRevisions": 0,
         "remainingRevisions": 1,
     }
+    async with SessionLocal() as session:
+        pending_api = await get_task_checkpoint(checkpoint.id, session)
+    assert pending_api["status"] == "pending"
+    assert pending_api["continuationRunId"] is None
+    assert pending_api["continuationStatus"] is None
+    assert pending_api["continuationOutputDigest"] is None
+    assert pending_api["continuationGeneration"] == 0
 
     driver = TaskCheckpointDriver("test-task-recovery")
-    assert await driver.poll_once()
+    async with SessionLocal() as session, session.begin():
+        handle = await driver.claim(session)
+    assert handle is not None
+    async with SessionLocal() as session:
+        running_api = await get_task_checkpoint(checkpoint.id, session)
+    assert running_api["status"] == "running"
+    assert running_api["claimGeneration"] == 1
+    assert running_api["continuationRunId"] is None
+    assert await driver.start_continuation(handle)
     async with SessionLocal() as session:
         checkpoint = await session.get(TaskCheckpoint, checkpoint.id)
         continuation_id = checkpoint.snapshot_json["continuationRunId"]
+        continuing_api = await get_task_checkpoint(checkpoint.id, session)
+    assert continuing_api["status"] == "continuing"
+    assert continuing_api["continuationRunId"] == continuation_id
+    assert continuing_api["continuationStatus"] == "queued"
+    assert continuing_api["continuationOutputDigest"] is None
+    assert continuing_api["continuationGeneration"] == 1
     assert await AgentRunWorker("test-continuation-agent").poll_once()
     assert await driver.poll_once()
 
@@ -356,11 +379,41 @@ async def test_task_checkpoint_claims_and_continues_from_tool_artifact(
         source = await session.get(ConversationRun, run_id)
         continuation = await session.get(ConversationRun, continuation_id)
         checkpoint = await session.get(TaskCheckpoint, checkpoint.id)
+        checkpoint_api = await get_task_checkpoint(checkpoint.id, session)
+        continuation_messages = [
+            item
+            for item in await session.scalars(
+                select(Message).where(
+                    Message.conversation_id == conversation_id
+                )
+            )
+            if item.content_json.get("taskCheckpointId") == checkpoint.id
+        ]
     assert source.status == "failed"
     assert continuation.status == "succeeded"
     assert continuation.output_json == {"reply": "第一季度：营收增长 12%"}
     assert continuation.input_json["continuationOfCheckpointId"] == checkpoint.id
     assert checkpoint.status == "succeeded"
+    assert checkpoint.snapshot_json["continuationStatus"] == "succeeded"
+    assert checkpoint.snapshot_json["continuationOutputDigest"] == digest_json(
+        continuation.output_json
+    )
+    assert checkpoint_api["chainStatus"] == "succeeded"
+    assert checkpoint_api["lineage"] == [
+        {
+            "checkpointId": checkpoint.id,
+            "sourceRunId": source.id,
+            "continuationRunId": continuation.id,
+            "generation": 1,
+            "status": "succeeded",
+            "continuationStatus": "succeeded",
+            "childCheckpointId": None,
+        }
+    ]
+    assert len(continuation_messages) == 1
+    assert continuation_messages[0].content_json[
+        "continuationOfConversationRunId"
+    ] == source.id
 
 
 async def test_checkpoint_attempt_digest_conflict_is_terminal(
@@ -656,8 +709,18 @@ async def test_task_checkpoint_late_same_owner_cannot_start_second_continuation(
                 )
             )
         )
+        messages = [
+            item
+            for item in await session.scalars(
+                select(Message).where(
+                    Message.conversation_id == conversation_id
+                )
+            )
+            if item.content_json.get("taskCheckpointId") == handle_a.id
+        ]
     assert len(continuations) == 1
     assert len(started) == 1
+    assert len(messages) == 1
 
 
 async def test_tool_result_duplicate_call_id_requires_identical_hash(

@@ -26,7 +26,7 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
 | Scale-1 Catalog 1000 | 1000 个已发布 Manifest → search | Registry 单元/集成门禁 | top-k≤8、总字节≤24KB、L0 不含 Schema/DAG |
 | Fence-1 迟到 Recovery | A 超租约 → B 重领 → A 返回 | generation/token、两个 Recovery NodeRun | 仅 B 的决定、替代输出和终态可提交 |
 | AgentRun handoff | AgentRun 只读 ToolResult → 失败 → pending TaskCheckpoint → Worker 崩溃 → 新 Worker continuation | `agent.handoff.*` | 新 Worker 领取 generation+1；claim handle 约束启动与终态；Host action ledger 复用结果且不增加外部调用 |
-| Real Tool failure handoff | 首次 Browser 503/断连 → 有限重试耗尽 → Worker 重启 → 外部恢复 → continuation → distill/publish → 新对话复用 | `tool.result(status=failed)`、`agent.failed`、`agent.handoff.*`、L0/L1 | 主错误保持 Tool 标准 code；失败 Artifact 可校验；只重试失败 action，已完成 action 不重做 |
+| Real Tool failure handoff | 首次 Browser 503/断连 → 有限重试耗尽 → Worker 重启 → 外部恢复 → continuation → 原 Conversation 回显 → distill/publish → 新对话复用 | `tool.result(status=failed)`、`agent.failed`、`agent.handoff.*`、L0/L1 | 主错误保持 Tool 标准 code；失败 Artifact 可校验；只重试失败 action；最终正文自动回到原 Chat，刷新不丢失、不重复 |
 | Generic lookup continuation | lookup 成功 → transform 瞬态失败 → output 未运行 | `agent.plan`、`tool.result`、`agent.handoff.*` | 同一 ContinuationRequest 复用 lookup ledger，只执行 remaining transform/output |
 | Generic file continuation | file/read 成功 → transform 失败 → Worker 重启 | `agent.plan`、PlanSnapshot Artifact、`agent.handoff.*` | 路径/内容参数化；恢复消费冻结 remaining plan，不缓存首次正文 |
 | AgentRun unknown | Worker 租约丢失 → awaiting_user → answer → continuation | `agent.handoff.user_answered` | 回答只能消费一次；未确认的未知副作用不得继续 |
@@ -38,6 +38,7 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
 | Natural read-only entry | `/chat` message → continue_agent → Browser/lookup/file | `agent.run.created`、`tool.*` | 不传 `allowedCapabilities`；服务端只授予已启用的受控只读 Broker |
 | Conversation result delivery | 新 Conversation → L0/L1 → Workflow Run terminal | `run.*`、持久 `runId` | succeeded output 或 failed code/message 直接显示在对话，刷新不丢失、不重复 |
 | Real UI main flow | Chat → distill/check/publish → reuse → RunDetail | DOM、SSE、console | Vite/Chromium 真实交互；成功/失败详情不白屏，console 无未捕获异常 |
+| Real UI failure handoff | Chat 自然输入 → 真 503 → source failed/pending → 停源 Worker → 外部恢复 → 新 Worker continuation | `agent.handoff.*`、持久 assistant message、checkpoint lineage | 原 Chat 无手动刷新即显示恢复正文；刷新后相同；source/checkpoint/continuation/generation/output 可观察，console 无错误 |
 
 ## 通用失败判定
 
@@ -50,6 +51,9 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
 - Browser L2/L3/L4 未按策略暂停或终止。
 - 第二次复用由测试手工创建 Component、持有 id 或 WorkflowVersion id 绕过 Catalog 发现。
 - AgentRun checkpoint 无消费者，或 continuation 重做已有 ToolResult/副作用。
+- continuation 只写 checkpoint 私有 snapshot，原 Conversation 无持久 assistant message；或
+  source failed 后 Chat 停止跟踪，必须手动刷新才能看到最终结果。
+- 重复 claim/reconcile 产生多个 continuation message，或多代失败同时显示多个最终错误。
 - 外部失败没有 failure fixture，baseline 退化为 `REPLAY_UNSUPPORTED`。
 - 冻结 `transport_error`/`timeout` 历史错误后直接设置
   `baselineReproduced=true`，或 occurrence 未达到两个独立 Run 就调用 Revision Agent。
@@ -92,6 +96,12 @@ Worker 和持久化数据库完成；仅存在类型、适配器或静态页面�
   continuation 后为 `continuing`，最终随 continuation 进入 `succeeded/failed`。checkpoint
   分别保存 completed/failed/remaining plan steps、pending calls 和 action ledger，并在加载前
   校验 source digest、PlanSnapshot digest 与 Artifact id/size/sha256/evidence digest。
+- continuation 入队与 checkpoint `running→continuing` CAS 在同一事务内，并原子创建带
+  `conversationRunId/continuationOfConversationRunId/taskCheckpointId/generation` 的 assistant
+  message。源 Run 保持 failed，不原地改写。
+- checkpoint API 返回每代 continuation status/output digest、child checkpoint 和链式 lineage；
+  output 本体始终从关联 `ConversationRun` 读取。Chat 对可恢复 source error 有界刷新到
+  `succeeded/failed/cancelled/awaiting_user`，刷新后从持久消息恢复同一链。
 
 ## Agent PlanSnapshot 与 Continuation
 
@@ -144,4 +154,5 @@ make browser-ui-check
 ```
 
 两个命令必须分别完成空库迁移、后端/前端门禁、进程级 E2E，以及真实
-Vite/Chromium 用户主流程。Chromium 无权限时只能明确 skip 原因，不能用 mock 记为通过。
+Vite/Chromium 用户主流程和独立 503 failure handoff。Chromium 无权限时只能明确 skip 原因，
+不能用 mock 记为通过。

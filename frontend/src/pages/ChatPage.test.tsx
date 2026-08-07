@@ -9,6 +9,7 @@ const getConversation = vi.fn()
 const sendMessage = vi.fn()
 const startAgentRun = vi.fn()
 const getConversationRun = vi.fn()
+const getTaskCheckpoint = vi.fn()
 const listConversationRunEvents = vi.fn()
 const getRun = vi.fn()
 const createConversation = vi.fn()
@@ -21,10 +22,13 @@ vi.mock('@/api/client', () => ({
     confirmComponent: (...args: unknown[]) => confirmComponent(...args),
     startAgentRun: (...args: unknown[]) => startAgentRun(...args),
     getConversationRun: (...args: unknown[]) => getConversationRun(...args),
+    getTaskCheckpoint: (...args: unknown[]) => getTaskCheckpoint(...args),
     listConversationRunEvents: (...args: unknown[]) => listConversationRunEvents(...args),
     getRun: (...args: unknown[]) => getRun(...args),
     distillConversationRun: vi.fn(),
   },
+  conversationRunUrl: (id: string) => `/api/conversation-runs/${id}`,
+  taskCheckpointUrl: (id: string) => `/api/task-checkpoints/${id}`,
 }))
 
 const candidateMessage = {
@@ -73,6 +77,62 @@ function renderAt(conversationId: string) {
   )
 }
 
+const sourceFailureMessage = {
+  id: 'source-message',
+  role: 'assistant',
+  content: {
+    type: 'agent_run',
+    state: 'failed',
+    text: '通用 Agent 已进入队列，运行事件将实时更新。',
+    conversationRunId: 'source-run',
+    runType: 'agent_run',
+  },
+}
+
+const continuationMessage = {
+  id: 'continuation-message',
+  role: 'assistant',
+  content: {
+    type: 'agent_run',
+    state: 'queued',
+    text: '已创建第 1 代失败接力，将从已冻结的剩余计划继续。',
+    conversationRunId: 'continuation-run',
+    runType: 'agent_run',
+    sourceRunId: 'source-run',
+    taskCheckpointId: 'checkpoint-12345678',
+    continuationGeneration: 1,
+  },
+}
+
+function checkpointSummary(chainStatus: string) {
+  return {
+    id: 'checkpoint-12345678',
+    sourceId: 'source-run',
+    status: chainStatus === 'succeeded' ? 'succeeded' : 'continuing',
+    continuationRunId: 'continuation-run',
+    continuationStatus: chainStatus === 'succeeded' ? 'succeeded' : 'running',
+    continuationOutputDigest: chainStatus === 'succeeded' ? 'sha256:output' : null,
+    continuationGeneration: 1,
+    sourceCheckpointId: null,
+    childCheckpointId: null,
+    nextContinuationRunId: null,
+    chainStatus,
+    chainError: null,
+    pendingQuestion: null,
+    lineage: [
+      {
+        checkpointId: 'checkpoint-12345678',
+        sourceRunId: 'source-run',
+        continuationRunId: 'continuation-run',
+        generation: 1,
+        status: chainStatus === 'succeeded' ? 'succeeded' : 'continuing',
+        continuationStatus: chainStatus === 'succeeded' ? 'succeeded' : 'running',
+        childCheckpointId: null,
+      },
+    ],
+  }
+}
+
 describe('ChatPage 候选组件闭环', () => {
   beforeEach(() => {
     confirmComponent.mockReset()
@@ -80,6 +140,7 @@ describe('ChatPage 候选组件闭环', () => {
     sendMessage.mockReset()
     startAgentRun.mockReset()
     getConversationRun.mockReset()
+    getTaskCheckpoint.mockReset()
     listConversationRunEvents.mockReset()
     getRun.mockReset()
     createConversation.mockReset()
@@ -254,6 +315,166 @@ describe('ChatPage 候选组件闭环', () => {
 
     await waitFor(() => expect(screen.getByText('自动探索完成')).toBeInTheDocument())
     expect(screen.getByRole('button', { name: '固化为组件' })).toBeInTheDocument()
+  })
+
+  it('source failed 后自动发现 continuation 并展示最终正文', async () => {
+    let conversationReads = 0
+    let continuationReads = 0
+    let checkpointReads = 0
+    getConversation.mockImplementation(async () => {
+      conversationReads += 1
+      return {
+        id: 'conv-1',
+        title: '真实失败接力',
+        boundComponentId: null,
+        messages:
+          conversationReads === 1
+            ? [sourceFailureMessage]
+            : [sourceFailureMessage, continuationMessage],
+      }
+    })
+    getConversationRun.mockImplementation(async (runId: string) => {
+      if (runId === 'source-run') {
+        return {
+          id: runId,
+          conversationId: 'conv-1',
+          status: 'failed',
+          runType: 'agent_run',
+          input: {},
+          output: {},
+          error: {
+            code: 'DEPENDENCY_UNAVAILABLE',
+            message: '上游暂不可用',
+            taskCheckpointId: 'checkpoint-12345678',
+          },
+        }
+      }
+      continuationReads += 1
+      const succeeded = continuationReads > 1
+      return {
+        id: runId,
+        conversationId: 'conv-1',
+        status: succeeded ? 'succeeded' : 'running',
+        runType: 'agent_run',
+        input: { continuationOfConversationRunId: 'source-run' },
+        output: succeeded ? { reply: '恢复后的正文' } : {},
+        error: null,
+      }
+    })
+    getTaskCheckpoint.mockImplementation(async () => {
+      checkpointReads += 1
+      return checkpointSummary(checkpointReads > 1 ? 'succeeded' : 'continuing')
+    })
+    listConversationRunEvents.mockResolvedValue([])
+
+    renderAt('conv-1')
+
+    await waitFor(() => expect(screen.getByText('恢复后的正文')).toBeInTheDocument())
+    expect(getConversation).toHaveBeenCalledTimes(2)
+    expect(screen.queryByText('上游暂不可用')).not.toBeInTheDocument()
+    expect(screen.getAllByText('恢复后的正文')).toHaveLength(1)
+    expect(screen.getAllByRole('link', { name: 'checkpoint checkpoi' })[0]).toHaveAttribute(
+      'href',
+      '/api/task-checkpoints/checkpoint-12345678',
+    )
+  })
+
+  it('刷新后从持久消息恢复 continuation 结果且不重复源错误', async () => {
+    getConversation.mockResolvedValue({
+      id: 'conv-1',
+      title: '已恢复的失败接力',
+      boundComponentId: null,
+      messages: [sourceFailureMessage, continuationMessage],
+    })
+    getConversationRun.mockImplementation(async (runId: string) =>
+      runId === 'source-run'
+        ? {
+            id: runId,
+            conversationId: 'conv-1',
+            status: 'failed',
+            runType: 'agent_run',
+            input: {},
+            output: {},
+            error: {
+              code: 'DEPENDENCY_UNAVAILABLE',
+              message: '源 503',
+              taskCheckpointId: 'checkpoint-12345678',
+            },
+          }
+        : {
+            id: runId,
+            conversationId: 'conv-1',
+            status: 'succeeded',
+            runType: 'agent_run',
+            input: { continuationOfConversationRunId: 'source-run' },
+            output: { reply: '刷新后仍可见的恢复正文' },
+            error: null,
+          },
+    )
+    getTaskCheckpoint.mockResolvedValue(checkpointSummary('succeeded'))
+    listConversationRunEvents.mockResolvedValue([])
+
+    renderAt('conv-1')
+
+    await waitFor(() =>
+      expect(screen.getByText('刷新后仍可见的恢复正文')).toBeInTheDocument(),
+    )
+    expect(screen.getAllByText('刷新后仍可见的恢复正文')).toHaveLength(1)
+    expect(screen.queryByText('源 503')).not.toBeInTheDocument()
+  })
+
+  it('接力完整性失败时区分最终错误与源错误', async () => {
+    getConversation.mockResolvedValue({
+      id: 'conv-1',
+      title: '接力终态失败',
+      boundComponentId: null,
+      messages: [sourceFailureMessage],
+    })
+    getConversationRun.mockResolvedValue({
+      id: 'source-run',
+      conversationId: 'conv-1',
+      status: 'failed',
+      runType: 'agent_run',
+      input: {},
+      output: {},
+      error: {
+        code: 'DEPENDENCY_UNAVAILABLE',
+        message: '源站点返回 503',
+        taskCheckpointId: 'checkpoint-12345678',
+      },
+    })
+    getTaskCheckpoint.mockResolvedValue({
+      ...checkpointSummary('failed'),
+      status: 'terminal',
+      continuationRunId: null,
+      continuationStatus: null,
+      chainError: {
+        code: 'CONTINUATION_INTEGRITY_FAILED',
+        message: 'PlanSnapshot digest 不一致',
+      },
+      lineage: [
+        {
+          checkpointId: 'checkpoint-12345678',
+          sourceRunId: 'source-run',
+          continuationRunId: null,
+          generation: 0,
+          status: 'terminal',
+          continuationStatus: null,
+          childCheckpointId: null,
+        },
+      ],
+    })
+    listConversationRunEvents.mockResolvedValue([])
+
+    renderAt('conv-1')
+
+    await waitFor(() =>
+      expect(screen.getByText('CONTINUATION_INTEGRITY_FAILED')).toBeInTheDocument(),
+    )
+    expect(screen.getByText('PlanSnapshot digest 不一致')).toBeInTheDocument()
+    expect(screen.getByText(/源错误：DEPENDENCY_UNAVAILABLE/)).toHaveTextContent(
+      '源站点返回 503',
+    )
   })
 
   it('刷新后直接展示 Workflow succeeded 的持久输出且不重复', async () => {

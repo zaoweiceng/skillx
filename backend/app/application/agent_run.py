@@ -1481,6 +1481,12 @@ class AgentRunWorker:
                 "id": run.id,
                 "digest": source_digest,
             },
+            "rootSourceRunId": run.input_json.get(
+                "rootSourceConversationRunId", run.id
+            ),
+            "sourceCheckpointId": run.input_json.get(
+                "continuationOfCheckpointId"
+            ),
             "sourceEvidence": source_evidence,
             "planSnapshot": plan_ref,
             "completedSteps": completed_steps,

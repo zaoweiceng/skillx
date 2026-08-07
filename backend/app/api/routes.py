@@ -4200,6 +4200,100 @@ async def get_task_checkpoint(
     if checkpoint is None:
         raise HTTPException(404, "TaskCheckpoint 不存在")
     snapshot = checkpoint.snapshot_json
+    continuation_run_id = snapshot.get("continuationRunId")
+    child_checkpoint = None
+    if continuation_run_id:
+        child_checkpoint = await session.scalar(
+            select(TaskCheckpoint).where(
+                TaskCheckpoint.source_kind == "conversation_run",
+                TaskCheckpoint.source_id == continuation_run_id,
+            )
+        )
+    child_checkpoint_id = snapshot.get("childCheckpointId") or (
+        child_checkpoint.id if child_checkpoint is not None else None
+    )
+    lineage: list[dict[str, Any]] = []
+    current = checkpoint
+    visited: set[str] = set()
+    while current is not None and current.id not in visited:
+        visited.add(current.id)
+        current_snapshot = current.snapshot_json or {}
+        current_continuation_id = current_snapshot.get("continuationRunId")
+        current_child = None
+        if current_continuation_id:
+            current_child = await session.scalar(
+                select(TaskCheckpoint).where(
+                    TaskCheckpoint.source_kind == "conversation_run",
+                    TaskCheckpoint.source_id == current_continuation_id,
+                )
+            )
+        current_child_id = current_snapshot.get("childCheckpointId") or (
+            current_child.id if current_child is not None else None
+        )
+        lineage.append(
+            {
+                "checkpointId": current.id,
+                "sourceRunId": current.source_id,
+                "continuationRunId": current_continuation_id,
+                "generation": current_snapshot.get(
+                    "continuationGeneration", 0
+                ),
+                "status": current.status,
+                "continuationStatus": current_snapshot.get(
+                    "continuationStatus"
+                ),
+                "childCheckpointId": current_child_id,
+            }
+        )
+        if current_child is None:
+            break
+        current = current_child
+    leaf = current or checkpoint
+    leaf_snapshot = leaf.snapshot_json or {}
+    if leaf.status == "succeeded":
+        chain_status = "succeeded"
+        chain_error = None
+    elif leaf.status == "awaiting_user":
+        chain_status = "awaiting_user"
+        chain_error = {
+            "code": "CONTINUATION_AWAITING_USER",
+            "message": leaf_snapshot.get("pendingQuestion")
+            or "失败接力正在等待人工确认",
+        }
+    elif leaf.status == "terminal":
+        chain_status = "failed"
+        if leaf_snapshot.get("budgetExhausted"):
+            chain_error = {
+                "code": "CONTINUATION_BUDGET_EXHAUSTED",
+                "message": "失败接力已耗尽 generation 预算",
+            }
+        elif (leaf_snapshot.get("remainingPlan") or {}).get("mode") == (
+            "integrity_failed"
+        ):
+            chain_error = {
+                "code": "CONTINUATION_INTEGRITY_FAILED",
+                "message": (leaf_snapshot.get("remainingPlan") or {}).get(
+                    "reason", "失败接力完整性校验失败"
+                ),
+            }
+        else:
+            chain_error = leaf_snapshot.get("continuationError") or {
+                "code": "CONTINUATION_TERMINAL",
+                "message": "失败接力已进入终态",
+            }
+    elif leaf.status == "failed" and leaf_snapshot.get("continuationRunId"):
+        chain_status = (
+            "cancelled"
+            if leaf_snapshot.get("continuationStatus") == "cancelled"
+            else "failed"
+        )
+        chain_error = leaf_snapshot.get("continuationError") or {
+            "code": "CONTINUATION_FAILED",
+            "message": "失败接力运行失败",
+        }
+    else:
+        chain_status = "continuing"
+        chain_error = None
     return {
         "id": checkpoint.id,
         "sourceKind": checkpoint.source_kind,
@@ -4209,11 +4303,25 @@ async def get_task_checkpoint(
         "digest": checkpoint.digest,
         "outcomeCertainty": snapshot.get("outcomeCertainty"),
         "pendingQuestion": snapshot.get("pendingQuestion"),
-        "continuationRunId": snapshot.get("continuationRunId"),
+        "continuationRunId": continuation_run_id,
+        "continuationStatus": snapshot.get("continuationStatus"),
+        "continuationOutputDigest": snapshot.get(
+            "continuationOutputDigest"
+        ),
         "claimGeneration": checkpoint.claim_generation,
         "continuationGeneration": snapshot.get(
             "continuationGeneration", 0
         ),
+        "sourceCheckpointId": snapshot.get("sourceCheckpointId"),
+        "childCheckpointId": child_checkpoint_id,
+        "nextContinuationRunId": (
+            (child_checkpoint.snapshot_json or {}).get("continuationRunId")
+            if child_checkpoint is not None
+            else None
+        ),
+        "chainStatus": chain_status,
+        "chainError": chain_error,
+        "lineage": lineage,
         "planSnapshot": snapshot.get("planSnapshot"),
         "reportedError": snapshot.get("reportedError"),
         "effectiveError": snapshot.get("effectiveError"),
