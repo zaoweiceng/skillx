@@ -497,16 +497,20 @@ class LLMExecutor:
             )
         except ModelRuntimeError as exc:
             snapshot = context.runtime_snapshot
+            runtime_selection = snapshot.get(
+                "runtimeSelection",
+                snapshot.get("runtimeUsed"),
+            )
             metrics = (
                 {
                     "provider": str(snapshot.get("provider") or "unknown"),
                     "model": str(snapshot.get("identity") or "unknown"),
-                    "runtimeUsed": str(snapshot["runtimeUsed"]),
+                    "runtimeUsed": str(runtime_selection),
                     "runtimeDigest": str(snapshot.get("runtimeDigest") or ""),
                     "fallbackReason": str(snapshot.get("fallbackReason") or ""),
                     "usageComplete": False,
                 }
-                if snapshot.get("runtimeUsed") in {"direct_llm", "agent_fallback"}
+                if runtime_selection in {"direct_llm", "agent_fallback"}
                 else {}
             )
             return NodeResult(
@@ -516,6 +520,10 @@ class LLMExecutor:
             )
         except Exception as exc:
             snapshot = context.runtime_snapshot
+            runtime_selection = snapshot.get(
+                "runtimeSelection",
+                snapshot.get("runtimeUsed"),
+            )
             return NodeResult(
                 status="failed",
                 error=ExecutionError(
@@ -525,13 +533,12 @@ class LLMExecutor:
                     {
                         "provider": str(snapshot.get("provider") or "unknown"),
                         "model": str(snapshot.get("identity") or "unknown"),
-                        "runtimeUsed": str(snapshot["runtimeUsed"]),
+                        "runtimeUsed": str(runtime_selection),
                         "runtimeDigest": str(snapshot.get("runtimeDigest") or ""),
                         "fallbackReason": str(snapshot.get("fallbackReason") or ""),
                         "usageComplete": False,
                     }
-                    if snapshot.get("runtimeUsed")
-                    in {"direct_llm", "agent_fallback"}
+                    if runtime_selection in {"direct_llm", "agent_fallback"}
                     else {}
                 ),
             )

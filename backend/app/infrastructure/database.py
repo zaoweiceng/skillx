@@ -496,6 +496,24 @@ class ConversationRunEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class BrowserRuntimeHeartbeat(Base, TimestampMixin):
+    """Browser Worker 的实际启动预检事实。
+
+    API 只读取此表，不依据网络 allowlist 推断 Chromium 是否可启动。
+    """
+
+    __tablename__ = "browser_runtime_heartbeats"
+
+    worker_id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32))
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    chromium_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    chromium_version: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    playwright_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    launch_succeeded: Mapped[bool] = mapped_column(Boolean, default=False)
+    evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
 class Distillation(Base, TimestampMixin):
     __tablename__ = "distillations"
 

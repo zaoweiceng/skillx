@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     agent_lease_seconds: int = 30
     agent_max_continuation_generations: int = 3
     browser_allowed_hosts: list[str] = []
+    browser_preflight_timeout_seconds: int = 10
+    browser_preflight_interval_seconds: int = 60
+    browser_heartbeat_ttl_seconds: int = 120
 
 
 @lru_cache

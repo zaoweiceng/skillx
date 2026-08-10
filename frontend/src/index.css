@@ -1712,14 +1712,67 @@ select:focus-visible {
 
 .inspector-fields input,
 .inspector-fields textarea,
+.inspector-fields select,
 .inspector-field input,
 .inspector-field textarea,
 .inspector-field select,
 .chat-composer textarea {
   width: 100%;
+  min-height: 36px;
+  padding: 8px 10px;
   border: 1px solid var(--line);
+  border-radius: 6px;
   background: var(--field);
   color: var(--text);
+  font: inherit;
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.inspector-fields textarea,
+.inspector-field textarea {
+  min-height: 88px;
+  resize: vertical;
+}
+
+.inspector-fields input:hover:not(:disabled),
+.inspector-fields textarea:hover:not(:disabled),
+.inspector-fields select:hover:not(:disabled),
+.inspector-field input:hover:not(:disabled),
+.inspector-field textarea:hover:not(:disabled),
+.inspector-field select:hover:not(:disabled) {
+  border-color: var(--muted);
+}
+
+.inspector-fields input:focus-visible,
+.inspector-fields textarea:focus-visible,
+.inspector-fields select:focus-visible,
+.inspector-field input:focus-visible,
+.inspector-field textarea:focus-visible,
+.inspector-field select:focus-visible {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+  outline: none;
+}
+
+.inspector-fields input:disabled,
+.inspector-fields textarea:disabled,
+.inspector-fields select:disabled,
+.inspector-field input:disabled,
+.inspector-field textarea:disabled,
+.inspector-field select:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.inspector-fields input[type="checkbox"],
+.inspector-field input[type="checkbox"] {
+  width: 18px;
+  min-height: 18px;
+  padding: 0;
+  accent-color: var(--accent);
 }
 
 :root[data-theme="light"] .brand-mark,
@@ -1838,10 +1891,10 @@ select:focus-visible {
 .inspector-field input,
 .inspector-field textarea,
 .mapping-row input {
-  background: #091216;
+  background: var(--field);
   border: 1px solid var(--line);
   border-radius: 6px;
-  color: #e8ede9;
+  color: var(--text);
   padding: 6px 8px;
   font-size: 12px;
 }

@@ -6,6 +6,7 @@ import logging
 import signal
 
 from app.application.agent_run import AgentRunWorker
+from app.application.browser_readiness import record_browser_runtime_heartbeat
 from app.application.orchestrator import WorkerService, reconcile_recent_runs
 from app.application.product_history import (
     PresentationDriver,
@@ -47,10 +48,23 @@ async def run_worker(
     except Exception:  # noqa: BLE001 - reconcile 失败不应阻止 Worker 启动。
         logger.exception("worker startup reconcile failed")
 
+    try:
+        browser_facts = await record_browser_runtime_heartbeat(service.worker_id)
+        logger.info(
+            "browser runtime preflight worker=%s status=%s",
+            service.worker_id,
+            browser_facts["status"],
+        )
+    except Exception:  # noqa: BLE001 - 预检失败要留证，但不能阻止非 Browser 工作流。
+        logger.exception("browser runtime preflight failed")
+
     # 明确的轮询就绪信号：黑盒 harness 据此确认 Worker 已进入领取循环，
     # 而不是仅检查进程尚未退出。
     print(f"worker polling worker_id={service.worker_id}", flush=True)
     ticks = 0
+    next_browser_preflight = (
+        loop.time() + settings.browser_preflight_interval_seconds
+    )
     while not stopping.is_set():
         processed = await service.run_once()
         try:
@@ -81,6 +95,14 @@ async def run_worker(
             processed_presentation = False
         # 周期性 reconcile（约每 60 次空闲轮询一次），限制批量，形成可观察 GC。
         ticks += 1
+        if loop.time() >= next_browser_preflight:
+            try:
+                await record_browser_runtime_heartbeat(service.worker_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("periodic browser runtime preflight failed")
+            next_browser_preflight = (
+                loop.time() + settings.browser_preflight_interval_seconds
+            )
         if ticks % 60 == 0:
             try:
                 async with SessionLocal() as session, session.begin():

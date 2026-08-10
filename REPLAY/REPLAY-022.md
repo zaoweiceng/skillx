@@ -6,7 +6,7 @@
 [`review/design-compliance-review-022.md`](review/design-compliance-review-022.md) 和
 [`review/code-review-022.md`](review/code-review-022.md)。
 
-执行基线：`1c9c7e3`。本报告对应当前未提交工作树；本轮未创建 Git 提交。
+执行基线：`1c9c7e3`。本报告所述改动已提交于 `9f9fb43`。
 
 范围：单用户 Local Demo；不增加鉴权、RBAC、多租户或分布式部署。
 

@@ -79,6 +79,14 @@ const baseRun = {
     capabilityLocks: [],
     mcpLocks: [],
   },
+  runtimeSnapshot: {
+    runtimeSelection: 'agent_fallback',
+    runtimeUsed: null,
+    runtimeCalls: [],
+    modelCalled: false,
+    totalTokens: 0,
+    fallbackReason: 'LLM_RUNTIME_UNCONFIGURED',
+  },
 }
 
 function renderPage() {
@@ -112,7 +120,12 @@ describe('RunDetailPage 可观测性与审批', () => {
     getRun.mockResolvedValue(baseRun)
     renderPage()
 
-    await waitFor(() => expect(screen.getByText('等待新事件')).toBeInTheDocument())
+    await waitFor(() =>
+      expect(screen.getByText('本会话未加载历史事件')).toBeInTheDocument(),
+    )
+    expect(screen.getByText('实时流已关闭')).toBeInTheDocument()
+    expect(screen.getByText('模型未调用 / 0 Token')).toBeInTheDocument()
+    expect(screen.queryByText('实际调用：agent_fallback')).not.toBeInTheDocument()
     expect(eventSources).toHaveLength(0)
   })
 

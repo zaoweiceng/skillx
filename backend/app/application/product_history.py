@@ -486,9 +486,16 @@ class PresentationDriver:
                     runtime_snapshot = run.runtime_snapshot_json or {}
                     if (
                         item.producer == "llm"
-                        and runtime_snapshot.get("runtimeUsed")
+                        and runtime_snapshot.get(
+                            "runtimeSelection",
+                            runtime_snapshot.get("runtimeUsed"),
+                        )
                         in {"direct_llm", "agent_fallback"}
                     ):
+                        runtime_selection = runtime_snapshot.get(
+                            "runtimeSelection",
+                            runtime_snapshot.get("runtimeUsed"),
+                        )
                         await record_model_usage(
                             session,
                             call_id=f"presentation:{item.id}",
@@ -498,7 +505,7 @@ class PresentationDriver:
                             presentation_id=item.id,
                             provider=runtime_snapshot.get("provider"),
                             model=runtime_snapshot.get("identity"),
-                            runtime_used=runtime_snapshot.get("runtimeUsed"),
+                            runtime_used=runtime_selection,
                             runtime_digest=runtime_snapshot.get("runtimeDigest"),
                             fallback_reason=runtime_snapshot.get("fallbackReason"),
                             usage_complete=False,

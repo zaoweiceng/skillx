@@ -292,27 +292,30 @@ def test_e2e_3c_direct_llm_does_not_fallback_after_request_started(
 
 def test_e2e_4_conversation_component(stack: DemoStack) -> None:
     with stack.client() as client:
-        conversation = client.post("/conversations", json={"title": "验收对话"}).json()
+        unbound = client.post("/conversations", json={"title": "未绑定对话"}).json()
+        unavailable = client.post(
+            f"/conversations/{unbound['id']}/messages",
+            json={"content": "上海天气如何"},
+        )
+        assert unavailable.status_code == 201, unavailable.text
+        assert unavailable.json()["assistant"]["state"] == "unavailable"
+        assert unavailable.json()["assistant"]["selectionMode"] == "unavailable"
+
+        component = _component(client, "确定性问候")
+        conversation = client.post(
+            "/conversations",
+            json={
+                "title": "显式绑定组件",
+                "boundComponentId": component["id"],
+            },
+        ).json()
         message = client.post(
             f"/conversations/{conversation['id']}/messages",
-            json={"content": "生成问候语 greeting 欢迎 welcome"},
+            json={"content": "问候 Bob", "inputs": {"name": "Bob"}},
         )
         assert message.status_code == 201, message.text
-        pending = message.json()["assistant"]
-        assert pending["state"] == "ask_user"
-        assert pending["agentAction"] == "ask_user"
-        assert pending["pendingSelectionId"]
-        assert pending["refs"][0].startswith("workflow:")
-        assert {item["level"] for item in pending["toolTimeline"]} == {"L0", "L1"}
-
-        resumed = client.post(
-            f"/conversations/{conversation['id']}/messages",
-            json={"content": "Bob"},
-        )
-        assert resumed.status_code == 201, resumed.text
-        selected = resumed.json()["assistant"]
-        assert selected["state"] == "workflow_run"
-        assert selected["resumedPendingSelection"] is True
+        selected = message.json()["assistant"]
+        assert selected["state"] == "component_run"
         run = poll_run(client, selected["runId"])
         assert run["status"] == "succeeded"
         assert run["output"] == {"message": "你好，Bob"}
@@ -367,20 +370,13 @@ def test_e2e_5_agent_distillation_reuse(stack: DemoStack) -> None:
         assert published.status_code == 201, published.text
         version_id = published.json()["id"]
 
-        # 5) 新 Conversation 以自然语言和不同业务键发现固化版本并交给 Runtime。
-        second_conversation = client.post(
-            "/conversations", json={"title": "非网页新对话复用"}
-        ).json()
+        # 5) fixture 只证明协议；通过冻结版本 API 以新输入验证 Runtime 复用。
         selected = client.post(
-            f"/conversations/{second_conversation['id']}/messages",
-            json={"content": "使用业务键 q2 执行结构化查询"},
+            f"/workflow-versions/{version_id}/runs",
+            json={"input": {"message": "q2"}},
         )
-        assert selected.status_code == 201, selected.text
-        assistant = selected.json()["assistant"]
-        assert assistant["state"] == "workflow_run"
-        assert assistant["workflowVersionId"] == version_id
-        assert {item["level"] for item in assistant["toolTimeline"]} == {"L0", "L1"}
-        run = poll_run(client, assistant["runId"])
+        assert selected.status_code == 202, selected.text
+        run = poll_run(client, selected.json()["id"])
         assert run["status"] == "succeeded", run
         # 新输入 q2 选出不同结果（编译复用，而非重跑同一 prompt）。
         assert run["output"] == {"reply": "第二季度：营收增长 8%"}
@@ -389,7 +385,7 @@ def test_e2e_5_agent_distillation_reuse(stack: DemoStack) -> None:
         assert "llm.call.completed" not in reuse_events
 
 
-def test_natural_message_entry_runs_read_only_browser_lookup_and_file(
+def test_workflow_disabled_message_runs_fixture_agent_protocol(
     stack: DemoStack,
 ) -> None:
     stack.set_article("自然入口网页正文")
@@ -422,6 +418,11 @@ def test_natural_message_entry_runs_read_only_browser_lookup_and_file(
             conversation = client.post(
                 "/conversations", json={"title": f"自然入口-{capability}"}
             ).json()
+            mode = client.patch(
+                f"/conversations/{conversation['id']}/workflow-mode",
+                json={"workflowMode": "disabled"},
+            )
+            assert mode.status_code == 200, mode.text
             sent = client.post(
                 f"/conversations/{conversation['id']}/messages",
                 json={"content": prompt},
@@ -431,6 +432,7 @@ def test_natural_message_entry_runs_read_only_browser_lookup_and_file(
             assert assistant["type"] == "agent_run"
             assert assistant["runType"] == "agent_run"
             assert assistant["state"] == "queued"
+            assert assistant["workflowModeSnapshot"] == "disabled"
 
             summary = poll_conversation_run(
                 client, assistant["conversationRunId"], timeout=60
@@ -1161,43 +1163,31 @@ def test_real_tool_failure_handoff_distill_and_second_reuse(
             f"/conversation-runs/{continuation_id}/distill"
         )
         assert distilled.status_code == 201, distilled.text
+        draft_workflow_id = distilled.json()["draftWorkflowId"]
         published = _publish_workflow(
-            client, distilled.json()["draftWorkflowId"]
+            client, draft_workflow_id
         )
         assert published.status_code == 201, published.text
         version_id = published.json()["id"]
 
         stack.set_article("接力固化后的新正文")
-        second_conversation = client.post(
-            "/conversations", json={"title": "失败恢复后复用"}
-        ).json()
         selected = client.post(
-            f"/conversations/{second_conversation['id']}/messages",
+            f"/workflow-versions/{version_id}/runs",
             json={
-                "content": (
-                    f"访问并总结这个网页：{stack.form_url}/article?handoff=1"
-                )
+                "input": {
+                    "message": f"{stack.form_url}/article?handoff=1"
+                }
             },
         )
-        assert selected.status_code == 201, selected.text
-        assistant = selected.json()["assistant"]
-        assert assistant["workflowVersionId"] == version_id
-        assert {item["level"] for item in assistant["toolTimeline"]} == {
-            "L0",
-            "L1",
-        }
-        reused_run = poll_run(client, assistant["runId"], timeout=60)
+        assert selected.status_code == 202, selected.text
+        reused_run = poll_run(client, selected.json()["id"], timeout=60)
         assert reused_run["status"] == "succeeded", reused_run
         assert "接力固化后的新正文" in reused_run["output"]["reply"]
 
-        described = client.post(
-            "/workflow-tools/describe",
-            json={
-                "sessionId": assistant["disclosureSessionId"],
-                "ref": assistant["refs"][0],
-            },
-        ).json()["workflow"]
-        assert described["lineage"]["sourceConversationRunId"] == continuation_id
+        workflow = client.get(f"/workflows/{draft_workflow_id}").json()
+        assert workflow["definition"]["metadata"]["lineage"][
+            "sourceConversationRunId"
+        ] == continuation_id
         checkpoint = client.get(
             f"/task-checkpoints/{checkpoint_id}"
         ).json()
@@ -2005,39 +1995,23 @@ def test_e2e_8b_real_browser_distillation_to_non_fake_agent(
         assert analysis["agentNodes"] == 1
         assert analysis["publishable"] is True
 
-        published = _publish_workflow(
-            client, distilled.json()["draftWorkflowId"]
-        )
+        draft_workflow_id = distilled.json()["draftWorkflowId"]
+        published = _publish_workflow(client, draft_workflow_id)
         assert published.status_code == 201, published.text
         version_id = published.json()["id"]
         stack.set_article("第二次运行的新正文：利润增长 21%。")
         second_url = f"{article_url}?version=b"
-        second_conversation = client.post(
-            "/conversations", json={"title": "新对话语义复用"}
-        ).json()
         selected = client.post(
-            f"/conversations/{second_conversation['id']}/messages",
-            json={"content": f"访问并总结这个网页：{second_url}"},
+            f"/workflow-versions/{version_id}/runs",
+            json={"input": {"message": second_url}},
         )
-        assert selected.status_code == 201, selected.text
-        assistant = selected.json()["assistant"]
-        assert assistant["state"] == "workflow_run"
-        assert assistant["agentAction"] == "run_full"
-        assert assistant["workflowVersionId"] == version_id
-        assert {item["level"] for item in assistant["toolTimeline"]} == {"L0", "L1"}
-        described = client.post(
-            "/workflow-tools/describe",
-            json={
-                "sessionId": assistant["disclosureSessionId"],
-                "ref": assistant["refs"][0],
-            },
-        )
-        assert described.status_code == 200, described.text
-        assert described.json()["workflow"]["lineage"]["sourceConversationRunId"] == (
-            conversation_run_id
-        )
+        assert selected.status_code == 202, selected.text
+        workflow = client.get(f"/workflows/{draft_workflow_id}").json()
+        assert workflow["definition"]["metadata"]["lineage"][
+            "sourceConversationRunId"
+        ] == conversation_run_id
 
-        completed = poll_run(client, assistant["runId"], timeout=60)
+        completed = poll_run(client, selected.json()["id"], timeout=60)
         assert completed["status"] == "succeeded", completed
         assert "利润增长 21%" in completed["output"]["reply"]
         node_types = {

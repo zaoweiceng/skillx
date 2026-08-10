@@ -127,6 +127,10 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
                 assert composer["x"] >= 0
                 assert composer["x"] + composer["width"] <= width
             page.set_viewport_size({"width": 1280, "height": 900})
+            page.get_by_role("button", name="工作流：开启").click()
+            expect(
+                page.get_by_role("button", name="工作流：关闭")
+            ).to_be_visible()
             _submit(
                 page,
                 (
@@ -152,46 +156,46 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
                 page.get_by_role("button", name="发布版本").click()
 
             stack.set_article("016 UI 第二次复用正文")
-            page.goto(f"{frontend_url}/chat")
-            page.wait_for_url("**/chat/*")
-            _submit(page, f"请访问并总结 {stack.form_url}/article?version=second")
-            structured_result = page.get_by_label("结构化结果")
-            expect(
-                structured_result.locator(".structured-summary").get_by_text(
-                    "016 UI 第二次复用正文", exact=True
-                )
-            ).to_be_visible(
+            page.goto(f"{frontend_url}/components")
+            page.get_by_role("link", name="网页内容读取与总结").first.click()
+            page.locator("#root_message").fill(
+                f"{stack.form_url}/article?version=second"
+            )
+            page.get_by_role("button", name="启动工作流").click()
+            expect(page.get_by_role("heading", name="运行详情")).to_be_visible(
                 timeout=60_000
             )
-            reading_result = page.get_by_label("阅读结果")
-            expect(reading_result).to_contain_text(
+            presentation_panel = page.locator("section").filter(
+                has=page.get_by_role("heading", name="阅读结果")
+            )
+            expect(presentation_panel).to_contain_text(
                 "016 UI 第二次复用正文", timeout=60_000
             )
-            terminal_metrics = page.locator(".turn-metrics").last.text_content()
-            page.wait_for_timeout(2_000)
-            assert page.locator(".turn-metrics").last.text_content() == terminal_metrics
             page.reload()
-            expect(page.get_by_label("阅读结果")).to_contain_text(
+            presentation_panel = page.locator("section").filter(
+                has=page.get_by_role("heading", name="阅读结果")
+            )
+            expect(presentation_panel).to_contain_text(
                 "016 UI 第二次复用正文", timeout=30_000
             )
-            assert page.locator(".turn-metrics").last.text_content() == terminal_metrics
-            page.get_by_role("link", name="查看运行").click()
             expect(page.get_by_role("heading", name="运行详情")).to_be_visible()
             expect(page.get_by_role("heading", name="结构化结果")).to_be_visible()
             expect(page.get_by_text("browser-read-summary.json")).to_be_visible()
+            expect(page.get_by_text("实时流已关闭")).to_be_visible()
             terminal_stream_count = len(stream_requests)
             page.wait_for_timeout(5_000)
             assert len(stream_requests) == terminal_stream_count
 
             stack.set_transient_healthy(False)
-            page.goto(f"{frontend_url}/chat")
-            page.wait_for_url("**/chat/*")
-            _submit(page, f"请访问并总结 {stack.form_url}/transient?mode=503")
-            expect(page.get_by_text("INVALID_INPUT")).to_be_visible(
+            page.goto(f"{frontend_url}/components")
+            page.get_by_role("link", name="网页内容读取与总结").first.click()
+            page.locator("#root_message").fill(
+                f"{stack.form_url}/transient?mode=503"
+            )
+            page.get_by_role("button", name="启动工作流").click()
+            expect(page.get_by_role("heading", name="运行错误")).to_be_visible(
                 timeout=60_000
             )
-            page.get_by_role("link", name="查看运行").click()
-            expect(page.get_by_role("heading", name="运行错误")).to_be_visible()
             expect(page.get_by_role("heading", name="检查点接力")).to_be_visible()
 
             page.goto(f"{frontend_url}/components")
@@ -211,11 +215,19 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
 
             page.goto(f"{frontend_url}/settings")
             expect(
-                page.get_by_text("当前仅可验证协议", exact=False)
+                page.get_by_text("自动选择不可用", exact=False)
             ).to_be_visible()
             expect(
                 page.get_by_text("协议 fixture 可用", exact=False)
             ).to_be_visible()
+            expect(
+                page.get_by_text("不参与产品语义选择", exact=False)
+            ).to_be_visible()
+            browser_card = page.locator("article").filter(
+                has=page.get_by_role("heading", name="浏览器运行时")
+            )
+            expect(browser_card).to_contain_text("available")
+            expect(browser_card).to_contain_text("Chromium")
             assert not console_errors, console_errors
             assert not console_warnings, console_warnings
             browser.close()
@@ -283,6 +295,10 @@ def test_real_ui_agent_failure_handoff_returns_to_original_chat() -> None:
             stack.set_transient_healthy(False)
             page.goto(f"{frontend_url}/chat")
             page.wait_for_url("**/chat/*")
+            page.get_by_role("button", name="工作流：开启").click()
+            expect(
+                page.get_by_role("button", name="工作流：关闭")
+            ).to_be_visible()
             with page.expect_response(
                 lambda response: "/messages" in response.url
                 and response.status == 201,

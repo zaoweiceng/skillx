@@ -88,7 +88,7 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
         run_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(runs)")
         }
-    assert revision == ("0019",)
+    assert revision == ("0020",)
     assert {
         "runs",
         "capability_versions",
@@ -106,6 +106,7 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
         "pending_selections",
         "task_checkpoints",
         "replay_fixtures",
+        "browser_runtime_heartbeats",
         "revision_proposals",
         "human_patches",
         "conversation_turns",

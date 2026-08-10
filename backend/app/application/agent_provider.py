@@ -134,6 +134,7 @@ async def provider_readiness() -> dict[str, Any]:
     return {
         "type": provider_type,
         "runtimeType": runtime.type,
+        "protocolTestOnly": provider_type == "fixture",
         "configured": configured,
         "protocolAvailable": protocol_available,
         "modelAvailable": model_available,

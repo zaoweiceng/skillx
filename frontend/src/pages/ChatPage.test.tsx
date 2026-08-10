@@ -16,6 +16,7 @@ const getRun = vi.fn()
 const createConversation = vi.fn()
 const listConversations = vi.fn()
 const updateConversationWorkflowMode = vi.fn()
+const getHealth = vi.fn()
 
 vi.mock('@/api/client', () => ({
   api: {
@@ -31,6 +32,7 @@ vi.mock('@/api/client', () => ({
     getTaskCheckpoint: (...args: unknown[]) => getTaskCheckpoint(...args),
     listConversationRunEvents: (...args: unknown[]) => listConversationRunEvents(...args),
     getRun: (...args: unknown[]) => getRun(...args),
+    getHealth: (...args: unknown[]) => getHealth(...args),
     distillConversationRun: vi.fn(),
   },
   conversationRunUrl: (id: string) => `/api/conversation-runs/${id}`,
@@ -152,8 +154,10 @@ describe('ChatPage 候选组件闭环', () => {
     createConversation.mockReset()
     listConversations.mockReset()
     updateConversationWorkflowMode.mockReset()
+    getHealth.mockReset()
     createConversation.mockResolvedValue({ id: 'conv-1', title: '新对话' })
     listConversations.mockResolvedValue({ items: [], nextCursor: null })
+    getHealth.mockResolvedValue({ workflowSelectionMode: 'real' })
     updateConversationWorkflowMode.mockResolvedValue({
       id: 'conv-1',
       workflowMode: 'disabled',
@@ -189,6 +193,26 @@ describe('ChatPage 候选组件闭环', () => {
 
     await waitFor(() => expect(getConversation).toHaveBeenCalledWith('conv-1'))
     expect(createConversation).toHaveBeenCalledTimes(1)
+  })
+
+  it('真实语义 Runtime 缺失时预先提示自动选择不可用', async () => {
+    getHealth.mockResolvedValue({ workflowSelectionMode: 'unavailable' })
+    getConversation.mockResolvedValue({
+      id: 'conv-1',
+      title: '新对话',
+      boundComponentId: null,
+      workflowMode: 'enabled',
+      messages: [],
+      turns: [],
+    })
+
+    renderAt('conv-1')
+
+    await waitFor(() =>
+      expect(
+        screen.getByText('自动选择不可用；请关闭工作流后继续通用 Agent'),
+      ).toBeInTheDocument(),
+    )
   })
 
   it('渲染候选卡片并支持确认后启动组件', async () => {

@@ -99,6 +99,7 @@ export default function RunDetailPage() {
 
   if (error && !run) return <div className="page error-panel">{error}</div>
   if (!run) return <div className="page loading-panel">正在读取持久化运行状态...</div>
+  const terminal = ['succeeded', 'failed', 'cancelled'].includes(run.status)
 
   return (
     <div className="page">
@@ -217,17 +218,24 @@ export default function RunDetailPage() {
         <aside className="panel event-panel">
           <div className="panel-heading">
             <div>
-              <span className="eyebrow">LIVE EVENT STREAM</span>
-              <h2>实时事件</h2>
+              <span className="eyebrow">
+                {terminal ? 'PERSISTED EVENT HISTORY' : 'LIVE EVENT STREAM'}
+              </span>
+              <h2>{terminal ? '事件记录' : '实时事件'}</h2>
             </div>
-            <span className="live-label">
-              <span className="pulse-dot" /> SSE
-            </span>
+            {terminal ? (
+              <span className="live-label">实时流已关闭</span>
+            ) : (
+              <span className="live-label">
+                <span className="pulse-dot" /> SSE
+              </span>
+            )}
           </div>
           <div className="event-list">
             {events.length === 0 && (
               <div className="event-empty">
-                <Clock size={16} /> 等待新事件
+                <Clock size={16} />{' '}
+                {terminal ? '本会话未加载历史事件' : '等待新事件'}
               </div>
             )}
             {events.map((event) => (
@@ -443,16 +451,28 @@ export default function RunDetailPage() {
             )}
           </div>
           <JsonBlock value={run.dependencyVersions} />
-          {run.runtimeSnapshot?.runtimeUsed && (
+          {run.runtimeSnapshot && (
             <div className="node-metrics">
               <span className="metric-chip">
-                {run.runtimeSnapshot.runtimeUsed === 'direct_llm'
+                启动选择：
+                {run.runtimeSnapshot.runtimeSelection === 'direct_llm'
                   ? 'LLM Runtime'
-                  : run.runtimeSnapshot.runtimeUsed === 'agent_fallback'
+                  : run.runtimeSnapshot.runtimeSelection === 'agent_fallback'
                     ? 'Agent fallback'
-                    : 'Runtime unavailable'}
+                    : '不可用'}
               </span>
-              {run.runtimeSnapshot.fallbackReason && (
+              <span className="metric-chip">
+                {run.runtimeSnapshot.modelCalled
+                  ? `实际调用：${run.runtimeSnapshot.runtimeUsed ?? '未记录'}`
+                  : '模型未调用 / 0 Token'}
+              </span>
+              {run.runtimeSnapshot.modelCalled &&
+                typeof run.runtimeSnapshot.totalTokens === 'number' && (
+                  <span className="metric-chip">
+                    {run.runtimeSnapshot.totalTokens} Token
+                  </span>
+                )}
+              {run.runtimeSnapshot.modelCalled && run.runtimeSnapshot.fallbackReason && (
                 <span className="metric-chip">
                   {run.runtimeSnapshot.fallbackReason}
                 </span>

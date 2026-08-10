@@ -129,7 +129,17 @@ export type Run = {
     complete: boolean
   }>
   runtimeSnapshot?: {
-    runtimeUsed?: 'direct_llm' | 'agent_fallback' | 'unavailable'
+    runtimeSelection?: 'direct_llm' | 'agent_fallback' | 'unavailable'
+    runtimeUsed?:
+      | 'direct_llm'
+      | 'agent_fallback'
+      | 'agent_runtime'
+      | 'fake_structured'
+      | 'mixed'
+      | null
+    runtimeCalls?: string[]
+    modelCalled?: boolean
+    totalTokens?: number
     runtimeKind?: 'llm_runtime' | 'agent_runtime' | null
     provider?: string | null
     identity?: string | null
@@ -416,6 +426,7 @@ export const api = {
       selectionProvider: {
         type: 'real' | 'fixture' | 'unavailable'
         runtimeType?: 'traex_managed' | 'openai_sidecar' | 'fixture' | 'unavailable'
+        protocolTestOnly?: boolean
         configured: boolean
         protocolAvailable: boolean
         modelAvailable: boolean
@@ -438,6 +449,7 @@ export const api = {
       agentRuntime?: {
         type: 'real' | 'fixture' | 'unavailable'
         runtimeType: 'traex_managed' | 'openai_sidecar' | 'fixture' | 'unavailable'
+        protocolTestOnly?: boolean
         configured: boolean
         protocolAvailable: boolean
         modelAvailable: boolean
@@ -466,7 +478,20 @@ export const api = {
         trigger: string
         executionErrorsFallback: boolean
       }
-      runtimes: Record<string, { status: string; detail: string }>
+      runtimes: Record<
+        string,
+        {
+          status: string
+          detail: string
+          workerId?: string | null
+          checkedAt?: string | null
+          stale?: boolean
+          chromiumPath?: string | null
+          chromiumVersion?: string | null
+          playwrightVersion?: string | null
+          launchSucceeded?: boolean
+        }
+      >
     }>('/health/ready'),
   probeProvider: () =>
     request<{

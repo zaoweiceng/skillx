@@ -39,7 +39,7 @@ class StructuredGenerationRuntime:
 
     def snapshot(self) -> dict[str, Any]:
         return {
-            "runtimeUsed": self.runtime_used,
+            "runtimeSelection": self.runtime_used,
             "runtimeKind": self.runtime_kind,
             "provider": self.provider,
             "identity": self.identity,
@@ -105,7 +105,12 @@ def resolve_structured_generation_runtime(
 def frozen_runtime_from_snapshot(
     snapshot: dict[str, Any] | None,
 ) -> StructuredGenerationRuntime:
-    if not snapshot or snapshot.get("runtimeUsed") not in {
+    selection = (
+        snapshot.get("runtimeSelection", snapshot.get("runtimeUsed"))
+        if snapshot
+        else None
+    )
+    if not snapshot or selection not in {
         "direct_llm",
         "agent_fallback",
     }:
@@ -114,7 +119,7 @@ def frozen_runtime_from_snapshot(
             "Run 未冻结可用的结构化生成 Runtime",
         )
     return StructuredGenerationRuntime(
-        runtime_used=snapshot["runtimeUsed"],
+        runtime_used=selection,
         runtime_kind=snapshot["runtimeKind"],
         provider=snapshot["provider"],
         identity=snapshot.get("identity"),
@@ -219,7 +224,7 @@ def runtime_snapshot_for_definition(definition: Any) -> dict[str, Any]:
     except ModelRuntimeError as exc:
         return {
             "policy": normalized,
-            "runtimeUsed": "unavailable",
+            "runtimeSelection": "unavailable",
             "runtimeKind": None,
             "provider": None,
             "identity": None,

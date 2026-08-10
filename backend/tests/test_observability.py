@@ -57,6 +57,10 @@ async def test_run_detail_exposes_node_timing_and_dependency_versions() -> None:
     assert detail["status"] == "succeeded"
     assert detail["dependencyVersions"]["executionClass"] == "zero_llm"
     assert detail["dependencyVersions"]["workflowDigest"]
+    assert detail["modelUsage"] == []
+    assert detail["runtimeSnapshot"]["runtimeUsed"] is None
+    assert detail["runtimeSnapshot"]["modelCalled"] is False
+    assert detail["runtimeSnapshot"]["totalTokens"] == 0
     # 每个节点都带 durationMs 与 metrics 字段（可为空但存在）。
     for node in detail["nodes"]:
         assert "durationMs" in node

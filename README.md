@@ -84,14 +84,31 @@ SkillX 注册只接受 `SKILLX_CAPABILITY_ROOT` 下的相对路径。Secret API 
 `permissions.secrets.use` 声明的句柄会注入 SkillXContext。MCP STDIO 的
 `environment` 同样只接受 `{"API_KEY": {"secretRef": "name"}}`，禁止明文值。
 
-真实模型通过
-`SKILLX_MODEL_ENDPOINT`、`SKILLX_MODEL_NAME` 和
-`SKILLX_MODEL_API_KEY_ENV` 指向的环境变量配置；TraeX 命令通过
-`SKILLX_TRAEX_COMMAND` 配置。`SKILLX_AGENT_PROVIDER_TYPE` 必须显式选择
-`real`、`fixture` 或 `unavailable`；真实 OpenAI-compatible Agent 可将命令指向
-`examples/openai_agent_sidecar.py`，fixture 只用于协议和故障测试。Secret 值不得写入
-`.env` 以外的工作流定义、
-事件或 Artifact。
+Local Demo 的真实语义 Agent 可使用 TraeX managed，不要求 Host 配置 LLM endpoint：
+
+```bash
+export SKILLX_AGENT_RUNTIME_TYPE=traex_managed
+export SKILLX_AGENT_COMMAND='["/path/to/traex-managed-adapter"]'
+export SKILLX_AGENT_ALLOWED_EXECUTABLES='["traex-managed-adapter"]'
+```
+
+该 command 必须实现本仓库 Agent Host 的双向 NDJSON/ToolResult 协议；普通交互式 `traex`
+CLI 不能直接代替 managed adapter。
+
+也可使用 `openai_sidecar`，其 endpoint/model/key 只属于 Agent Runtime；Direct LLM
+通过独立的 `SKILLX_LLM_*` 配置，二者不共享 endpoint 或 key：
+
+```bash
+export SKILLX_AGENT_RUNTIME_TYPE=openai_sidecar
+export SKILLX_AGENT_COMMAND='["python3","../examples/openai_agent_sidecar.py"]'
+export SKILLX_AGENT_ALLOWED_EXECUTABLES='["python3"]'
+export SKILLX_AGENT_ENDPOINT='https://provider.example/v1/chat/completions'
+export SKILLX_AGENT_MODEL='provider-agent-model'
+export SKILLX_AGENT_API_KEY_ENV='SKILLX_AGENT_API_KEY'
+```
+
+`fixture` 只用于协议和故障测试，并标记为 `protocolTestOnly`；它不会让 Chat 的自动工作流
+选择进入可用状态。Secret 值不得写入工作流定义、事件或 Artifact。
 
 ## 验证
 
@@ -113,8 +130,9 @@ npm run build
 - `make demo-check`：在 `quality-check` 之上执行真实 API + 独立 Worker 子进程黑盒 E2E；
   场景数量和完成状态以 `docs/demo-acceptance.md` 为准。
 - `make browser-ui-check`：启动全新数据库、API、Worker、Vite、动态站点和 Chromium，
-  验证自然探索、固化发布、渐进复用、terminal output、成功/失败运行详情，以及真实
-  Browser 503 接力结果自动返回原 Conversation。
+  验证 fixture 协议 Agent（工作流关闭）、固化发布、显式组件复用、terminal output、
+  成功/失败运行详情，以及真实 Browser 503 接力结果自动返回原 Conversation。真实语义
+  自动选择需另行配置 `traex_managed` 或 `openai_sidecar`，fixture 不计作该项证据。
 
 测试覆盖双 Worker fencing/CAS、原子并发配额、取消、超时、并行汇聚、SkillX 版本锁定、
 MCP STDIO/HTTP 与契约漂移、Hybrid/真实 TraeX Agent、轨迹固化与发布复用、浏览器一次性

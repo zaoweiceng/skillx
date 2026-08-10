@@ -17,6 +17,7 @@ from app.application.agent_run import AgentRunWorker
 from app.application.compiler import WorkflowCompiler
 from app.application.orchestrator import WorkerService
 from app.application.plans import WorkflowSelection
+from app.application.runtime_config import semantic_workflow_selection_available
 from app.application.workflow_catalog import build_manifest, create_disclosure_session
 from app.config import get_settings
 from app.infrastructure.database import (
@@ -101,6 +102,51 @@ def traex_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         settings, "traex_allowed_executables", [Path(sys.executable).name]
     )
+    # 本文件验证 fixture 的 Progressive WorkflowSelection 协议。产品入口默认拒绝
+    # protocolTestOnly runtime；仅这些协议测试显式打开入口，避免把 fixture 当语义证据。
+    monkeypatch.setattr(
+        "app.api.routes.semantic_workflow_selection_available",
+        lambda: True,
+    )
+
+
+def test_semantic_selection_requires_real_allowlisted_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "agent_runtime_type", "traex_managed")
+    monkeypatch.setattr(settings, "agent_command", ["/missing/traex-managed"])
+    monkeypatch.setattr(
+        settings,
+        "agent_allowed_executables",
+        ["traex-managed"],
+    )
+
+    assert semantic_workflow_selection_available() is False
+
+
+async def test_product_message_rejects_protocol_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "agent_provider_type", "fixture")
+    monkeypatch.setattr(settings, "traex_command", [sys.executable, str(STUB)])
+    monkeypatch.setattr(
+        settings, "traex_allowed_executables", [Path(sys.executable).name]
+    )
+    conversation_id = await _seed()
+
+    async with SessionLocal() as session:
+        response = await create_message(
+            conversation_id,
+            MessageCreate(content="上海天气如何"),
+            session,
+        )
+
+    assistant = response["assistant"]
+    assert assistant["state"] == "unavailable"
+    assert assistant["code"] == "WORKFLOW_SELECTION_UNAVAILABLE"
+    assert assistant["selectionMode"] == "unavailable"
 
 
 async def _seed() -> str:

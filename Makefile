@@ -1,4 +1,4 @@
-.PHONY: demo-check quality-check backend-check browser-install browser-check frontend-check migration-check e2e-check browser-ui-check
+.PHONY: demo-check quality-check backend-check browser-install browser-check frontend-check migration-check e2e-check browser-ui-check doc-chain-check
 
 UV_CACHE_DIR ?= /tmp/skillx-workflow-uv-cache
 export UV_CACHE_DIR
@@ -7,7 +7,7 @@ export UV_CACHE_DIR
 demo-check: quality-check e2e-check
 
 # 较快的静态/单元/进程内集成检查，不含黑盒子进程 E2E。
-quality-check: backend-check migration-check frontend-check
+quality-check: backend-check migration-check frontend-check doc-chain-check
 
 backend-check:
 	cd backend && uv run ruff check app tests migrations e2e ../examples/local_weather_mcp.py ../examples/traex_stub.py ../examples/openai_agent_sidecar.py ../examples/local_form_site.py
@@ -40,3 +40,6 @@ frontend-check:
 	cd frontend && npm run lint
 	cd frontend && npm run test
 	cd frontend && npm run build
+
+doc-chain-check:
+	python3 tools/check_doc_chain.py

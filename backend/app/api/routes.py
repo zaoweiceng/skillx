@@ -36,6 +36,7 @@ from app.application.agent_run import (
     summarize_run,
 )
 from app.application.agent_run import _append_event as append_agent_event
+from app.application.browser_readiness import browser_runtime_readiness
 from app.application.capabilities import (
     CapabilityResolutionError,
     register_skillx,
@@ -81,7 +82,10 @@ from app.application.product_history import (
 )
 from app.application.replay import run_isolated_replay, run_replay_proof
 from app.application.retries import auto_retry_allowed
-from app.application.runtime_config import agent_runtime_config
+from app.application.runtime_config import (
+    agent_runtime_config,
+    semantic_workflow_selection_available,
+)
 from app.application.secrets import (
     SecretResolutionError,
     register_secret_reference,
@@ -525,13 +529,15 @@ async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str
         ) from exc
     provider = await provider_readiness()
     llm_runtime = await llm_runtime_readiness()
+    browser_runtime = await browser_runtime_readiness(session)
+    worker_available = bool(
+        browser_runtime.get("workerId") and not browser_runtime.get("stale")
+    )
     return {
         "status": "ready",
         "migration": revision,
         "workflowSelectionMode": (
-            provider["type"]
-            if provider["type"] in {"real", "fixture"}
-            else "unavailable"
+            "real" if semantic_workflow_selection_available() else "unavailable"
         ),
         "selectionProvider": provider,
         "agentRuntime": provider,
@@ -544,19 +550,14 @@ async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str
         "runtimes": {
             "database": {"status": "available", "detail": "SQLite 与迁移可用"},
             "worker": {
-                "status": "unknown",
-                "detail": "API 进程不伪造独立 Worker 在线状态",
-            },
-            "browser": {
-                "status": (
-                    "configured"
-                    if get_settings().browser_allowed_hosts
-                    else "unconfigured"
+                "status": "available" if worker_available else "unknown",
+                "detail": (
+                    f"Worker {browser_runtime['workerId']} 已写入运行时心跳"
+                    if worker_available
+                    else "未发现新鲜的独立 Worker 心跳"
                 ),
-                "detail": "Host allowlist 已配置"
-                if get_settings().browser_allowed_hosts
-                else "未配置 Browser Host allowlist",
             },
+            "browser": browser_runtime,
             "secretProvider": {
                 "status": "reference_only",
                 "detail": "仅解析环境变量引用，不存储明文",
@@ -3128,6 +3129,28 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
         }
         for item in usage_rows
     ]
+    actual_runtimes = list(
+        dict.fromkeys(
+            item.runtime_used
+            for item in usage_rows
+            if item.runtime_used is not None
+        )
+    )
+    runtime_snapshot = dict(run.runtime_snapshot_json or {})
+    runtime_snapshot["runtimeUsed"] = (
+        actual_runtimes[0]
+        if len(actual_runtimes) == 1
+        else "mixed"
+        if actual_runtimes
+        else None
+    )
+    runtime_snapshot["runtimeCalls"] = actual_runtimes
+    runtime_snapshot["modelCalled"] = bool(usage_rows)
+    runtime_snapshot["totalTokens"] = sum(
+        item.total_tokens or 0 for item in usage_rows
+    )
+    result["runtimeSnapshot"] = runtime_snapshot
+    result["dependencyVersions"]["modelRuntime"] = runtime_snapshot
     return result
 
 
@@ -4105,15 +4128,16 @@ async def _unbound_conversation_message(
     turn_id: str,
     user_message_id: str,
 ) -> tuple[dict[str, Any], ConversationRun | None]:
-    if (
-        not agent_runtime_config().configured
-    ):
+    if not semantic_workflow_selection_available():
         return (
             {
                 "type": "workflow_selection",
                 "state": "unavailable",
                 "code": "WORKFLOW_SELECTION_UNAVAILABLE",
-                "text": "语义选择服务不可用。可稍后重试，或关闭工作流后交给通用 Agent。",
+                "text": (
+                    "自动选择不可用：未配置真实语义 Agent Runtime。"
+                    "可关闭工作流后继续使用通用 Agent；协议 fixture 不会用于产品语义选择。"
+                ),
                 "offerAgentRun": True,
                 "selectionMode": "unavailable",
             },

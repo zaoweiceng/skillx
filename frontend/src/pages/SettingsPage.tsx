@@ -6,7 +6,12 @@ type Health = Awaited<ReturnType<typeof api.getHealth>>
 
 function tone(status: string) {
   if (['available', 'configured', 'reference_only'].includes(status)) return 'success'
-  if (['unknown', 'fixture'].includes(status)) return 'warning'
+  if (
+    ['unknown', 'fixture', 'stale', 'binary_missing', 'permission_denied', 'launch_failed'].includes(
+      status,
+    )
+  )
+    return 'warning'
   return 'neutral'
 }
 
@@ -83,6 +88,15 @@ export default function SettingsPage() {
           icon: PanelsTopLeft,
           name: '浏览器运行时',
           ...health.runtimes.browser,
+          detail: `${health.runtimes.browser.detail}${
+            health.runtimes.browser.chromiumVersion
+              ? ` · Chromium ${health.runtimes.browser.chromiumVersion}`
+              : ''
+          }${
+            health.runtimes.browser.checkedAt
+              ? ` · ${new Date(health.runtimes.browser.checkedAt).toLocaleString()}`
+              : ''
+          }`,
         },
         {
           icon: KeyRound,
@@ -109,14 +123,17 @@ export default function SettingsPage() {
       {health && (
         <div className="notice-panel">
           当前工作流选择 Provider：<strong>{health.workflowSelectionMode}</strong>
-          {health.workflowSelectionMode === 'unavailable' && '。真实语义 Agent 未配置。'}
-          {health.workflowSelectionMode === 'fixture' && '。当前仅可验证协议，不代表真实语义能力。'}
+          {health.workflowSelectionMode === 'unavailable' && '。自动选择不可用。'}
+          {provider?.protocolTestOnly &&
+            ' 协议 fixture 仅用于协议/故障测试，不参与产品语义选择。'}
           <span>
             当前结构化生成路径：
             <strong>
               {llmRuntime?.configured
                 ? ' LLM Runtime'
-                : agentRuntime?.configured
+                : agentRuntime?.protocolTestOnly
+                  ? ' 协议测试 Agent fallback'
+                  : agentRuntime?.configured
                   ? ' Agent fallback'
                   : ' unavailable'}
             </strong>

@@ -45,6 +45,9 @@ export default function ChatPage() {
   const [historyOpen, setHistoryOpen] = useState(false)
   const [traceOpen, setTraceOpen] = useState(false)
   const [workflowMode, setWorkflowMode] = useState<'enabled' | 'disabled'>('enabled')
+  const [workflowSelectionAvailable, setWorkflowSelectionAvailable] = useState<
+    boolean | null
+  >(null)
   const [switchingMode, setSwitchingMode] = useState(false)
   const [clock, setClock] = useState(Date.now())
   const [optimisticStartedAt, setOptimisticStartedAt] = useState<number | null>(null)
@@ -86,6 +89,15 @@ export default function ChatPage() {
         setError(reason.message)
       })
   }, [routeConversationId, navigate])
+
+  useEffect(() => {
+    api
+      .getHealth()
+      .then((health) => {
+        setWorkflowSelectionAvailable(health.workflowSelectionMode === 'real')
+      })
+      .catch(() => setWorkflowSelectionAvailable(null))
+  }, [])
 
   const refresh = useCallback(async () => {
     if (!conversationId) return
@@ -1013,8 +1025,10 @@ export default function ChatPage() {
           </div>
           <form className="chat-composer" onSubmit={send}>
             <span className="composer-mode-note">
-              {workflowMode === 'enabled'
-                ? 'Agent 可按需发现并自动执行工作流'
+              {workflowMode === 'enabled' && workflowSelectionAvailable === false
+                ? '自动选择不可用；请关闭工作流后继续通用 Agent'
+                : workflowMode === 'enabled'
+                  ? 'Agent 可按需发现并自动执行工作流'
                 : '下一条消息不会披露或调用任何 workflow.* 工具'}
               {optimisticStartedAt !== null &&
                 ` · ${((clock - optimisticStartedAt) / 1000).toFixed(1)}s`}

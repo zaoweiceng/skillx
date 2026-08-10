@@ -53,13 +53,14 @@ describe('产品状态页面', () => {
     expect(screen.queryByText('零模型组件')).not.toBeInTheDocument()
   })
 
-  it('展示 ready API 的 fixture 事实而非静态真实模型状态', async () => {
+  it('fixture 仅显示协议事实，自动选择保持不可用', async () => {
     getHealth.mockResolvedValue({
       status: 'ready',
-      migration: '0018',
-      workflowSelectionMode: 'fixture',
+      migration: '0020',
+      workflowSelectionMode: 'unavailable',
       selectionProvider: {
         type: 'fixture',
+        protocolTestOnly: true,
         configured: true,
         protocolAvailable: true,
         modelAvailable: false,
@@ -72,13 +73,20 @@ describe('产品状态页面', () => {
       runtimes: {
         database: { status: 'available', detail: 'SQLite 可用' },
         worker: { status: 'unknown', detail: '未检测' },
-        browser: { status: 'configured', detail: '已配置' },
+        browser: {
+          status: 'permission_denied',
+          detail: 'Chromium 启动被操作系统权限拒绝',
+          checkedAt: '2026-08-10T06:00:00Z',
+          launchSucceeded: false,
+        },
         secretProvider: { status: 'reference_only', detail: '引用模式' },
       },
     })
     render(<SettingsPage />)
-    await waitFor(() => expect(screen.getAllByText('fixture')).toHaveLength(2))
-    expect(screen.getByText(/仅可验证协议/)).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByText('fixture')).toBeInTheDocument())
+    expect(screen.getByText(/自动选择不可用/)).toBeInTheDocument()
+    expect(screen.getByText(/不参与产品语义选择/)).toBeInTheDocument()
     expect(screen.getByText(/协议 fixture 可用/)).toBeInTheDocument()
+    expect(screen.getByText('permission_denied')).toBeInTheDocument()
   })
 })

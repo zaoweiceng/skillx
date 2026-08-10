@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Literal
 
 from app.application.compiler import digest_json
@@ -151,3 +153,20 @@ def runtime_config_facts() -> dict[str, object]:
             "digest": agent.digest,
         },
     }
+
+
+def semantic_workflow_selection_available() -> bool:
+    runtime = agent_runtime_config()
+    if (
+        not runtime.configured
+        or runtime.type not in {"traex_managed", "openai_sidecar"}
+        or not runtime.command
+    ):
+        return False
+    executable = Path(runtime.command[0])
+    resolved = (
+        executable
+        if executable.is_absolute() and executable.is_file()
+        else shutil.which(runtime.command[0])
+    )
+    return resolved is not None and executable.name in runtime.allowed_executables
