@@ -127,6 +127,12 @@ export type Run = {
     outputTokens: number | null
     totalTokens: number | null
     complete: boolean
+    attempted: boolean
+    dispatched: boolean
+    completed: boolean
+    attemptedAt: string
+    requestDispatchedAt: string | null
+    completedAt: string | null
   }>
   runtimeSnapshot?: {
     runtimeSelection?: 'direct_llm' | 'agent_fallback' | 'unavailable'
@@ -364,6 +370,11 @@ export type ConversationRunEvent = {
   createdAt?: string
 }
 
+export type RunEvent = ConversationRunEvent & {
+  id?: string
+  runId?: string
+}
+
 export type ConversationRunSummary = {
   id: string
   conversationId: string
@@ -486,7 +497,7 @@ export const api = {
           workerId?: string | null
           checkedAt?: string | null
           stale?: boolean
-          chromiumPath?: string | null
+          chromiumExecutable?: string | null
           chromiumVersion?: string | null
           playwrightVersion?: string | null
           launchSucceeded?: boolean
@@ -528,6 +539,10 @@ export const api = {
     )
   },
   getRun: (id: string) => request<Run>(`/runs/${id}`),
+  listRunEvents: (id: string, after = 0, limit = 200) =>
+    request<RunEvent[]>(
+      `/runs/${id}/events?after=${after}&limit=${limit}`,
+    ),
   getRunTechnicalError: (id: string) =>
     request<{
       runId: string
@@ -798,8 +813,8 @@ export const api = {
     }>(`/conversation-runs/${id}/distill`, { method: 'POST' }),
 }
 
-export function eventStreamUrl(runId: string): string {
-  return `${API_BASE}/runs/${runId}/events/stream`
+export function eventStreamUrl(runId: string, after = 0): string {
+  return `${API_BASE}/runs/${runId}/events/stream?after=${after}`
 }
 
 export function conversationRunUrl(runId: string): string {

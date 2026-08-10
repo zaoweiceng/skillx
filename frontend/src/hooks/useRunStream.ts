@@ -1,18 +1,16 @@
 import { useEffect } from 'react'
 import { create } from 'zustand'
 
-import { eventStreamUrl } from '@/api/client'
+import { eventStreamUrl, type RunEvent } from '@/api/client'
 
-type RunEvent = {
+type StoredRunEvent = RunEvent & {
   runId: string
-  seq: number
-  type: string
-  payload: Record<string, unknown>
 }
 
 type EventState = {
-  events: Record<string, RunEvent[]>
-  add: (runId: string, event: RunEvent) => void
+  events: Record<string, StoredRunEvent[]>
+  add: (runId: string, event: StoredRunEvent) => void
+  addMany: (runId: string, events: StoredRunEvent[]) => void
   clear: (runId: string) => void
 }
 
@@ -22,7 +20,27 @@ export const useRunEvents = create<EventState>((set) => ({
     set((state) => {
       const current = state.events[runId] ?? []
       if (current.some((item) => item.seq === event.seq)) return state
-      return { events: { ...state.events, [runId]: [...current, event] } }
+      return {
+        events: {
+          ...state.events,
+          [runId]: [...current, event].sort((left, right) => left.seq - right.seq),
+        },
+      }
+    }),
+  addMany: (runId, incoming) =>
+    set((state) => {
+      const bySequence = new Map(
+        (state.events[runId] ?? []).map((event) => [event.seq, event]),
+      )
+      incoming.forEach((event) => bySequence.set(event.seq, event))
+      return {
+        events: {
+          ...state.events,
+          [runId]: [...bySequence.values()].sort(
+            (left, right) => left.seq - right.seq,
+          ),
+        },
+      }
     }),
   clear: (runId) =>
     set((state) => {
@@ -38,13 +56,20 @@ const TERMINAL_EVENTS = new Set(['run.completed', 'run.failed', 'run.cancelled']
 export function useRunStream(
   runId: string | undefined,
   runStatus: string | undefined,
+  historyLoaded: boolean,
+  after: number,
   onEvent: () => void,
 ): void {
   const add = useRunEvents((state) => state.add)
 
   useEffect(() => {
-    if (!runId || !runStatus || TERMINAL_STATUSES.has(runStatus)) return
-    const stream = new EventSource(eventStreamUrl(runId))
+    if (
+      !runId ||
+      !runStatus ||
+      !historyLoaded ||
+      TERMINAL_STATUSES.has(runStatus)
+    ) return
+    const stream = new EventSource(eventStreamUrl(runId, after))
     const eventTypes = [
       'run.created',
       'run.started',
@@ -55,9 +80,26 @@ export function useRunStream(
       'node.started',
       'node.completed',
       'node.failed',
+      'node.cancelled',
       'node.skipped',
+      'node.retry_scheduled',
+      'node.stale_result_ignored',
+      'node.takeover_ready',
+      'node.unknown_outcome',
       'approval.requested',
       'approval.resolved',
+      'presentation.started',
+      'presentation.delta',
+      'presentation.completed',
+      'presentation.failed',
+      'recovery.attempt_started',
+      'recovery.question',
+      'recovery.user_answered',
+      'run.cancellation_requested',
+      'run.recovery_approval_requested',
+      'run.recovery_rejected',
+      'run.recovery_requested',
+      'run.timeout_requested',
     ]
     let closed = false
     let listeners: Array<{ type: string; listener: (message: MessageEvent<string>) => void }> = []
@@ -71,7 +113,7 @@ export function useRunStream(
     }
     listeners = eventTypes.map((type) => {
       const listener = (message: MessageEvent<string>) => {
-        const data = JSON.parse(message.data) as Omit<RunEvent, 'type'>
+        const data = JSON.parse(message.data) as Omit<StoredRunEvent, 'type'>
         add(runId, { ...data, type })
         onEvent()
         if (TERMINAL_EVENTS.has(type)) close()
@@ -80,5 +122,5 @@ export function useRunStream(
       return { type, listener }
     })
     return close
-  }, [add, onEvent, runId, runStatus])
+  }, [add, after, historyLoaded, onEvent, runId, runStatus])
 }

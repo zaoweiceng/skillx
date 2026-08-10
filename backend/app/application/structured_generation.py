@@ -58,6 +58,7 @@ class StructuredGenerationResult:
     total_tokens: int
     usage_complete: bool
     tool_request_count: int = 0
+    request_dispatched: bool = True
 
 
 def normalize_model_runtime_policy(
@@ -165,7 +166,11 @@ class AgentStructuredGenerationAdapter:
                 )
             )
         except AgentHostError as exc:
-            raise ModelRuntimeError(exc.code, exc.message) from exc
+            raise ModelRuntimeError(
+                exc.code,
+                exc.message,
+                request_dispatched=exc.request_dispatched,
+            ) from exc
         tool_requests = sum(event["type"] == "tool.requested" for event in result.runtime_events)
         if tool_requests:
             raise ModelRuntimeError(
@@ -181,6 +186,7 @@ class AgentStructuredGenerationAdapter:
             total_tokens=result.total_tokens,
             usage_complete=result.usage_complete,
             tool_request_count=tool_requests,
+            request_dispatched=result.request_dispatched,
         )
 
 

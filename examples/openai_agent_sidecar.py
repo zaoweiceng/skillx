@@ -96,7 +96,7 @@ def provider_config() -> tuple[str, str, str]:
     return endpoint, model, api_key
 
 
-def post_completion(payload: dict[str, Any]) -> dict[str, Any]:
+def post_completion(payload: dict[str, Any], *, attempt: int) -> dict[str, Any]:
     endpoint, _model, api_key = provider_config()
     request = urllib.request.Request(
         endpoint,
@@ -108,6 +108,7 @@ def post_completion(payload: dict[str, Any]) -> dict[str, Any]:
         method="POST",
     )
     try:
+        emit({"type": "model.request.dispatched", "payload": {"attempt": attempt}})
         with urllib.request.urlopen(request, timeout=60) as response:
             decoded = json.loads(response.read())
     except urllib.error.HTTPError as exc:
@@ -267,7 +268,7 @@ def run(args: argparse.Namespace) -> int:
                     "schema": output_schema,
                 },
             }
-        response = post_completion(request)
+        response = post_completion(request, attempt=step)
         usage = response.get("usage") or {}
         usage_complete = usage_complete and {
             "prompt_tokens",

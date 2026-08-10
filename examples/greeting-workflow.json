@@ -2,7 +2,14 @@
   "apiVersion": "workflow.platform/v1",
   "kind": "Workflow",
   "metadata": {
-    "name": "greeting"
+    "name": "greeting",
+    "capability": {
+      "summary": "根据姓名生成确定性的问候语。",
+      "useWhen": ["用户希望向明确姓名的人生成问候语"],
+      "doNotUseWhen": ["用户要求发送消息或执行其他副作用"],
+      "examples": ["问候 Alice"],
+      "tags": ["问候", "文本"]
+    }
   },
   "spec": {
     "inputSchema": {

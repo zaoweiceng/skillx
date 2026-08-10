@@ -151,6 +151,10 @@ class LogPayload(_PayloadBase):
     message: str = ""
 
 
+class ModelRequestPayload(_PayloadBase):
+    attempt: StrictInt = Field(default=1, ge=1)
+
+
 class AgentPlanEvent(BaseModel):
     type: Literal["agent.plan"]
     payload: PlanPayload
@@ -211,6 +215,11 @@ class LogEvent(BaseModel):
     payload: LogPayload
 
 
+class ModelRequestDispatchedEvent(BaseModel):
+    type: Literal["model.request.dispatched"]
+    payload: ModelRequestPayload
+
+
 AgentEvent = Annotated[
     AgentPlanEvent
     | AgentStepEvent
@@ -223,7 +232,8 @@ AgentEvent = Annotated[
     | BrowserActionCompletedEvent
     | ToolRequestedEvent
     | ToolResultEvent
-    | LogEvent,
+    | LogEvent
+    | ModelRequestDispatchedEvent,
     Field(discriminator="type"),
 ]
 
@@ -367,6 +377,11 @@ class AgentEventValidator:
                     "inputTokens": payload.get("inputTokens", 0),
                     "outputTokens": payload.get("outputTokens", 0),
                 },
+            }
+        if event_type == "model.request.dispatched":
+            return {
+                "type": event_type,
+                "payload": {"attempt": payload.get("attempt", 1)},
             }
         if event_type == "agent.plan":
             audit = {"summary": payload.get("summary", "")}

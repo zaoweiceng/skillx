@@ -59,6 +59,7 @@ class AgentHostError(Exception):
         failed_call_id: str | None = None,
         protocol_violation: str | None = None,
         reported_error: dict[str, Any] | None = None,
+        request_dispatched: bool = False,
     ) -> None:
         policy = error_policy(code)
         self.code = policy.code
@@ -69,6 +70,7 @@ class AgentHostError(Exception):
         self.failed_call_id = failed_call_id
         self.protocol_violation = protocol_violation
         self.reported_error = reported_error
+        self.request_dispatched = request_dispatched
         self.effective_error = {
             "code": self.code,
             "message": self.message,
@@ -126,6 +128,7 @@ class AgentHostResult:
     output_tokens: int = 0
     total_tokens: int = 0
     usage_complete: bool = True
+    request_dispatched: bool = False
     plan_snapshot: dict[str, Any] | None = None
     accepted_plan_digest: str | None = None
     accepted_plan_revision: int | None = None
@@ -470,7 +473,9 @@ class AgentHost:
 
                     event_type = runtime_event["type"]
                     payload = runtime_event["payload"]
-                    if event_type == "agent.plan" and isinstance(
+                    if event_type == "model.request.dispatched":
+                        result.request_dispatched = True
+                    elif event_type == "agent.plan" and isinstance(
                         payload.get("steps"), list
                     ):
                         if (
@@ -678,6 +683,9 @@ class AgentHost:
                             self._normalize_action(event_type, started, payload)
                         )
                     elif event_type == "agent.step.completed":
+                        # Backward-compatible managed adapters may not yet emit the
+                        # explicit dispatch event, but a model step proves dispatch.
+                        result.request_dispatched = True
                         result.step_count += 1
                         result.input_tokens += payload.get("inputTokens", 0)
                         result.output_tokens += payload.get("outputTokens", 0)
@@ -782,26 +790,44 @@ class AgentHost:
                             failed_call_id=payload.get("callId"),
                             reported_error=reported_error,
                         )
+        except AgentHostError as exc:
+            exc.request_dispatched = (
+                exc.request_dispatched or result.request_dispatched
+            )
+            raise
         except TimeoutError as exc:
             await self._cancel(adapter, request.run_id)
-            raise AgentHostError("TIMEOUT", "Agent 运行超时，已取消") from exc
+            raise AgentHostError(
+                "TIMEOUT",
+                "Agent 运行超时，已取消",
+                request_dispatched=result.request_dispatched,
+            ) from exc
         except AdapterError as exc:
             if failed_tool_result is not None:
                 raise self._failed_tool_error(
                     failed_tool_result,
                     protocol_violation=f"Agent 子进程提前退出: {exc}",
                 ) from exc
-            raise AgentHostError("EXECUTION_FAILED", str(exc)) from exc
+            raise AgentHostError(
+                "EXECUTION_FAILED",
+                str(exc),
+                request_dispatched=result.request_dispatched,
+            ) from exc
 
         if output is None and failed_tool_result is not None:
             raise self._failed_tool_error(failed_tool_result)
         if output is None:
-            raise AgentHostError("EXECUTION_FAILED", "Agent 未返回结构化输出")
+            raise AgentHostError(
+                "EXECUTION_FAILED",
+                "Agent 未返回结构化输出",
+                request_dispatched=result.request_dispatched,
+            )
         errors = list(Draft202012Validator(request.output_schema).iter_errors(output))
         if errors:
             raise AgentHostError(
                 "CONTRACT_VIOLATION",
                 f"Agent 输出不符合 outputSchema: {errors[0].message}",
+                request_dispatched=result.request_dispatched,
             )
         result.output = output
         result.plan_step_states = step_states

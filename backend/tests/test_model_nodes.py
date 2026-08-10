@@ -6,9 +6,11 @@ from threading import Thread
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import pytest
 from sqlalchemy import select
 
+from app.api.routes import get_run
 from app.application.compiler import WorkflowCompiler, WorkflowValidationError
 from app.application.orchestrator import Orchestrator, WorkerService
 from app.config import get_settings
@@ -20,6 +22,7 @@ from app.infrastructure.database import (
     Workflow,
     WorkflowVersion,
 )
+from app.runtime.models import ModelRuntimeError, OpenAICompatibleAdapter
 
 STUB = Path(__file__).resolve().parents[2] / "examples" / "traex_stub.py"
 
@@ -170,8 +173,15 @@ async def test_hybrid_workflow_only_llm_node_reports_tokens() -> None:
                 )
             )
         ).all()
+        usage = await session.scalar(
+            select(ModelUsage).where(ModelUsage.run_id == run_id)
+        )
+        detail = await get_run(run_id, session)
         assert len(events) == 1
         assert events[0].payload_json["inputTokens"] > 0
+        assert usage is not None
+        assert usage.request_dispatched_at is None
+        assert detail["runtimeSnapshot"]["modelCalled"] is False
 
 
 async def test_fake_agent_emits_auditable_events() -> None:
@@ -228,13 +238,17 @@ async def test_llm_unconfigured_uses_toolless_agent_structured_fallback(
         event_types = set(
             await session.scalars(select(RunEvent.type).where(RunEvent.run_id == run_id))
         )
+        detail = await get_run(run_id, session)
     assert usage is not None
     assert usage.runtime_used == "agent_fallback"
     assert usage.fallback_reason == "LLM_RUNTIME_UNCONFIGURED"
     assert usage.input_tokens == 12
     assert usage.output_tokens == 8
     assert usage.total_tokens == 20
+    assert usage.request_dispatched_at is not None
+    assert usage.completed_at is not None
     assert "tool.requested" not in event_types
+    assert detail["runtimeSnapshot"]["modelCalled"] is True
 
 
 async def test_both_model_runtimes_unavailable_fails_stably(
@@ -286,11 +300,62 @@ async def test_direct_llm_never_falls_back_after_request_started(
         event_types = set(
             await session.scalars(select(RunEvent.type).where(RunEvent.run_id == run_id))
         )
+        detail = await get_run(run_id, session)
     assert (usage.runtime_used if usage else None) == (
         expected_runtime or "direct_llm"
     )
     assert "tool.requested" not in event_types
+    assert detail["runtimeSnapshot"]["modelCalled"] is True
     if status != 200:
         assert usage is not None
         assert usage.usage_complete is False
         assert usage.total_tokens is None
+        assert usage.request_dispatched_at is not None
+        assert usage.completed_at is None
+    else:
+        assert usage is not None
+        assert usage.request_dispatched_at is not None
+        assert usage.completed_at is not None
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.ConnectError("dns failed"),
+        httpx.TimeoutException("timed out"),
+    ],
+)
+async def test_direct_llm_transport_failures_record_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: httpx.HTTPError,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "llm_runtime_type", "openai_compatible")
+    monkeypatch.setattr(settings, "llm_endpoint", "https://provider.invalid/v1")
+    monkeypatch.setattr(settings, "llm_model", "direct-test-model")
+    monkeypatch.setattr(settings, "llm_api_key_env", "TEST_LLM_RUNTIME_KEY")
+    monkeypatch.setenv("TEST_LLM_RUNTIME_KEY", "configured")
+
+    class FailingClient:
+        async def __aenter__(self) -> "FailingClient":
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+        async def post(self, *_args: object, **_kwargs: object) -> None:
+            raise failure
+
+    monkeypatch.setattr(
+        "app.runtime.models.httpx.AsyncClient",
+        lambda **_kwargs: FailingClient(),
+    )
+
+    with pytest.raises(ModelRuntimeError) as raised:
+        await OpenAICompatibleAdapter().generate(
+            "test",
+            {"type": "object"},
+            10,
+        )
+
+    assert raised.value.request_dispatched is True

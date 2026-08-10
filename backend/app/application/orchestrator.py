@@ -1394,7 +1394,6 @@ class WorkerService:
                 and (
                     result.status == "succeeded"
                     or result.metrics.get("runtimeUsed")
-                    in {"direct_llm", "agent_fallback"}
                 )
             ):
                 from app.application.product_history import record_model_usage
@@ -1461,6 +1460,8 @@ class WorkerService:
                             ),
                         )
                     ),
+                    dispatched=bool(result.metrics.get("requestDispatched")),
+                    completed=result.status == "succeeded",
                 )
             await append_event(
                 session,

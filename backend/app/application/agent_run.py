@@ -55,6 +55,7 @@ class AgentRunError(Exception):
         failed_call_id: str | None = None,
         protocol_violation: str | None = None,
         reported_error: dict[str, Any] | None = None,
+        request_dispatched: bool = False,
     ) -> None:
         policy = error_policy(code)
         self.code = policy.code
@@ -63,6 +64,7 @@ class AgentRunError(Exception):
         self.failed_call_id = failed_call_id
         self.protocol_violation = protocol_violation
         self.reported_error = reported_error
+        self.request_dispatched = request_dispatched
         self.effective_error = {
             "code": self.code,
             "message": self.message,
@@ -510,6 +512,7 @@ class AgentRunWorker:
                 failed_call_id=exc.failed_call_id,
                 protocol_violation=exc.protocol_violation,
                 reported_error=exc.reported_error,
+                request_dispatched=exc.request_dispatched,
             )
         except asyncio.CancelledError:
             terminal = None  # 由 signal 决定 cancelled/lost
@@ -550,6 +553,7 @@ class AgentRunWorker:
             claim_generation,
             claim_token,
             usage_complete=result.usage_complete,
+            request_dispatched=result.request_dispatched,
             accepted_plan_digest=result.accepted_plan_digest,
             accepted_plan_revision=result.accepted_plan_revision,
             plan_step_states=result.plan_step_states,
@@ -935,6 +939,17 @@ class AgentRunWorker:
             if claimed.rowcount != 1:
                 await session.delete(checkpoint)
                 return
+            await record_model_usage(
+                session,
+                call_id=f"conversation-agent:{run_id}:{claim_generation}",
+                stage="general_agent",
+                turn_id=run.turn_id,
+                conversation_run_id=run_id,
+                provider="traex",
+                usage_complete=False,
+                dispatched=error.request_dispatched,
+                completed=False,
+            )
             await _append_event(
                 session,
                 run_id,
@@ -999,6 +1014,7 @@ class AgentRunWorker:
         claim_token: str | None,
         *,
         usage_complete: bool = True,
+        request_dispatched: bool = True,
         accepted_plan_digest: str | None = None,
         accepted_plan_revision: int | None = None,
         plan_step_states: dict[str, str] | None = None,
@@ -1075,6 +1091,8 @@ class AgentRunWorker:
                     provider="traex",
                     total_tokens=total_tokens if usage_complete else None,
                     usage_complete=usage_complete,
+                    dispatched=request_dispatched,
+                    completed=True,
                 )
                 session.add(
                     Artifact(

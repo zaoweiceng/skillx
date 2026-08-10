@@ -64,7 +64,10 @@ async def record_model_usage(
     reasoning_tokens: int | None = None,
     total_tokens: int | None = None,
     usage_complete: bool = False,
+    dispatched: bool = True,
+    completed: bool = True,
 ) -> None:
+    now = utcnow()
     if total_tokens is None and input_tokens is not None and output_tokens is not None:
         total_tokens = (
             input_tokens
@@ -94,7 +97,10 @@ async def record_model_usage(
             reasoning_tokens=reasoning_tokens,
             total_tokens=total_tokens,
             usage_complete=usage_complete,
-            created_at=utcnow(),
+            attempted_at=now,
+            request_dispatched_at=now if dispatched else None,
+            completed_at=now if completed else None,
+            created_at=now,
         )
         .on_conflict_do_nothing(index_elements=["call_id", "attempt"])
     )
@@ -139,11 +145,18 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
         if may_have_called_model:
             return {"state": "unavailable", "totalTokens": None, "stages": []}
         return {"state": "zero", "totalTokens": 0, "stages": []}
-    counted = sum(item.total_tokens or 0 for item in rows if item.total_tokens is not None)
-    known = [item for item in rows if item.total_tokens is not None]
+    dispatched_rows = [
+        item for item in rows if item.request_dispatched_at is not None
+    ]
+    counted = sum(
+        item.total_tokens or 0
+        for item in dispatched_rows
+        if item.total_tokens is not None
+    )
+    known = [item for item in dispatched_rows if item.total_tokens is not None]
     if not known:
         state = "unavailable"
-    elif all(item.usage_complete for item in rows):
+    elif all(item.usage_complete for item in dispatched_rows):
         state = "complete"
     else:
         state = "partial"
@@ -160,6 +173,9 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
                 "fallbackReason": item.fallback_reason,
                 "totalTokens": item.total_tokens,
                 "complete": item.usage_complete,
+                "attempted": True,
+                "dispatched": item.request_dispatched_at is not None,
+                "completed": item.completed_at is not None,
             }
             for item in rows
         ],
@@ -509,6 +525,12 @@ class PresentationDriver:
                             runtime_digest=runtime_snapshot.get("runtimeDigest"),
                             fallback_reason=runtime_snapshot.get("fallbackReason"),
                             usage_complete=False,
+                            dispatched=(
+                                exc.request_dispatched
+                                if isinstance(exc, ModelRuntimeError)
+                                else False
+                            ),
+                            completed=False,
                         )
                     await finalize_turn(session, run.turn_id, "succeeded", completed_at=now)
                 return

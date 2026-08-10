@@ -537,7 +537,11 @@ async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str
         "status": "ready",
         "migration": revision,
         "workflowSelectionMode": (
-            "real" if semantic_workflow_selection_available() else "unavailable"
+            "real"
+            if semantic_workflow_selection_available(
+                probe_verified=bool(provider.get("modelAvailable"))
+            )
+            else "unavailable"
         ),
         "selectionProvider": provider,
         "agentRuntime": provider,
@@ -589,6 +593,8 @@ async def run_provider_probe(
             model=result.get("model"),
             total_tokens=result.get("totalTokens"),
             usage_complete=bool(result.get("usageComplete")),
+            dispatched=bool(result.get("requestDispatched")),
+            completed=bool(result.get("completed")),
         )
         await session.commit()
     return result
@@ -3126,6 +3132,12 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             "outputTokens": item.output_tokens,
             "totalTokens": item.total_tokens,
             "complete": item.usage_complete,
+            "attempted": True,
+            "dispatched": item.request_dispatched_at is not None,
+            "completed": item.completed_at is not None,
+            "attemptedAt": rfc3339(item.attempted_at),
+            "requestDispatchedAt": rfc3339(item.request_dispatched_at),
+            "completedAt": rfc3339(item.completed_at),
         }
         for item in usage_rows
     ]
@@ -3134,6 +3146,7 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             item.runtime_used
             for item in usage_rows
             if item.runtime_used is not None
+            and item.request_dispatched_at is not None
         )
     )
     runtime_snapshot = dict(run.runtime_snapshot_json or {})
@@ -3145,9 +3158,13 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
         else None
     )
     runtime_snapshot["runtimeCalls"] = actual_runtimes
-    runtime_snapshot["modelCalled"] = bool(usage_rows)
+    runtime_snapshot["modelCalled"] = any(
+        item.request_dispatched_at is not None for item in usage_rows
+    )
     runtime_snapshot["totalTokens"] = sum(
-        item.total_tokens or 0 for item in usage_rows
+        item.total_tokens or 0
+        for item in usage_rows
+        if item.request_dispatched_at is not None
     )
     result["runtimeSnapshot"] = runtime_snapshot
     result["dependencyVersions"]["modelRuntime"] = runtime_snapshot
@@ -3457,6 +3474,7 @@ async def reject(approval_id: str, session: AsyncSession = Depends(get_session))
 async def list_events(
     run_id: str,
     after: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=500),
     session: AsyncSession = Depends(get_session),
 ) -> list[dict[str, Any]]:
     events = (
@@ -3464,6 +3482,7 @@ async def list_events(
             select(RunEvent)
             .where(RunEvent.run_id == run_id, RunEvent.seq > after)
             .order_by(RunEvent.seq)
+            .limit(limit)
         )
     ).all()
     return [
@@ -3482,10 +3501,11 @@ async def list_events(
 async def stream_events(
     run_id: str,
     request: Request,
+    after: int = Query(default=0, ge=0),
     last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
 ) -> StreamingResponse:
     async def generate() -> Any:
-        cursor = int(last_event_id or 0)
+        cursor = max(after, int(last_event_id or 0))
         while not await request.is_disconnected():
             async for session in get_session():
                 events = (
@@ -4128,7 +4148,10 @@ async def _unbound_conversation_message(
     turn_id: str,
     user_message_id: str,
 ) -> tuple[dict[str, Any], ConversationRun | None]:
-    if not semantic_workflow_selection_available():
+    provider = await provider_readiness()
+    if not semantic_workflow_selection_available(
+        probe_verified=bool(provider.get("modelAvailable"))
+    ):
         return (
             {
                 "type": "workflow_selection",

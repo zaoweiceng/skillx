@@ -106,7 +106,7 @@ def traex_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     # protocolTestOnly runtime；仅这些协议测试显式打开入口，避免把 fixture 当语义证据。
     monkeypatch.setattr(
         "app.api.routes.semantic_workflow_selection_available",
-        lambda: True,
+        lambda **_kwargs: True,
     )
 
 
@@ -122,7 +122,23 @@ def test_semantic_selection_requires_real_allowlisted_executable(
         ["traex-managed"],
     )
 
-    assert semantic_workflow_selection_available() is False
+    assert semantic_workflow_selection_available(probe_verified=True) is False
+
+
+def test_semantic_selection_requires_successful_capability_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "agent_runtime_type", "traex_managed")
+    monkeypatch.setattr(settings, "agent_command", [sys.executable])
+    monkeypatch.setattr(
+        settings,
+        "agent_allowed_executables",
+        [Path(sys.executable).name],
+    )
+
+    assert semantic_workflow_selection_available(probe_verified=False) is False
+    assert semantic_workflow_selection_available(probe_verified=True) is True
 
 
 async def test_product_message_rejects_protocol_fixture(

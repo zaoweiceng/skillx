@@ -42,4 +42,5 @@ frontend-check:
 	cd frontend && npm run build
 
 doc-chain-check:
+	cd tools && python3 -m unittest -q test_check_doc_chain.py
 	python3 tools/check_doc_chain.py

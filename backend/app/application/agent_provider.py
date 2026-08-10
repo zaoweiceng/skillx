@@ -90,7 +90,10 @@ async def provider_readiness() -> dict[str, Any]:
         ):
             summary = "Agent sidecar endpoint、model 或 API key 未完整配置"
         elif runtime.type == "traex_managed":
-            summary = "TraeX managed Agent 协议已配置，不要求 Host 持有 LLM endpoint"
+            summary = (
+                "TraeX managed Agent 协议已配置；需完成 Host ToolResult 能力探测后"
+                "才开放语义选择"
+            )
         elif _last_probe is None:
             summary = "Agent Runtime 已配置，尚未执行同路径主动探测"
         elif not cache_valid:
@@ -107,10 +110,9 @@ async def provider_readiness() -> dict[str, Any]:
         summary = "真实语义 Agent 未配置"
     model_available = bool(
         provider_type == "real"
-        and (
-            (runtime.type == "traex_managed" and protocol_available)
-            or (cache_valid and _last_probe and _last_probe.get("ok"))
-        )
+        and cache_valid
+        and _last_probe
+        and _last_probe.get("ok")
     )
     last_probe = (
         {
@@ -227,6 +229,8 @@ async def probe_provider() -> dict[str, Any]:
             "sidecarDigest": sidecar_digest,
             "totalTokens": result.total_tokens,
             "usageComplete": result.usage_complete,
+            "requestDispatched": result.request_dispatched,
+            "completed": True,
         }
     except AgentHostError as exc:
         _last_probe = {
@@ -239,6 +243,8 @@ async def probe_provider() -> dict[str, Any]:
             "configDigest": config_digest,
             "sidecarDigest": sidecar_digest,
             "code": exc.code,
+            "requestDispatched": exc.request_dispatched,
+            "completed": False,
         }
     return {
         **_last_probe,

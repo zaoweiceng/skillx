@@ -233,7 +233,16 @@ def _weather_workflow(snapshot_id: str) -> dict:
     return {
         "apiVersion": "workflow.platform/v1",
         "kind": "Workflow",
-        "metadata": {"name": "local-weather"},
+        "metadata": {
+            "name": "local-weather",
+            "capability": {
+                "summary": "查询指定城市的本地天气并返回天气状况与温度。",
+                "useWhen": ["用户明确询问某个城市的天气、天气状况或温度"],
+                "doNotUseWhen": ["用户未提供可唯一确定的城市或请求天气以外的信息"],
+                "examples": ["上海天气如何", "查询广州当前天气"],
+                "tags": ["天气", "城市", "查询"],
+            },
+        },
         "spec": {
             "inputSchema": {
                 "type": "object",

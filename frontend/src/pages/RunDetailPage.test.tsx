@@ -6,6 +6,7 @@ import { useRunEvents } from '@/hooks/useRunStream'
 import RunDetailPage from '@/pages/RunDetailPage'
 
 const getRun = vi.fn()
+const listRunEvents = vi.fn()
 const approve = vi.fn()
 const reject = vi.fn()
 const applyWorkflowPatch = vi.fn()
@@ -36,13 +37,15 @@ class FakeEventSource {
 vi.mock('@/api/client', () => ({
   api: {
     getRun: (...args: unknown[]) => getRun(...args),
+    listRunEvents: (...args: unknown[]) => listRunEvents(...args),
     approve: (...args: unknown[]) => approve(...args),
     reject: (...args: unknown[]) => reject(...args),
     applyWorkflowPatch: (...args: unknown[]) => applyWorkflowPatch(...args),
     proposeRevision: (...args: unknown[]) => proposeRevision(...args),
     cancelRun: vi.fn(),
   },
-  eventStreamUrl: () => 'http://localhost/stream',
+  eventStreamUrl: (_id: string, after: number) =>
+    `http://localhost/stream?after=${after}`,
 }))
 
 const baseRun = {
@@ -102,6 +105,8 @@ function renderPage() {
 describe('RunDetailPage 可观测性与审批', () => {
   beforeEach(() => {
     getRun.mockReset()
+    listRunEvents.mockReset()
+    listRunEvents.mockResolvedValue([])
     approve.mockReset()
     reject.mockReset()
     applyWorkflowPatch.mockReset()
@@ -116,17 +121,40 @@ describe('RunDetailPage 可观测性与审批', () => {
     vi.unstubAllGlobals()
   })
 
-  it('终态 Run 不创建 EventSource', async () => {
+  it('终态 Run 恢复持久事件且不创建 EventSource', async () => {
     getRun.mockResolvedValue(baseRun)
+    listRunEvents.mockResolvedValue([
+      {
+        id: 'event-1',
+        seq: 1,
+        type: 'run.completed',
+        payload: { status: 'succeeded' },
+      },
+    ])
     renderPage()
 
     await waitFor(() =>
-      expect(screen.getByText('本会话未加载历史事件')).toBeInTheDocument(),
+      expect(screen.getByText('run.completed')).toBeInTheDocument(),
     )
+    expect(listRunEvents).toHaveBeenCalledWith('run-1', 0, 200)
     expect(screen.getByText('实时流已关闭')).toBeInTheDocument()
     expect(screen.getByText('模型未调用 / 0 Token')).toBeInTheDocument()
     expect(screen.queryByText('实际调用：agent_fallback')).not.toBeInTheDocument()
     expect(eventSources).toHaveLength(0)
+  })
+
+  it('历史加载后从最后 seq 建立 SSE 并去重排序', async () => {
+    getRun.mockResolvedValue({ ...baseRun, status: 'running', output: null })
+    listRunEvents.mockResolvedValue([
+      { seq: 2, type: 'node.started', payload: {} },
+      { seq: 1, type: 'run.started', payload: {} },
+    ])
+    renderPage()
+
+    await waitFor(() => expect(eventSources).toHaveLength(1))
+    expect(eventSources[0].url).toBe('http://localhost/stream?after=2')
+    expect(screen.getByText('run.started')).toBeInTheDocument()
+    expect(screen.getByText('node.started')).toBeInTheDocument()
   })
 
   it('收到终态事件后立即关闭 EventSource', async () => {

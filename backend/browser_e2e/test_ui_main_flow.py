@@ -109,7 +109,7 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
                 "request",
                 lambda request: (
                     stream_requests.append(request.url)
-                    if request.url.endswith("/events/stream")
+                        if "/events/stream" in request.url
                     else None
                 ),
             )
@@ -180,9 +180,12 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             )
             expect(page.get_by_role("heading", name="运行详情")).to_be_visible()
             expect(page.get_by_role("heading", name="结构化结果")).to_be_visible()
-            expect(page.get_by_text("browser-read-summary.json")).to_be_visible()
+            expect(
+                page.get_by_role("link", name="browser-read-summary.json")
+            ).to_be_visible()
             expect(page.get_by_text("实时流已关闭")).to_be_visible()
             terminal_stream_count = len(stream_requests)
+            assert terminal_stream_count > 0
             page.wait_for_timeout(5_000)
             assert len(stream_requests) == terminal_stream_count
 

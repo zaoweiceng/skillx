@@ -155,7 +155,7 @@ def runtime_config_facts() -> dict[str, object]:
     }
 
 
-def semantic_workflow_selection_available() -> bool:
+def semantic_workflow_selection_available(*, probe_verified: bool = False) -> bool:
     runtime = agent_runtime_config()
     if (
         not runtime.configured
@@ -169,4 +169,8 @@ def semantic_workflow_selection_available() -> bool:
         if executable.is_absolute() and executable.is_file()
         else shutil.which(runtime.command[0])
     )
-    return resolved is not None and executable.name in runtime.allowed_executables
+    return (
+        probe_verified
+        and resolved is not None
+        and executable.name in runtime.allowed_executables
+    )

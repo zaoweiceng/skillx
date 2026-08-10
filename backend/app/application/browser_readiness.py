@@ -189,7 +189,7 @@ async def browser_runtime_readiness(session: AsyncSession) -> dict[str, Any]:
             "workerId": None,
             "checkedAt": None,
             "stale": status == "stale",
-            "chromiumPath": None,
+            "chromiumExecutable": None,
             "chromiumVersion": None,
             "playwrightVersion": None,
             "launchSucceeded": False,
@@ -214,7 +214,9 @@ async def browser_runtime_readiness(session: AsyncSession) -> dict[str, Any]:
         "workerId": heartbeat.worker_id,
         "checkedAt": rfc3339(heartbeat.checked_at),
         "stale": stale,
-        "chromiumPath": heartbeat.chromium_path,
+        "chromiumExecutable": (
+            Path(heartbeat.chromium_path).name if heartbeat.chromium_path else None
+        ),
         "chromiumVersion": heartbeat.chromium_version,
         "playwrightVersion": heartbeat.playwright_version,
         "launchSucceeded": heartbeat.launch_succeeded,

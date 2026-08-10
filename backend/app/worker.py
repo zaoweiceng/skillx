@@ -20,6 +20,31 @@ from app.infrastructure.database import SessionLocal, init_database
 logger = logging.getLogger("skillx.worker")
 
 
+async def browser_health_loop(worker_id: str, stopping: asyncio.Event) -> None:
+    """Run Browser startup probes outside the serial work-claim loop."""
+
+    settings = get_settings()
+    while not stopping.is_set():
+        try:
+            facts = await record_browser_runtime_heartbeat(worker_id)
+            logger.info(
+                "browser runtime preflight worker=%s status=%s",
+                worker_id,
+                facts["status"],
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - Browser health is isolated from work claims.
+            logger.exception("browser runtime preflight failed")
+        try:
+            await asyncio.wait_for(
+                stopping.wait(),
+                timeout=settings.browser_preflight_interval_seconds,
+            )
+        except TimeoutError:
+            pass
+
+
 async def run_worker(
     worker_id: str | None = None,
     *,
@@ -48,78 +73,72 @@ async def run_worker(
     except Exception:  # noqa: BLE001 - reconcile 失败不应阻止 Worker 启动。
         logger.exception("worker startup reconcile failed")
 
-    try:
-        browser_facts = await record_browser_runtime_heartbeat(service.worker_id)
-        logger.info(
-            "browser runtime preflight worker=%s status=%s",
-            service.worker_id,
-            browser_facts["status"],
-        )
-    except Exception:  # noqa: BLE001 - 预检失败要留证，但不能阻止非 Browser 工作流。
-        logger.exception("browser runtime preflight failed")
+    browser_health_task = asyncio.create_task(
+        browser_health_loop(service.worker_id, stopping),
+        name=f"browser-health-{service.worker_id}",
+    )
 
     # 明确的轮询就绪信号：黑盒 harness 据此确认 Worker 已进入领取循环，
     # 而不是仅检查进程尚未退出。
     print(f"worker polling worker_id={service.worker_id}", flush=True)
     ticks = 0
-    next_browser_preflight = (
-        loop.time() + settings.browser_preflight_interval_seconds
-    )
-    while not stopping.is_set():
-        processed = await service.run_once()
-        try:
-            processed_agent = await agent_worker.poll_once()
-        except Exception:  # noqa: BLE001 - 记录根因后继续工作流循环，不静默吞掉。
-            logger.exception("agent worker poll_once failed on worker %s", service.worker_id)
-            processed_agent = False
-        try:
-            processed_recovery = await recovery_driver.poll_once()
-        except Exception:  # noqa: BLE001 - 恢复失败记录根因后继续。
-            logger.exception("recovery driver poll_once failed on worker %s", service.worker_id)
-            processed_recovery = False
-        processed_task_recovery = False
-        if task_recovery_enabled:
+    try:
+        while not stopping.is_set():
+            processed = await service.run_once()
             try:
-                processed_task_recovery = await task_recovery_driver.poll_once()
-            except Exception:  # noqa: BLE001 - 保留 checkpoint 供租约过期后重新领取。
-                logger.exception(
-                    "task recovery driver poll_once failed on worker %s",
-                    service.worker_id,
-                )
-        try:
-            processed_presentation = await presentation_driver.poll_once()
-            async with SessionLocal() as session, session.begin():
-                await finalize_ready_turns(session)
-        except Exception:  # noqa: BLE001 - 展示失败不能中断执行 Worker。
-            logger.exception("presentation driver poll_once failed")
-            processed_presentation = False
-        # 周期性 reconcile（约每 60 次空闲轮询一次），限制批量，形成可观察 GC。
-        ticks += 1
-        if loop.time() >= next_browser_preflight:
+                processed_agent = await agent_worker.poll_once()
+            except Exception:  # noqa: BLE001 - 记录根因后继续工作流循环，不静默吞掉。
+                logger.exception("agent worker poll_once failed on worker %s", service.worker_id)
+                processed_agent = False
             try:
-                await record_browser_runtime_heartbeat(service.worker_id)
-            except Exception:  # noqa: BLE001
-                logger.exception("periodic browser runtime preflight failed")
-            next_browser_preflight = (
-                loop.time() + settings.browser_preflight_interval_seconds
-            )
-        if ticks % 60 == 0:
+                processed_recovery = await recovery_driver.poll_once()
+            except Exception:  # noqa: BLE001 - 恢复失败记录根因后继续。
+                logger.exception("recovery driver poll_once failed on worker %s", service.worker_id)
+                processed_recovery = False
+            processed_task_recovery = False
+            if task_recovery_enabled:
+                try:
+                    processed_task_recovery = await task_recovery_driver.poll_once()
+                except Exception:  # noqa: BLE001 - 保留 checkpoint 供租约过期后重新领取。
+                    logger.exception(
+                        "task recovery driver poll_once failed on worker %s",
+                        service.worker_id,
+                    )
             try:
+                processed_presentation = await presentation_driver.poll_once()
                 async with SessionLocal() as session, session.begin():
-                    await reconcile_recent_runs(session, limit=20)
-            except Exception:  # noqa: BLE001
-                logger.exception("periodic reconcile failed")
-        if (
-            not processed
-            and not processed_agent
-            and not processed_recovery
-            and not processed_task_recovery
-            and not processed_presentation
-        ):
-            try:
-                await asyncio.wait_for(stopping.wait(), timeout=settings.worker_poll_seconds)
-            except TimeoutError:
-                pass
+                    await finalize_ready_turns(session)
+            except Exception:  # noqa: BLE001 - 展示失败不能中断执行 Worker。
+                logger.exception("presentation driver poll_once failed")
+                processed_presentation = False
+            # 周期性 reconcile（约每 60 次空闲轮询一次），限制批量，形成可观察 GC。
+            ticks += 1
+            if ticks % 60 == 0:
+                try:
+                    async with SessionLocal() as session, session.begin():
+                        await reconcile_recent_runs(session, limit=20)
+                except Exception:  # noqa: BLE001
+                    logger.exception("periodic reconcile failed")
+            if (
+                not processed
+                and not processed_agent
+                and not processed_recovery
+                and not processed_task_recovery
+                and not processed_presentation
+            ):
+                try:
+                    await asyncio.wait_for(
+                        stopping.wait(), timeout=settings.worker_poll_seconds
+                    )
+                except TimeoutError:
+                    pass
+    finally:
+        stopping.set()
+        browser_health_task.cancel()
+        try:
+            await browser_health_task
+        except asyncio.CancelledError:
+            pass
 
 
 def main() -> None:

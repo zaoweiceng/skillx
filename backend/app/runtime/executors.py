@@ -423,6 +423,7 @@ class LLMExecutor:
         prompt = node.config.get("prompt", "{input}").replace(
             "{input}", json.dumps(inputs, ensure_ascii=False)
         )
+        request_dispatched = False
         try:
             max_output_tokens = int(node.config.get("maxOutputTokens", 1000))
             if node.config.get("modelProfile") == "fake":
@@ -439,6 +440,7 @@ class LLMExecutor:
                 provider = "fixture"
                 usage_complete = fake.usage_complete
                 tool_request_count = 0
+                request_dispatched = False
             else:
                 generated = await StructuredGenerationResolver().generate(
                     StructuredGenerationRequest(
@@ -464,6 +466,7 @@ class LLMExecutor:
                 provider = generated.runtime.provider
                 usage_complete = generated.usage_complete
                 tool_request_count = generated.tool_request_count
+                request_dispatched = generated.request_dispatched
             Draft202012Validator(output_schema).validate(output)
             return NodeResult(
                 status="succeeded",
@@ -479,6 +482,7 @@ class LLMExecutor:
                     "fallbackReason": fallback_reason,
                     "usageComplete": usage_complete,
                     "toolRequestCount": tool_request_count,
+                    "requestDispatched": request_dispatched,
                 },
                 events=[
                     {
@@ -509,6 +513,7 @@ class LLMExecutor:
                     "runtimeDigest": str(snapshot.get("runtimeDigest") or ""),
                     "fallbackReason": str(snapshot.get("fallbackReason") or ""),
                     "usageComplete": False,
+                    "requestDispatched": exc.request_dispatched,
                 }
                 if runtime_selection in {"direct_llm", "agent_fallback"}
                 else {}
@@ -537,6 +542,7 @@ class LLMExecutor:
                         "runtimeDigest": str(snapshot.get("runtimeDigest") or ""),
                         "fallbackReason": str(snapshot.get("fallbackReason") or ""),
                         "usageComplete": False,
+                        "requestDispatched": request_dispatched,
                     }
                     if runtime_selection in {"direct_llm", "agent_fallback"}
                     else {}
@@ -592,7 +598,13 @@ class AgentExecutor:
             return NodeResult(
                 status="succeeded",
                 output=output,
-                metrics={"agentSteps": 1, "totalTokens": 0},
+                metrics={
+                    "agentSteps": 1,
+                    "totalTokens": 0,
+                    "provider": "fixture",
+                    "runtimeUsed": "fake_structured",
+                    "requestDispatched": False,
+                },
                 events=events,
                 artifacts=[artifact],
             )
@@ -603,6 +615,11 @@ class AgentExecutor:
                     code="MODEL_NOT_CONFIGURED",
                     message="TraeX Runtime 尚未配置",
                 ),
+                metrics={
+                    "provider": "traex",
+                    "runtimeUsed": "agent_runtime",
+                    "requestDispatched": False,
+                },
             )
         # 005-A：Workflow Agent 节点与 Conversation Agent 共享同一 AgentHost，
         # 得到一致的权限交集、事件契约、预算与取消语义；差异只在事件 sink。
@@ -643,6 +660,11 @@ class AgentExecutor:
                 status="failed",
                 error=ExecutionError(code=exc.code, message=exc.message),
                 events=audit_events,
+                metrics={
+                    "provider": "traex",
+                    "runtimeUsed": "agent_runtime",
+                    "requestDispatched": exc.request_dispatched,
+                },
             )
         # 原始轨迹写受控 Artifact；数据库事件只保留脱敏审计事件。
         artifact = write_json_artifact(
@@ -660,6 +682,9 @@ class AgentExecutor:
             metrics={
                 "agentSteps": result.step_count or len(audit_events),
                 "totalTokens": result.total_tokens,
+                "provider": "traex",
+                "runtimeUsed": "agent_runtime",
+                "requestDispatched": result.request_dispatched,
             },
             artifacts=[artifact],
         )

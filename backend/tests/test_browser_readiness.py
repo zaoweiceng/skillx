@@ -1,3 +1,4 @@
+import asyncio
 from datetime import timedelta
 
 from app.application.browser_readiness import (
@@ -11,6 +12,7 @@ from app.infrastructure.database import (
     SessionLocal,
     utcnow,
 )
+from app.worker import browser_health_loop
 
 
 def test_browser_launch_error_classification_is_actionable() -> None:
@@ -62,6 +64,8 @@ async def test_browser_readiness_uses_persisted_worker_fact_and_expires(
     assert fresh["status"] == "permission_denied"
     assert fresh["workerId"] == "browser-worker"
     assert fresh["launchSucceeded"] is False
+    assert fresh["chromiumExecutable"] == "chromium"
+    assert "chromiumPath" not in fresh
 
     async with SessionLocal() as session, session.begin():
         row = await session.get(BrowserRuntimeHeartbeat, "browser-worker")
@@ -71,3 +75,28 @@ async def test_browser_readiness_uses_persisted_worker_fact_and_expires(
         stale = await browser_runtime_readiness(session)
     assert stale["status"] == "stale"
     assert stale["observedStatus"] == "permission_denied"
+
+
+async def test_browser_health_timeout_does_not_block_other_tasks(monkeypatch) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked_preflight(_worker_id: str) -> dict:
+        started.set()
+        await release.wait()
+        return {"status": "available"}
+
+    monkeypatch.setattr("app.worker.record_browser_runtime_heartbeat", blocked_preflight)
+    stopping = asyncio.Event()
+    task = asyncio.create_task(browser_health_loop("worker-test", stopping))
+    await asyncio.wait_for(started.wait(), timeout=0.2)
+
+    ordinary_work = asyncio.create_task(asyncio.sleep(0.01, result="completed"))
+    assert await asyncio.wait_for(ordinary_work, timeout=0.1) == "completed"
+
+    stopping.set()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass

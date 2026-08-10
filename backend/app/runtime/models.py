@@ -47,9 +47,16 @@ class FakeModelAdapter:
 
 
 class ModelRuntimeError(RuntimeError):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        request_dispatched: bool = False,
+    ) -> None:
         self.code = code
         self.message = message
+        self.request_dispatched = request_dispatched
         super().__init__(message)
 
 
@@ -84,21 +91,32 @@ class OpenAICompatibleAdapter:
                 },
             },
         }
+        request_dispatched = False
         try:
             async with httpx.AsyncClient(timeout=60) as client:
+                request_dispatched = True
                 response = await client.post(
                     runtime.endpoint,
                     headers={"authorization": f"Bearer {api_key}"},
                     json=request,
                 )
             if response.status_code in {401, 403}:
-                raise ModelRuntimeError("MODEL_AUTH_FAILED", "LLM Provider 鉴权失败")
+                raise ModelRuntimeError(
+                    "MODEL_AUTH_FAILED",
+                    "LLM Provider 鉴权失败",
+                    request_dispatched=True,
+                )
             if response.status_code == 429:
-                raise ModelRuntimeError("RATE_LIMITED", "LLM Provider 请求限流")
+                raise ModelRuntimeError(
+                    "RATE_LIMITED",
+                    "LLM Provider 请求限流",
+                    request_dispatched=True,
+                )
             if response.is_error:
                 raise ModelRuntimeError(
                     "MODEL_PROVIDER_ERROR",
                     f"LLM Provider 返回 HTTP {response.status_code}",
+                    request_dispatched=True,
                 )
             payload = response.json()
             content = payload["choices"][0]["message"]["content"]
@@ -106,14 +124,22 @@ class OpenAICompatibleAdapter:
         except ModelRuntimeError:
             raise
         except httpx.TimeoutException as exc:
-            raise ModelRuntimeError("TIMEOUT", "LLM Provider 请求超时") from exc
+            raise ModelRuntimeError(
+                "TIMEOUT",
+                "LLM Provider 请求超时",
+                request_dispatched=request_dispatched,
+            ) from exc
         except httpx.HTTPError as exc:
             raise ModelRuntimeError(
-                "DEPENDENCY_UNAVAILABLE", "LLM Provider 连接失败"
+                "DEPENDENCY_UNAVAILABLE",
+                "LLM Provider 连接失败",
+                request_dispatched=request_dispatched,
             ) from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise ModelRuntimeError(
-                "MODEL_MALFORMED_OUTPUT", "LLM Provider 返回无法解析的结构化结果"
+                "MODEL_MALFORMED_OUTPUT",
+                "LLM Provider 返回无法解析的结构化结果",
+                request_dispatched=request_dispatched,
             ) from exc
         usage = payload.get("usage", {})
         return ModelResult(

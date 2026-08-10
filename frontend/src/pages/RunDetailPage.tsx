@@ -26,7 +26,10 @@ export default function RunDetailPage() {
   const { id } = useParams()
   const [run, setRun] = useState<Run>()
   const [error, setError] = useState('')
+  const [historyLoaded, setHistoryLoaded] = useState(false)
+  const [streamAfter, setStreamAfter] = useState(0)
   const selectedEvents = useRunEvents((state) => (id ? state.events[id] : undefined))
+  const addManyEvents = useRunEvents((state) => state.addMany)
   const events = selectedEvents ?? EMPTY_EVENTS
   // WorkflowPatch 治理：应用受控补丁 → 展示 replay diagnostics → 打开生成的 draft。
   const [patchDraft, setPatchDraft] = useState<{
@@ -46,7 +49,38 @@ export default function RunDetailPage() {
   }, [id])
 
   useEffect(refresh, [refresh])
-  useRunStream(id, run?.status, refresh)
+  useEffect(() => {
+    if (!id) return
+    let cancelled = false
+    setHistoryLoaded(false)
+    setStreamAfter(0)
+    const load = async () => {
+      let after = 0
+      const pageSize = 200
+      while (!cancelled) {
+        const page = await api.listRunEvents(id, after, pageSize)
+        if (cancelled) return
+        addManyEvents(
+          id,
+          page.map((event) => ({ ...event, runId: id })),
+        )
+        if (page.length === 0) break
+        after = Math.max(after, ...page.map((event) => event.seq))
+        if (page.length < pageSize) break
+      }
+      if (!cancelled) {
+        setStreamAfter(after)
+        setHistoryLoaded(true)
+      }
+    }
+    load().catch((reason: Error) => {
+      if (!cancelled) setError(reason.message)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [addManyEvents, id])
+  useRunStream(id, run?.status, historyLoaded, streamAfter, refresh)
 
   async function decide(approval: Approval, approved: boolean) {
     try {
@@ -235,7 +269,11 @@ export default function RunDetailPage() {
             {events.length === 0 && (
               <div className="event-empty">
                 <Clock size={16} />{' '}
-                {terminal ? '本会话未加载历史事件' : '等待新事件'}
+                {!historyLoaded
+                  ? '正在加载持久事件'
+                  : terminal
+                    ? '数据库中无持久事件'
+                    : '等待新事件'}
               </div>
             )}
             {events.map((event) => (
