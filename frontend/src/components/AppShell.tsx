@@ -5,9 +5,12 @@ import {
   Cable,
   ChevronRight,
   CircleDot,
+  Moon,
   Settings,
+  Sun,
 } from 'lucide-react'
 import { NavLink, Outlet } from 'react-router-dom'
+import { useTheme } from '@/hooks/useTheme'
 
 const navigation = [
   { to: '/chat', label: '对话', icon: Bot },
@@ -18,6 +21,7 @@ const navigation = [
 ]
 
 export default function AppShell() {
+  const { isDark, toggleTheme } = useTheme()
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -50,6 +54,16 @@ export default function AppShell() {
             <small>API / Worker 分进程</small>
           </div>
         </div>
+        <button
+          className="theme-toggle"
+          type="button"
+          aria-label={isDark ? '切换到亮色主题' : '切换到暗色主题'}
+          aria-pressed={isDark}
+          onClick={toggleTheme}
+        >
+          {isDark ? <Moon size={15} /> : <Sun size={15} />}
+          <span>{isDark ? '暗色' : '亮色'}</span>
+        </button>
       </aside>
       <main className="workspace">
         <Outlet />

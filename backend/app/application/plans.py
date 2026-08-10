@@ -52,6 +52,17 @@ class ExecutionPlan(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
+class BindingSource(BaseModel):
+    field: str
+    source: Literal["user_message", "history_message", "tool_result"]
+    message_id: str | None = Field(default=None, alias="messageId")
+    quote: str
+    confidence: float = Field(ge=0, le=1)
+    uncertain: bool = False
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+
 class WorkflowSelection(BaseModel):
     action: Literal[
         "run_full", "run_fragment", "compose", "continue_agent", "ask_user"
@@ -59,6 +70,9 @@ class WorkflowSelection(BaseModel):
     reason: str = ""
     refs: list[str] = Field(default_factory=list)
     bindings: dict[str, Any] = Field(default_factory=dict)
+    binding_sources: list[BindingSource] = Field(
+        default_factory=list, alias="bindingSources"
+    )
     missing_inputs: list[str] = Field(default_factory=list, alias="missingInputs")
     question: str | None = None
     plan: dict[str, Any] | None = None

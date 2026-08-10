@@ -26,6 +26,7 @@ from app.application.artifact_integrity import (
 )
 from app.application.compiler import digest_json
 from app.application.error_policy import error_policy
+from app.application.product_history import record_model_usage
 from app.config import get_settings
 from app.infrastructure.database import (
     Artifact,
@@ -159,6 +160,7 @@ async def enqueue_agent_run(
     *,
     config: AgentRunConfig | None = None,
     prompt: str | None = None,
+    turn_id: str | None = None,
 ) -> ConversationRun:
     """先持久化、后执行：在短事务内创建 ``queued`` run 与 created 事件并返回 handle。
 
@@ -171,6 +173,7 @@ async def enqueue_agent_run(
     conversation_run = ConversationRun(
         id=str(uuid4()),
         conversation_id=conversation.id,
+        turn_id=turn_id,
         status="queued",
         run_type="agent_run",
         input_json={"message": content, "prompt": prompt if prompt is not None else content},
@@ -1043,6 +1046,24 @@ class AgentRunWorker:
             if claimed.rowcount != 1:
                 committed = False
             else:
+                run_record = await session.get(ConversationRun, run_id)
+                await record_model_usage(
+                    session,
+                    call_id=f"conversation-agent:{run_id}:{claim_generation}",
+                    stage=(
+                        "failure_continuation"
+                        if run_record
+                        and run_record.input_json.get(
+                            "continuationOfConversationRunId"
+                        )
+                        else "general_agent"
+                    ),
+                    turn_id=run_record.turn_id if run_record else None,
+                    conversation_run_id=run_id,
+                    provider="traex",
+                    total_tokens=total_tokens,
+                    usage_complete=True,
+                )
                 session.add(
                     Artifact(
                         id=str(uuid4()),

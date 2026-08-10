@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
+from jsonschema import Draft202012Validator, FormatChecker
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
@@ -62,6 +64,12 @@ from app.application.plans import (
     expire_plan_snapshot,
     verify_plan_snapshot,
 )
+from app.application.product_history import (
+    normalize_presentation_policy,
+    presentation_view,
+    record_model_usage,
+    turn_view,
+)
 from app.application.replay import run_isolated_replay, run_replay_proof
 from app.application.retries import auto_retry_allowed
 from app.application.secrets import (
@@ -103,6 +111,7 @@ from app.infrastructure.database import (
     Conversation,
     ConversationRun,
     ConversationRunEvent,
+    ConversationTurn,
     Distillation,
     ExecutionCheckpoint,
     FailureObservation,
@@ -110,6 +119,7 @@ from app.infrastructure.database import (
     MCPServer,
     MCPToolSnapshot,
     Message,
+    ModelUsage,
     NodeRun,
     PendingSelection,
     PlanSnapshot,
@@ -118,6 +128,7 @@ from app.infrastructure.database import (
     RevisionProposal,
     Run,
     RunEvent,
+    RunPresentation,
     SecretReference,
     TaskCheckpoint,
     Workflow,
@@ -209,6 +220,10 @@ class SecretReferenceCreate(BaseModel):
 class ConversationCreate(BaseModel):
     title: str = "新对话"
     bound_component_id: str | None = Field(default=None, alias="boundComponentId")
+
+
+class ConversationModeUpdate(BaseModel):
+    workflow_mode: str = Field(alias="workflowMode", pattern="^(enabled|disabled)$")
 
 
 class MessageCreate(BaseModel):
@@ -435,6 +450,7 @@ def run_view(
         "workflowVersionId": run.workflow_version_id,
         "planSnapshotId": run.plan_snapshot_id,
         "componentId": run.component_id,
+        "turnId": run.turn_id,
         "status": run.status,
         "input": redact(run.input_json, input_schema),
         "output": redact(run.output_json, output_schema),
@@ -442,6 +458,7 @@ def run_view(
         "createdAt": run.created_at,
         "startedAt": run.started_at,
         "finishedAt": run.finished_at,
+        "durationMs": _duration_ms(run.started_at, run.finished_at),
     }
     if node_runs is not None:
         payload["nodes"] = [
@@ -475,7 +492,7 @@ async def health_live() -> dict[str, str]:
 
 
 @router.get("/health/ready")
-async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str, str]:
+async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
     try:
         revision = await session.scalar(text("SELECT version_num FROM alembic_version"))
         expected = alembic_head_revision()
@@ -492,7 +509,13 @@ async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str
             503,
             detail={"code": "NOT_READY", "message": str(exc)},
         ) from exc
-    return {"status": "ready", "migration": revision}
+    return {
+        "status": "ready",
+        "migration": revision,
+        "workflowSelectionMode": (
+            "agent" if get_settings().traex_command else "unavailable"
+        ),
+    }
 
 
 @router.get("/workflows")
@@ -534,6 +557,34 @@ async def get_workflow(
     if item is None:
         raise HTTPException(404, "工作流不存在")
     return workflow_view(item)
+
+
+@router.get("/workflows/{workflow_id}/versions")
+async def list_workflow_versions(
+    workflow_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    if await session.get(Workflow, workflow_id) is None:
+        raise HTTPException(404, "工作流不存在")
+    rows = (
+        await session.scalars(
+            select(WorkflowVersion)
+            .where(WorkflowVersion.workflow_id == workflow_id)
+            .order_by(WorkflowVersion.version.desc())
+        )
+    ).all()
+    return [
+        {
+            "id": item.id,
+            "workflowId": item.workflow_id,
+            "version": item.version,
+            "digest": item.digest,
+            "definition": item.definition_json,
+            "presentationPolicy": item.presentation_policy_json,
+            "createdAt": item.created_at,
+        }
+        for item in rows
+    ]
 
 
 @router.put("/workflows/{workflow_id}/draft")
@@ -851,6 +902,38 @@ async def publish_workflow(
     lineage = dict(
         compiled.definition.metadata.get("revisionLineage", {})
     )
+    capability_metadata = compiled.definition.metadata.get("capability")
+    if isinstance(capability_metadata, dict):
+        missing_metadata = [
+            field
+            for field in ("summary", "useWhen")
+            if not capability_metadata.get(field)
+        ]
+        if missing_metadata:
+            raise HTTPException(
+                422,
+                detail={
+                    "code": "CAPABILITY_METADATA_REQUIRED",
+                    "message": "目录公开前必须补充能力摘要和适用场景",
+                    "fields": [
+                        f"metadata.capability.{field}" for field in missing_metadata
+                    ],
+                },
+            )
+    try:
+        frozen_presentation_policy = normalize_presentation_policy(
+            compiled.definition.metadata,
+            execution_class=execution_class,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "PRESENTATION_POLICY_INVALID",
+                "message": str(exc),
+                "field": "metadata.presentationPolicy",
+            },
+        ) from exc
     version = WorkflowVersion(
         id=str(uuid4()),
         workflow_id=item.id,
@@ -867,6 +950,7 @@ async def publish_workflow(
         published_from_draft_revision=body.draft_revision,
         published_from_draft_digest=body.draft_digest,
         revision_lineage_json=lineage,
+        presentation_policy_json=frozen_presentation_policy,
     )
     session.add(version)
     await session.flush()
@@ -2141,7 +2225,10 @@ async def execute_workflow_selection(
 
 
 async def _execute_selection_service(
-    session: AsyncSession, body: WorkflowSelection
+    session: AsyncSession,
+    body: WorkflowSelection,
+    *,
+    turn_id: str | None = None,
 ) -> dict[str, Any]:
     if body.action in {"run_full", "run_fragment", "compose"}:
         prepared, _ = await _prepare_selection(session, body)
@@ -2172,7 +2259,9 @@ async def _execute_selection_service(
         version = await session.get(WorkflowVersion, manifest.workflow_version_id)
         if version is None:
             raise CatalogError("WorkflowVersion 不存在")
-        run = await orchestrator.create_run(session, version, body.bindings)
+        run = await orchestrator.create_run(
+            session, version, body.bindings, turn_id=turn_id
+        )
         return {
             "action": body.action,
             "status": run.status,
@@ -2203,7 +2292,9 @@ async def _execute_selection_service(
             },
         }
         snapshot = await create_plan_snapshot(session, raw_plan)
-        run = await orchestrator.create_plan_run(session, snapshot, body.bindings)
+        run = await orchestrator.create_plan_run(
+            session, snapshot, body.bindings, turn_id=turn_id
+        )
         return {
             "action": body.action,
             "status": run.status,
@@ -2213,7 +2304,9 @@ async def _execute_selection_service(
     assert body.plan is not None
     await require_plan_refs_disclosed(session, body.session_id, body.plan)
     snapshot = await create_plan_snapshot(session, body.plan)
-    run = await orchestrator.create_plan_run(session, snapshot, body.bindings)
+    run = await orchestrator.create_plan_run(
+        session, snapshot, body.bindings, turn_id=turn_id
+    )
     return {
         "action": body.action,
         "status": run.status,
@@ -2596,13 +2689,82 @@ async def create_component_run(
     return run_view(run)
 
 
+@router.post("/workflow-versions/{workflow_version_id}/runs", status_code=202)
+async def create_workflow_version_run(
+    workflow_version_id: str,
+    body: RunCreate,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    version = await session.get(WorkflowVersion, workflow_version_id)
+    if version is None:
+        raise HTTPException(404, "已发布 WorkflowVersion 不存在")
+    try:
+        run = await orchestrator.create_run(session, version, body.input)
+    except ValueError as exc:
+        raise HTTPException(
+            422,
+            detail={"code": "INVALID_INPUT", "message": str(exc)},
+        ) from exc
+    await session.commit()
+    return run_view(run)
+
+
 @router.get("/runs")
 async def list_runs(
+    component_id: str | None = Query(default=None, alias="componentId"),
+    workflow_version_id: str | None = Query(
+        default=None, alias="workflowVersionId"
+    ),
+    status: str | None = None,
+    cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=200),
     session: AsyncSession = Depends(get_session),
-) -> list[dict[str, Any]]:
-    rows = (await session.scalars(select(Run).order_by(Run.created_at.desc()).limit(limit))).all()
-    return [run_view(item) for item in rows]
+) -> dict[str, Any]:
+    statement = select(Run)
+    if component_id:
+        statement = statement.where(Run.component_id == component_id)
+    if workflow_version_id:
+        statement = statement.where(
+            Run.workflow_version_id == workflow_version_id
+        )
+    if status:
+        statement = statement.where(Run.status == status)
+    if cursor:
+        cursor_at, cursor_id = _decode_run_cursor(cursor)
+        statement = statement.where(
+            or_(
+                Run.created_at < cursor_at,
+                (Run.created_at == cursor_at) & (Run.id < cursor_id),
+            )
+        )
+    rows = (
+        await session.scalars(
+            statement.order_by(Run.created_at.desc(), Run.id.desc()).limit(limit + 1)
+        )
+    ).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    items = []
+    for item in rows:
+        latest_presentation = await session.scalar(
+            select(RunPresentation)
+            .where(RunPresentation.run_id == item.id)
+            .order_by(RunPresentation.revision.desc())
+            .limit(1)
+        )
+        view = run_view(item)
+        view["presentation"] = (
+            presentation_view(latest_presentation) if latest_presentation else None
+        )
+        items.append(view)
+    return {
+        "items": items,
+        "nextCursor": (
+            _run_cursor(rows[-1].created_at, rows[-1].id)
+            if has_more and rows
+            else None
+        ),
+    }
 
 
 @router.get("/runs/{run_id}")
@@ -2806,6 +2968,38 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             ],
         }
         for item in observations
+    ]
+    presentations = (
+        await session.scalars(
+            select(RunPresentation)
+            .where(RunPresentation.run_id == run.id)
+            .order_by(RunPresentation.revision)
+        )
+    ).all()
+    result["presentations"] = [presentation_view(item) for item in presentations]
+    result["presentation"] = (
+        presentation_view(presentations[-1]) if presentations else None
+    )
+    usage_rows = (
+        await session.scalars(
+            select(ModelUsage)
+            .where(ModelUsage.run_id == run.id)
+            .order_by(ModelUsage.created_at)
+        )
+    ).all()
+    result["modelUsage"] = [
+        {
+            "callId": item.call_id,
+            "attempt": item.attempt,
+            "stage": item.stage,
+            "provider": item.provider,
+            "model": item.model,
+            "inputTokens": item.input_tokens,
+            "outputTokens": item.output_tokens,
+            "totalTokens": item.total_tokens,
+            "complete": item.usage_complete,
+        }
+        for item in usage_rows
     ]
     return result
 
@@ -3398,6 +3592,7 @@ async def create_conversation(
         id=str(uuid4()),
         title=body.title,
         bound_component_id=body.bound_component_id,
+        workflow_mode="enabled",
     )
     session.add(item)
     await session.commit()
@@ -3405,6 +3600,147 @@ async def create_conversation(
         "id": item.id,
         "title": item.title,
         "boundComponentId": item.bound_component_id,
+        "workflowMode": item.workflow_mode,
+    }
+
+
+def _conversation_cursor(last_message_at: datetime | None, conversation_id: str) -> str:
+    payload = json.dumps(
+        {
+            "at": last_message_at.isoformat() if last_message_at else None,
+            "id": conversation_id,
+        },
+        separators=(",", ":"),
+    ).encode()
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _decode_conversation_cursor(cursor: str) -> tuple[datetime | None, str]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode())
+        return (
+            datetime.fromisoformat(payload["at"]) if payload.get("at") else None,
+            str(payload["id"]),
+        )
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(422, "无效的 conversation cursor") from exc
+
+
+def _run_cursor(created_at: datetime, run_id: str) -> str:
+    return _conversation_cursor(created_at, run_id)
+
+
+def _decode_run_cursor(cursor: str) -> tuple[datetime, str]:
+    created_at, run_id = _decode_conversation_cursor(cursor)
+    if created_at is None:
+        raise HTTPException(422, "run cursor 缺少时间")
+    return created_at, run_id
+
+
+@router.get("/conversations")
+async def list_conversations(
+    cursor: str | None = None,
+    limit: int = Query(default=30, ge=1, le=100),
+    query: str | None = Query(default=None, max_length=200),
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    statement = select(Conversation)
+    if query:
+        statement = statement.where(Conversation.title.contains(query.strip()))
+    if cursor:
+        cursor_at, cursor_id = _decode_conversation_cursor(cursor)
+        if cursor_at is None:
+            statement = statement.where(
+                Conversation.last_message_at.is_(None),
+                Conversation.id < cursor_id,
+            )
+        else:
+            statement = statement.where(
+                or_(
+                    Conversation.last_message_at < cursor_at,
+                    Conversation.last_message_at.is_(None),
+                    (
+                        (Conversation.last_message_at == cursor_at)
+                        & (Conversation.id < cursor_id)
+                    ),
+                )
+            )
+    rows = (
+        await session.scalars(
+            statement.order_by(
+                Conversation.last_message_at.desc().nullslast(),
+                Conversation.id.desc(),
+            ).limit(limit + 1)
+        )
+    ).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    items = []
+    for item in rows:
+        latest = await session.scalar(
+            select(Message)
+            .where(Message.conversation_id == item.id)
+            .order_by(Message.created_at.desc(), Message.id.desc())
+            .limit(1)
+        )
+        active_turn = await session.scalar(
+            select(ConversationTurn.id).where(
+                ConversationTurn.conversation_id == item.id,
+                ConversationTurn.completed_at.is_(None),
+            )
+        )
+        content = latest.content_json if latest else {}
+        items.append(
+            {
+                "id": item.id,
+                "title": item.title,
+                "preview": str(content.get("text", ""))[:120],
+                "lastMessageAt": (
+                    item.last_message_at.isoformat() if item.last_message_at else None
+                ),
+                "status": "active" if active_turn else "idle",
+                "workflowMode": item.workflow_mode,
+            }
+        )
+    return {
+        "items": items,
+        "nextCursor": (
+            _conversation_cursor(rows[-1].last_message_at, rows[-1].id)
+            if has_more and rows
+            else None
+        ),
+    }
+
+
+@router.patch("/conversations/{conversation_id}/workflow-mode")
+async def update_conversation_workflow_mode(
+    conversation_id: str,
+    body: ConversationModeUpdate,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    item = await session.get(Conversation, conversation_id)
+    if item is None:
+        raise HTTPException(404, "对话不存在")
+    previous = item.workflow_mode
+    item.workflow_mode = body.workflow_mode
+    cancelled_pending = 0
+    if previous == "enabled" and body.workflow_mode == "disabled":
+        result = await session.execute(
+            update(PendingSelection)
+            .where(
+                PendingSelection.conversation_id == item.id,
+                PendingSelection.status == "awaiting_input",
+            )
+            .values(status="cancelled_by_mode_change")
+        )
+        cancelled_pending = result.rowcount
+    await session.commit()
+    return {
+        "id": item.id,
+        "workflowMode": item.workflow_mode,
+        "appliesFrom": "next_turn",
+        "cancelledPendingSelections": cancelled_pending,
     }
 
 
@@ -3420,14 +3756,32 @@ async def get_conversation(
             select(Message).where(Message.conversation_id == item.id).order_by(Message.created_at)
         )
     ).all()
+    turns = (
+        await session.scalars(
+            select(ConversationTurn)
+            .where(ConversationTurn.conversation_id == item.id)
+            .order_by(ConversationTurn.accepted_at)
+        )
+    ).all()
     return {
         "id": item.id,
         "title": item.title,
         "boundComponentId": item.bound_component_id,
+        "workflowMode": item.workflow_mode,
+        "lastMessageAt": (
+            item.last_message_at.isoformat() if item.last_message_at else None
+        ),
         "messages": [
-            {"id": message.id, "role": message.role, "content": message.content_json}
+            {
+                "id": message.id,
+                "role": message.role,
+                "content": message.content_json,
+                "turnId": message.turn_id,
+                "createdAt": message.created_at.isoformat(),
+            }
             for message in messages
         ],
+        "turns": [await turn_view(session, turn) for turn in turns],
     }
 
 
@@ -3440,41 +3794,105 @@ async def create_message(
     conversation = await session.get(Conversation, conversation_id)
     if conversation is None:
         raise HTTPException(404, "对话不存在")
+    accepted_at = utcnow()
+    turn = ConversationTurn(
+        id=str(uuid4()),
+        conversation_id=conversation.id,
+        workflow_mode_snapshot=conversation.workflow_mode,
+        status="processing",
+        accepted_at=accepted_at,
+    )
+    session.add(turn)
+    await session.flush()
     user_message = Message(
         id=str(uuid4()),
         conversation_id=conversation.id,
+        turn_id=turn.id,
         role="user",
         content_json={"type": "text", "text": body.content},
+        created_at=accepted_at,
     )
-    component_id = body.component_id or conversation.bound_component_id
+    session.add(user_message)
+    await session.flush()
+    turn.user_message_id = user_message.id
+    component_id = (
+        body.component_id or conversation.bound_component_id
+        if conversation.workflow_mode == "enabled"
+        else None
+    )
     assistant_content: dict[str, Any]
     conversation_run: ConversationRun | None = None
     if component_id:
         # 绑定组件或显式指定组件：补参齐全则启动 Workflow，否则请求补参。
         assistant_content = await _bound_component_message(
-            session, component_id, body.content, body.inputs
+            session, component_id, body.content, body.inputs, turn.id
         )
+    elif conversation.workflow_mode == "disabled":
+        config = AgentRunConfig.default()
+        config.allowed_capabilities = tuple(
+            capability
+            for capability in config.allowed_capabilities
+            if not capability.startswith("workflow.")
+        )
+        conversation_run = await enqueue_agent_run(
+            session,
+            conversation,
+            body.content,
+            config=config,
+            turn_id=turn.id,
+        )
+        assistant_content = {
+            **build_agent_run_message(
+                conversation_run,
+                "本轮已冻结为工作流关闭模式，由通用 Agent 处理。",
+            ),
+            "workflowModeSnapshot": "disabled",
+        }
     else:
         assistant_content, conversation_run = await _unbound_conversation_message(
-            session, conversation, body
+            session, conversation, body, turn.id, user_message.id
         )
+    responded_at = utcnow()
     assistant_message = Message(
         id=str(uuid4()),
         conversation_id=conversation.id,
+        turn_id=turn.id,
         role="assistant",
         content_json=assistant_content,
+        created_at=responded_at,
     )
+    turn.first_response_at = responded_at
+    assistant_content["workflowModeSnapshot"] = turn.workflow_mode_snapshot
+    if assistant_content.get("state") == "ask_user":
+        turn.status = "ask_user"
+        turn.completed_at = responded_at
+        turn.elapsed_ms = max(
+            0, int((responded_at - accepted_at).total_seconds() * 1000)
+        )
+    elif assistant_content.get("state") in {"error", "unavailable"}:
+        turn.status = "error"
+        turn.completed_at = responded_at
+        turn.elapsed_ms = max(
+            0, int((responded_at - accepted_at).total_seconds() * 1000)
+        )
     session.add_all(
         [
-            user_message,
             assistant_message,
             *([conversation_run] if conversation_run is not None else []),
         ]
     )
+    await session.flush()
+    turn.assistant_message_id = assistant_message.id
+    conversation.last_message_at = responded_at
+    conversation.updated_at = responded_at
+    if conversation.title == "新对话":
+        title = " ".join(body.content.split())
+        conversation.title = title[:32] + ("…" if len(title) > 32 else "")
     await session.commit()
     return {
         "userMessageId": user_message.id,
         "assistant": assistant_message.content_json,
+        "turn": await turn_view(session, turn),
     }
 
 
@@ -3482,7 +3900,21 @@ async def _unbound_conversation_message(
     session: AsyncSession,
     conversation: Conversation,
     body: MessageCreate,
+    turn_id: str,
+    user_message_id: str,
 ) -> tuple[dict[str, Any], ConversationRun | None]:
+    if not get_settings().traex_command:
+        return (
+            {
+                "type": "workflow_selection",
+                "state": "unavailable",
+                "code": "WORKFLOW_SELECTION_UNAVAILABLE",
+                "text": "语义选择服务不可用。可稍后重试，或关闭工作流后交给通用 Agent。",
+                "offerAgentRun": True,
+                "selectionMode": "unavailable",
+            },
+            None,
+        )
     pending = await session.scalar(
         select(PendingSelection)
         .where(
@@ -3497,24 +3929,14 @@ async def _unbound_conversation_message(
         supplied = dict(body.inputs or {})
         missing = list(pending.missing_inputs_json or [])
         if not supplied and len(missing) == 1:
-            supplied[missing[0]] = body.content
+            compact_answer = body.content.strip()
+            if (
+                compact_answer
+                and len(compact_answer) <= 64
+                and not any(mark in compact_answer for mark in "，。！？；\n")
+            ):
+                supplied[missing[0]] = compact_answer
         bindings = {**(pending.bindings_json or {}), **supplied}
-        still_missing = [field for field in missing if field not in bindings]
-        if still_missing:
-            pending.bindings_json = bindings
-            pending.missing_inputs_json = still_missing
-            return (
-                {
-                    "type": "workflow_selection",
-                    "state": "ask_user",
-                    "text": f"仍需补充：{', '.join(still_missing)}",
-                    "required": still_missing,
-                    "pendingSelectionId": pending.id,
-                    "disclosureSessionId": pending.disclosure_session_id,
-                    "agentAction": "ask_user",
-                },
-                None,
-            )
         stored = dict(pending.selection_json)
         resume_action = stored.pop("resumeAction", "run_full")
         selection = WorkflowSelection.model_validate(
@@ -3526,7 +3948,23 @@ async def _unbound_conversation_message(
                 "question": None,
             }
         )
-        result = await _execute_selection_service(session, selection)
+        selection, _ = await _prepare_selection(session, selection)
+        if selection.action == "ask_user":
+            pending.bindings_json = bindings
+            pending.missing_inputs_json = selection.missing_inputs
+            return (
+                {
+                    "type": "workflow_selection",
+                    "state": "ask_user",
+                    "text": selection.question,
+                    "required": selection.missing_inputs,
+                    "pendingSelectionId": pending.id,
+                    "disclosureSessionId": pending.disclosure_session_id,
+                    "agentAction": "ask_user",
+                },
+                None,
+            )
+        result = await _execute_selection_service(session, selection, turn_id=turn_id)
         pending.status = "resumed"
         pending.bindings_json = bindings
         return _selection_result_message(selection, result, resumed=True), None
@@ -3537,7 +3975,11 @@ async def _unbound_conversation_message(
         agent_run_id=f"selection:{uuid4()}",
     )
     selection, tool_timeline = await _select_workflow_candidate(
-        session, body.content, disclosure.id
+        session,
+        body.content,
+        disclosure.id,
+        turn_id=turn_id,
+        user_message_id=user_message_id,
     )
     selection, resume_action = await _prepare_selection(session, selection)
     if selection.action == "ask_user":
@@ -3569,6 +4011,9 @@ async def _unbound_conversation_message(
                 "disclosureSessionId": disclosure.id,
                 "disclosureLevel": "L1",
                 "toolTimeline": tool_timeline,
+                "bindingSources": [
+                    item.model_dump(by_alias=True) for item in selection.binding_sources
+                ],
             },
             None,
         )
@@ -3611,6 +4056,7 @@ async def _unbound_conversation_message(
                 f"remainingBudget={json.dumps(remaining_budget)}\n"
                 f"用户任务：{body.content}"
             ),
+            turn_id=turn_id,
         )
         run.input_json = {
             **run.input_json,
@@ -3631,7 +4077,7 @@ async def _unbound_conversation_message(
             },
             run,
         )
-    result = await _execute_selection_service(session, selection)
+    result = await _execute_selection_service(session, selection, turn_id=turn_id)
     message = _selection_result_message(selection, result, resumed=False)
     message["toolTimeline"] = tool_timeline
     return message, None
@@ -3655,6 +4101,9 @@ def _selection_result_message(
         "refs": selection.refs,
         "agentAction": selection.action,
         "selectionReason": selection.reason,
+        "bindingSources": [
+            item.model_dump(by_alias=True) for item in selection.binding_sources
+        ],
         "disclosureSessionId": selection.session_id,
         "disclosureLevel": "L2" if selection.action != "run_full" else "L1",
         "resumedPendingSelection": resumed,
@@ -3666,63 +4115,17 @@ async def _select_workflow_candidate(
     session: AsyncSession,
     user_text: str,
     session_id: str,
+    *,
+    turn_id: str | None = None,
+    user_message_id: str | None = None,
 ) -> tuple[WorkflowSelection, list[dict[str, Any]]]:
     if not get_settings().traex_command:
-        call = await consume_session_call(
-            session,
-            session_id,
-            "search",
-            {"queryDigest": digest_json(user_text), "limit": 5},
-        )
-        cards = await search_manifests(session, user_text, limit=5)
-        await disclose_refs(
-            session,
-            session_id,
-            [str(card["workflowRef"]) for card in cards],
-            "L0",
-        )
-        await record_disclosure_response(
-            session, call.id, {"level": "L0", "items": cards}, level="L0"
-        )
-        if not cards:
-            return (
-                WorkflowSelection(
-                    action="continue_agent",
-                    reason="目录无匹配且 TraeX Runtime 未配置",
-                    sessionId=session_id,
-                ),
-                [{"type": "workflow.search", "level": "L0", "count": 0}],
-            )
-        ref = str(cards[0]["workflowRef"])
-        workflow = await describe_workflow(session, ref)
-        await disclose_refs(session, session_id, [ref], "L1")
-        required = workflow["inputSchema"].get("required", [])
-        if required:
-            return (
-                WorkflowSelection(
-                    action="ask_user",
-                    reason="按 Registry 排序选择候选后发现缺少必填输入",
-                    refs=[ref],
-                    missingInputs=required,
-                    question=f"请补充输入：{', '.join(required)}",
-                    sessionId=session_id,
-                ),
-                [
-                    {"type": "workflow.search", "level": "L0", "count": len(cards)},
-                    {"type": "workflow.describe", "level": "L1", "ref": ref},
-                ],
-            )
-        return (
-            WorkflowSelection(
-                action="run_full",
-                reason="无 TraeX Runtime，按 Registry 排序使用完整 Workflow",
-                refs=[ref],
-                sessionId=session_id,
-            ),
-            [
-                {"type": "workflow.search", "level": "L0", "count": len(cards)},
-                {"type": "workflow.describe", "level": "L1", "ref": ref},
-            ],
+        raise HTTPException(
+            503,
+            detail={
+                "code": "WORKFLOW_SELECTION_UNAVAILABLE",
+                "message": "语义选择服务不可用",
+            },
         )
     selection_schema = WorkflowSelection.model_json_schema(by_alias=True)
     selection_schema["properties"].pop("sessionId", None)
@@ -3735,7 +4138,11 @@ async def _select_workflow_candidate(
             "Progressive WorkflowSelection。你必须先调用 workflow.search 获取 L0，"
             "只在需要时调用 workflow.describe/describe_fragment/slice/compile_plan。"
             "不得选择未披露 ref，不得假设 Schema/DAG；编译失败时根据 diagnostics 修正。"
-            "输出 WorkflowSelection；信息不足时 ask_user，无合适候选时 continue_agent。\n"
+            "比较 useWhen/doNotUseWhen、输入输出、副作用和成本后输出 WorkflowSelection。"
+            "从用户明确表达提取 bindings，并为每个字段返回 bindingSources（原文 quote、"
+            "messageId、confidence、uncertain）；禁止编造。只有 Schema 校验后仍缺失或"
+            "有真实歧义才 ask_user，无合适候选时 continue_agent。\n"
+            f"userMessageId={user_message_id or 'unknown'}\n"
             f"user={body_text(user_text)}\n"
         ),
         output_schema=selection_schema,
@@ -3759,6 +4166,16 @@ async def _select_workflow_candidate(
         selection = WorkflowSelection.model_validate(
             {**result.output, "sessionId": session_id}
         )
+        if turn_id:
+            await record_model_usage(
+                session,
+                call_id=request.run_id,
+                stage="workflow_selection",
+                turn_id=turn_id,
+                provider="traex",
+                total_tokens=result.total_tokens,
+                usage_complete=True,
+            )
     except (AgentHostError, ValueError) as exc:
         raise HTTPException(
             502,
@@ -3892,37 +4309,72 @@ async def _prepare_selection(
     """Validate disclosure and turn missing executable inputs into resumable state."""
 
     resume_action = _selection_resume_action(selection)
-    if selection.action in {"ask_user", "continue_agent"}:
+    if selection.action == "continue_agent":
+        return selection, resume_action
+    if selection.action == "ask_user" and not selection.refs and selection.plan is None:
         return selection, resume_action
 
     required: list[str]
+    schema: dict[str, Any]
     compiled_plan: dict[str, Any] | None = selection.compiled_plan
-    if selection.action == "run_full":
+    effective_action = resume_action if selection.action == "ask_user" else selection.action
+    if effective_action == "run_full":
         level = await require_disclosed_ref(
             session, selection.session_id, selection.refs[0]
         )
         if level not in {"L1", "L2"}:
             raise CatalogError("run_full 必须先披露 Workflow L1")
         workflow = await describe_workflow(session, selection.refs[0])
-        required = list(workflow["inputSchema"].get("required", []))
-    elif selection.action == "run_fragment":
+        schema = workflow["inputSchema"]
+        required = list(schema.get("required", []))
+    elif effective_action == "run_fragment":
         level = await require_disclosed_ref(
             session, selection.session_id, selection.refs[0]
         )
         if level != "L2":
             raise CatalogError("run_fragment 必须先调用 workflow.describe_fragment 披露 L2")
         fragment = await describe_fragment(session, selection.refs[0])
-        required = list(fragment["boundaryInputSchema"].get("required", []))
+        schema = fragment["boundaryInputSchema"]
+        required = list(schema.get("required", []))
     else:
         assert selection.plan is not None
         await require_plan_refs_disclosed(
             session, selection.session_id, selection.plan
         )
         compiled_plan = await compile_plan(session, selection.plan)
-        required = list(selection.plan.get("inputSchema", {}).get("required", []))
+        schema = selection.plan.get("inputSchema", {})
+        required = list(schema.get("required", []))
 
     missing = [field for field in required if field not in selection.bindings]
-    if not missing:
+    validation_errors = sorted(
+        Draft202012Validator(
+            schema,
+            format_checker=FormatChecker(),
+        ).iter_errors(selection.bindings),
+        key=lambda error: list(error.absolute_path),
+    )
+    invalid = []
+    for error in validation_errors:
+        if error.validator == "required":
+            continue
+        if error.validator == "additionalProperties":
+            extras = sorted(
+                set(selection.bindings) - set(schema.get("properties", {}))
+            )
+            for field in extras:
+                if field not in invalid:
+                    invalid.append(field)
+            continue
+        field = str(next(iter(error.absolute_path), "__root__"))
+        if field not in missing and field not in invalid:
+            invalid.append(field)
+    uncertain = [
+        source.field
+        for source in selection.binding_sources
+        if source.uncertain and source.field not in missing
+    ]
+    unresolved = [*missing, *invalid, *[field for field in uncertain if field not in invalid]]
+    if not unresolved:
         if compiled_plan is not selection.compiled_plan:
             selection = selection.model_copy(
                 update={"compiled_plan": compiled_plan}
@@ -3933,8 +4385,12 @@ async def _prepare_selection(
         {
             **selection.model_dump(by_alias=True),
             "action": "ask_user",
-            "missingInputs": missing,
-            "question": f"请补充输入：{', '.join(missing)}",
+            "missingInputs": unresolved,
+            "question": (
+                f"请补充输入：{', '.join(missing)}"
+                if missing and not invalid and not uncertain
+                else f"请确认或重新提供有效参数：{', '.join(unresolved)}"
+            ),
             "compiledPlan": compiled_plan,
         }
     )
@@ -3946,6 +4402,7 @@ async def _bound_component_message(
     component_id: str,
     content: str,
     inputs: dict[str, Any] | None,
+    turn_id: str | None = None,
 ) -> dict[str, Any]:
     component = await session.get(Component, component_id)
     version = (
@@ -3972,7 +4429,9 @@ async def _bound_component_message(
         )
         return candidate_message(candidate, missing=missing)
     try:
-        run = await orchestrator.create_run(session, version, inputs or {}, component.id)
+        run = await orchestrator.create_run(
+            session, version, inputs or {}, component.id, turn_id=turn_id
+        )
     except ValueError as exc:
         raise HTTPException(
             422,
@@ -4004,6 +4463,14 @@ async def confirm_component(
     conversation = await session.get(Conversation, conversation_id)
     if conversation is None:
         raise HTTPException(404, "对话不存在")
+    if conversation.workflow_mode != "enabled":
+        raise HTTPException(
+            409,
+            detail={
+                "code": "WORKFLOW_MODE_DISABLED",
+                "message": "该对话已关闭工作流，旧候选不能继续启动",
+            },
+        )
     component = await session.get(Component, body.component_id)
     version = (
         await session.get(WorkflowVersion, component.default_version_id) if component else None
@@ -4027,8 +4494,20 @@ async def confirm_component(
             422,
             detail={"code": "MISSING_INPUTS", "message": "缺少必填参数", "fields": missing},
         )
+    source_turn = await session.scalar(
+        select(ConversationTurn)
+        .where(ConversationTurn.conversation_id == conversation.id)
+        .order_by(ConversationTurn.accepted_at.desc())
+        .limit(1)
+    )
     try:
-        run = await orchestrator.create_run(session, version, body.inputs, component.id)
+        run = await orchestrator.create_run(
+            session,
+            version,
+            body.inputs,
+            component.id,
+            turn_id=source_turn.id if source_turn else None,
+        )
     except ValueError as exc:
         raise HTTPException(
             422,
@@ -4037,6 +4516,7 @@ async def confirm_component(
     assistant_message = Message(
         id=str(uuid4()),
         conversation_id=conversation.id,
+        turn_id=source_turn.id if source_turn else None,
         role="assistant",
         content_json={
             "type": "component_run",
@@ -4048,6 +4528,13 @@ async def confirm_component(
             "text": "组件已启动，后续执行由 Workflow Runtime 接管。",
         },
     )
+    now = utcnow()
+    conversation.last_message_at = now
+    conversation.updated_at = now
+    if source_turn:
+        source_turn.status = "processing"
+        source_turn.completed_at = None
+        source_turn.elapsed_ms = None
     session.add(assistant_message)
     await session.commit()
     return {"runId": run.id, "assistant": assistant_message.content_json}
@@ -4071,11 +4558,35 @@ async def start_agent_run(
     if conversation is None:
         raise HTTPException(404, "对话不存在")
     default_config = AgentRunConfig.default()
+    requested_capabilities = _resolve_agent_capabilities(body.allowed_capabilities)
+    if conversation.workflow_mode == "disabled":
+        attempted_workflow = [
+            item for item in requested_capabilities if item.startswith("workflow.")
+        ]
+        if body.allowed_capabilities is not None and attempted_workflow:
+            raise HTTPException(
+                403,
+                detail={
+                    "code": "WORKFLOW_MODE_DISABLED",
+                    "message": "该对话当前禁止 workflow.* 能力",
+                },
+            )
+        requested_capabilities = tuple(
+            item
+            for item in requested_capabilities
+            if not item.startswith("workflow.")
+        )
+    source_turn = await session.scalar(
+        select(ConversationTurn)
+        .where(ConversationTurn.conversation_id == conversation.id)
+        .order_by(ConversationTurn.accepted_at.desc())
+        .limit(1)
+    )
     config = AgentRunConfig(
         output_schema=default_config.output_schema,
         max_steps=min(body.max_steps or default_config.max_steps, default_config.max_steps),
         max_total_tokens=default_config.max_total_tokens,
-        allowed_capabilities=_resolve_agent_capabilities(body.allowed_capabilities),
+        allowed_capabilities=requested_capabilities,
         max_duration_seconds=default_config.max_duration_seconds,
     )
     conversation_run = await enqueue_agent_run(
@@ -4083,6 +4594,7 @@ async def start_agent_run(
         conversation,
         body.content,
         config=config,
+        turn_id=source_turn.id if source_turn else None,
     )
     assistant_content = build_agent_run_message(
         conversation_run,
@@ -4091,9 +4603,17 @@ async def start_agent_run(
     assistant_message = Message(
         id=str(uuid4()),
         conversation_id=conversation.id,
+        turn_id=source_turn.id if source_turn else None,
         role="assistant",
         content_json=assistant_content,
     )
+    now = utcnow()
+    conversation.last_message_at = now
+    conversation.updated_at = now
+    if source_turn:
+        source_turn.status = "processing"
+        source_turn.completed_at = None
+        source_turn.elapsed_ms = None
     session.add(assistant_message)
     await session.commit()
     return {

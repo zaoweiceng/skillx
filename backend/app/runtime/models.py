@@ -16,6 +16,7 @@ class ModelResult:
     input_tokens: int
     output_tokens: int
     model: str
+    usage_complete: bool = True
 
 
 class ModelAdapter(Protocol):
@@ -87,4 +88,7 @@ class OpenAICompatibleAdapter:
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
             model=payload.get("model", settings.model_name),
+            usage_complete=(
+                "prompt_tokens" in usage and "completion_tokens" in usage
+            ),
         )

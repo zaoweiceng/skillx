@@ -256,6 +256,7 @@ class Orchestrator:
         inputs: dict[str, Any],
         component_id: str | None = None,
         owner_id: str = "local-user",
+        turn_id: str | None = None,
     ) -> Run:
         definition = WorkflowDefinition.model_validate(workflow_version.definition_json)
         errors = list(Draft202012Validator(definition.spec.input_schema).iter_errors(inputs))
@@ -265,6 +266,7 @@ class Orchestrator:
             id=str(uuid4()),
             workflow_version_id=workflow_version.id,
             component_id=component_id,
+            turn_id=turn_id,
             owner_id=owner_id,
             status="queued",
             input_json=inputs,
@@ -286,6 +288,7 @@ class Orchestrator:
         snapshot: PlanSnapshot,
         inputs: dict[str, Any],
         owner_id: str = "local-user",
+        turn_id: str | None = None,
     ) -> Run:
         from app.application.plans import verify_plan_snapshot
 
@@ -299,6 +302,7 @@ class Orchestrator:
             workflow_version_id=None,
             plan_snapshot_id=snapshot.id,
             owner_id=owner_id,
+            turn_id=turn_id,
             status="queued",
             input_json=inputs,
         )
@@ -1339,6 +1343,53 @@ class WorkerService:
                     claimed.node_run_id,
                 )
                 return
+            if (
+                result.status == "succeeded"
+                and claimed.node.type in {NodeType.LLM, NodeType.AGENT}
+            ):
+                from app.application.product_history import record_model_usage
+
+                run_record = await session.get(Run, claimed.run_id)
+                input_tokens = result.metrics.get("inputTokens")
+                output_tokens = result.metrics.get("outputTokens")
+                total_tokens = result.metrics.get("totalTokens")
+                await record_model_usage(
+                    session,
+                    call_id=f"workflow-node:{claimed.node_run_id}",
+                    attempt=claimed.attempt,
+                    stage=(
+                        "workflow_llm"
+                        if claimed.node.type == NodeType.LLM
+                        else "workflow_agent"
+                    ),
+                    turn_id=run_record.turn_id if run_record else None,
+                    run_id=claimed.run_id,
+                    provider=(
+                        "openai-compatible"
+                        if claimed.node.type == NodeType.LLM
+                        else "traex"
+                    ),
+                    model=result.metrics.get("model"),
+                    input_tokens=(
+                        int(input_tokens) if isinstance(input_tokens, int) else None
+                    ),
+                    output_tokens=(
+                        int(output_tokens) if isinstance(output_tokens, int) else None
+                    ),
+                    total_tokens=(
+                        int(total_tokens) if isinstance(total_tokens, int) else None
+                    ),
+                    usage_complete=bool(
+                        result.metrics.get(
+                            "usageComplete",
+                            total_tokens is not None
+                            or (
+                                input_tokens is not None
+                                and output_tokens is not None
+                            ),
+                        )
+                    ),
+                )
             await append_event(
                 session,
                 claimed.run_id,

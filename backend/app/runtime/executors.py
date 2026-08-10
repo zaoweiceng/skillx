@@ -436,6 +436,7 @@ class LLMExecutor:
                     "inputTokens": result.input_tokens,
                     "outputTokens": result.output_tokens,
                     "model": result.model,
+                    "usageComplete": result.usage_complete,
                 },
                 events=[
                     {

@@ -1,8 +1,17 @@
-import { ArrowLeft, CheckCircle2, Code2, Plus, Save, Send } from 'lucide-react'
+import Form from '@rjsf/core'
+import validator from '@rjsf/validator-ajv8'
+import { ArrowLeft, CheckCircle2, Code2, Play, Plus, Save, Send } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 
-import { api, type NodeDefinition, type Workflow, type WorkflowDefinition } from '@/api/client'
+import {
+  api,
+  type NodeDefinition,
+  type Run,
+  type Workflow,
+  type WorkflowDefinition,
+  type WorkflowVersionSummary,
+} from '@/api/client'
 import { EditableCanvas } from '@/components/EditableCanvas'
 import { WorkflowGraph } from '@/components/WorkflowGraph'
 import { outputVariables, reachableUpstream } from '@/lib/variablePicker'
@@ -16,11 +25,13 @@ import {
   setInputMapping,
   updateNode,
 } from '@/lib/workflowEdit'
+import { rjsfSchema } from '@/lib/utils'
 
 type Diagnostic = { level: string; code: string; path: string; message: string }
 
 export default function WorkflowEditorPage() {
   const { id } = useParams()
+  const navigate = useNavigate()
   const [workflow, setWorkflow] = useState<Workflow>()
   // 结构化 state 为唯一真相；JSON 仅作为高级导入/导出视图。
   const [definition, setDefinition] = useState<WorkflowDefinition>()
@@ -33,6 +44,9 @@ export default function WorkflowEditorPage() {
   const [publishing, setPublishing] = useState(false)
   const [selectedNodeId, setSelectedNodeId] = useState('')
   const [mappingField, setMappingField] = useState('')
+  const [versions, setVersions] = useState<WorkflowVersionSummary[]>([])
+  const [versionRuns, setVersionRuns] = useState<Run[]>([])
+  const [runInput, setRunInput] = useState<Record<string, unknown>>({})
 
   useEffect(() => {
     if (!id) return
@@ -41,6 +55,18 @@ export default function WorkflowEditorPage() {
       .then((item) => {
         setWorkflow(item)
         setDefinition(item.definition)
+        if (typeof api.listWorkflowVersions === 'function') {
+          api.listWorkflowVersions(item.id).then(async (published) => {
+            setVersions(published)
+            if (published[0] && typeof api.listRuns === 'function') {
+              const history = await api.listRuns({
+                workflowVersionId: published[0].id,
+                limit: 20,
+              })
+              setVersionRuns(history.items)
+            }
+          })
+        }
       })
       .catch((reason: Error) => setError(reason.message))
   }, [id])
@@ -170,6 +196,9 @@ export default function WorkflowEditorPage() {
       setNotice(
         `已发布不可变版本 v${version.version}，组件入口 ${component.id.slice(0, 8)} 已创建`,
       )
+      if (typeof api.listWorkflowVersions === 'function') {
+        setVersions(await api.listWorkflowVersions(id))
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '发布失败')
     } finally {
@@ -192,6 +221,20 @@ export default function WorkflowEditorPage() {
       setError('')
     } catch {
       setError('JSON 语法错误，无法导入')
+    }
+  }
+
+  async function runPublishedVersion() {
+    const version = versions[0]
+    if (!version) return
+    setBusy(true)
+    try {
+      const run = await api.createWorkflowVersionRun(version.id, runInput)
+      navigate(`/runs/${run.id}`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '运行已发布版本失败')
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -331,6 +374,67 @@ export default function WorkflowEditorPage() {
 
       {/* 只读小图便于总览 */}
       {!showJson && <WorkflowGraph definition={definition} compact />}
+
+      <section className="detail-grid published-version-panel">
+        <div className="panel result-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">PUBLISHED HISTORY</span>
+              <h2>已发布版本与运行历史</h2>
+            </div>
+            <span>{versions.length} 个版本</span>
+          </div>
+          {versions.length === 0 ? (
+            <p className="inspector-empty">尚未发布；草稿不能进入正式运行历史。</p>
+          ) : (
+            <div className="node-table">
+              {versions.map((version) => (
+                <div className="node-row" key={version.id}>
+                  <div>
+                    <strong>v{version.version}</strong>
+                    <small>{new Date(version.createdAt).toLocaleString()}</small>
+                    <code className="digest-line">{version.digest}</code>
+                  </div>
+                </div>
+              ))}
+              {versionRuns.map((run) => (
+                <Link className="node-row" to={`/runs/${run.id}`} key={run.id}>
+                  <span className={`status-badge ${run.status}`}>{run.status}</span>
+                  <div>
+                    <strong>{new Date(run.createdAt).toLocaleString()}</strong>
+                    <small>{run.durationMs ?? '待完成'}ms</small>
+                  </div>
+                </Link>
+              ))}
+            </div>
+          )}
+        </div>
+        {versions[0] && (
+          <aside className="panel run-form">
+            <div className="panel-heading">
+              <div>
+                <span className="eyebrow">RUN PUBLISHED VERSION</span>
+                <h2>手动运行 v{versions[0].version}</h2>
+              </div>
+              <Play size={16} />
+            </div>
+            <Form
+              schema={rjsfSchema(versions[0].definition.spec.inputSchema)}
+              uiSchema={versions[0].definition.spec.uiSchema}
+              validator={validator}
+              formData={runInput}
+              onChange={(event) =>
+                setRunInput((event.formData as Record<string, unknown>) ?? {})
+              }
+              onSubmit={runPublishedVersion}
+            >
+              <button className="button primary wide" type="submit" disabled={busy}>
+                <Play size={14} /> 启动已发布版本
+              </button>
+            </Form>
+          </aside>
+        )}
+      </section>
     </div>
   )
 }
@@ -351,6 +455,11 @@ function CapabilityMetadataEditor({
   const fragments = Array.isArray(definition.metadata.callableFragments)
     ? (definition.metadata.callableFragments as Array<Record<string, unknown>>)
     : []
+  const presentation =
+    typeof definition.metadata.presentationPolicy === 'object' &&
+    definition.metadata.presentationPolicy
+      ? (definition.metadata.presentationPolicy as Record<string, unknown>)
+      : {}
 
   function patchMetadata(nextCapability: Record<string, unknown>, nextFragments = fragments) {
     onChange({
@@ -360,6 +469,30 @@ function CapabilityMetadataEditor({
         capability: nextCapability,
         callableFragments: nextFragments,
       },
+    })
+  }
+
+  function patchPresentation(patch: Record<string, unknown>) {
+    onChange({
+      ...definition,
+      metadata: {
+        ...definition.metadata,
+        presentationPolicy: { ...presentation, ...patch },
+      },
+    })
+  }
+
+  function listValue(key: string) {
+    return Array.isArray(capability[key]) ? (capability[key] as unknown[]).join(', ') : ''
+  }
+
+  function patchList(key: string, value: string) {
+    patchMetadata({
+      ...capability,
+      [key]: value
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean),
     })
   }
 
@@ -410,18 +543,65 @@ function CapabilityMetadataEditor({
         <label>
           <span>适用场景（逗号分隔）</span>
           <input
-            value={Array.isArray(capability.useWhen) ? capability.useWhen.join(', ') : ''}
-            onChange={(event) =>
-              patchMetadata({
-                ...capability,
-                useWhen: event.target.value
-                  .split(',')
-                  .map((item) => item.trim())
-                  .filter(Boolean),
-              })
-            }
+            value={listValue('useWhen')}
+            onChange={(event) => patchList('useWhen', event.target.value)}
           />
         </label>
+        <label>
+          <span>不适用场景（逗号分隔）</span>
+          <input
+            value={listValue('doNotUseWhen')}
+            onChange={(event) => patchList('doNotUseWhen', event.target.value)}
+          />
+        </label>
+        <label>
+          <span>示例（逗号分隔）</span>
+          <input
+            value={listValue('examples')}
+            onChange={(event) => patchList('examples', event.target.value)}
+          />
+        </label>
+        <label>
+          <span>标签（逗号分隔）</span>
+          <input
+            value={listValue('tags')}
+            onChange={(event) => patchList('tags', event.target.value)}
+          />
+        </label>
+        <div className="presentation-policy-editor">
+          <label>
+            <input
+              type="checkbox"
+              checked={presentation.enabled === true}
+              onChange={(event) =>
+                patchPresentation({
+                  enabled: event.target.checked,
+                  audience: event.target.checked ? 'end_user' : 'internal',
+                })
+              }
+            />
+            <span>面向最终用户生成阅读结果</span>
+          </label>
+          <label>
+            <span>生成方式</span>
+            <select
+              value={String(presentation.producer ?? 'template')}
+              onChange={(event) => patchPresentation({ producer: event.target.value })}
+            >
+              <option value="template">稳定模板（零 LLM）</option>
+              <option value="llm">LLM 整理</option>
+            </select>
+          </label>
+          {String(presentation.producer ?? 'template') === 'template' && (
+            <label>
+              <span>模板（支持 {'{json}'} 和顶层字段）</span>
+              <input
+                value={String(presentation.template ?? '执行结果：{json}')}
+                onChange={(event) => patchPresentation({ template: event.target.value })}
+              />
+            </label>
+          )}
+        </div>
         {fragments.map((fragment, index) => (
           <div className="node-row" key={`${String(fragment.name)}-${index}`}>
             <label>

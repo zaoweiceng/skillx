@@ -3,7 +3,24 @@ import type { WorkflowDefinition } from '@/api/client'
 export const defaultWorkflow: WorkflowDefinition = {
   apiVersion: 'workflow.platform/v1',
   kind: 'Workflow',
-  metadata: { name: 'greeting' },
+  metadata: {
+    name: 'greeting',
+    capability: {
+      summary: '根据姓名生成问候语',
+      useWhen: ['需要向某人问候'],
+      doNotUseWhen: ['需要发送消息或执行其他副作用'],
+      examples: ['问候 Alice'],
+      tags: ['问候'],
+    },
+    presentationPolicy: {
+      enabled: true,
+      audience: 'end_user',
+      producer: 'template',
+      template: '{message}',
+      language: 'zh-CN',
+      maxLength: 500,
+    },
+  },
   spec: {
     inputSchema: {
       $schema: 'https://json-schema.org/draft/2020-12/schema',

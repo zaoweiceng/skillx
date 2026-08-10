@@ -4,6 +4,7 @@ import {
   Ban,
   Check,
   Clock,
+  Copy,
   Download,
   RotateCw,
   X,
@@ -229,10 +230,66 @@ export default function RunDetailPage() {
       {(run.output || run.error) && (
         <section className="panel result-panel">
           <div className="panel-heading">
-            <h2>{run.error ? '运行错误' : '最终输出'}</h2>
+            <h2>{run.error ? '运行错误' : '结构化结果'}</h2>
             <StatusBadge status={run.status} />
+            {!run.error && (
+              <button
+                className="button ghost"
+                type="button"
+                onClick={() =>
+                  navigator.clipboard.writeText(JSON.stringify(run.output, null, 2))
+                }
+              >
+                <Copy size={13} /> 复制 JSON
+              </button>
+            )}
           </div>
           <JsonBlock value={run.error ?? run.output} />
+        </section>
+      )}
+
+      {run.presentation && (
+        <section className="panel result-panel">
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">PRESENTATION</span>
+              <h2>阅读结果</h2>
+            </div>
+            <span className={`status-badge ${run.presentation.status}`}>
+              {run.presentation.status}
+            </span>
+            {run.presentation.text && (
+              <button
+                className="button ghost"
+                type="button"
+                onClick={() =>
+                  navigator.clipboard.writeText(run.presentation?.text ?? '')
+                }
+              >
+                <Copy size={13} /> 复制文本
+              </button>
+            )}
+          </div>
+          {run.presentation.text && (
+            <p className="presentation-reading">{run.presentation.text}</p>
+          )}
+          {run.presentation.status === 'running' && (
+            <p className="hint">规范 JSON 已完成，文本正在流式整理。</p>
+          )}
+          {run.presentation.status === 'failed' && (
+            <div className="error-panel">
+              文本整理失败：{String(run.presentation.error?.message ?? '未知错误')}。规范结果不受影响。
+            </div>
+          )}
+        </section>
+      )}
+
+      {(run.modelUsage?.length ?? 0) > 0 && (
+        <section className="panel result-panel">
+          <div className="panel-heading">
+            <h2>模型用量</h2>
+          </div>
+          <JsonBlock value={run.modelUsage} />
         </section>
       )}
 

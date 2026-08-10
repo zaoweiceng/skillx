@@ -4,8 +4,9 @@ import { ArrowLeft, Clock3, Play, ShieldAlert } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 
-import { api, type ComponentSummary } from '@/api/client'
+import { api, type ComponentSummary, type Run } from '@/api/client'
 import { WorkflowGraph } from '@/components/WorkflowGraph'
+import { rjsfSchema } from '@/lib/utils'
 
 export default function ComponentDetailPage() {
   const { id } = useParams()
@@ -14,11 +15,29 @@ export default function ComponentDetailPage() {
   const [formData, setFormData] = useState<Record<string, unknown>>({})
   const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const [runs, setRuns] = useState<Run[]>([])
+  const [runsCursor, setRunsCursor] = useState<string | null>(null)
 
   useEffect(() => {
     if (!id) return
-    api.getComponent(id).then(setComponent).catch((reason: Error) => setError(reason.message))
+    Promise.all([
+      api.getComponent(id),
+      api.listRuns({ componentId: id, limit: 20 }),
+    ])
+      .then(([item, history]) => {
+        setComponent(item)
+        setRuns(history.items)
+        setRunsCursor(history.nextCursor)
+      })
+      .catch((reason: Error) => setError(reason.message))
   }, [id])
+
+  async function loadMoreRuns() {
+    if (!id || !runsCursor) return
+    const page = await api.listRuns({ componentId: id, cursor: runsCursor, limit: 20 })
+    setRuns((current) => [...current, ...page.items])
+    setRunsCursor(page.nextCursor)
+  }
 
   async function runComponent() {
     if (!id) return
@@ -158,7 +177,7 @@ export default function ComponentDetailPage() {
             <Play size={18} />
           </div>
           <Form
-            schema={component.definition.spec.inputSchema}
+            schema={rjsfSchema(component.definition.spec.inputSchema)}
             uiSchema={component.definition.spec.uiSchema}
             validator={validator}
             formData={formData}
@@ -182,6 +201,49 @@ export default function ComponentDetailPage() {
             </span>
           </div>
         </aside>
+      </section>
+
+      <section className="panel result-panel">
+        <div className="panel-heading">
+          <div>
+            <span className="eyebrow">INVOCATION HISTORY</span>
+            <h2>调用历史</h2>
+          </div>
+          <span>{runs.length} 条已加载</span>
+        </div>
+        {runs.length === 0 ? (
+          <div className="empty-state">暂无调用记录</div>
+        ) : (
+          <div className="node-table">
+            {runs.map((run) => (
+              <Link className="node-row run-history-row" to={`/runs/${run.id}`} key={run.id}>
+                <span className={`status-badge ${run.status}`}>{run.status}</span>
+                <div>
+                  <strong>{new Date(run.createdAt).toLocaleString()}</strong>
+                  <small>
+                    {run.durationMs === null || run.durationMs === undefined
+                      ? '耗时待定'
+                      : `${run.durationMs}ms`}
+                    {' · '}
+                    version {run.workflowVersionId?.slice(0, 8)}
+                    {' · '}
+                    Presentation {run.presentation?.status ?? '未启用'}
+                  </small>
+                  <code className="digest-line">
+                    输入 {JSON.stringify(run.input).slice(0, 100)}
+                    {' · '}
+                    输出 {JSON.stringify(run.output).slice(0, 100)}
+                  </code>
+                </div>
+              </Link>
+            ))}
+          </div>
+        )}
+        {runsCursor && (
+          <button className="button ghost" type="button" onClick={loadMoreRuns}>
+            加载更多
+          </button>
+        )}
       </section>
     </div>
   )

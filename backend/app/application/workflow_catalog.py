@@ -424,7 +424,7 @@ async def build_manifest(
             str(manifest["summary"]),
             *map(str, manifest["tags"]),
             *map(str, manifest["useWhen"]),
-            *map(str, manifest["doNotUseWhen"]),
+            *map(str, manifest["examples"]),
         ]
     ).lower()
     item = WorkflowCapabilityManifest(
@@ -631,7 +631,27 @@ async def search_manifests(
             )
         }
         card["manifestDigest"] = row.digest
-        card["matchReason"] = {"score": score, "query": query[:200]}
+        normalized = query.strip().lower()
+        matched = [
+            value
+            for value in [
+                manifest["name"],
+                manifest["summary"],
+                *manifest.get("tags", []),
+                *manifest.get("useWhen", []),
+                *manifest.get("examples", []),
+            ]
+            if normalized and _score(normalized, str(value).lower()) > 0
+        ][:3]
+        card["matchReason"] = {
+            "score": score,
+            "query": query[:200],
+            "summary": (
+                f"命中：{'；'.join(map(str, matched))}"
+                if matched
+                else "名称、标签或适用场景存在语义召回"
+            ),
+        }
         encoded = len(json.dumps(card, ensure_ascii=False).encode())
         if total + encoded > MAX_SEARCH_BYTES:
             break

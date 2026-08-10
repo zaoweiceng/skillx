@@ -1,4 +1,6 @@
 import { Bot, Database, KeyRound, PanelsTopLeft, ServerCog } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { api } from '@/api/client'
 
 const settings = [
   {
@@ -39,6 +41,14 @@ const settings = [
 ]
 
 export default function SettingsPage() {
+  const [selectionMode, setSelectionMode] = useState<'agent' | 'unavailable'>(
+    'unavailable',
+  )
+
+  useEffect(() => {
+    api.getHealth().then((health) => setSelectionMode(health.workflowSelectionMode))
+  }, [])
+
   return (
     <div className="page">
       <header className="page-header">
@@ -48,6 +58,10 @@ export default function SettingsPage() {
           <p>外部 Runtime 未配置时明确失败，不允许隐式升级到 Agent。</p>
         </div>
       </header>
+      <div className="notice-panel">
+        当前工作流选择模式：<strong>{selectionMode}</strong>
+        {selectionMode === 'unavailable' && '。语义选择服务不可用时不会静默使用目录第一项。'}
+      </div>
       <section className="settings-grid">
         {settings.map(({ icon: Icon, name, description, status, tone }) => (
           <article className="setting-card" key={name}>

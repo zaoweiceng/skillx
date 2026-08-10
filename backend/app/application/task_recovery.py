@@ -337,6 +337,7 @@ class TaskCheckpointDriver:
                 str(source.input_json.get("message", "")),
                 config=config,
                 prompt=prompt,
+                turn_id=source.turn_id,
             )
             continuation.input_json = {
                 **continuation.input_json,
@@ -355,6 +356,7 @@ class TaskCheckpointDriver:
             continuation_message = Message(
                 id=str(uuid4()),
                 conversation_id=conversation.id,
+                turn_id=source.turn_id,
                 role="assistant",
                 content_json={
                     "type": "agent_run",

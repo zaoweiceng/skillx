@@ -8,14 +8,12 @@ from app.api.routes import (
     confirm_component,
     create_message,
 )
-from app.application.agent_host import LOCAL_DEMO_READ_ONLY_CAPABILITIES
 from app.application.compiler import WorkflowCompiler
 from app.application.conversation import candidate_snapshot_digest
 from app.application.orchestrator import WorkerService
 from app.infrastructure.database import (
     Component,
     Conversation,
-    ConversationRun,
     Run,
     SessionLocal,
     Workflow,
@@ -78,7 +76,7 @@ async def test_conversation_confirmed_component_hands_control_to_workflow() -> N
         assert run.output_json == {"message": "你好，Alice"}
 
 
-async def test_unbound_conversation_continues_with_persistent_agent_run() -> None:
+async def test_unbound_conversation_reports_selection_unavailable_without_model() -> None:
     async with SessionLocal() as session, session.begin():
         conversation = Conversation(id=str(uuid4()), title="通用 Agent 对话")
         session.add(conversation)
@@ -88,21 +86,10 @@ async def test_unbound_conversation_continues_with_persistent_agent_run() -> Non
             MessageCreate(content="分析这个新任务"),
             session,
         )
-    assert response["assistant"]["type"] == "agent_run"
-    assert response["assistant"]["state"] == "queued"
-    assert response["assistant"]["runType"] == "agent_run"
-    assert response["assistant"]["agentAction"] == "continue_agent"
-    async with SessionLocal() as session:
-        run = await session.get(
-            ConversationRun,
-            response["assistant"]["conversationRunId"],
-        )
-    assert run is not None
-    assert run.run_type == "agent_run"
-    assert run.status == "queued"
-    assert tuple(run.config_json["allowedCapabilities"]) == (
-        LOCAL_DEMO_READ_ONLY_CAPABILITIES
-    )
+    assert response["assistant"]["type"] == "workflow_selection"
+    assert response["assistant"]["state"] == "unavailable"
+    assert response["assistant"]["code"] == "WORKFLOW_SELECTION_UNAVAILABLE"
+    assert response["assistant"]["selectionMode"] == "unavailable"
 
 
 async def _seed_greeting_component(name: str, description: str) -> tuple[str, str]:
@@ -140,7 +127,7 @@ async def _seed_greeting_component(name: str, description: str) -> tuple[str, st
     return component.id, conversation.id
 
 
-async def test_continue_agent_does_not_use_undisclosed_component_heuristic() -> None:
+async def test_unconfigured_selector_does_not_use_component_heuristic() -> None:
     _, conversation_id = await _seed_greeting_component(
         "问候组件", "生成问候语 greeting 欢迎 welcome"
     )
@@ -151,8 +138,8 @@ async def test_continue_agent_does_not_use_undisclosed_component_heuristic() -> 
             session,
         )
     assistant = response["assistant"]
-    assert assistant["type"] == "agent_run"
-    assert assistant["agentAction"] == "continue_agent"
+    assert assistant["type"] == "workflow_selection"
+    assert assistant["code"] == "WORKFLOW_SELECTION_UNAVAILABLE"
     assert "candidateSnapshotDigest" not in assistant
 
 

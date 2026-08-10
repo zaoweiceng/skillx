@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -13,10 +14,15 @@ const getTaskCheckpoint = vi.fn()
 const listConversationRunEvents = vi.fn()
 const getRun = vi.fn()
 const createConversation = vi.fn()
+const listConversations = vi.fn()
+const updateConversationWorkflowMode = vi.fn()
 
 vi.mock('@/api/client', () => ({
   api: {
     createConversation: (...args: unknown[]) => createConversation(...args),
+    listConversations: (...args: unknown[]) => listConversations(...args),
+    updateConversationWorkflowMode: (...args: unknown[]) =>
+      updateConversationWorkflowMode(...args),
     getConversation: (...args: unknown[]) => getConversation(...args),
     sendMessage: (...args: unknown[]) => sendMessage(...args),
     confirmComponent: (...args: unknown[]) => confirmComponent(...args),
@@ -144,11 +150,45 @@ describe('ChatPage 候选组件闭环', () => {
     listConversationRunEvents.mockReset()
     getRun.mockReset()
     createConversation.mockReset()
+    listConversations.mockReset()
+    updateConversationWorkflowMode.mockReset()
     createConversation.mockResolvedValue({ id: 'conv-1', title: '新对话' })
+    listConversations.mockResolvedValue({ items: [], nextCursor: null })
+    updateConversationWorkflowMode.mockResolvedValue({
+      id: 'conv-1',
+      workflowMode: 'disabled',
+      appliesFrom: 'next_turn',
+      cancelledPendingSelections: 0,
+    })
   })
 
   afterEach(() => {
     cleanup()
+  })
+
+  it('在 StrictMode 下进入 /chat 只创建一个对话', async () => {
+    getConversation.mockResolvedValue({
+      id: 'conv-1',
+      title: '新对话',
+      boundComponentId: null,
+      workflowMode: 'enabled',
+      messages: [],
+      turns: [],
+    })
+
+    render(
+      <StrictMode>
+        <MemoryRouter initialEntries={['/chat']}>
+          <Routes>
+            <Route path="/chat" element={<ChatPage />} />
+            <Route path="/chat/:id" element={<ChatPage />} />
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    )
+
+    await waitFor(() => expect(getConversation).toHaveBeenCalledWith('conv-1'))
+    expect(createConversation).toHaveBeenCalledTimes(1)
   })
 
   it('渲染候选卡片并支持确认后启动组件', async () => {
@@ -541,5 +581,42 @@ describe('ChatPage 候选组件闭环', () => {
 
     await waitFor(() => expect(screen.getByText('DEPENDENCY_UNAVAILABLE')).toBeInTheDocument())
     expect(screen.getByText('上游暂不可用')).toBeInTheDocument()
+  })
+
+  it('展示持久历史并切换当前对话的工作流模式', async () => {
+    getConversation.mockResolvedValue({
+      id: 'conv-1',
+      title: '当前对话',
+      boundComponentId: null,
+      workflowMode: 'enabled',
+      turns: [],
+      messages: [],
+    })
+    listConversations.mockResolvedValue({
+      items: [
+        {
+          id: 'conv-1',
+          title: '当前对话',
+          preview: '上海天气如何',
+          lastMessageAt: '2026-08-10T10:00:00Z',
+          status: 'idle',
+          workflowMode: 'enabled',
+        },
+      ],
+      nextCursor: null,
+    })
+
+    renderAt('conv-1')
+
+    await waitFor(() => expect(screen.getByText('当前对话')).toBeInTheDocument())
+    const toggle = screen.getByRole('button', { name: '工作流：开启' })
+    fireEvent.click(toggle)
+    await waitFor(() =>
+      expect(updateConversationWorkflowMode).toHaveBeenCalledWith('conv-1', 'disabled'),
+    )
+    expect(screen.getByRole('button', { name: '工作流：关闭' })).toHaveAttribute(
+      'aria-pressed',
+      'false',
+    )
   })
 })

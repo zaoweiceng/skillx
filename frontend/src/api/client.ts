@@ -102,6 +102,7 @@ export type Run = {
   workflowVersionId: string | null
   planSnapshotId?: string | null
   componentId: string | null
+  turnId?: string | null
   status: string
   input: Record<string, unknown>
   output: Record<string, unknown> | null
@@ -109,6 +110,20 @@ export type Run = {
   createdAt: string
   startedAt: string | null
   finishedAt: string | null
+  durationMs?: number | null
+  presentation?: RunPresentation | null
+  presentations?: RunPresentation[]
+  modelUsage?: Array<{
+    callId: string
+    attempt: number
+    stage: string
+    provider: string | null
+    model: string | null
+    inputTokens: number | null
+    outputTokens: number | null
+    totalTokens: number | null
+    complete: boolean
+  }>
   nodes?: NodeRun[]
   approvals?: Approval[]
   artifacts?: Array<{
@@ -174,6 +189,51 @@ export type Run = {
   }>
 }
 
+export type RunPresentation = {
+  id: string
+  revision: number
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  text: string | null
+  producer: 'template' | 'llm'
+  model: string | null
+  error: Record<string, unknown> | null
+  startedAt: string | null
+  completedAt: string | null
+  elapsedMs: number | null
+}
+
+export type TokenSummary = {
+  state: 'zero' | 'complete' | 'partial' | 'unavailable'
+  totalTokens: number | null
+  stages: Array<{
+    stage: string
+    provider: string | null
+    model: string | null
+    totalTokens: number | null
+    complete: boolean
+  }>
+}
+
+export type ConversationTurn = {
+  id: string
+  workflowModeSnapshot: 'enabled' | 'disabled'
+  status: string
+  acceptedAt: string
+  firstResponseAt: string | null
+  completedAt: string | null
+  elapsedMs: number | null
+  usage: TokenSummary
+}
+
+export type ConversationSummary = {
+  id: string
+  title: string
+  preview: string
+  lastMessageAt: string | null
+  status: string
+  workflowMode: 'enabled' | 'disabled'
+}
+
 export type Workflow = {
   id: string
   name: string
@@ -186,6 +246,16 @@ export type Workflow = {
   definition: WorkflowDefinition
   createdAt: string
   updatedAt: string
+}
+
+export type WorkflowVersionSummary = {
+  id: string
+  workflowId: string
+  version: number
+  digest: string
+  definition: WorkflowDefinition
+  presentationPolicy: Record<string, unknown>
+  createdAt: string
 }
 
 export type ChatMessageContent = {
@@ -220,6 +290,16 @@ export type ChatMessageContent = {
   disclosureLevel?: string
   pendingSelectionId?: string
   resumedPendingSelection?: boolean
+  workflowModeSnapshot?: 'enabled' | 'disabled'
+  selectionMode?: 'agent' | 'unavailable'
+  bindingSources?: Array<{
+    field: string
+    source: string
+    messageId?: string
+    quote: string
+    confidence: number
+    uncertain: boolean
+  }>
   refs?: string[]
   toolTimeline?: Array<{
     type: string
@@ -248,7 +328,7 @@ export type WorkflowCapabilityCard = {
   approvalRequired: boolean
   estimatedCost: { llmCalls: number }
   manifestDigest: string
-  matchReason: { score: number; query: string }
+  matchReason: { score: number; query: string; summary?: string }
 }
 
 export type ConversationRunEvent = {
@@ -312,6 +392,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  getHealth: () =>
+    request<{
+      status: string
+      migration: string
+      workflowSelectionMode: 'agent' | 'unavailable'
+    }>('/health/ready'),
   listComponents: () => request<ComponentSummary[]>('/components'),
   getComponent: (id: string) => request<ComponentSummary>(`/components/${id}`),
   createRun: (id: string, input: Record<string, unknown>) =>
@@ -319,7 +405,21 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ input }),
     }),
-  listRuns: () => request<Run[]>('/runs'),
+  listRuns: (filters: {
+    componentId?: string
+    workflowVersionId?: string
+    status?: string
+    cursor?: string
+    limit?: number
+  } = {}) => {
+    const params = new URLSearchParams()
+    Object.entries(filters).forEach(([key, value]) => {
+      if (value !== undefined) params.set(key, String(value))
+    })
+    return request<{ items: Run[]; nextCursor: string | null }>(
+      `/runs${params.size ? `?${params}` : ''}`,
+    )
+  },
   getRun: (id: string) => request<Run>(`/runs/${id}`),
   createWorkflowSession: (conversationId?: string) =>
     request<{ id: string; status: string; expiresAt: string }>('/workflow-tools/sessions', {
@@ -360,6 +460,13 @@ export const api = {
     }),
   listWorkflows: () => request<Workflow[]>('/workflows'),
   getWorkflow: (id: string) => request<Workflow>(`/workflows/${id}`),
+  listWorkflowVersions: (id: string) =>
+    request<WorkflowVersionSummary[]>(`/workflows/${id}/versions`),
+  createWorkflowVersionRun: (id: string, input: Record<string, unknown>) =>
+    request<Run>(`/workflow-versions/${id}/runs`, {
+      method: 'POST',
+      body: JSON.stringify({ input }),
+    }),
   createWorkflow: (name: string, definition: WorkflowDefinition) =>
     request<Workflow>('/workflows', {
       method: 'POST',
@@ -462,23 +569,56 @@ export const api = {
       }>
     >('/capabilities'),
   createConversation: (title: string) =>
-    request<{ id: string; title: string }>('/conversations', {
+    request<{ id: string; title: string; workflowMode: 'enabled' | 'disabled' }>(
+      '/conversations',
+      {
       method: 'POST',
       body: JSON.stringify({ title }),
+      },
+    ),
+  listConversations: (cursor?: string, query?: string) => {
+    const params = new URLSearchParams({ limit: '30' })
+    if (cursor) params.set('cursor', cursor)
+    if (query) params.set('query', query)
+    return request<{ items: ConversationSummary[]; nextCursor: string | null }>(
+      `/conversations?${params}`,
+    )
+  },
+  updateConversationWorkflowMode: (
+    id: string,
+    workflowMode: 'enabled' | 'disabled',
+  ) =>
+    request<{
+      id: string
+      workflowMode: 'enabled' | 'disabled'
+      appliesFrom: string
+      cancelledPendingSelections: number
+    }>(`/conversations/${id}/workflow-mode`, {
+      method: 'PATCH',
+      body: JSON.stringify({ workflowMode }),
     }),
   getConversation: (id: string) =>
     request<{
       id: string
       title: string
       boundComponentId: string | null
+      workflowMode: 'enabled' | 'disabled'
+      lastMessageAt: string | null
       messages: Array<{
         id: string
         role: string
         content: ChatMessageContent
+        turnId: string | null
+        createdAt: string
       }>
+      turns: ConversationTurn[]
     }>(`/conversations/${id}`),
   sendMessage: (id: string, content: string) =>
-    request<{ userMessageId: string; assistant: ChatMessageContent }>(
+    request<{
+      userMessageId: string
+      assistant: ChatMessageContent
+      turn: ConversationTurn
+    }>(
       `/conversations/${id}/messages`,
       { method: 'POST', body: JSON.stringify({ content }) },
     ),

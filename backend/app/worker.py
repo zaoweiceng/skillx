@@ -7,6 +7,10 @@ import signal
 
 from app.application.agent_run import AgentRunWorker
 from app.application.orchestrator import WorkerService, reconcile_recent_runs
+from app.application.product_history import (
+    PresentationDriver,
+    finalize_ready_turns,
+)
 from app.application.recovery import RecoveryDriver
 from app.application.task_recovery import TaskCheckpointDriver
 from app.config import get_settings
@@ -29,6 +33,7 @@ async def run_worker(
     agent_worker = AgentRunWorker(f"{service.worker_id}-agent")
     recovery_driver = RecoveryDriver()
     task_recovery_driver = TaskCheckpointDriver(f"{service.worker_id}-task-recovery")
+    presentation_driver = PresentationDriver()
     stopping = asyncio.Event()
     loop = asyncio.get_running_loop()
     for event in (signal.SIGINT, signal.SIGTERM):
@@ -67,6 +72,13 @@ async def run_worker(
                     "task recovery driver poll_once failed on worker %s",
                     service.worker_id,
                 )
+        try:
+            processed_presentation = await presentation_driver.poll_once()
+            async with SessionLocal() as session, session.begin():
+                await finalize_ready_turns(session)
+        except Exception:  # noqa: BLE001 - 展示失败不能中断执行 Worker。
+            logger.exception("presentation driver poll_once failed")
+            processed_presentation = False
         # 周期性 reconcile（约每 60 次空闲轮询一次），限制批量，形成可观察 GC。
         ticks += 1
         if ticks % 60 == 0:
@@ -80,6 +92,7 @@ async def run_worker(
             and not processed_agent
             and not processed_recovery
             and not processed_task_recovery
+            and not processed_presentation
         ):
             try:
                 await asyncio.wait_for(stopping.wait(), timeout=settings.worker_poll_seconds)

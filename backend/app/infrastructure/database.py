@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -74,6 +75,9 @@ class WorkflowVersion(Base, TimestampMixin):
         String(80), nullable=True
     )
     revision_lineage_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict
+    )
+    presentation_policy_json: Mapped[dict[str, Any]] = mapped_column(
         JSON, default=dict
     )
     workflow: Mapped[Workflow] = relationship(back_populates="versions")
@@ -153,6 +157,13 @@ class Run(Base, TimestampMixin):
             "(workflow_version_id IS NOT NULL) != (plan_snapshot_id IS NOT NULL)",
             name="ck_run_execution_source",
         ),
+        Index("ix_runs_component_created", "component_id", "created_at", "id"),
+        Index(
+            "ix_runs_workflow_version_created",
+            "workflow_version_id",
+            "created_at",
+            "id",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -163,6 +174,9 @@ class Run(Base, TimestampMixin):
         ForeignKey("plan_snapshots.id"), nullable=True
     )
     component_id: Mapped[str | None] = mapped_column(ForeignKey("components.id"), nullable=True)
+    turn_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversation_turns.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     owner_id: Mapped[str] = mapped_column(String(120), default="local-user")
     status: Mapped[str] = mapped_column(String(32), index=True, default="queued")
     input_json: Mapped[dict[str, Any]] = mapped_column(JSON)
@@ -351,12 +365,19 @@ class Artifact(Base, TimestampMixin):
 
 class Conversation(Base, TimestampMixin):
     __tablename__ = "conversations"
+    __table_args__ = (
+        Index("ix_conversations_activity", "last_message_at", "id"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     owner_id: Mapped[str] = mapped_column(String(120), default="local-user")
     title: Mapped[str] = mapped_column(String(200), default="新对话")
     bound_component_id: Mapped[str | None] = mapped_column(
         ForeignKey("components.id"), nullable=True
+    )
+    workflow_mode: Mapped[str] = mapped_column(String(16), default="enabled")
+    last_message_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
 
@@ -369,7 +390,41 @@ class Message(Base):
     )
     role: Mapped[str] = mapped_column(String(20))
     content_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    turn_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversation_turns.id", ondelete="SET NULL"), nullable=True, index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ConversationTurn(Base, TimestampMixin):
+    __tablename__ = "conversation_turns"
+    __table_args__ = (
+        Index("ix_conversation_turns_conversation", "conversation_id", "accepted_at", "id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    user_message_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    assistant_message_id: Mapped[str | None] = mapped_column(
+        String(36), nullable=True
+    )
+    parent_turn_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversation_turns.id", ondelete="SET NULL"), nullable=True
+    )
+    workflow_mode_snapshot: Mapped[str] = mapped_column(String(16))
+    status: Mapped[str] = mapped_column(String(24), default="accepted", index=True)
+    accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    first_response_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    elapsed_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class ConversationRun(Base, TimestampMixin):
@@ -381,6 +436,9 @@ class ConversationRun(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     conversation_id: Mapped[str] = mapped_column(
         ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    turn_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversation_turns.id", ondelete="SET NULL"), nullable=True, index=True
     )
     status: Mapped[str] = mapped_column(String(20))
     run_type: Mapped[str] = mapped_column(String(24), default="agent_run")
@@ -593,6 +651,65 @@ class PendingSelection(Base, TimestampMixin):
     missing_inputs_json: Mapped[list[str]] = mapped_column(JSON, default=list)
     status: Mapped[str] = mapped_column(String(24), default="awaiting_input", index=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class RunPresentation(Base, TimestampMixin):
+    __tablename__ = "run_presentations"
+    __table_args__ = (
+        Index("uq_run_presentation_revision", "run_id", "revision", unique=True),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), index=True
+    )
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+    text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    producer: Mapped[str] = mapped_column(String(20))
+    model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    config_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    prompt_template_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    elapsed_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class ModelUsage(Base):
+    __tablename__ = "model_usage"
+    __table_args__ = (
+        Index("uq_model_usage_call_attempt", "call_id", "attempt", unique=True),
+        Index("ix_model_usage_turn", "turn_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    turn_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversation_turns.id", ondelete="CASCADE"), nullable=True
+    )
+    run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("runs.id", ondelete="CASCADE"), nullable=True
+    )
+    conversation_run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("conversation_runs.id", ondelete="CASCADE"), nullable=True
+    )
+    presentation_id: Mapped[str | None] = mapped_column(
+        ForeignKey("run_presentations.id", ondelete="CASCADE"), nullable=True
+    )
+    call_id: Mapped[str] = mapped_column(String(160))
+    attempt: Mapped[int] = mapped_column(Integer, default=1)
+    provider: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    stage: Mapped[str] = mapped_column(String(40))
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cached_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reasoning_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    usage_complete: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class TaskCheckpoint(Base, TimestampMixin):

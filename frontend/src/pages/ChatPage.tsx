@@ -1,7 +1,15 @@
 import Form from '@rjsf/core'
 import validator from '@rjsf/validator-ajv8'
-import { Bot, CornerDownLeft, Link2Off, MessageSquareText } from 'lucide-react'
-import { FormEvent, useCallback, useEffect, useState } from 'react'
+import {
+  Bot,
+  CornerDownLeft,
+  History,
+  Link2Off,
+  MessageSquareText,
+  Plus,
+  Workflow,
+} from 'lucide-react'
+import { FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import {
@@ -10,22 +18,35 @@ import {
   conversationRunUrl,
   ConversationRunEvent,
   type ConversationRunSummary,
+  type ConversationSummary,
+  type ConversationTurn,
   type Run,
   taskCheckpointUrl,
   type TaskCheckpointSummary,
 } from '@/api/client'
+import { rjsfSchema } from '@/lib/utils'
 
 type Message = {
   id: string
   role: string
   content: ChatMessageContent
+  turnId?: string | null
 }
 
 export default function ChatPage() {
   const { id: routeConversationId } = useParams()
   const navigate = useNavigate()
+  const createRequestRef = useRef(false)
   const [conversationId, setConversationId] = useState(routeConversationId ?? '')
   const [messages, setMessages] = useState<Message[]>([])
+  const [turns, setTurns] = useState<ConversationTurn[]>([])
+  const [history, setHistory] = useState<ConversationSummary[]>([])
+  const [historyCursor, setHistoryCursor] = useState<string | null>(null)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [workflowMode, setWorkflowMode] = useState<'enabled' | 'disabled'>('enabled')
+  const [switchingMode, setSwitchingMode] = useState(false)
+  const [clock, setClock] = useState(Date.now())
+  const [optimisticStartedAt, setOptimisticStartedAt] = useState<number | null>(null)
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
   const [error, setError] = useState('')
@@ -50,19 +71,27 @@ export default function ChatPage() {
   // conversationId 写入路由：新对话创建后导航到 /chat/:id，刷新可恢复同一会话。
   useEffect(() => {
     if (routeConversationId) {
+      createRequestRef.current = false
       setConversationId(routeConversationId)
       return
     }
+    if (createRequestRef.current) return
+    createRequestRef.current = true
     api
       .createConversation('新对话')
       .then((item) => navigate(`/chat/${item.id}`, { replace: true }))
-      .catch((reason: Error) => setError(reason.message))
+      .catch((reason: Error) => {
+        createRequestRef.current = false
+        setError(reason.message)
+      })
   }, [routeConversationId, navigate])
 
   const refresh = useCallback(async () => {
     if (!conversationId) return
     const conversation = await api.getConversation(conversationId)
     setMessages(conversation.messages)
+    setTurns(conversation.turns ?? [])
+    setWorkflowMode(conversation.workflowMode ?? 'enabled')
     const agentRunIds = Array.from(
       new Set(
         conversation.messages
@@ -133,9 +162,35 @@ export default function ChatPage() {
     }
   }, [conversationId])
 
+  const refreshHistory = useCallback(async () => {
+    if (typeof api.listConversations !== 'function') return
+    const page = await api.listConversations()
+    setHistory(page.items)
+    setHistoryCursor(page.nextCursor)
+  }, [])
+
   useEffect(() => {
     refresh().catch((reason: Error) => setError(reason.message))
-  }, [refresh])
+    refreshHistory().catch((reason: Error) => setError(reason.message))
+  }, [refresh, refreshHistory])
+
+  useEffect(() => {
+    setMessages([])
+    setTurns([])
+    setTraceEvents([])
+    setAgentRuns({})
+    setWorkflowRuns({})
+    setTaskCheckpoints({})
+    setActiveRunId('')
+    setOptimisticStartedAt(null)
+  }, [conversationId])
+
+  useEffect(() => {
+    const hasActiveTurn = turns.some((turn) => !turn.completedAt)
+    if (!hasActiveTurn && optimisticStartedAt === null) return
+    const timer = window.setInterval(() => setClock(Date.now()), 250)
+    return () => window.clearInterval(timer)
+  }, [turns, optimisticStartedAt])
 
   // 订阅活动 Agent 运行的规范化事件，直到进入终态。
   useEffect(() => {
@@ -233,6 +288,7 @@ export default function ChatPage() {
     const text = input.trim()
     setInput('')
     setSending(true)
+    setOptimisticStartedAt(Date.now())
     const optimistic: Message = {
       id: `local-${Date.now()}`,
       role: 'user',
@@ -248,11 +304,74 @@ export default function ChatPage() {
         setActiveRunId(result.assistant.conversationRunId)
       }
       await refresh()
+      await refreshHistory()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '发送失败')
     } finally {
       setSending(false)
+      setOptimisticStartedAt(null)
     }
+  }
+
+  async function createNewConversation() {
+    try {
+      const item = await api.createConversation('新对话')
+      await refreshHistory()
+      navigate(`/chat/${item.id}`)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '新建对话失败')
+    }
+  }
+
+  async function loadMoreHistory() {
+    if (!historyCursor) return
+    try {
+      const page = await api.listConversations(historyCursor)
+      setHistory((current) => [...current, ...page.items])
+      setHistoryCursor(page.nextCursor)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '加载历史失败')
+    }
+  }
+
+  async function toggleWorkflowMode() {
+    if (!conversationId) return
+    setSwitchingMode(true)
+    setError('')
+    const next = workflowMode === 'enabled' ? 'disabled' : 'enabled'
+    try {
+      const result = await api.updateConversationWorkflowMode(conversationId, next)
+      setWorkflowMode(result.workflowMode)
+      if (result.cancelledPendingSelections > 0) {
+        setError('未执行的候选已关闭；切换只影响下一条消息，活动运行保持不变。')
+      }
+      await refreshHistory()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '切换工作流模式失败')
+    } finally {
+      setSwitchingMode(false)
+    }
+  }
+
+  function turnFor(message: Message) {
+    return turns.find((turn) => turn.id === message.turnId)
+  }
+
+  function elapsedLabel(turn?: ConversationTurn) {
+    if (!turn) return null
+    const elapsed =
+      turn.elapsedMs ??
+      Math.max(0, clock - new Date(turn.acceptedAt).getTime())
+    return `${(elapsed / 1000).toFixed(1)}s`
+  }
+
+  function tokenLabel(turn?: ConversationTurn) {
+    if (!turn) return null
+    if (turn.usage.state === 'unavailable') return 'Token 不可用'
+    if (turn.usage.state === 'partial') {
+      return `已统计 ${turn.usage.totalTokens ?? 0} Token，另有部分不可用`
+    }
+    return `${turn.usage.totalTokens ?? 0} Token`
   }
 
   async function startComponent(message: Message) {
@@ -337,7 +456,7 @@ export default function ChatPage() {
         </div>
         {content.inputSchema && (
           <Form
-            schema={content.inputSchema}
+            schema={rjsfSchema(content.inputSchema)}
             uiSchema={content.uiSchema ?? {}}
             validator={validator}
             formData={candidateInputs[message.id] ?? {}}
@@ -554,11 +673,49 @@ export default function ChatPage() {
       return <span className={`status-badge ${run.status}`}>{run.status}</span>
     }
     if (run.status === 'succeeded') {
-      const reply =
-        run.output && typeof run.output.reply === 'string' ? run.output.reply : undefined
       return (
-        <div className="result-panel" role="status" aria-label="Workflow 运行结果">
-          {reply ?? JSON.stringify(run.output)}
+        <div className="dual-result" role="status" aria-label="Workflow 运行结果">
+          <div className="result-layer">
+            <div className="result-layer-heading">
+              <strong>结构化结果</strong>
+              <button
+                className="button ghost"
+                type="button"
+                onClick={() =>
+                  navigator.clipboard.writeText(JSON.stringify(run.output, null, 2))
+                }
+              >
+                复制 JSON
+              </button>
+            </div>
+            {typeof run.output?.reply === 'string' && (
+              <p className="structured-summary">{run.output.reply}</p>
+            )}
+            <pre className="json-block">{JSON.stringify(run.output, null, 2)}</pre>
+          </div>
+          {run.presentation?.status === 'completed' && (
+            <div className="result-layer">
+              <div className="result-layer-heading">
+                <strong>阅读结果</strong>
+                <button
+                  className="button ghost"
+                  type="button"
+                  onClick={() =>
+                    navigator.clipboard.writeText(run.presentation?.text ?? '')
+                  }
+                >
+                  复制文本
+                </button>
+              </div>
+              <p className="presentation-text">{run.presentation.text}</p>
+            </div>
+          )}
+          {run.presentation?.status === 'running' && (
+            <span className="hint">正在整理阅读结果...</span>
+          )}
+          {run.presentation?.status === 'failed' && (
+            <span className="error-code">文本整理失败，结构化结果不受影响</span>
+          )}
         </div>
       )
     }
@@ -613,12 +770,69 @@ export default function ChatPage() {
           <span className="eyebrow">GENERAL AGENT WORKSPACE</span>
           <h1>通用对话</h1>
         </div>
-        <div className="context-pill">
-          <Link2Off size={14} />
-          未绑定组件
+        <div className="chat-header-actions">
+          <button
+            className="mobile-history-toggle"
+            type="button"
+            aria-label="打开历史对话"
+            aria-expanded={historyOpen}
+            onClick={() => setHistoryOpen((current) => !current)}
+          >
+            <History size={14} />
+          </button>
+          <button
+            className={`workflow-mode-toggle ${workflowMode}`}
+            type="button"
+            aria-pressed={workflowMode === 'enabled'}
+            disabled={switchingMode}
+            onClick={toggleWorkflowMode}
+          >
+            <Workflow size={14} />
+            工作流：{workflowMode === 'enabled' ? '开启' : '关闭'}
+          </button>
+          <div className="context-pill">
+            <Link2Off size={14} />
+            未绑定组件
+          </div>
         </div>
       </header>
       <div className="chat-layout">
+        <aside
+          className={`conversation-history ${historyOpen ? 'open' : ''}`}
+          aria-label="历史对话"
+        >
+          <div className="history-heading">
+            <span><History size={14} /> 历史对话</span>
+            <button type="button" aria-label="新建对话" onClick={createNewConversation}>
+              <Plus size={15} />
+            </button>
+          </div>
+          <nav>
+            {history.map((item) => (
+              <Link
+                className={`history-item ${item.id === conversationId ? 'active' : ''}`}
+                aria-current={item.id === conversationId ? 'page' : undefined}
+                key={item.id}
+                to={`/chat/${item.id}`}
+                onClick={() => setHistoryOpen(false)}
+              >
+                <strong>{item.title}</strong>
+                <span>{item.preview || '暂无消息'}</span>
+                <small>
+                  {item.lastMessageAt
+                    ? new Date(item.lastMessageAt).toLocaleString()
+                    : '新对话'}
+                </small>
+              </Link>
+            ))}
+            {history.length === 0 && <span className="hint">暂无历史对话</span>}
+          </nav>
+          {historyCursor && (
+            <button className="button ghost" type="button" onClick={loadMoreHistory}>
+              加载更多
+            </button>
+          )}
+        </aside>
         <section className="message-stream">
           {messages.length === 0 && (
             <div className="chat-empty">
@@ -647,6 +861,17 @@ export default function ChatPage() {
               <div>
                 <small>{message.role === 'assistant' ? 'SkillX Agent' : '用户'}</small>
                 <p>{message.content.text}</p>
+                {message.role === 'assistant' && turnFor(message) && (
+                  <div className="turn-metrics">
+                    <span className="metric-chip">
+                      {turnFor(message)?.workflowModeSnapshot === 'enabled'
+                        ? '工作流开启'
+                        : '工作流关闭'}
+                    </span>
+                    <span className="metric-chip">{elapsedLabel(turnFor(message))}</span>
+                    <span className="metric-chip">{tokenLabel(turnFor(message))}</span>
+                  </div>
+                )}
                 {message.content.code && (
                   <span className="error-code">{message.content.code}</span>
                 )}
@@ -676,6 +901,18 @@ export default function ChatPage() {
                     )}
                   </div>
                 )}
+                {(message.content.bindingSources?.length ?? 0) > 0 && (
+                  <div className="binding-evidence" aria-label="参数绑定来源">
+                    {message.content.bindingSources?.map((source) => (
+                      <span className="metric-chip" key={`${source.field}-${source.quote}`}>
+                        {source.field} ← “{source.quote}”
+                        {' · '}
+                        {(source.confidence * 100).toFixed(0)}%
+                        {source.uncertain ? ' · 待确认' : ' · 已校验'}
+                      </span>
+                    ))}
+                  </div>
+                )}
                 {(message.content.toolTimeline?.length ?? 0) > 0 && (
                   <ol className="trace-timeline" aria-label="Workflow Broker 时间线">
                     {message.content.toolTimeline?.map((item, index) => (
@@ -703,7 +940,8 @@ export default function ChatPage() {
                 {message.content.type === 'component_candidate' && renderCandidate(message)}
                 {message.content.type === 'workflow_candidates' &&
                   renderWorkflowCandidates(message)}
-                {message.content.offerAgentRun && (
+                {message.content.offerAgentRun &&
+                  message.content.code !== 'WORKFLOW_SELECTION_UNAVAILABLE' && (
                   <button
                     className="button ghost"
                     type="button"
@@ -711,6 +949,11 @@ export default function ChatPage() {
                     onClick={() => startAgent(sourcePromptFor(message))}
                   >
                     {startingAgent ? '正在启动 Agent...' : '启动通用 Agent 探索'}
+                  </button>
+                )}
+                {message.content.code === 'WORKFLOW_SELECTION_UNAVAILABLE' && (
+                  <button className="button ghost" type="button" onClick={toggleWorkflowMode}>
+                    关闭工作流，下一条交给通用 Agent
                   </button>
                 )}
                 {message.content.runId && (
@@ -749,6 +992,13 @@ export default function ChatPage() {
         </aside>
       </div>
       <form className="chat-composer" onSubmit={send}>
+        <span className="composer-mode-note">
+          {workflowMode === 'enabled'
+            ? 'Agent 可按需发现并自动执行工作流'
+            : '下一条消息不会披露或调用任何 workflow.* 工具'}
+          {optimisticStartedAt !== null &&
+            ` · ${((clock - optimisticStartedAt) / 1000).toFixed(1)}s`}
+        </span>
         <textarea
           aria-label="对话输入"
           placeholder="描述一个需要探索或固化的任务..."
