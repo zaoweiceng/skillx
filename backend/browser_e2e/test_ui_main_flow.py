@@ -90,11 +90,14 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
                 raise
             page = browser.new_page()
             console_errors: list[str] = []
+            console_warnings: list[str] = []
             page.on(
                 "console",
                 lambda message: (
                     console_errors.append(message.text)
                     if message.type == "error"
+                    else console_warnings.append(message.text)
+                    if message.type == "warning"
                     else None
                 ),
             )
@@ -115,6 +118,9 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             page.get_by_role("button", name="固化为组件").click()
             page.get_by_role("link", name="打开固化草稿").click()
             expect(page.get_by_role("heading", name="网页内容读取与总结")).to_be_visible()
+            page.get_by_role(
+                "checkbox", name="面向最终用户生成阅读结果"
+            ).check()
             page.get_by_role("button", name="静态检查").click()
             with page.expect_response(
                 lambda response: response.url.endswith("/publish")
@@ -127,12 +133,29 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             page.goto(f"{frontend_url}/chat")
             page.wait_for_url("**/chat/*")
             _submit(page, f"请访问并总结 {stack.form_url}/article?version=second")
-            expect(page.get_by_text("016 UI 第二次复用正文")).to_be_visible(
+            structured_result = page.get_by_label("结构化结果")
+            expect(
+                structured_result.locator(".structured-summary").get_by_text(
+                    "016 UI 第二次复用正文", exact=True
+                )
+            ).to_be_visible(
                 timeout=60_000
             )
+            reading_result = page.get_by_label("阅读结果")
+            expect(reading_result).to_contain_text(
+                "016 UI 第二次复用正文", timeout=60_000
+            )
+            terminal_metrics = page.locator(".turn-metrics").last.text_content()
+            page.wait_for_timeout(2_000)
+            assert page.locator(".turn-metrics").last.text_content() == terminal_metrics
+            page.reload()
+            expect(page.get_by_label("阅读结果")).to_contain_text(
+                "016 UI 第二次复用正文", timeout=30_000
+            )
+            assert page.locator(".turn-metrics").last.text_content() == terminal_metrics
             page.get_by_role("link", name="查看运行").click()
             expect(page.get_by_role("heading", name="运行详情")).to_be_visible()
-            expect(page.get_by_role("heading", name="最终输出")).to_be_visible()
+            expect(page.get_by_role("heading", name="结构化结果")).to_be_visible()
             expect(page.get_by_text("browser-read-summary.json")).to_be_visible()
 
             stack.set_transient_healthy(False)
@@ -149,7 +172,27 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             page.goto(f"{frontend_url}/components")
             expect(page.get_by_role("heading", name="已发布组件")).to_be_visible()
             expect(page.get_by_text("网页内容读取与总结").first).to_be_visible()
+            agent_filter = page.get_by_role("button", name="Agent 工作流")
+            agent_filter.focus()
+            agent_filter.press("Enter")
+            expect(agent_filter).to_have_attribute("aria-pressed", "true")
+            expect(page.get_by_text("网页内容读取与总结").first).to_be_visible()
+
+            theme_toggle = page.get_by_role("button", name="切换到暗色主题")
+            theme_toggle.click()
+            expect(page.get_by_role("button", name="切换到亮色主题")).to_be_visible()
+            page.reload()
+            expect(page.get_by_role("button", name="切换到亮色主题")).to_be_visible()
+
+            page.goto(f"{frontend_url}/settings")
+            expect(
+                page.get_by_text("当前仅可验证协议", exact=False)
+            ).to_be_visible()
+            expect(
+                page.get_by_text("协议 fixture 可用", exact=False)
+            ).to_be_visible()
             assert not console_errors, console_errors
+            assert not console_warnings, console_warnings
             browser.close()
     except pytest.skip.Exception:
         raise

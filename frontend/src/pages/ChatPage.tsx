@@ -152,7 +152,14 @@ export default function ChatPage() {
     setWorkflowRuns(Object.fromEntries(loadedRuns.map((run) => [run.id, run])))
     setActiveWorkflowRunIds(
       loadedRuns
-        .filter((run) => run.status === 'queued' || run.status === 'running')
+        .filter(
+          (run) =>
+            run.status === 'queued' ||
+            run.status === 'running' ||
+            (run.presentationExpected &&
+              run.presentation?.status !== 'completed' &&
+              run.presentation?.status !== 'failed'),
+        )
         .map((run) => run.id)
         .join(','),
     )
@@ -196,6 +203,7 @@ export default function ChatPage() {
   useEffect(() => {
     if (!activeRunId) return
     let cancelled = false
+    let timer = 0
     async function poll() {
       try {
         const [summary, events] = await Promise.all([
@@ -208,11 +216,9 @@ export default function ChatPage() {
         setTraceEvents(events)
         // queued/running 均为非终态：长任务由独立 Worker 执行，持续轮询直到终态。
         if (summary.status === 'queued' || summary.status === 'running') {
-          window.setTimeout(poll, 800)
-        } else if (
-          summary.status === 'failed' &&
-          typeof summary.error?.taskCheckpointId === 'string'
-        ) {
+          timer = window.setTimeout(poll, 800)
+        } else {
+          // 终态提交与 Usage 账本在服务端事务完成后，强制刷新一次 Turn。
           await refresh()
         }
       } catch (reason) {
@@ -222,6 +228,7 @@ export default function ChatPage() {
     poll()
     return () => {
       cancelled = true
+      window.clearTimeout(timer)
     }
   }, [activeRunId, refresh])
 
@@ -259,6 +266,8 @@ export default function ChatPage() {
   useEffect(() => {
     if (!activeWorkflowRunIds) return
     let cancelled = false
+    let timer = 0
+    let attempts = 0
     const runIds = activeWorkflowRunIds.split(',').filter(Boolean)
     async function poll() {
       try {
@@ -269,9 +278,21 @@ export default function ChatPage() {
           ...Object.fromEntries(runs.map((run) => [run.id, run])),
         }))
         const pending = runs.filter(
-          (run) => run.status === 'queued' || run.status === 'running',
+          (run) =>
+            run.status === 'queued' ||
+            run.status === 'running' ||
+            (run.presentationExpected &&
+              run.presentation?.status !== 'completed' &&
+              run.presentation?.status !== 'failed'),
         )
-        if (pending.length > 0) window.setTimeout(poll, 800)
+        await refresh()
+        if (cancelled) return
+        attempts += 1
+        if (pending.length > 0 && attempts < 375) {
+          timer = window.setTimeout(poll, 800)
+        } else if (attempts >= 375) {
+          setError('运行结果刷新超时；服务端仍会继续，可刷新页面恢复跟踪。')
+        }
       } catch (reason) {
         if (!cancelled) setError(reason instanceof Error ? reason.message : '加载运行结果失败')
       }
@@ -279,8 +300,9 @@ export default function ChatPage() {
     poll()
     return () => {
       cancelled = true
+      window.clearTimeout(timer)
     }
-  }, [activeWorkflowRunIds])
+  }, [activeWorkflowRunIds, refresh])
 
   async function send(event: FormEvent) {
     event.preventDefault()
@@ -367,6 +389,7 @@ export default function ChatPage() {
 
   function tokenLabel(turn?: ConversationTurn) {
     if (!turn) return null
+    if (turn.usage.state === 'pending') return 'Token 统计中'
     if (turn.usage.state === 'unavailable') return 'Token 不可用'
     if (turn.usage.state === 'partial') {
       return `已统计 ${turn.usage.totalTokens ?? 0} Token，另有部分不可用`
@@ -675,7 +698,7 @@ export default function ChatPage() {
     if (run.status === 'succeeded') {
       return (
         <div className="dual-result" role="status" aria-label="Workflow 运行结果">
-          <div className="result-layer">
+          <div className="result-layer" aria-label="结构化结果">
             <div className="result-layer-heading">
               <strong>结构化结果</strong>
               <button
@@ -694,7 +717,7 @@ export default function ChatPage() {
             <pre className="json-block">{JSON.stringify(run.output, null, 2)}</pre>
           </div>
           {run.presentation?.status === 'completed' && (
-            <div className="result-layer">
+            <div className="result-layer" aria-label="阅读结果">
               <div className="result-layer-heading">
                 <strong>阅读结果</strong>
                 <button
@@ -908,7 +931,9 @@ export default function ChatPage() {
                         {source.field} ← “{source.quote}”
                         {' · '}
                         {(source.confidence * 100).toFixed(0)}%
-                        {source.uncertain ? ' · 待确认' : ' · 已校验'}
+                        {source.serverVerified
+                          ? ` · 服务端已校验${source.normalizationType ? ` (${source.normalizationType})` : ''}`
+                          : ' · 待确认'}
                       </span>
                     ))}
                   </div>

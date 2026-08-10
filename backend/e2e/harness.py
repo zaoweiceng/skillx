@@ -126,6 +126,7 @@ def start_stack(
         "SKILLX_ARTIFACT_ROOT": str(artifact_root),
         "SKILLX_AUTO_CREATE_SCHEMA": "false",
         # 配置仓库内 TraeX-compatible fixture，使真实 Agent 主路径可达。
+        "SKILLX_AGENT_PROVIDER_TYPE": "fixture",
         "SKILLX_TRAEX_COMMAND": f'["{sys.executable}", "{TRAEX_STUB}"]',
         "SKILLX_TRAEX_ALLOWED_EXECUTABLES": f'["{Path(sys.executable).name}"]',
         # Host policy 授予的 Agent Tool 集合：请求方能力只能取交集缩小，不能扩大。

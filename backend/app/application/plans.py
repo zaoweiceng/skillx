@@ -6,7 +6,7 @@ from datetime import timedelta
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.compiler import WorkflowCompiler, digest_json
@@ -56,9 +56,13 @@ class BindingSource(BaseModel):
     field: str
     source: Literal["user_message", "history_message", "tool_result"]
     message_id: str | None = Field(default=None, alias="messageId")
+    call_id: str | None = Field(default=None, alias="callId")
+    path: str | None = None
     quote: str
     confidence: float = Field(ge=0, le=1)
     uncertain: bool = False
+    server_verified: bool = Field(default=False, alias="serverVerified")
+    normalization_type: str | None = Field(default=None, alias="normalizationType")
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
@@ -113,6 +117,20 @@ class WorkflowSelection(BaseModel):
         elif self.action == "compose":
             if self.plan is None:
                 raise ValueError("compose 需要 ExecutionPlan")
+        return self
+
+    @model_validator(mode="after")
+    def validate_binding_source_coverage(
+        self, info: ValidationInfo
+    ) -> WorkflowSelection:
+        if info.context and info.context.get("manual_execution"):
+            return self
+        source_fields = [item.field for item in self.binding_sources]
+        if (
+            set(source_fields) != set(self.bindings)
+            or len(source_fields) != len(set(source_fields))
+        ):
+            raise ValueError("每个 binding 必须有且仅有一个同字段 bindingSource")
         return self
 
 

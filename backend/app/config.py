@@ -1,5 +1,6 @@
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -24,6 +25,7 @@ class Settings(BaseSettings):
     model_endpoint: str | None = None
     model_name: str | None = None
     model_api_key_env: str = "SKILLX_MODEL_API_KEY"
+    agent_provider_type: Literal["real", "fixture", "unavailable"] = "unavailable"
     traex_command: list[str] | None = None
     traex_allowed_executables: list[str] = ["traex"]
     # Agent Host policy：Host 授予的 Tool 集合是安全边界，请求只能取交集缩小范围，

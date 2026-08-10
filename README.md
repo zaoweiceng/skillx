@@ -87,7 +87,10 @@ SkillX 注册只接受 `SKILLX_CAPABILITY_ROOT` 下的相对路径。Secret API 
 真实模型通过
 `SKILLX_MODEL_ENDPOINT`、`SKILLX_MODEL_NAME` 和
 `SKILLX_MODEL_API_KEY_ENV` 指向的环境变量配置；TraeX 命令通过
-`SKILLX_TRAEX_COMMAND` 配置。Secret 值不得写入 `.env` 以外的工作流定义、
+`SKILLX_TRAEX_COMMAND` 配置。`SKILLX_AGENT_PROVIDER_TYPE` 必须显式选择
+`real`、`fixture` 或 `unavailable`；真实 OpenAI-compatible Agent 可将命令指向
+`examples/openai_agent_sidecar.py`，fixture 只用于协议和故障测试。Secret 值不得写入
+`.env` 以外的工作流定义、
 事件或 Artifact。
 
 ## 验证

@@ -211,6 +211,7 @@ def main() -> int:
     parser.add_argument("--max-steps", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=30000)
     parser.add_argument("--allowed-tools", default="[]")
+    parser.add_argument("--output-schema", default="{}")
     args = parser.parse_args()
 
     mode = _directive(args.prompt, "MODE", "ok")
@@ -220,6 +221,10 @@ def main() -> int:
     if "Progressive WorkflowSelection" in args.prompt:
         user_match = re.search(r"user=(.*)", args.prompt)
         user_text = user_match.group(1).strip() if user_match else _clean_message(args.prompt)
+        message_id_match = re.search(r"userMessageId=([^\s]+)", args.prompt)
+        user_message_id = (
+            message_id_match.group(1) if message_id_match else "unknown"
+        )
         requested_action = _directive(args.prompt, "SELECTION", "auto")
         emit({"type": "agent.plan", "payload": {"summary": "渐进发现 Workflow"}})
         emit(
@@ -280,6 +285,8 @@ def main() -> int:
             if url_match
             else lookup_match.group(0)
             if lookup_match
+            else _clean_message(user_text)
+            if requested_action in {"run_full", "run_fragment", "compose"}
             else None
         )
         bindings = (
@@ -419,6 +426,20 @@ def main() -> int:
                 },
                 "missingInputs": [],
             }
+        if output.get("bindings"):
+            output["bindingSources"] = [
+                {
+                    "field": field,
+                    "source": "user_message",
+                    "messageId": user_message_id,
+                    "quote": str(value),
+                    "confidence": 1,
+                    "uncertain": False,
+                }
+                for field, value in output["bindings"].items()
+            ]
+            if _directive(args.prompt, "SOURCE", "valid") == "forged":
+                output["bindingSources"][0]["quote"] = "不存在的引文"
         emit(
             {
                 "type": "agent.step.completed",

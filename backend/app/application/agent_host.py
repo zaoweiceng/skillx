@@ -122,6 +122,7 @@ class AgentHostResult:
     audit_events: list[dict[str, Any]] = field(default_factory=list)
     step_count: int = 0
     total_tokens: int = 0
+    usage_complete: bool = True
     plan_snapshot: dict[str, Any] | None = None
     accepted_plan_digest: str | None = None
     accepted_plan_revision: int | None = None
@@ -199,7 +200,10 @@ class AgentHost:
         if self._adapter is not None:
             return self._adapter
         settings = get_settings()
-        if not settings.traex_command:
+        if (
+            settings.agent_provider_type == "unavailable"
+            or not settings.traex_command
+        ):
             raise AgentHostError("MODEL_NOT_CONFIGURED", "TraeX Runtime 尚未配置")
         return TraeXSubprocessAdapter(
             settings.traex_command,
@@ -235,6 +239,7 @@ class AgentHost:
         run_request = AgentRunRequest(
             prompt=request.prompt,
             working_directory=request.working_directory,
+            output_schema=request.output_schema,
             allowed_tools=effective,
             max_steps=request.max_steps,
             max_tokens=request.max_total_tokens,
@@ -691,6 +696,7 @@ class AgentHost:
                             )
                     elif event_type == "agent.completed":
                         output = payload.get("output")
+                        result.usage_complete = payload.get("usageComplete", True)
                         if broker_results:
                             try:
                                 self._validate_output_provenance(

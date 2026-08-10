@@ -6,6 +6,7 @@ import { api, type ComponentSummary } from '@/api/client'
 
 export default function ComponentsPage() {
   const [components, setComponents] = useState<ComponentSummary[]>([])
+  const [filter, setFilter] = useState<'all' | 'zero_llm' | 'hybrid' | 'agent'>('all')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
 
@@ -16,6 +17,16 @@ export default function ComponentsPage() {
       .catch((reason: Error) => setError(reason.message))
       .finally(() => setLoading(false))
   }, [])
+  const filtered =
+    filter === 'all'
+      ? components
+      : components.filter((component) => component.executionClass === filter)
+  const filters = [
+    ['all', '全部'],
+    ['zero_llm', '零 LLM'],
+    ['hybrid', '局部 LLM'],
+    ['agent', 'Agent 工作流'],
+  ] as const
 
   return (
     <div className="page">
@@ -33,10 +44,17 @@ export default function ComponentsPage() {
       </header>
 
       <div className="filter-strip">
-        <button className="filter-chip active">全部</button>
-        <button className="filter-chip">零 LLM</button>
-        <button className="filter-chip">局部 LLM</button>
-        <button className="filter-chip">Agent 工作流</button>
+        {filters.map(([value, label]) => (
+          <button
+            className={`filter-chip ${filter === value ? 'active' : ''}`}
+            type="button"
+            aria-pressed={filter === value}
+            onClick={() => setFilter(value)}
+            key={value}
+          >
+            {label}
+          </button>
+        ))}
       </div>
 
       {loading && <div className="skeleton-grid" aria-label="加载组件" />}
@@ -51,8 +69,15 @@ export default function ComponentsPage() {
           </Link>
         </section>
       )}
+      {!loading && !error && components.length > 0 && filtered.length === 0 && (
+        <section className="empty-state">
+          <Boxes size={30} />
+          <h2>当前分类暂无组件</h2>
+          <p>切换其他执行分类查看已发布组件。</p>
+        </section>
+      )}
       <section className="component-grid">
-        {components.map((component, index) => (
+        {filtered.map((component, index) => (
           <Link
             className="component-card"
             to={`/components/${component.id}`}

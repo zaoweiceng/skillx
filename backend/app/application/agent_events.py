@@ -86,6 +86,7 @@ class StepCompletedPayload(_PayloadBase):
 class CompletedPayload(_PayloadBase):
     steps: StrictInt | None = None
     totalTokens: StrictInt | None = None
+    usageComplete: bool = True
     output: dict[str, Any] | None = None
     provenance: list[dict[str, Any]] = Field(default_factory=list)
     outputProvenance: dict[str, dict[str, Any]] = Field(default_factory=dict)

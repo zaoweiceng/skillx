@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -7,6 +8,7 @@ from app.application.compiler import WorkflowCompiler
 from app.application.product_history import (
     PresentationDriver,
     record_model_usage,
+    turn_view,
     usage_summary,
 )
 from app.infrastructure.database import (
@@ -102,6 +104,28 @@ async def test_usage_ledger_deduplicates_call_attempt_and_reports_partial() -> N
     async with SessionLocal() as session:
         rows = (await session.scalars(select(ModelUsage))).all()
     assert len(rows) == 2
+
+
+async def test_turn_time_is_rfc3339_utc_after_sqlite_round_trip() -> None:
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="timezone")
+        turn = ConversationTurn(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            workflow_mode_snapshot="enabled",
+            status="processing",
+            accepted_at=datetime(2026, 8, 10, 6, 0, tzinfo=UTC),
+        )
+        session.add_all([conversation, turn])
+
+    async with SessionLocal() as session:
+        persisted = await session.get(ConversationTurn, turn.id)
+        assert persisted is not None
+        view = await turn_view(session, persisted)
+
+    assert view["acceptedAt"] == "2026-08-10T06:00:00Z"
+    assert view["usage"]["state"] == "pending"
+    assert view["usage"]["totalTokens"] is None
 
 
 async def test_template_presentation_is_persisted_without_changing_run_output() -> None:

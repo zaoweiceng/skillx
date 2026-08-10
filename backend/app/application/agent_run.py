@@ -545,6 +545,7 @@ class AgentRunWorker:
             result.total_tokens,
             claim_generation,
             claim_token,
+            usage_complete=result.usage_complete,
             accepted_plan_digest=result.accepted_plan_digest,
             accepted_plan_revision=result.accepted_plan_revision,
             plan_step_states=result.plan_step_states,
@@ -987,6 +988,7 @@ class AgentRunWorker:
         claim_generation: int,
         claim_token: str | None,
         *,
+        usage_complete: bool = True,
         accepted_plan_digest: str | None = None,
         accepted_plan_revision: int | None = None,
         plan_step_states: dict[str, str] | None = None,
@@ -1061,8 +1063,8 @@ class AgentRunWorker:
                     turn_id=run_record.turn_id if run_record else None,
                     conversation_run_id=run_id,
                     provider="traex",
-                    total_tokens=total_tokens,
-                    usage_complete=True,
+                    total_tokens=total_tokens if usage_complete else None,
+                    usage_complete=usage_complete,
                 )
                 session.add(
                     Artifact(

@@ -410,7 +410,7 @@ describe('ChatPage 候选组件闭环', () => {
     renderAt('conv-1')
 
     await waitFor(() => expect(screen.getByText('恢复后的正文')).toBeInTheDocument())
-    expect(getConversation).toHaveBeenCalledTimes(2)
+    expect(getConversation.mock.calls.length).toBeGreaterThanOrEqual(2)
     expect(screen.queryByText('上游暂不可用')).not.toBeInTheDocument()
     expect(screen.getAllByText('恢复后的正文')).toHaveLength(1)
     expect(screen.getAllByRole('link', { name: 'checkpoint checkpoi' })[0]).toHaveAttribute(

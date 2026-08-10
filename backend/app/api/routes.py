@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -11,7 +12,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from jsonschema import Draft202012Validator, FormatChecker
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +23,7 @@ from app.application.agent_host import (
     AgentHostRequest,
     resolve_local_demo_capabilities,
 )
+from app.application.agent_provider import provider_readiness
 from app.application.agent_run import (
     AgentRunConfig,
     build_agent_run_message,
@@ -66,6 +68,7 @@ from app.application.plans import (
 )
 from app.application.product_history import (
     normalize_presentation_policy,
+    presentation_policy,
     presentation_view,
     record_model_usage,
     turn_view,
@@ -136,6 +139,7 @@ from app.infrastructure.database import (
     WorkflowFragmentManifest,
     WorkflowVersion,
     get_session,
+    rfc3339,
     utcnow,
 )
 from app.infrastructure.migrations import alembic_head_revision
@@ -509,12 +513,37 @@ async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str
             503,
             detail={"code": "NOT_READY", "message": str(exc)},
         ) from exc
+    provider = await provider_readiness()
     return {
         "status": "ready",
         "migration": revision,
         "workflowSelectionMode": (
-            "agent" if get_settings().traex_command else "unavailable"
+            provider["type"]
+            if provider["type"] in {"real", "fixture"}
+            else "unavailable"
         ),
+        "selectionProvider": provider,
+        "runtimes": {
+            "database": {"status": "available", "detail": "SQLite 与迁移可用"},
+            "worker": {
+                "status": "unknown",
+                "detail": "API 进程不伪造独立 Worker 在线状态",
+            },
+            "browser": {
+                "status": (
+                    "configured"
+                    if get_settings().browser_allowed_hosts
+                    else "unconfigured"
+                ),
+                "detail": "Host allowlist 已配置"
+                if get_settings().browser_allowed_hosts
+                else "未配置 Browser Host allowlist",
+            },
+            "secretProvider": {
+                "status": "reference_only",
+                "detail": "仅解析环境变量引用，不存储明文",
+            },
+        },
     }
 
 
@@ -2203,13 +2232,23 @@ async def validate_workflow_selection(
 
 @router.post("/workflow-tools/execute-selection", status_code=202)
 async def execute_workflow_selection(
-    body: WorkflowSelection,
+    body: dict[str, Any],
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    """Execute each Selection branch without silently coercing it to run_full."""
+    """Execute an explicitly submitted selection.
+
+    This is the manual API boundary, not an Agent output path. Agent-originated
+    selections are source-verified in ``_unbound_conversation_message`` before
+    they reach the execution service.
+    """
 
     try:
-        result = await _execute_selection_service(session, body)
+        selection = WorkflowSelection.model_validate(
+            body, context={"manual_execution": True}
+        )
+        result = await _execute_selection_service(
+            session, selection, source_verified=True
+        )
         await session.commit()
         return result
     except (CatalogError, PlanCompileError, WorkflowValidationError, ValueError) as exc:
@@ -2218,7 +2257,7 @@ async def execute_workflow_selection(
             422,
             detail={
                 "code": "SELECTION_EXECUTION_REJECTED",
-                "action": body.action,
+                "action": body.get("action"),
                 "diagnostics": [{"message": str(exc)}],
             },
         ) from exc
@@ -2229,8 +2268,9 @@ async def _execute_selection_service(
     body: WorkflowSelection,
     *,
     turn_id: str | None = None,
+    source_verified: bool = False,
 ) -> dict[str, Any]:
-    if body.action in {"run_full", "run_fragment", "compose"}:
+    if body.action in {"run_full", "run_fragment", "compose"} and not source_verified:
         prepared, _ = await _prepare_selection(session, body)
         if prepared.action == "ask_user":
             raise PlanCompileError(
@@ -2980,6 +3020,7 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
     result["presentation"] = (
         presentation_view(presentations[-1]) if presentations else None
     )
+    result["presentationExpected"] = presentation_policy(version)["enabled"]
     usage_rows = (
         await session.scalars(
             select(ModelUsage)
@@ -3607,7 +3648,7 @@ async def create_conversation(
 def _conversation_cursor(last_message_at: datetime | None, conversation_id: str) -> str:
     payload = json.dumps(
         {
-            "at": last_message_at.isoformat() if last_message_at else None,
+            "at": rfc3339(last_message_at),
             "id": conversation_id,
         },
         separators=(",", ":"),
@@ -3697,7 +3738,7 @@ async def list_conversations(
                 "title": item.title,
                 "preview": str(content.get("text", ""))[:120],
                 "lastMessageAt": (
-                    item.last_message_at.isoformat() if item.last_message_at else None
+                    rfc3339(item.last_message_at)
                 ),
                 "status": "active" if active_turn else "idle",
                 "workflowMode": item.workflow_mode,
@@ -3769,7 +3810,7 @@ async def get_conversation(
         "boundComponentId": item.bound_component_id,
         "workflowMode": item.workflow_mode,
         "lastMessageAt": (
-            item.last_message_at.isoformat() if item.last_message_at else None
+            rfc3339(item.last_message_at)
         ),
         "messages": [
             {
@@ -3777,7 +3818,7 @@ async def get_conversation(
                 "role": message.role,
                 "content": message.content_json,
                 "turnId": message.turn_id,
-                "createdAt": message.created_at.isoformat(),
+                "createdAt": rfc3339(message.created_at),
             }
             for message in messages
         ],
@@ -3903,7 +3944,10 @@ async def _unbound_conversation_message(
     turn_id: str,
     user_message_id: str,
 ) -> tuple[dict[str, Any], ConversationRun | None]:
-    if not get_settings().traex_command:
+    if (
+        get_settings().agent_provider_type == "unavailable"
+        or not get_settings().traex_command
+    ):
         return (
             {
                 "type": "workflow_selection",
@@ -3939,16 +3983,48 @@ async def _unbound_conversation_message(
         bindings = {**(pending.bindings_json or {}), **supplied}
         stored = dict(pending.selection_json)
         resume_action = stored.pop("resumeAction", "run_full")
+        trusted_tool_evidence = stored.pop("_verifiedToolEvidence", {})
         selection = WorkflowSelection.model_validate(
             {
                 **stored,
                 "action": resume_action,
                 "bindings": bindings,
+                "bindingSources": [
+                    *[
+                        {
+                            **item,
+                            "source": (
+                                "history_message"
+                                if item.get("source") == "user_message"
+                                else item.get("source")
+                            ),
+                        }
+                        for item in stored.get("bindingSources", [])
+                    ],
+                    *[
+                        {
+                            "field": field,
+                            "source": "user_message",
+                            "messageId": user_message_id,
+                            "quote": str(value),
+                            "confidence": 1,
+                            "uncertain": False,
+                        }
+                        for field, value in supplied.items()
+                        if str(value) in body.content
+                    ],
+                ],
                 "missingInputs": [],
                 "question": None,
             }
         )
-        selection, _ = await _prepare_selection(session, selection)
+        selection, _ = await _prepare_selection(
+            session,
+            selection,
+            conversation_id=conversation.id,
+            current_message_id=user_message_id,
+            trusted_tool_evidence=trusted_tool_evidence,
+        )
         if selection.action == "ask_user":
             pending.bindings_json = bindings
             pending.missing_inputs_json = selection.missing_inputs
@@ -3964,7 +4040,9 @@ async def _unbound_conversation_message(
                 },
                 None,
             )
-        result = await _execute_selection_service(session, selection, turn_id=turn_id)
+        result = await _execute_selection_service(
+            session, selection, turn_id=turn_id, source_verified=True
+        )
         pending.status = "resumed"
         pending.bindings_json = bindings
         return _selection_result_message(selection, result, resumed=True), None
@@ -3974,14 +4052,20 @@ async def _unbound_conversation_message(
         conversation_id=conversation.id,
         agent_run_id=f"selection:{uuid4()}",
     )
-    selection, tool_timeline = await _select_workflow_candidate(
+    selection, tool_timeline, tool_evidence = await _select_workflow_candidate(
         session,
         body.content,
         disclosure.id,
         turn_id=turn_id,
         user_message_id=user_message_id,
     )
-    selection, resume_action = await _prepare_selection(session, selection)
+    selection, resume_action = await _prepare_selection(
+        session,
+        selection,
+        conversation_id=conversation.id,
+        current_message_id=user_message_id,
+        tool_evidence=tool_evidence,
+    )
     if selection.action == "ask_user":
         pending = PendingSelection(
             id=str(uuid4()),
@@ -3991,6 +4075,7 @@ async def _unbound_conversation_message(
             selection_json={
                 **selection.model_dump(by_alias=True),
                 "resumeAction": resume_action,
+                "_verifiedToolEvidence": tool_evidence,
             },
             bindings_json=selection.bindings,
             missing_inputs_json=selection.missing_inputs,
@@ -4077,7 +4162,9 @@ async def _unbound_conversation_message(
             },
             run,
         )
-    result = await _execute_selection_service(session, selection, turn_id=turn_id)
+    result = await _execute_selection_service(
+        session, selection, turn_id=turn_id, source_verified=True
+    )
     message = _selection_result_message(selection, result, resumed=False)
     message["toolTimeline"] = tool_timeline
     return message, None
@@ -4118,8 +4205,15 @@ async def _select_workflow_candidate(
     *,
     turn_id: str | None = None,
     user_message_id: str | None = None,
-) -> tuple[WorkflowSelection, list[dict[str, Any]]]:
-    if not get_settings().traex_command:
+) -> tuple[
+    WorkflowSelection,
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
+    if (
+        get_settings().agent_provider_type == "unavailable"
+        or not get_settings().traex_command
+    ):
         raise HTTPException(
             503,
             detail={
@@ -4163,9 +4257,38 @@ async def _select_workflow_candidate(
         for adapter in workflow_tool_adapters(session, session_id):
             registry.register(adapter)
         result = await AgentHost(tool_registry=registry).execute(request)
-        selection = WorkflowSelection.model_validate(
-            {**result.output, "sessionId": session_id}
-        )
+        try:
+            selection = WorkflowSelection.model_validate(
+                {**result.output, "sessionId": session_id}
+            )
+        except ValidationError:
+            raw_bindings = result.output.get("bindings")
+            if not isinstance(raw_bindings, dict) or not raw_bindings:
+                raise
+            raw_plan = result.output.get("plan")
+            raw_refs = result.output.get("refs")
+            selection = WorkflowSelection.model_validate(
+                {
+                    "action": "ask_user",
+                    "reason": "Agent 返回的参数来源结构无效",
+                    "refs": (
+                        raw_refs
+                        if isinstance(raw_plan, dict) and isinstance(raw_refs, list)
+                        else raw_refs[:1]
+                        if isinstance(raw_refs, list)
+                        else []
+                    ),
+                    "bindings": {},
+                    "bindingSources": [],
+                    "missingInputs": list(raw_bindings),
+                    "question": (
+                        "参数来源无法由服务端验证，请重新提供："
+                        + ", ".join(raw_bindings)
+                    ),
+                    "plan": raw_plan if isinstance(raw_plan, dict) else None,
+                    "sessionId": session_id,
+                }
+            )
         if turn_id:
             await record_model_usage(
                 session,
@@ -4173,8 +4296,10 @@ async def _select_workflow_candidate(
                 stage="workflow_selection",
                 turn_id=turn_id,
                 provider="traex",
-                total_tokens=result.total_tokens,
-                usage_complete=True,
+                total_tokens=(
+                    result.total_tokens if result.usage_complete else None
+                ),
+                usage_complete=result.usage_complete,
             )
     except (AgentHostError, ValueError) as exc:
         raise HTTPException(
@@ -4182,6 +4307,7 @@ async def _select_workflow_candidate(
             detail={"code": "WORKFLOW_SELECTION_FAILED", "message": str(exc)},
         ) from exc
     timeline = []
+    tool_evidence: dict[str, dict[str, Any]] = {}
     level_by_capability = {
         "workflow.search": "L0",
         "workflow.describe": "L1",
@@ -4197,6 +4323,14 @@ async def _select_workflow_candidate(
         if capability not in level_by_capability:
             continue
         output = payload.get("output")
+        call_id = payload.get("callId")
+        if (
+            event["type"] == "tool.result"
+            and isinstance(call_id, str)
+            and payload.get("status") == "succeeded"
+            and isinstance(output, dict)
+        ):
+            tool_evidence[call_id] = output
         bounded_result = _bounded_disclosure_result(capability, output)
         timeline.append(
             {
@@ -4220,7 +4354,7 @@ async def _select_workflow_candidate(
                 ),
             }
         )
-    return selection, timeline
+    return selection, timeline, tool_evidence
 
 
 def _bounded_disclosure_result(
@@ -4302,9 +4436,145 @@ def _selection_resume_action(selection: WorkflowSelection) -> str:
     return "run_full"
 
 
+def _binding_normalization(value: Any, quote: str) -> str | None:
+    if isinstance(value, str):
+        if value == quote:
+            return "exact"
+        if value.strip() == quote.strip():
+            return "whitespace"
+        if quote.endswith(("市", "省", "区", "县")) and value == quote[:-1]:
+            return "place_suffix_removed"
+        return None
+    if isinstance(value, bool):
+        return "boolean" if quote.strip().lower() == str(value).lower() else None
+    if isinstance(value, (int, float)):
+        match = re.fullmatch(r"\s*[-+]?(?:\d+(?:\.\d*)?|\.\d+)\s*", quote)
+        if match and float(quote) == float(value):
+            return "number"
+        return None
+    if isinstance(value, list):
+        if value and all(isinstance(item, (str, int, float)) for item in value):
+            return (
+                "list_extraction"
+                if all(str(item) in quote for item in value)
+                else None
+            )
+    canonical = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return "json" if canonical == quote.strip() else None
+
+
+def _tool_evidence_value(output: dict[str, Any], path: str) -> Any:
+    normalized = path.removeprefix("$.").removeprefix("output.")
+    value: Any = output
+    for part in normalized.split("."):
+        if not part:
+            continue
+        match = re.fullmatch(r"([^\[]+)(?:\[(\d+)])?", part)
+        if match is None or not isinstance(value, dict):
+            raise KeyError(path)
+        value = value[match.group(1)]
+        if match.group(2) is not None:
+            if not isinstance(value, list):
+                raise KeyError(path)
+            value = value[int(match.group(2))]
+    return value
+
+
+async def _verify_binding_sources(
+    session: AsyncSession,
+    selection: WorkflowSelection,
+    *,
+    conversation_id: str | None,
+    current_message_id: str | None,
+    tool_evidence: dict[str, dict[str, Any]],
+) -> tuple[WorkflowSelection, list[str]]:
+    sources_by_field: dict[str, list[Any]] = {}
+    for source in selection.binding_sources:
+        sources_by_field.setdefault(source.field, []).append(source)
+    invalid = [
+        field
+        for field in set(selection.bindings) | set(sources_by_field)
+        if field not in selection.bindings or len(sources_by_field.get(field, [])) != 1
+    ]
+    verified_sources = []
+    for field, value in selection.bindings.items():
+        matches = sources_by_field.get(field, [])
+        if len(matches) != 1:
+            continue
+        source = matches[0]
+        normalization: str | None = None
+        if source.uncertain or source.confidence < 0.7 or not source.quote:
+            invalid.append(field)
+            continue
+        if source.source in {"user_message", "history_message"}:
+            message = (
+                await session.get(Message, source.message_id)
+                if source.message_id
+                else None
+            )
+            if (
+                message is None
+                or conversation_id is None
+                or message.conversation_id != conversation_id
+                or message.role != "user"
+                or (
+                    source.source == "user_message"
+                    and source.message_id != current_message_id
+                )
+            ):
+                invalid.append(field)
+                continue
+            text_value = str((message.content_json or {}).get("text", ""))
+            if source.quote not in text_value:
+                invalid.append(field)
+                continue
+            normalization = _binding_normalization(value, source.quote)
+        else:
+            output = tool_evidence.get(source.call_id or "")
+            try:
+                evidence_value = (
+                    _tool_evidence_value(output, source.path or "")
+                    if output is not None and source.path
+                    else None
+                )
+            except (KeyError, IndexError):
+                evidence_value = None
+            if evidence_value != value:
+                invalid.append(field)
+                continue
+            encoded = (
+                evidence_value
+                if isinstance(evidence_value, str)
+                else json.dumps(evidence_value, ensure_ascii=False, sort_keys=True)
+            )
+            if source.quote not in encoded:
+                invalid.append(field)
+                continue
+            normalization = "tool_result_path"
+        if normalization is None:
+            invalid.append(field)
+            continue
+        verified_sources.append(
+            source.model_copy(
+                update={
+                    "server_verified": True,
+                    "normalization_type": normalization,
+                    "uncertain": False,
+                }
+            )
+        )
+    selection = selection.model_copy(update={"binding_sources": verified_sources})
+    return selection, list(dict.fromkeys(invalid))
+
+
 async def _prepare_selection(
     session: AsyncSession,
     selection: WorkflowSelection,
+    *,
+    conversation_id: str | None = None,
+    current_message_id: str | None = None,
+    tool_evidence: dict[str, dict[str, Any]] | None = None,
+    trusted_tool_evidence: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[WorkflowSelection, str]:
     """Validate disclosure and turn missing executable inputs into resumable state."""
 
@@ -4345,6 +4615,13 @@ async def _prepare_selection(
         schema = selection.plan.get("inputSchema", {})
         required = list(schema.get("required", []))
 
+    selection, source_invalid = await _verify_binding_sources(
+        session,
+        selection,
+        conversation_id=conversation_id,
+        current_message_id=current_message_id,
+        tool_evidence={**(trusted_tool_evidence or {}), **(tool_evidence or {})},
+    )
     missing = [field for field in required if field not in selection.bindings]
     validation_errors = sorted(
         Draft202012Validator(
@@ -4353,7 +4630,7 @@ async def _prepare_selection(
         ).iter_errors(selection.bindings),
         key=lambda error: list(error.absolute_path),
     )
-    invalid = []
+    invalid = list(source_invalid)
     for error in validation_errors:
         if error.validator == "required":
             continue
@@ -4381,10 +4658,23 @@ async def _prepare_selection(
             )
         return selection, resume_action
 
+    unresolved_set = set(unresolved)
+    safe_bindings = {
+        field: value
+        for field, value in selection.bindings.items()
+        if field not in unresolved_set
+    }
+    safe_sources = [
+        source.model_dump(by_alias=True)
+        for source in selection.binding_sources
+        if source.field not in unresolved_set
+    ]
     pending = WorkflowSelection.model_validate(
         {
             **selection.model_dump(by_alias=True),
             "action": "ask_user",
+            "bindings": safe_bindings,
+            "bindingSources": safe_sources,
             "missingInputs": unresolved,
             "question": (
                 f"请补充输入：{', '.join(missing)}"

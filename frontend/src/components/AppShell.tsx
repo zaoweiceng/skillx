@@ -51,7 +51,7 @@ export default function AppShell() {
           <span className="pulse-dot" />
           <div>
             <strong>本地运行时</strong>
-            <small>API / Worker 分进程</small>
+            <small>真实状态见系统页</small>
           </div>
         </div>
         <button

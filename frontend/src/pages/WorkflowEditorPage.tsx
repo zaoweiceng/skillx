@@ -522,7 +522,7 @@ function CapabilityMetadataEditor({
   }
 
   return (
-    <section className="panel source-panel">
+    <section className="panel capability-metadata-panel">
       <div className="panel-heading">
         <div>
           <span className="eyebrow">CAPABILITY CONTRACT</span>

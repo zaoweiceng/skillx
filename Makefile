@@ -1,5 +1,8 @@
 .PHONY: demo-check quality-check backend-check browser-install frontend-check migration-check e2e-check browser-ui-check
 
+UV_CACHE_DIR ?= /tmp/skillx-workflow-uv-cache
+export UV_CACHE_DIR
+
 # 完整验收：质量门禁 + docs/demo-acceptance.md 定义的真实黑盒 E2E。
 demo-check: quality-check e2e-check
 
@@ -7,7 +10,7 @@ demo-check: quality-check e2e-check
 quality-check: backend-check migration-check frontend-check
 
 backend-check:
-	cd backend && uv run ruff check app tests migrations e2e ../examples/local_weather_mcp.py ../examples/traex_stub.py ../examples/local_form_site.py
+	cd backend && uv run ruff check app tests migrations e2e ../examples/local_weather_mcp.py ../examples/traex_stub.py ../examples/openai_agent_sidecar.py ../examples/local_form_site.py
 	cd backend && uv run pytest -q
 
 browser-install:

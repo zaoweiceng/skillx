@@ -113,6 +113,7 @@ export type Run = {
   durationMs?: number | null
   presentation?: RunPresentation | null
   presentations?: RunPresentation[]
+  presentationExpected?: boolean
   modelUsage?: Array<{
     callId: string
     attempt: number
@@ -203,7 +204,7 @@ export type RunPresentation = {
 }
 
 export type TokenSummary = {
-  state: 'zero' | 'complete' | 'partial' | 'unavailable'
+  state: 'pending' | 'zero' | 'complete' | 'partial' | 'unavailable'
   totalTokens: number | null
   stages: Array<{
     stage: string
@@ -291,7 +292,7 @@ export type ChatMessageContent = {
   pendingSelectionId?: string
   resumedPendingSelection?: boolean
   workflowModeSnapshot?: 'enabled' | 'disabled'
-  selectionMode?: 'agent' | 'unavailable'
+  selectionMode?: 'real' | 'fixture' | 'unavailable'
   bindingSources?: Array<{
     field: string
     source: string
@@ -299,6 +300,8 @@ export type ChatMessageContent = {
     quote: string
     confidence: number
     uncertain: boolean
+    serverVerified?: boolean
+    normalizationType?: string | null
   }>
   refs?: string[]
   toolTimeline?: Array<{
@@ -396,7 +399,15 @@ export const api = {
     request<{
       status: string
       migration: string
-      workflowSelectionMode: 'agent' | 'unavailable'
+      workflowSelectionMode: 'real' | 'fixture' | 'unavailable'
+      selectionProvider: {
+        type: 'real' | 'fixture' | 'unavailable'
+        configured: boolean
+        protocolAvailable: boolean
+        modelAvailable: boolean
+        lastProbe: { at: string; ok: boolean; summary: string }
+      }
+      runtimes: Record<string, { status: string; detail: string }>
     }>('/health/ready'),
   listComponents: () => request<ComponentSummary[]>('/components'),
   getComponent: (id: string) => request<ComponentSummary>(`/components/${id}`),

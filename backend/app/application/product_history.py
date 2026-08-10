@@ -19,6 +19,7 @@ from app.infrastructure.database import (
     RunPresentation,
     SessionLocal,
     WorkflowVersion,
+    rfc3339,
     utcnow,
 )
 from app.runtime.models import OpenAICompatibleAdapter
@@ -92,6 +93,35 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
         )
     ).all()
     if not rows:
+        turn = await session.get(ConversationTurn, turn_id)
+        if turn is not None and turn.completed_at is None:
+            return {"state": "pending", "totalTokens": None, "stages": []}
+        agent_run = await session.scalar(
+            select(ConversationRun.id).where(ConversationRun.turn_id == turn_id).limit(1)
+        )
+        workflow_runs = (
+            await session.scalars(select(Run).where(Run.turn_id == turn_id))
+        ).all()
+        may_have_called_model = agent_run is not None or (
+            turn is not None and turn.status == "error"
+        )
+        for run in workflow_runs:
+            version = (
+                await session.get(WorkflowVersion, run.workflow_version_id)
+                if run.workflow_version_id
+                else None
+            )
+            if (
+                version is None
+                or version.validation_json.get("executionClass") != "zero_llm"
+                or (
+                    presentation_policy(version)["enabled"]
+                    and presentation_policy(version)["producer"] == "llm"
+                )
+            ):
+                may_have_called_model = True
+        if may_have_called_model:
+            return {"state": "unavailable", "totalTokens": None, "stages": []}
         return {"state": "zero", "totalTokens": 0, "stages": []}
     counted = sum(item.total_tokens or 0 for item in rows if item.total_tokens is not None)
     known = [item for item in rows if item.total_tokens is not None]
@@ -140,11 +170,9 @@ async def turn_view(session: AsyncSession, turn: ConversationTurn) -> dict[str, 
         "id": turn.id,
         "workflowModeSnapshot": turn.workflow_mode_snapshot,
         "status": turn.status,
-        "acceptedAt": turn.accepted_at.isoformat(),
-        "firstResponseAt": (
-            turn.first_response_at.isoformat() if turn.first_response_at else None
-        ),
-        "completedAt": turn.completed_at.isoformat() if turn.completed_at else None,
+        "acceptedAt": rfc3339(turn.accepted_at),
+        "firstResponseAt": rfc3339(turn.first_response_at),
+        "completedAt": rfc3339(turn.completed_at),
         "elapsedMs": turn.elapsed_ms,
         "usage": await usage_summary(session, turn.id),
     }
@@ -213,8 +241,8 @@ def presentation_view(item: RunPresentation) -> dict[str, Any]:
         "producer": item.producer,
         "model": item.model,
         "error": item.error_json,
-        "startedAt": item.started_at.isoformat() if item.started_at else None,
-        "completedAt": item.completed_at.isoformat() if item.completed_at else None,
+        "startedAt": rfc3339(item.started_at),
+        "completedAt": rfc3339(item.completed_at),
         "elapsedMs": item.elapsed_ms,
     }
 
@@ -454,6 +482,22 @@ async def finalize_ready_turns(session: AsyncSession) -> int:
             (item.finished_at for item in all_runs if item.finished_at is not None),
             default=utcnow(),
         )
+        presentation_finished = [
+            presentation.completed_at
+            for run in workflow_runs
+            if (
+                presentation := await session.scalar(
+                    select(RunPresentation)
+                    .where(RunPresentation.run_id == run.id)
+                    .order_by(RunPresentation.revision.desc())
+                    .limit(1)
+                )
+            )
+            is not None
+            and presentation.completed_at is not None
+        ]
+        if presentation_finished:
+            finished = max(finished, *presentation_finished)
         await finalize_turn(session, turn.id, status, completed_at=finished)
         completed += 1
     return completed

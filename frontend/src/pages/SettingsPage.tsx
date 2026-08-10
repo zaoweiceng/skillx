@@ -2,52 +2,61 @@ import { Bot, Database, KeyRound, PanelsTopLeft, ServerCog } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { api } from '@/api/client'
 
-const settings = [
-  {
-    icon: Database,
-    name: 'SQLite WAL',
-    description: '运行、节点、审批与事件的唯一事实来源',
-    status: '已启用',
-    tone: 'success',
-  },
-  {
-    icon: ServerCog,
-    name: '独立 Worker',
-    description: '数据库租约、心跳、重试与崩溃恢复',
-    status: '需启动进程',
-    tone: 'warning',
-  },
-  {
-    icon: Bot,
-    name: 'LLM / TraeX',
-    description: '仅允许显式 LLM 或 Agent 节点调用',
-    status: '未配置',
-    tone: 'neutral',
-  },
-  {
-    icon: PanelsTopLeft,
-    name: '浏览器运行时',
-    description: '页面契约和漂移检测可用，提交 Adapter 待配置',
-    status: '部分可用',
-    tone: 'warning',
-  },
-  {
-    icon: KeyRound,
-    name: 'Secret Provider',
-    description: '仅存储引用，禁止明文进入工作流和日志',
-    status: '未配置',
-    tone: 'neutral',
-  },
-]
+type Health = Awaited<ReturnType<typeof api.getHealth>>
+
+function tone(status: string) {
+  if (['available', 'configured', 'reference_only'].includes(status)) return 'success'
+  if (['unknown', 'fixture'].includes(status)) return 'warning'
+  return 'neutral'
+}
 
 export default function SettingsPage() {
-  const [selectionMode, setSelectionMode] = useState<'agent' | 'unavailable'>(
-    'unavailable',
-  )
+  const [health, setHealth] = useState<Health | null>(null)
+  const [error, setError] = useState('')
 
   useEffect(() => {
-    api.getHealth().then((health) => setSelectionMode(health.workflowSelectionMode))
+    api
+      .getHealth()
+      .then(setHealth)
+      .catch((reason: Error) => setError(reason.message))
   }, [])
+
+  const provider = health?.selectionProvider
+  const runtimeCards = health
+    ? [
+        {
+          icon: Database,
+          name: 'SQLite',
+          ...health.runtimes.database,
+        },
+        {
+          icon: ServerCog,
+          name: '独立 Worker',
+          ...health.runtimes.worker,
+        },
+        {
+          icon: Bot,
+          name: '语义 Agent',
+          status:
+            provider?.type === 'real' && provider.modelAvailable
+              ? 'available'
+              : provider?.type === 'fixture'
+                ? 'fixture'
+                : 'unconfigured',
+          detail: provider?.lastProbe.summary ?? '未检测',
+        },
+        {
+          icon: PanelsTopLeft,
+          name: '浏览器运行时',
+          ...health.runtimes.browser,
+        },
+        {
+          icon: KeyRound,
+          name: 'Secret Provider',
+          ...health.runtimes.secretProvider,
+        },
+      ]
+    : []
 
   return (
     <div className="page">
@@ -58,21 +67,26 @@ export default function SettingsPage() {
           <p>外部 Runtime 未配置时明确失败，不允许隐式升级到 Agent。</p>
         </div>
       </header>
-      <div className="notice-panel">
-        当前工作流选择模式：<strong>{selectionMode}</strong>
-        {selectionMode === 'unavailable' && '。语义选择服务不可用时不会静默使用目录第一项。'}
-      </div>
+      {error && <div className="error-panel">运行状态探测失败：{error}</div>}
+      {!health && !error && <div className="notice-panel">正在探测真实运行状态…</div>}
+      {health && (
+        <div className="notice-panel">
+          当前工作流选择 Provider：<strong>{health.workflowSelectionMode}</strong>
+          {health.workflowSelectionMode === 'unavailable' && '。真实语义 Agent 未配置。'}
+          {health.workflowSelectionMode === 'fixture' && '。当前仅可验证协议，不代表真实语义能力。'}
+        </div>
+      )}
       <section className="settings-grid">
-        {settings.map(({ icon: Icon, name, description, status, tone }) => (
+        {runtimeCards.map(({ icon: Icon, name, detail, status }) => (
           <article className="setting-card" key={name}>
             <span className="setting-icon">
               <Icon size={19} />
             </span>
             <div>
               <h2>{name}</h2>
-              <p>{description}</p>
+              <p>{detail}</p>
             </div>
-            <span className={`status-badge ${tone}`}>{status}</span>
+            <span className={`status-badge ${tone(status)}`}>{status}</span>
           </article>
         ))}
       </section>

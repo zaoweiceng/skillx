@@ -11,6 +11,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from app.config import get_settings
+
 
 class AdapterError(RuntimeError):
     pass
@@ -274,6 +276,7 @@ class StdioMCPGateway:
 class AgentRunRequest:
     prompt: str
     working_directory: Path
+    output_schema: dict[str, Any] = field(default_factory=dict)
     allowed_tools: list[str] = field(default_factory=list)
     max_steps: int = 8
     max_tokens: int = 30000
@@ -289,6 +292,15 @@ class TraeXSubprocessAdapter:
     async def events(self, run_id: str, request: AgentRunRequest) -> AsyncIterator[dict[str, Any]]:
         working_directory = request.working_directory.resolve()
         working_directory.mkdir(parents=True, exist_ok=True)
+        settings = get_settings()
+        provider_environment = {
+            "SKILLX_MODEL_ENDPOINT": settings.model_endpoint or "",
+            "SKILLX_MODEL_NAME": settings.model_name or "",
+            "SKILLX_MODEL_API_KEY_ENV": settings.model_api_key_env,
+        }
+        api_key = os.environ.get(settings.model_api_key_env)
+        if api_key:
+            provider_environment[settings.model_api_key_env] = api_key
         process = await asyncio.create_subprocess_exec(
             *self.command,
             "--prompt",
@@ -299,11 +311,13 @@ class TraeXSubprocessAdapter:
             str(request.max_tokens),
             "--allowed-tools",
             json.dumps(request.allowed_tools, ensure_ascii=False),
+            "--output-schema",
+            json.dumps(request.output_schema, ensure_ascii=False),
             cwd=working_directory,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={"PATH": os.environ.get("PATH", "")},
+            env={"PATH": os.environ.get("PATH", ""), **provider_environment},
         )
         self._processes[run_id] = process
         if not process.stdout:

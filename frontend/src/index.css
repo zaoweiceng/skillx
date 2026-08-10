@@ -179,14 +179,14 @@ button {
 
 .nav-item:hover {
   color: var(--text);
-  background: #142128;
-  border-color: #23343c;
+  background: var(--panel-raised);
+  border-color: var(--line);
 }
 
 .nav-item.active {
   color: var(--text);
   background: linear-gradient(90deg, rgba(229, 155, 69, 0.17), transparent);
-  border-color: #59472f;
+  border-color: var(--accent);
 }
 
 .nav-item.active::before {
@@ -210,7 +210,8 @@ button {
   margin: auto 14px 16px;
   padding: 13px;
   border: 1px solid var(--line);
-  background: #101b21;
+  background: var(--panel-raised);
+  color: var(--text);
 }
 
 .theme-toggle {
@@ -1073,6 +1074,46 @@ select:focus-visible {
   flex-direction: column;
 }
 
+.capability-metadata-panel {
+  margin-bottom: 16px;
+}
+
+.presentation-policy-editor {
+  display: grid;
+  width: 100%;
+  grid-template-columns: minmax(220px, 0.7fr) minmax(280px, 1.3fr);
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line-soft);
+  background: var(--panel-raised);
+}
+
+.presentation-policy-editor > label:first-child,
+.presentation-policy-editor > label:last-child {
+  grid-column: 1 / -1;
+}
+
+.presentation-policy-editor > label:first-child {
+  display: flex;
+  align-items: center;
+}
+
+.presentation-policy-editor > label:first-child input {
+  width: auto;
+}
+
+.inspector-fields .node-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.inspector-fields .node-row small {
+  grid-column: 1 / -1;
+}
+
 .source-editor {
   min-height: 0;
   flex: 1;
@@ -1653,13 +1694,6 @@ select:focus-visible {
   fill: #172126 !important;
 }
 
-.inspector-fields > div {
-  display: grid;
-  grid-template-columns: 100px 1fr;
-  gap: 8px;
-  font-size: 13px;
-}
-
 .inspector-fields dt {
   color: var(--muted, #888);
 }
@@ -1936,6 +1970,17 @@ select:focus-visible {
   .source-panel,
   .preview-panel {
     min-height: 600px;
+  }
+
+  .presentation-policy-editor,
+  .inspector-fields .node-row {
+    grid-template-columns: 1fr;
+  }
+
+  .presentation-policy-editor > label,
+  .inspector-fields .node-row > label,
+  .inspector-fields .node-row small {
+    grid-column: 1;
   }
 }
 

@@ -75,6 +75,7 @@ def agent_workflow(*, allowed: list[str], prompt: str = "完成任务") -> dict[
 @pytest.fixture
 def traex_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = get_settings()
+    monkeypatch.setattr(settings, "agent_provider_type", "fixture")
     monkeypatch.setattr(settings, "traex_command", [sys.executable, str(STUB)])
     monkeypatch.setattr(settings, "traex_allowed_executables", [Path(sys.executable).name])
 

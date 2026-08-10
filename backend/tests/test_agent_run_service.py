@@ -49,6 +49,7 @@ STUB = Path(__file__).resolve().parents[2] / "examples" / "traex_stub.py"
 @pytest.fixture
 def traex_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = get_settings()
+    monkeypatch.setattr(settings, "agent_provider_type", "fixture")
     monkeypatch.setattr(settings, "traex_command", [sys.executable, str(STUB)])
     monkeypatch.setattr(settings, "traex_allowed_executables", [Path(sys.executable).name])
     monkeypatch.setattr(
