@@ -88,7 +88,7 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
         run_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(runs)")
         }
-    assert revision == ("0018",)
+    assert revision == ("0019",)
     assert {
         "runs",
         "capability_versions",
@@ -149,7 +149,12 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
         "presentation_policy_json",
     } <= version_columns
     assert {"workflow_mode", "last_message_at"} <= conversation_columns
-    assert "turn_id" in run_columns
+    assert {"turn_id", "runtime_snapshot_json"} <= run_columns
+    with sqlite3.connect(database) as connection:
+        usage_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(model_usage)")
+        }
+    assert {"runtime_used", "runtime_digest", "fallback_reason"} <= usage_columns
     with sqlite3.connect(database) as connection:
         checkpoint_columns = {
             row[1]

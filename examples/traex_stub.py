@@ -91,6 +91,32 @@ def _clean_message(prompt: str) -> str:
     return re.sub(r"\[\[.*?\]\]", "", prompt).strip()
 
 
+def _fixture_value(schema: dict[str, Any], field: str, reply: str) -> Any:
+    if "const" in schema:
+        return schema["const"]
+    if isinstance(schema.get("enum"), list) and schema["enum"]:
+        return schema["enum"][0]
+    if "default" in schema:
+        return schema["default"]
+    kind = schema.get("type")
+    if kind == "object":
+        properties = schema.get("properties", {})
+        required = schema.get("required", list(properties))
+        return {
+            name: _fixture_value(properties.get(name, {}), name, reply)
+            for name in required
+        }
+    if kind == "array":
+        return []
+    if kind in {"integer", "number"}:
+        return 0
+    if kind == "boolean":
+        return False
+    if field in {"reply", "text"}:
+        return reply
+    return "fixture"
+
+
 def _plan_step(
     step_id: str,
     capability: str,
@@ -217,6 +243,7 @@ def main() -> int:
     mode = _directive(args.prompt, "MODE", "ok")
     reply = _directive(args.prompt, "REPLY", "已完成任务")
     allowed = json.loads(args.allowed_tools) if args.allowed_tools else []
+    output_schema = json.loads(args.output_schema) if args.output_schema else {}
 
     if "Progressive WorkflowSelection" in args.prompt:
         user_match = re.search(r"user=(.*)", args.prompt)
@@ -1784,7 +1811,7 @@ def main() -> int:
     if mode == "bad_schema":
         output = {"unexpected": "field"}
     else:
-        output = {"reply": reply}
+        output = _fixture_value(output_schema, "output", reply)
 
     emit(
         {

@@ -21,6 +21,7 @@ from app.application.agent_plans import (
 )
 from app.application.compiler import digest_json
 from app.application.error_policy import error_policy
+from app.application.runtime_config import agent_runtime_config
 from app.application.tool_broker import (
     ToolAdapterRegistry,
     ToolBrokerError,
@@ -121,6 +122,8 @@ class AgentHostResult:
     runtime_events: list[dict[str, Any]] = field(default_factory=list)
     audit_events: list[dict[str, Any]] = field(default_factory=list)
     step_count: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
     total_tokens: int = 0
     usage_complete: bool = True
     plan_snapshot: dict[str, Any] | None = None
@@ -199,15 +202,12 @@ class AgentHost:
     def _resolve_adapter(self) -> TraeXSubprocessAdapter:
         if self._adapter is not None:
             return self._adapter
-        settings = get_settings()
-        if (
-            settings.agent_provider_type == "unavailable"
-            or not settings.traex_command
-        ):
+        runtime = agent_runtime_config()
+        if not runtime.configured or not runtime.command:
             raise AgentHostError("MODEL_NOT_CONFIGURED", "TraeX Runtime 尚未配置")
         return TraeXSubprocessAdapter(
-            settings.traex_command,
-            set(settings.traex_allowed_executables),
+            list(runtime.command),
+            set(runtime.allowed_executables),
         )
 
     async def execute(
@@ -679,9 +679,9 @@ class AgentHost:
                         )
                     elif event_type == "agent.step.completed":
                         result.step_count += 1
-                        result.total_tokens += payload.get("inputTokens", 0) + payload.get(
-                            "outputTokens", 0
-                        )
+                        result.input_tokens += payload.get("inputTokens", 0)
+                        result.output_tokens += payload.get("outputTokens", 0)
+                        result.total_tokens = result.input_tokens + result.output_tokens
                         if result.step_count > request.max_steps:
                             await self._cancel(adapter, request.run_id)
                             raise AgentHostError(

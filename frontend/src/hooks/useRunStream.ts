@@ -32,11 +32,18 @@ export const useRunEvents = create<EventState>((set) => ({
     }),
 }))
 
-export function useRunStream(runId: string | undefined, onEvent: () => void): void {
+const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'cancelled'])
+const TERMINAL_EVENTS = new Set(['run.completed', 'run.failed', 'run.cancelled'])
+
+export function useRunStream(
+  runId: string | undefined,
+  runStatus: string | undefined,
+  onEvent: () => void,
+): void {
   const add = useRunEvents((state) => state.add)
 
   useEffect(() => {
-    if (!runId) return
+    if (!runId || !runStatus || TERMINAL_STATUSES.has(runStatus)) return
     const stream = new EventSource(eventStreamUrl(runId))
     const eventTypes = [
       'run.created',
@@ -52,20 +59,26 @@ export function useRunStream(runId: string | undefined, onEvent: () => void): vo
       'approval.requested',
       'approval.resolved',
     ]
-    const listeners = eventTypes.map((type) => {
-      const listener = (message: MessageEvent<string>) => {
-        const data = JSON.parse(message.data) as Omit<RunEvent, 'type'>
-        add(runId, { ...data, type })
-        onEvent()
-      }
-      stream.addEventListener(type, listener as EventListener)
-      return { type, listener }
-    })
-    return () => {
+    let closed = false
+    let listeners: Array<{ type: string; listener: (message: MessageEvent<string>) => void }> = []
+    const close = () => {
+      if (closed) return
+      closed = true
       listeners.forEach(({ type, listener }) =>
         stream.removeEventListener(type, listener as EventListener),
       )
       stream.close()
     }
-  }, [add, onEvent, runId])
+    listeners = eventTypes.map((type) => {
+      const listener = (message: MessageEvent<string>) => {
+        const data = JSON.parse(message.data) as Omit<RunEvent, 'type'>
+        add(runId, { ...data, type })
+        onEvent()
+        if (TERMINAL_EVENTS.has(type)) close()
+      }
+      stream.addEventListener(type, listener as EventListener)
+      return { type, listener }
+    })
+    return close
+  }, [add, onEvent, runId, runStatus])
 }

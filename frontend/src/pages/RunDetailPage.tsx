@@ -46,7 +46,7 @@ export default function RunDetailPage() {
   }, [id])
 
   useEffect(refresh, [refresh])
-  useRunStream(id, refresh)
+  useRunStream(id, run?.status, refresh)
 
   async function decide(approval: Approval, approved: boolean) {
     try {
@@ -274,7 +274,30 @@ export default function RunDetailPage() {
           {technicalEvidence && (
             <details className="technical-evidence">
               <summary>已脱敏、限长的技术证据</summary>
-              <JsonBlock value={technicalEvidence} />
+              <div className="node-table">
+                {technicalEvidence.errors.map((item) => (
+                  <div className="node-row" key={`${item.ref}-${item.evidenceDigest}`}>
+                    <strong>{item.code}</strong>
+                    <small>
+                      {item.scope}
+                      {item.nodeId ? ` / ${item.nodeId} / attempt ${item.attempt}` : ''}
+                    </small>
+                    <p>{item.userMessage}</p>
+                    <span className="metric-chip">建议：{item.action}</span>
+                    <span className="metric-chip">
+                      evidence {item.evidenceDigest.slice(0, 18)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+              {technicalEvidence.evidence.map((item) => (
+                <details key={item.digest}>
+                  <summary>
+                    Evidence {item.digest.slice(0, 18)} · {item.refs.length} refs
+                  </summary>
+                  <JsonBlock value={item.detail} />
+                </details>
+              ))}
             </details>
           )}
         </section>
@@ -420,6 +443,25 @@ export default function RunDetailPage() {
             )}
           </div>
           <JsonBlock value={run.dependencyVersions} />
+          {run.runtimeSnapshot?.runtimeUsed && (
+            <div className="node-metrics">
+              <span className="metric-chip">
+                {run.runtimeSnapshot.runtimeUsed === 'direct_llm'
+                  ? 'LLM Runtime'
+                  : run.runtimeSnapshot.runtimeUsed === 'agent_fallback'
+                    ? 'Agent fallback'
+                    : 'Runtime unavailable'}
+              </span>
+              {run.runtimeSnapshot.fallbackReason && (
+                <span className="metric-chip">
+                  {run.runtimeSnapshot.fallbackReason}
+                </span>
+              )}
+              <span className="metric-chip">
+                policy {run.runtimeSnapshot.policyDigest?.slice(0, 18)}
+              </span>
+            </div>
+          )}
         </section>
       )}
 

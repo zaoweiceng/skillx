@@ -27,6 +27,7 @@ from app.application.expressions import ExpressionError, resolve_mapping
 from app.application.mcp import MCPConfigurationError, MCPLockDriftError, resolve_mcp_node
 from app.application.retries import auto_retry_allowed
 from app.application.security import event_payload, redact
+from app.application.structured_generation import runtime_snapshot_for_definition
 from app.config import get_settings
 from app.domain.workflow import NodeResult, NodeType, WorkflowDefinition, WorkflowNode
 from app.infrastructure.database import (
@@ -273,6 +274,7 @@ class Orchestrator:
             owner_id=owner_id,
             status="queued",
             input_json=inputs,
+            runtime_snapshot_json=runtime_snapshot_for_definition(definition),
         )
         session.add(run)
         await session.flush()
@@ -308,6 +310,7 @@ class Orchestrator:
             turn_id=turn_id,
             status="queued",
             input_json=inputs,
+            runtime_snapshot_json=runtime_snapshot_for_definition(definition),
         )
         session.add(run)
         await session.flush()
@@ -894,6 +897,7 @@ class ClaimedExecution:
     run_input: dict[str, Any]
     node: WorkflowNode
     max_duration_seconds: int
+    runtime_snapshot: dict[str, Any]
 
 
 class WorkerService:
@@ -1104,6 +1108,7 @@ class WorkerService:
                 run_input=run.input_json,
                 node=node,
                 max_duration_seconds=definition.spec.policies.max_duration_seconds,
+                runtime_snapshot=run.runtime_snapshot_json or {},
             )
         return None
 
@@ -1157,6 +1162,7 @@ class WorkerService:
                     run_input=claimed.run_input,
                     node_run_id=claimed.node_run_id,
                     cancellation=cancellation,
+                    runtime_snapshot=claimed.runtime_snapshot,
                 ),
                 claimed.node,
                 claimed.inputs,
@@ -1384,8 +1390,12 @@ class WorkerService:
                 )
                 return
             if (
-                result.status == "succeeded"
-                and claimed.node.type in {NodeType.LLM, NodeType.AGENT}
+                claimed.node.type in {NodeType.LLM, NodeType.AGENT}
+                and (
+                    result.status == "succeeded"
+                    or result.metrics.get("runtimeUsed")
+                    in {"direct_llm", "agent_fallback"}
+                )
             ):
                 from app.application.product_history import record_model_usage
 
@@ -1404,12 +1414,34 @@ class WorkerService:
                     ),
                     turn_id=run_record.turn_id if run_record else None,
                     run_id=claimed.run_id,
-                    provider=(
-                        "openai-compatible"
-                        if claimed.node.type == NodeType.LLM
-                        else "traex"
+                    provider=str(
+                        result.metrics.get(
+                            "provider",
+                            "traex"
+                            if claimed.node.type == NodeType.AGENT
+                            else "openai-compatible",
+                        )
                     ),
                     model=result.metrics.get("model"),
+                    runtime_used=(
+                        str(result.metrics["runtimeUsed"])
+                        if "runtimeUsed" in result.metrics
+                        else (
+                            "agent_runtime"
+                            if claimed.node.type == NodeType.AGENT
+                            else None
+                        )
+                    ),
+                    runtime_digest=(
+                        str(result.metrics["runtimeDigest"])
+                        if "runtimeDigest" in result.metrics
+                        else None
+                    ),
+                    fallback_reason=(
+                        str(result.metrics["fallbackReason"])
+                        if result.metrics.get("fallbackReason")
+                        else None
+                    ),
                     input_tokens=(
                         int(input_tokens) if isinstance(input_tokens, int) else None
                     ),

@@ -1,4 +1,6 @@
+import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -11,6 +13,9 @@ from app.application.product_history import (
     turn_view,
     usage_summary,
 )
+from app.application.structured_generation import runtime_snapshot_for_definition
+from app.config import get_settings
+from app.domain.workflow import WorkflowDefinition
 from app.infrastructure.database import (
     Component,
     Conversation,
@@ -26,6 +31,8 @@ from app.infrastructure.database import (
     utcnow,
 )
 from tests.fixtures import deterministic_workflow
+
+STUB = Path(__file__).resolve().parents[2] / "examples" / "traex_stub.py"
 
 
 async def test_disabled_conversation_fences_workflow_capabilities() -> None:
@@ -201,6 +208,73 @@ async def test_template_presentation_is_persisted_without_changing_run_output() 
         "presentation.completed",
     ]
     assert not await PresentationDriver().poll_once()
+
+
+async def test_llm_presentation_uses_same_agent_fallback_snapshot(
+    monkeypatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "llm_runtime_type", "unavailable")
+    monkeypatch.setattr(settings, "agent_runtime_type", "fixture")
+    monkeypatch.setattr(settings, "agent_command", [sys.executable, str(STUB)])
+    monkeypatch.setattr(
+        settings, "agent_allowed_executables", [Path(sys.executable).name]
+    )
+    definition = deterministic_workflow()
+    compiled = WorkflowCompiler().compile(definition)
+    now = utcnow()
+    async with SessionLocal() as session, session.begin():
+        workflow = Workflow(
+            id=str(uuid4()),
+            name="fallback-presentation",
+            draft_revision=1,
+            draft_json=definition,
+        )
+        session.add(workflow)
+        await session.flush()
+        version = WorkflowVersion(
+            id=str(uuid4()),
+            workflow_id=workflow.id,
+            version=1,
+            definition_json=definition,
+            digest=compiled.digest,
+            validation_json={"executionClass": "hybrid"},
+            presentation_policy_json={
+                "enabled": True,
+                "audience": "end_user",
+                "producer": "llm",
+                "prompt": "整理结果",
+                "language": "zh-CN",
+                "maxLength": 200,
+            },
+        )
+        session.add(version)
+        await session.flush()
+        run = Run(
+            id=str(uuid4()),
+            workflow_version_id=version.id,
+            status="succeeded",
+            input_json={"name": "Alice"},
+            output_json={"message": "你好，Alice"},
+            runtime_snapshot_json=runtime_snapshot_for_definition(
+                WorkflowDefinition.model_validate(definition)
+            ),
+            started_at=now,
+            finished_at=now,
+        )
+        session.add(run)
+
+    assert await PresentationDriver().poll_once()
+    async with SessionLocal() as session:
+        presentation = await session.scalar(select(RunPresentation))
+        usage = await session.scalar(
+            select(ModelUsage).where(ModelUsage.presentation_id == presentation.id)
+        )
+    assert presentation is not None
+    assert presentation.status == "completed"
+    assert usage is not None
+    assert usage.runtime_used == "agent_fallback"
+    assert usage.fallback_reason == "LLM_RUNTIME_UNCONFIGURED"
 
 
 async def test_run_history_filters_on_server() -> None:

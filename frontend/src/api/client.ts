@@ -120,11 +120,23 @@ export type Run = {
     stage: string
     provider: string | null
     model: string | null
+    runtimeUsed: 'direct_llm' | 'agent_fallback' | 'agent_runtime' | 'fake_structured' | null
+    runtimeDigest: string | null
+    fallbackReason: string | null
     inputTokens: number | null
     outputTokens: number | null
     totalTokens: number | null
     complete: boolean
   }>
+  runtimeSnapshot?: {
+    runtimeUsed?: 'direct_llm' | 'agent_fallback' | 'unavailable'
+    runtimeKind?: 'llm_runtime' | 'agent_runtime' | null
+    provider?: string | null
+    identity?: string | null
+    runtimeDigest?: string
+    policyDigest?: string
+    fallbackReason?: string | null
+  }
   nodes?: NodeRun[]
   approvals?: Approval[]
   artifacts?: Array<{
@@ -147,6 +159,7 @@ export type Run = {
     executionClass?: string | null
     capabilityLocks?: unknown[]
     mcpLocks?: unknown[]
+    modelRuntime?: Record<string, unknown>
     lineage?: Record<string, unknown>
     revisionLineage?: Record<string, unknown>
   }
@@ -402,9 +415,13 @@ export const api = {
       workflowSelectionMode: 'real' | 'fixture' | 'unavailable'
       selectionProvider: {
         type: 'real' | 'fixture' | 'unavailable'
+        runtimeType?: 'traex_managed' | 'openai_sidecar' | 'fixture' | 'unavailable'
         configured: boolean
         protocolAvailable: boolean
         modelAvailable: boolean
+        model?: string | null
+        digest?: string
+        source?: string
         lastProbe: {
           at: string | null
           ok: boolean
@@ -417,6 +434,37 @@ export const api = {
           code?: string
         }
         nextProbeAllowedAt: string | null
+      }
+      agentRuntime?: {
+        type: 'real' | 'fixture' | 'unavailable'
+        runtimeType: 'traex_managed' | 'openai_sidecar' | 'fixture' | 'unavailable'
+        configured: boolean
+        protocolAvailable: boolean
+        modelAvailable: boolean
+        model: string | null
+        digest: string
+        source: string
+        lastProbe: {
+          at: string | null
+          ok: boolean
+          summary: string
+          totalTokens?: number
+        }
+        nextProbeAllowedAt: string | null
+      }
+      llmRuntime?: {
+        type: 'openai_compatible' | 'unavailable'
+        configured: boolean
+        protocol: string
+        model: string | null
+        digest: string
+        source: string
+        probe: { kind: string; ok: boolean; summary: string }
+      }
+      modelRuntimeFallbackPolicy?: {
+        order: string[]
+        trigger: string
+        executionErrorsFallback: boolean
       }
       runtimes: Record<string, { status: string; detail: string }>
     }>('/health/ready'),
@@ -458,12 +506,22 @@ export const api = {
   getRunTechnicalError: (id: string) =>
     request<{
       runId: string
-      error: Record<string, unknown> | null
-      nodes: Array<{
-        nodeId: string
-        attempt: number
-        error: Record<string, unknown> | null
+      errors: Array<{
+        scope: 'run' | 'node'
+        ref: string
+        nodeId?: string
+        attempt?: number
+        code: string
+        userMessage: string
+        action: string
+        evidenceDigest: string
       }>
+      evidence: Array<{
+        digest: string
+        detail: Record<string, unknown>
+        refs: string[]
+      }>
+      truncated?: boolean
     }>(`/runs/${id}/technical-error`),
   createWorkflowSession: (conversationId?: string) =>
     request<{ id: string; status: string; expiresAt: string }>('/workflow-tools/sessions', {

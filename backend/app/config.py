@@ -26,6 +26,18 @@ class Settings(BaseSettings):
     model_name: str | None = None
     model_api_key_env: str = "SKILLX_MODEL_API_KEY"
     agent_provider_type: Literal["real", "fixture", "unavailable"] = "unavailable"
+    llm_runtime_type: Literal["openai_compatible", "unavailable"] = "unavailable"
+    llm_endpoint: str | None = None
+    llm_model: str | None = None
+    llm_api_key_env: str = "SKILLX_LLM_API_KEY"
+    agent_runtime_type: Literal["traex_managed", "openai_sidecar", "fixture", "unavailable"] = (
+        "unavailable"
+    )
+    agent_command: list[str] | None = None
+    agent_allowed_executables: list[str] = ["traex"]
+    agent_endpoint: str | None = None
+    agent_model: str | None = None
+    agent_api_key_env: str = "SKILLX_AGENT_API_KEY"
     provider_probe_timeout_seconds: int = 30
     provider_probe_cooldown_seconds: int = 300
     provider_probe_ttl_seconds: int = 900

@@ -23,7 +23,11 @@ from app.application.agent_host import (
     AgentHostRequest,
     resolve_local_demo_capabilities,
 )
-from app.application.agent_provider import probe_provider, provider_readiness
+from app.application.agent_provider import (
+    llm_runtime_readiness,
+    probe_provider,
+    provider_readiness,
+)
 from app.application.agent_run import (
     AgentRunConfig,
     build_agent_run_message,
@@ -77,6 +81,7 @@ from app.application.product_history import (
 )
 from app.application.replay import run_isolated_replay, run_replay_proof
 from app.application.retries import auto_retry_allowed
+from app.application.runtime_config import agent_runtime_config
 from app.application.secrets import (
     SecretResolutionError,
     register_secret_reference,
@@ -465,6 +470,7 @@ def run_view(
         "startedAt": rfc3339(run.started_at),
         "finishedAt": rfc3339(run.finished_at),
         "durationMs": _duration_ms(run.started_at, run.finished_at),
+        "runtimeSnapshot": run.runtime_snapshot_json or {},
     }
     if node_runs is not None:
         payload["nodes"] = [
@@ -518,6 +524,7 @@ async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str
             detail={"code": "NOT_READY", "message": str(exc)},
         ) from exc
     provider = await provider_readiness()
+    llm_runtime = await llm_runtime_readiness()
     return {
         "status": "ready",
         "migration": revision,
@@ -527,6 +534,13 @@ async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str
             else "unavailable"
         ),
         "selectionProvider": provider,
+        "agentRuntime": provider,
+        "llmRuntime": llm_runtime,
+        "modelRuntimeFallbackPolicy": {
+            "order": ["llm_runtime", "agent_runtime"],
+            "trigger": "startup_unavailable_only",
+            "executionErrorsFallback": False,
+        },
         "runtimes": {
             "database": {"status": "available", "detail": "SQLite 与迁移可用"},
             "worker": {
@@ -3001,6 +3015,7 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
         "executionClass": validation.get("executionClass"),
         "capabilityLocks": validation.get("capabilityLocks", []),
         "mcpLocks": validation.get("mcpLocks", []),
+        "modelRuntime": run.runtime_snapshot_json or {},
         "lineage": source_definition.get("metadata", {}).get("lineage", {}),
         "revisionLineage": (
             version.revision_lineage_json
@@ -3103,6 +3118,9 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             "stage": item.stage,
             "provider": item.provider,
             "model": item.model,
+            "runtimeUsed": item.runtime_used,
+            "runtimeDigest": item.runtime_digest,
+            "fallbackReason": item.fallback_reason,
             "inputTokens": item.input_tokens,
             "outputTokens": item.output_tokens,
             "totalTokens": item.total_tokens,
@@ -3130,18 +3148,61 @@ async def get_run_technical_error(
             .order_by(NodeRun.created_at, NodeRun.attempt)
         )
     ).all()
-    return {
-        "runId": run.id,
-        "error": technical_error(run.error_json),
-        "nodes": [
+    projected = [
+        {"scope": "run", "ref": f"run:{run.id}", "error": technical_error(run.error_json)},
+        *[
             {
+                "scope": "node",
+                "ref": f"run:{run.id}:node:{item.id}",
                 "nodeId": item.node_id,
                 "attempt": item.attempt,
                 "error": technical_error(item.error_json),
             }
             for item in nodes
         ],
+    ]
+    evidence: dict[str, dict[str, Any]] = {}
+    errors: list[dict[str, Any]] = []
+    for item in projected:
+        error = item.pop("error")
+        if error is None:
+            continue
+        detail = error.pop("technicalDetail", {})
+        evidence_digest = digest_json(detail)
+        bucket = evidence.setdefault(
+            evidence_digest,
+            {"digest": evidence_digest, "detail": detail, "refs": []},
+        )
+        bucket["refs"].append(item["ref"])
+        errors.append({**item, **error, "evidenceDigest": evidence_digest})
+    response = {
+        "runId": run.id,
+        "errors": errors,
+        "evidence": list(evidence.values()),
     }
+    max_bytes = 6000
+    encoded = digest_safe_json(response).encode("utf-8")
+    if len(encoded) > max_bytes:
+        for item in response["evidence"]:
+            summary = digest_safe_json(item["detail"])
+            item["detail"] = {"summary": summary[:512], "truncated": True}
+        encoded = digest_safe_json(response).encode("utf-8")
+    if len(encoded) > max_bytes:
+        response["evidence"] = [
+            {
+                "digest": item["digest"],
+                "refs": item["refs"],
+                "detail": {"summary": "技术证据已截断", "truncated": True},
+            }
+            for item in response["evidence"][:4]
+        ]
+        response["truncated"] = True
+        while (
+            len(digest_safe_json(response).encode("utf-8")) > max_bytes
+            and response["errors"]
+        ):
+            response["errors"].pop()
+    return response
 
 
 @router.post("/runs/{run_id}/cancel", status_code=202)
@@ -4045,8 +4106,7 @@ async def _unbound_conversation_message(
     user_message_id: str,
 ) -> tuple[dict[str, Any], ConversationRun | None]:
     if (
-        get_settings().agent_provider_type == "unavailable"
-        or not get_settings().traex_command
+        not agent_runtime_config().configured
     ):
         return (
             {
@@ -4311,8 +4371,7 @@ async def _select_workflow_candidate(
     dict[str, dict[str, Any]],
 ]:
     if (
-        get_settings().agent_provider_type == "unavailable"
-        or not get_settings().traex_command
+        not agent_runtime_config().configured
     ):
         raise HTTPException(
             503,

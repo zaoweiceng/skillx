@@ -1,7 +1,8 @@
+import json
 from typing import Any
 from uuid import uuid4
 
-from app.api.routes import get_component, get_run
+from app.api.routes import get_component, get_run, get_run_technical_error
 from app.application.compiler import WorkflowCompiler
 from app.application.orchestrator import Orchestrator, WorkerService
 from app.infrastructure.database import (
@@ -72,6 +73,46 @@ async def test_component_detail_exposes_business_and_technical_views() -> None:
     assert "businessView" in detail and "technicalView" in detail
     assert detail["technicalView"]["nodeCount"] >= 2
     assert detail["businessView"]["recentRunCount"] >= 0
+
+
+async def test_technical_error_response_is_idempotent_deduplicated_and_globally_bounded() -> None:
+    from app.application.error_policy import persisted_error
+    from app.infrastructure.database import NodeRun, Run
+
+    _, run_id = await _seed_component_and_run()
+    repeated = persisted_error(
+        {
+            "code": "DEPENDENCY_UNAVAILABLE",
+            "message": "Browser startup failed " + "same-log " * 2000,
+        }
+    )
+    async with SessionLocal() as session, session.begin():
+        run = await session.get(Run, run_id)
+        assert run is not None
+        run.status = "failed"
+        run.error_json = repeated
+        for index in range(12):
+            session.add(
+                NodeRun(
+                    id=str(uuid4()),
+                    run_id=run_id,
+                    node_id=f"failed-{index}",
+                    node_type="browser",
+                    attempt=1,
+                    status="failed",
+                    input_json={},
+                    error_json=repeated,
+                )
+            )
+
+    async with SessionLocal() as session:
+        response = await get_run_technical_error(run_id, session)
+
+    encoded = json.dumps(response, ensure_ascii=False).encode()
+    assert len(encoded) < 6000
+    assert len(response["evidence"]) == 1
+    assert len(response["evidence"][0]["refs"]) == 13
+    assert '"summary": "{\\"summary\\"' not in encoded.decode()
 
 
 async def test_run_detail_exposes_checkpoint_recovery_evidence() -> None:

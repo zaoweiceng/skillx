@@ -11,7 +11,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from app.config import get_settings
+from app.application.runtime_config import agent_runtime_config
 
 
 class AdapterError(RuntimeError):
@@ -292,15 +292,18 @@ class TraeXSubprocessAdapter:
     async def events(self, run_id: str, request: AgentRunRequest) -> AsyncIterator[dict[str, Any]]:
         working_directory = request.working_directory.resolve()
         working_directory.mkdir(parents=True, exist_ok=True)
-        settings = get_settings()
+        runtime = agent_runtime_config()
         provider_environment = {
-            "SKILLX_MODEL_ENDPOINT": settings.model_endpoint or "",
-            "SKILLX_MODEL_NAME": settings.model_name or "",
-            "SKILLX_MODEL_API_KEY_ENV": settings.model_api_key_env,
+            "SKILLX_AGENT_ENDPOINT": runtime.endpoint or "",
+            "SKILLX_AGENT_MODEL": runtime.model or "",
+            "SKILLX_AGENT_API_KEY_ENV": runtime.api_key_env,
+            "SKILLX_MODEL_ENDPOINT": runtime.endpoint or "",
+            "SKILLX_MODEL_NAME": runtime.model or "",
+            "SKILLX_MODEL_API_KEY_ENV": runtime.api_key_env,
         }
-        api_key = os.environ.get(settings.model_api_key_env)
+        api_key = os.environ.get(runtime.api_key_env)
         if api_key:
-            provider_environment[settings.model_api_key_env] = api_key
+            provider_environment[runtime.api_key_env] = api_key
         process = await asyncio.create_subprocess_exec(
             *self.command,
             "--prompt",

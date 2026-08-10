@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 from uuid import uuid4
@@ -21,8 +21,13 @@ from app.application.artifact_integrity import (
 )
 from app.application.compiler import digest_json
 from app.application.mcp import call_mcp_contract
+from app.application.runtime_config import agent_runtime_config
 from app.application.secrets import contains_secret
 from app.application.security import redact
+from app.application.structured_generation import (
+    StructuredGenerationRequest,
+    StructuredGenerationResolver,
+)
 from app.config import get_settings
 from app.domain.workflow import ExecutionError, NodeResult, NodeType, WorkflowNode
 from app.runtime.browser import (
@@ -35,7 +40,7 @@ from app.runtime.browser import (
     url_matches,
 )
 from app.runtime.contract_patch import ContractPatchViolation, build_contract_patch
-from app.runtime.models import FakeModelAdapter, OpenAICompatibleAdapter
+from app.runtime.models import FakeModelAdapter, ModelRuntimeError
 from app.runtime.playwright_browser import (
     BrowserExecutionError,
     BrowserSubmitUnknownOutcome,
@@ -164,6 +169,7 @@ class RunContext:
     run_input: dict[str, Any]
     node_run_id: str
     cancellation: CancellationToken
+    runtime_snapshot: dict[str, Any] = field(default_factory=dict)
 
 
 class NodeExecutor(Protocol):
@@ -417,47 +423,117 @@ class LLMExecutor:
         prompt = node.config.get("prompt", "{input}").replace(
             "{input}", json.dumps(inputs, ensure_ascii=False)
         )
-        adapter = (
-            FakeModelAdapter(node.config.get("fakeOutput", {}))
-            if node.config.get("modelProfile") == "fake"
-            else OpenAICompatibleAdapter()
-        )
         try:
-            result = await adapter.generate(
-                prompt,
-                output_schema,
-                int(node.config.get("maxOutputTokens", 1000)),
-            )
-            Draft202012Validator(output_schema).validate(result.output)
+            max_output_tokens = int(node.config.get("maxOutputTokens", 1000))
+            if node.config.get("modelProfile") == "fake":
+                fake = await FakeModelAdapter(
+                    node.config.get("fakeOutput", {})
+                ).generate(prompt, output_schema, max_output_tokens)
+                output = fake.output
+                input_tokens = fake.input_tokens
+                output_tokens = fake.output_tokens
+                model = fake.model
+                runtime_used = "fake_structured"
+                runtime_digest = digest_json({"profile": "fake"})
+                fallback_reason = ""
+                provider = "fixture"
+                usage_complete = fake.usage_complete
+                tool_request_count = 0
+            else:
+                generated = await StructuredGenerationResolver().generate(
+                    StructuredGenerationRequest(
+                        call_id=f"structured:{context.node_run_id}",
+                        prompt=prompt,
+                        output_schema=output_schema,
+                        max_output_tokens=max_output_tokens,
+                        working_directory=(
+                            get_settings().artifact_root
+                            / context.run_id
+                            / f"structured-{node.id}"
+                        ),
+                    ),
+                    context.runtime_snapshot,
+                )
+                output = generated.output
+                input_tokens = generated.input_tokens
+                output_tokens = generated.output_tokens
+                model = generated.runtime.identity or generated.runtime.provider
+                runtime_used = generated.runtime.runtime_used
+                runtime_digest = generated.runtime.digest
+                fallback_reason = generated.runtime.fallback_reason or ""
+                provider = generated.runtime.provider
+                usage_complete = generated.usage_complete
+                tool_request_count = generated.tool_request_count
+            Draft202012Validator(output_schema).validate(output)
             return NodeResult(
                 status="succeeded",
-                output=result.output,
+                output=output,
                 metrics={
-                    "inputTokens": result.input_tokens,
-                    "outputTokens": result.output_tokens,
-                    "model": result.model,
-                    "usageComplete": result.usage_complete,
+                    "inputTokens": input_tokens,
+                    "outputTokens": output_tokens,
+                    "totalTokens": input_tokens + output_tokens,
+                    "model": model,
+                    "provider": provider,
+                    "runtimeUsed": runtime_used,
+                    "runtimeDigest": runtime_digest,
+                    "fallbackReason": fallback_reason,
+                    "usageComplete": usage_complete,
+                    "toolRequestCount": tool_request_count,
                 },
                 events=[
                     {
                         "type": "llm.call.completed",
                         "payload": {
-                            "model": result.model,
-                            "inputTokens": result.input_tokens,
-                            "outputTokens": result.output_tokens,
+                            "model": model,
+                            "runtimeUsed": runtime_used,
+                            "runtimeDigest": runtime_digest,
+                            "fallbackReason": fallback_reason or None,
+                            "inputTokens": input_tokens,
+                            "outputTokens": output_tokens,
+                            "toolRequestCount": tool_request_count,
                         },
                     }
                 ],
             )
-        except Exception as exc:
-            code = (
-                "MODEL_NOT_CONFIGURED"
-                if "MODEL_NOT_CONFIGURED" in str(exc)
-                else "CONTRACT_VIOLATION"
+        except ModelRuntimeError as exc:
+            snapshot = context.runtime_snapshot
+            metrics = (
+                {
+                    "provider": str(snapshot.get("provider") or "unknown"),
+                    "model": str(snapshot.get("identity") or "unknown"),
+                    "runtimeUsed": str(snapshot["runtimeUsed"]),
+                    "runtimeDigest": str(snapshot.get("runtimeDigest") or ""),
+                    "fallbackReason": str(snapshot.get("fallbackReason") or ""),
+                    "usageComplete": False,
+                }
+                if snapshot.get("runtimeUsed") in {"direct_llm", "agent_fallback"}
+                else {}
             )
             return NodeResult(
                 status="failed",
-                error=ExecutionError(code=code, message=str(exc)),
+                error=ExecutionError(code=exc.code, message=exc.message),
+                metrics=metrics,
+            )
+        except Exception as exc:
+            snapshot = context.runtime_snapshot
+            return NodeResult(
+                status="failed",
+                error=ExecutionError(
+                    code="MODEL_MALFORMED_OUTPUT", message=str(exc)
+                ),
+                metrics=(
+                    {
+                        "provider": str(snapshot.get("provider") or "unknown"),
+                        "model": str(snapshot.get("identity") or "unknown"),
+                        "runtimeUsed": str(snapshot["runtimeUsed"]),
+                        "runtimeDigest": str(snapshot.get("runtimeDigest") or ""),
+                        "fallbackReason": str(snapshot.get("fallbackReason") or ""),
+                        "usageComplete": False,
+                    }
+                    if snapshot.get("runtimeUsed")
+                    in {"direct_llm", "agent_fallback"}
+                    else {}
+                ),
             )
 
 
@@ -513,8 +589,7 @@ class AgentExecutor:
                 events=events,
                 artifacts=[artifact],
             )
-        settings = get_settings()
-        if not settings.traex_command:
+        if not agent_runtime_config().configured:
             return NodeResult(
                 status="failed",
                 error=ExecutionError(

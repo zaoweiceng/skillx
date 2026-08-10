@@ -1,3 +1,8 @@
+import json
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from threading import Thread
 from typing import Any
 from uuid import uuid4
 
@@ -6,7 +11,60 @@ from sqlalchemy import select
 
 from app.application.compiler import WorkflowCompiler, WorkflowValidationError
 from app.application.orchestrator import Orchestrator, WorkerService
-from app.infrastructure.database import Run, RunEvent, SessionLocal, Workflow, WorkflowVersion
+from app.config import get_settings
+from app.infrastructure.database import (
+    ModelUsage,
+    Run,
+    RunEvent,
+    SessionLocal,
+    Workflow,
+    WorkflowVersion,
+)
+
+STUB = Path(__file__).resolve().parents[2] / "examples" / "traex_stub.py"
+
+
+class _ModelHandler(BaseHTTPRequestHandler):
+    status = 200
+
+    def do_POST(self) -> None:  # noqa: N802
+        length = int(self.headers.get("content-length", "0"))
+        self.rfile.read(length)
+        if self.status != 200:
+            self.send_response(self.status)
+            self.end_headers()
+            return
+        payload = {
+            "model": "direct-test-model",
+            "choices": [{"message": {"content": json.dumps({"category": "direct"})}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+        }
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_: object) -> None:
+        return
+
+
+class ModelServer:
+    def __init__(self, status: int) -> None:
+        handler = type("ConfiguredModelHandler", (_ModelHandler,), {"status": status})
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self) -> str:
+        self.thread.start()
+        host, port = self.server.server_address
+        return f"http://{host}:{port}/v1/chat/completions"
+
+    def __exit__(self, *_: object) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
 
 
 def model_workflow(node_type: str = "llm") -> dict[str, Any]:
@@ -89,8 +147,9 @@ async def execute_workflow(definition: dict[str, Any]) -> tuple[str, Run]:
         run = await Orchestrator().create_run(session, version, {"text": "产品很好"})
         run_id = run.id
     worker = WorkerService("model-worker")
-    for _ in range(3):
-        assert await worker.run_once()
+    for _ in range(5):
+        if not await worker.run_once():
+            break
     async with SessionLocal() as session:
         completed = await session.get(Run, run_id)
         assert completed is not None
@@ -134,3 +193,104 @@ def test_agent_without_limits_is_rejected() -> None:
         WorkflowCompiler().compile(definition)
 
     assert "AGENT_LIMITS_REQUIRED" in {item.code for item in error.value.diagnostics}
+
+
+def _real_model_workflow() -> dict[str, Any]:
+    definition = model_workflow("llm")
+    definition["spec"]["nodes"][1]["config"].pop("modelProfile")
+    return definition
+
+
+def _configure_agent_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "agent_runtime_type", "fixture")
+    monkeypatch.setattr(settings, "agent_command", [sys.executable, str(STUB)])
+    monkeypatch.setattr(
+        settings, "agent_allowed_executables", [Path(sys.executable).name]
+    )
+
+
+async def test_llm_unconfigured_uses_toolless_agent_structured_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "llm_runtime_type", "unavailable")
+    _configure_agent_fixture(monkeypatch)
+
+    run_id, run = await execute_workflow(_real_model_workflow())
+
+    assert run.status == "succeeded"
+    assert run.output_json == {"category": "fixture"}
+    async with SessionLocal() as session:
+        usage = await session.scalar(
+            select(ModelUsage).where(ModelUsage.run_id == run_id)
+        )
+        event_types = set(
+            await session.scalars(select(RunEvent.type).where(RunEvent.run_id == run_id))
+        )
+    assert usage is not None
+    assert usage.runtime_used == "agent_fallback"
+    assert usage.fallback_reason == "LLM_RUNTIME_UNCONFIGURED"
+    assert usage.input_tokens == 12
+    assert usage.output_tokens == 8
+    assert usage.total_tokens == 20
+    assert "tool.requested" not in event_types
+
+
+async def test_both_model_runtimes_unavailable_fails_stably(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "llm_runtime_type", "unavailable")
+    monkeypatch.setattr(settings, "agent_runtime_type", "unavailable")
+    monkeypatch.setattr(settings, "agent_command", None)
+
+    _run_id, run = await execute_workflow(_real_model_workflow())
+
+    assert run.status == "failed"
+    assert run.error_json["code"] == "MODEL_RUNTIME_UNAVAILABLE"
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_status", "expected_code", "expected_runtime"),
+    [
+        (200, "succeeded", None, "direct_llm"),
+        (401, "failed", "MODEL_AUTH_FAILED", None),
+        (429, "failed", "RATE_LIMITED", None),
+    ],
+)
+async def test_direct_llm_never_falls_back_after_request_started(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    expected_status: str,
+    expected_code: str | None,
+    expected_runtime: str | None,
+) -> None:
+    settings = get_settings()
+    _configure_agent_fixture(monkeypatch)
+    monkeypatch.setattr(settings, "llm_runtime_type", "openai_compatible")
+    monkeypatch.setattr(settings, "llm_model", "direct-test-model")
+    monkeypatch.setattr(settings, "llm_api_key_env", "TEST_LLM_RUNTIME_KEY")
+    monkeypatch.setenv("TEST_LLM_RUNTIME_KEY", "configured")
+    with ModelServer(status) as endpoint:
+        monkeypatch.setattr(settings, "llm_endpoint", endpoint)
+        run_id, run = await execute_workflow(_real_model_workflow())
+
+    assert run.status == expected_status
+    if expected_code:
+        assert run.error_json["code"] == expected_code
+    async with SessionLocal() as session:
+        usage = await session.scalar(
+            select(ModelUsage).where(ModelUsage.run_id == run_id)
+        )
+        event_types = set(
+            await session.scalars(select(RunEvent.type).where(RunEvent.run_id == run_id))
+        )
+    assert (usage.runtime_used if usage else None) == (
+        expected_runtime or "direct_llm"
+    )
+    assert "tool.requested" not in event_types
+    if status != 200:
+        assert usage is not None
+        assert usage.usage_complete is False
+        assert usage.total_tokens is None

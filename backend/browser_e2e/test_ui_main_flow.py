@@ -94,6 +94,7 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             utc_context.close()
             console_errors: list[str] = []
             console_warnings: list[str] = []
+            stream_requests: list[str] = []
             page.on(
                 "console",
                 lambda message: (
@@ -101,6 +102,14 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
                     if message.type == "error"
                     else console_warnings.append(message.text)
                     if message.type == "warning"
+                    else None
+                ),
+            )
+            page.on(
+                "request",
+                lambda request: (
+                    stream_requests.append(request.url)
+                    if request.url.endswith("/events/stream")
                     else None
                 ),
             )
@@ -170,6 +179,9 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             expect(page.get_by_role("heading", name="运行详情")).to_be_visible()
             expect(page.get_by_role("heading", name="结构化结果")).to_be_visible()
             expect(page.get_by_text("browser-read-summary.json")).to_be_visible()
+            terminal_stream_count = len(stream_requests)
+            page.wait_for_timeout(5_000)
+            assert len(stream_requests) == terminal_stream_count
 
             stack.set_transient_healthy(False)
             page.goto(f"{frontend_url}/chat")

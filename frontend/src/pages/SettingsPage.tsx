@@ -40,6 +40,8 @@ export default function SettingsPage() {
   }
 
   const provider = health?.selectionProvider
+  const agentRuntime = health?.agentRuntime ?? provider
+  const llmRuntime = health?.llmRuntime
   const runtimeCards = health
     ? [
         {
@@ -54,20 +56,28 @@ export default function SettingsPage() {
         },
         {
           icon: Bot,
-          name: '语义 Agent',
+          name: 'Agent Runtime',
           status:
-            provider?.type === 'real' && provider.modelAvailable
+            agentRuntime?.type === 'real' && agentRuntime.modelAvailable
               ? 'available'
-              : provider?.type === 'fixture'
+              : agentRuntime?.type === 'fixture'
                 ? 'fixture'
                 : 'unconfigured',
-          detail: provider
-            ? `${provider.lastProbe.summary}${
-                typeof provider.lastProbe.totalTokens === 'number'
-                  ? ` · operational probe ${provider.lastProbe.totalTokens} Token`
+          detail: agentRuntime
+            ? `${agentRuntime.lastProbe.summary}${
+                typeof agentRuntime.lastProbe.totalTokens === 'number'
+                  ? ` · operational probe ${agentRuntime.lastProbe.totalTokens} Token`
                   : ''
               }`
             : '未检测',
+        },
+        {
+          icon: ServerCog,
+          name: 'LLM Runtime',
+          status: llmRuntime?.configured ? 'available' : 'unconfigured',
+          detail:
+            llmRuntime?.probe.summary ??
+            'Direct LLM Runtime 未配置；符合策略时使用无 Tool 的 Agent fallback。',
         },
         {
           icon: PanelsTopLeft,
@@ -88,7 +98,10 @@ export default function SettingsPage() {
         <div>
           <span className="eyebrow">RUNTIME GOVERNANCE</span>
           <h1>系统与执行环境</h1>
-          <p>外部 Runtime 未配置时明确失败，不允许隐式升级到 Agent。</p>
+          <p>
+            结构化生成优先使用 LLM Runtime；仅启动前未配置时使用受约束的 Agent fallback。
+            401、429、超时或畸形输出不会切换 Runtime。
+          </p>
         </div>
       </header>
       {error && <div className="error-panel">运行状态探测失败：{error}</div>}
@@ -98,6 +111,17 @@ export default function SettingsPage() {
           当前工作流选择 Provider：<strong>{health.workflowSelectionMode}</strong>
           {health.workflowSelectionMode === 'unavailable' && '。真实语义 Agent 未配置。'}
           {health.workflowSelectionMode === 'fixture' && '。当前仅可验证协议，不代表真实语义能力。'}
+          <span>
+            当前结构化生成路径：
+            <strong>
+              {llmRuntime?.configured
+                ? ' LLM Runtime'
+                : agentRuntime?.configured
+                  ? ' Agent fallback'
+                  : ' unavailable'}
+            </strong>
+            。
+          </span>
           {provider?.type === 'real' && (
             <>
               <span>

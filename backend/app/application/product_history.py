@@ -13,6 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.application.compiler import digest_json
 from app.application.error_policy import persisted_error, public_error
 from app.application.orchestrator import append_event
+from app.application.structured_generation import (
+    StructuredGenerationRequest,
+    StructuredGenerationResolver,
+)
+from app.config import get_settings
 from app.infrastructure.database import (
     ConversationRun,
     ConversationTurn,
@@ -24,7 +29,7 @@ from app.infrastructure.database import (
     rfc3339,
     utcnow,
 )
-from app.runtime.models import OpenAICompatibleAdapter
+from app.runtime.models import ModelRuntimeError
 
 _FORMATTER = string.Formatter()
 _MAX_PRESENTATION_TEMPLATE_LENGTH = 8000
@@ -50,6 +55,9 @@ async def record_model_usage(
     presentation_id: str | None = None,
     provider: str | None = None,
     model: str | None = None,
+    runtime_used: str | None = None,
+    runtime_digest: str | None = None,
+    fallback_reason: str | None = None,
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     cached_tokens: int | None = None,
@@ -76,6 +84,9 @@ async def record_model_usage(
             attempt=attempt,
             provider=provider,
             model=model,
+            runtime_used=runtime_used,
+            runtime_digest=runtime_digest,
+            fallback_reason=fallback_reason,
             stage=stage,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -144,6 +155,9 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
                 "stage": item.stage,
                 "provider": item.provider,
                 "model": item.model,
+                "runtimeUsed": item.runtime_used,
+                "runtimeDigest": item.runtime_digest,
+                "fallbackReason": item.fallback_reason,
                 "totalTokens": item.total_tokens,
                 "complete": item.usage_complete,
             }
@@ -408,23 +422,36 @@ class PresentationDriver:
                     model = None
                     usage: tuple[int | None, int | None, bool] = (None, None, True)
                 elif policy["producer"] == "llm":
-                    result = await OpenAICompatibleAdapter().generate(
-                        f"{policy['prompt']}\nJSON={json.dumps(output, ensure_ascii=False)}",
-                        {
-                            "type": "object",
-                            "properties": {"text": {"type": "string"}},
-                            "required": ["text"],
-                            "additionalProperties": False,
-                        },
-                        policy["maxLength"],
+                    result = await StructuredGenerationResolver().generate(
+                        StructuredGenerationRequest(
+                            call_id=f"presentation:{item.id}",
+                            prompt=(
+                                f"{policy['prompt']}\n"
+                                f"JSON={json.dumps(output, ensure_ascii=False)}"
+                            ),
+                            output_schema={
+                                "type": "object",
+                                "properties": {"text": {"type": "string"}},
+                                "required": ["text"],
+                                "additionalProperties": False,
+                            },
+                            max_output_tokens=policy["maxLength"],
+                            working_directory=(
+                                get_settings().artifact_root
+                                / run.id
+                                / f"presentation-{item.id}"
+                            ),
+                        ),
+                        run.runtime_snapshot_json,
                     )
                     text = str(result.output["text"])[: policy["maxLength"]]
-                    model = result.model
+                    model = result.runtime.identity or result.runtime.provider
                     usage = (
                         result.input_tokens,
                         result.output_tokens,
                         result.usage_complete,
                     )
+                    runtime_usage = result.runtime
                 else:
                     raise ValueError(f"未知 Presentation producer: {policy['producer']}")
             except Exception as exc:  # noqa: BLE001 - presentation failure is isolated.
@@ -435,9 +462,14 @@ class PresentationDriver:
                         return
                     now = utcnow()
                     item.status = "failed"
+                    error_code = (
+                        exc.code
+                        if isinstance(exc, ModelRuntimeError)
+                        else "PRESENTATION_FAILED"
+                    )
                     item.error_json = persisted_error(
                         {
-                            "code": "PRESENTATION_FAILED",
+                            "code": error_code,
                             "message": str(exc),
                             "retryable": False,
                         },
@@ -451,6 +483,26 @@ class PresentationDriver:
                         "presentation.failed",
                         {"presentationId": item.id, "error": item.error_json},
                     )
+                    runtime_snapshot = run.runtime_snapshot_json or {}
+                    if (
+                        item.producer == "llm"
+                        and runtime_snapshot.get("runtimeUsed")
+                        in {"direct_llm", "agent_fallback"}
+                    ):
+                        await record_model_usage(
+                            session,
+                            call_id=f"presentation:{item.id}",
+                            stage="presentation",
+                            turn_id=run.turn_id,
+                            run_id=run.id,
+                            presentation_id=item.id,
+                            provider=runtime_snapshot.get("provider"),
+                            model=runtime_snapshot.get("identity"),
+                            runtime_used=runtime_snapshot.get("runtimeUsed"),
+                            runtime_digest=runtime_snapshot.get("runtimeDigest"),
+                            fallback_reason=runtime_snapshot.get("fallbackReason"),
+                            usage_complete=False,
+                        )
                     await finalize_turn(session, run.turn_id, "succeeded", completed_at=now)
                 return
 
@@ -497,8 +549,11 @@ class PresentationDriver:
                     turn_id=run.turn_id,
                     run_id=run.id,
                     presentation_id=item.id,
-                    provider="openai-compatible",
+                    provider=runtime_usage.provider,
                     model=model,
+                    runtime_used=runtime_usage.runtime_used,
+                    runtime_digest=runtime_usage.digest,
+                    fallback_reason=runtime_usage.fallback_reason,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     usage_complete=complete,

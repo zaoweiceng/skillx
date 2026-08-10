@@ -87,6 +87,16 @@ def sanitize_technical_detail(value: Any) -> Any:
 def bounded_technical_json(value: Any) -> Any:
     """Keep the complete projection small even for deeply nested provider logs."""
 
+    if (
+        isinstance(value, dict)
+        and value.get("truncated") is True
+        and isinstance(value.get("summary"), str)
+        and set(value).issubset({"summary", "truncated"})
+    ):
+        return {
+            "summary": sanitize_technical_detail(value["summary"]),
+            "truncated": True,
+        }
     sanitized = sanitize_technical_detail(value)
     encoded = json.dumps(sanitized, ensure_ascii=False, default=str)
     if len(encoded) <= MAX_TECHNICAL_DETAIL_CHARS:

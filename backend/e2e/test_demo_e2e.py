@@ -8,9 +8,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections.abc import Iterator
 from copy import deepcopy
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
 
 import httpx
 import pytest
@@ -23,6 +26,48 @@ from e2e.harness import (
     start_stack,
     stop_stack,
 )
+
+
+class _LLMHandler(BaseHTTPRequestHandler):
+    status = 200
+
+    def do_POST(self) -> None:  # noqa: N802
+        self.rfile.read(int(self.headers.get("content-length", "0")))
+        if self.status != 200:
+            self.send_response(self.status)
+            self.end_headers()
+            return
+        payload = {
+            "model": "e2e-direct-model",
+            "choices": [{"message": {"content": json.dumps({"category": "direct"})}}],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+        }
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_: object) -> None:
+        return
+
+
+class _LLMServer:
+    def __init__(self, status: int) -> None:
+        handler = type("ConfiguredLLMHandler", (_LLMHandler,), {"status": status})
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.thread = Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self) -> str:
+        self.thread.start()
+        host, port = self.server.server_address
+        return f"http://{host}:{port}/v1/chat/completions"
+
+    def __exit__(self, *_: object) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
 
 
 @pytest.fixture(scope="module")
@@ -117,6 +162,132 @@ def test_e2e_3_hybrid_component(stack: DemoStack) -> None:
         assert run["status"] == "succeeded"
         assert run["output"] == {"category": "feedback"}
         assert "llm.call.completed" in _events(client, run["id"])
+
+
+def test_e2e_3b_agent_structured_fallback_for_node_and_presentation(
+    isolated_stack: DemoStack,
+) -> None:
+    """真实 API/Worker/Agent 子进程：LLM 未配置时两类结构化生成共用冻结 fallback。"""
+
+    with isolated_stack.client() as client:
+        component = _component(client, "反馈分类")
+        workflow = client.get(f"/workflows/{component['workflowId']}").json()
+        definition = workflow["definition"]
+        semantic = next(
+            node for node in definition["spec"]["nodes"] if node["type"] == "llm"
+        )
+        semantic["config"].pop("modelProfile", None)
+        definition["metadata"]["presentationPolicy"] = {
+            "enabled": True,
+            "audience": "end_user",
+            "producer": "llm",
+            "prompt": "用一句话说明分类结果",
+            "language": "zh-CN",
+            "maxLength": 120,
+        }
+        updated = client.put(
+            f"/workflows/{component['workflowId']}/draft",
+            json={"revision": workflow["draftRevision"], "definition": definition},
+        )
+        assert updated.status_code == 200, updated.text
+        published = _publish_workflow(client, component["workflowId"])
+        assert published.status_code == 201, published.text
+        created = client.post(
+            f"/workflow-versions/{published.json()['id']}/runs",
+            json={"input": {"text": "这个产品很好"}},
+        )
+        assert created.status_code == 202, created.text
+        run = poll_run(client, created.json()["id"], timeout=60)
+        assert run["status"] == "succeeded", run
+
+        deadline = time.time() + 30
+        detail = run
+        while time.time() < deadline:
+            detail = client.get(f"/runs/{run['id']}").json()
+            if (detail.get("presentation") or {}).get("status") == "completed":
+                break
+            time.sleep(0.2)
+        assert detail["runtimeSnapshot"]["runtimeUsed"] == "agent_fallback"
+        assert detail["runtimeSnapshot"]["fallbackReason"] == "LLM_RUNTIME_UNCONFIGURED"
+        assert detail["presentation"]["status"] == "completed"
+        assert len(detail["modelUsage"]) == 2
+        assert {
+            item["runtimeUsed"] for item in detail["modelUsage"]
+        } == {"agent_fallback"}
+        assert all(item["complete"] for item in detail["modelUsage"])
+        assert all(item["totalTokens"] == 20 for item in detail["modelUsage"])
+        llm_node = next(node for node in detail["nodes"] if node["type"] == "llm")
+        assert llm_node["metrics"]["toolRequestCount"] == 0
+        assert "tool.requested" not in _events(client, run["id"])
+
+
+@pytest.mark.parametrize(
+    ("provider_status", "expected_code"),
+    [(200, None), (401, "MODEL_AUTH_FAILED")],
+)
+def test_e2e_3c_direct_llm_does_not_fallback_after_request_started(
+    request: pytest.FixtureRequest,
+    provider_status: int,
+    expected_code: str | None,
+) -> None:
+    with _LLMServer(provider_status) as endpoint:
+        direct_stack = start_stack(
+            model_env={
+                "SKILLX_LLM_RUNTIME_TYPE": "openai_compatible",
+                "SKILLX_LLM_ENDPOINT": endpoint,
+                "SKILLX_LLM_MODEL": "e2e-direct-model",
+                "SKILLX_LLM_API_KEY_ENV": "SKILLX_E2E_LLM_KEY",
+                "SKILLX_E2E_LLM_KEY": "configured",
+            }
+        )
+        failed = True
+        try:
+            with direct_stack.client() as client:
+                component = _component(client, "反馈分类")
+                workflow = client.get(f"/workflows/{component['workflowId']}").json()
+                definition = workflow["definition"]
+                semantic = next(
+                    node for node in definition["spec"]["nodes"] if node["type"] == "llm"
+                )
+                semantic["config"].pop("modelProfile", None)
+                updated = client.put(
+                    f"/workflows/{component['workflowId']}/draft",
+                    json={
+                        "revision": workflow["draftRevision"],
+                        "definition": definition,
+                    },
+                )
+                assert updated.status_code == 200, updated.text
+                published = _publish_workflow(client, component["workflowId"])
+                assert published.status_code == 201, published.text
+                created = client.post(
+                    f"/workflow-versions/{published.json()['id']}/runs",
+                    json={"input": {"text": "这个产品很好"}},
+                )
+                run = poll_run(client, created.json()["id"], timeout=60)
+                detail = client.get(f"/runs/{run['id']}").json()
+                assert detail["runtimeSnapshot"]["runtimeUsed"] == "direct_llm"
+                assert len(detail["modelUsage"]) == 1
+                usage = detail["modelUsage"][0]
+                assert usage["runtimeUsed"] == "direct_llm"
+                assert usage["fallbackReason"] is None
+                assert "tool.requested" not in _events(client, run["id"])
+                if expected_code is None:
+                    assert run["status"] == "succeeded", run
+                    assert usage["complete"] is True
+                    assert usage["totalTokens"] == 10
+                else:
+                    assert run["status"] == "failed", run
+                    assert run["error"]["code"] == expected_code
+                    assert usage["complete"] is False
+                    assert usage["totalTokens"] is None
+                failed = False
+        finally:
+            failed = failed or bool(
+                getattr(request.node, "rep_call", None)
+                and request.node.rep_call.failed
+            )
+            stop_stack(direct_stack, failed=failed)
 
 
 def test_e2e_4_conversation_component(stack: DemoStack) -> None:

@@ -141,6 +141,10 @@ def test_public_error_hides_and_technical_view_bounds_diagnostics() -> None:
     assert "super-secret" not in str(evidence)
     assert "token=secret" not in str(evidence)
     assert sanitize_technical_detail("x" * 5000).endswith("[TRUNCATED]")
+    assert durable["errorEnvelopeVersion"] == 1
+    assert persisted_error(durable) == durable
+    assert public_error(persisted_error(durable)) == projected
+    assert technical_error(persisted_error(durable)) == evidence
 
 
 async def test_ready_reads_cached_facts_without_running_agent_host(

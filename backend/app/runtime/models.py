@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from app.config import get_settings
+from app.application.runtime_config import llm_runtime_config
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,13 @@ class FakeModelAdapter:
         )
 
 
+class ModelRuntimeError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(message)
+
+
 class OpenAICompatibleAdapter:
     async def generate(
         self,
@@ -53,14 +60,19 @@ class OpenAICompatibleAdapter:
         output_schema: dict[str, Any],
         max_output_tokens: int,
     ) -> ModelResult:
-        settings = get_settings()
-        if not settings.model_endpoint or not settings.model_name:
-            raise RuntimeError("MODEL_NOT_CONFIGURED")
-        api_key = os.environ.get(settings.model_api_key_env)
+        runtime = llm_runtime_config()
+        if not runtime.configured or not runtime.endpoint or not runtime.model:
+            raise ModelRuntimeError(
+                "MODEL_RUNTIME_UNAVAILABLE", "Direct LLM Runtime 未配置"
+            )
+        api_key = os.environ.get(runtime.api_key_env)
         if not api_key:
-            raise RuntimeError(f"缺少环境变量 {settings.model_api_key_env}")
+            raise ModelRuntimeError(
+                "MODEL_RUNTIME_UNAVAILABLE",
+                f"缺少环境变量 {runtime.api_key_env}",
+            )
         request = {
-            "model": settings.model_name,
+            "model": runtime.model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_output_tokens,
             "response_format": {
@@ -72,22 +84,43 @@ class OpenAICompatibleAdapter:
                 },
             },
         }
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                settings.model_endpoint,
-                headers={"authorization": f"Bearer {api_key}"},
-                json=request,
-            )
-            response.raise_for_status()
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                response = await client.post(
+                    runtime.endpoint,
+                    headers={"authorization": f"Bearer {api_key}"},
+                    json=request,
+                )
+            if response.status_code in {401, 403}:
+                raise ModelRuntimeError("MODEL_AUTH_FAILED", "LLM Provider 鉴权失败")
+            if response.status_code == 429:
+                raise ModelRuntimeError("RATE_LIMITED", "LLM Provider 请求限流")
+            if response.is_error:
+                raise ModelRuntimeError(
+                    "MODEL_PROVIDER_ERROR",
+                    f"LLM Provider 返回 HTTP {response.status_code}",
+                )
             payload = response.json()
-        content = payload["choices"][0]["message"]["content"]
-        output = json.loads(content) if isinstance(content, str) else content
+            content = payload["choices"][0]["message"]["content"]
+            output = json.loads(content) if isinstance(content, str) else content
+        except ModelRuntimeError:
+            raise
+        except httpx.TimeoutException as exc:
+            raise ModelRuntimeError("TIMEOUT", "LLM Provider 请求超时") from exc
+        except httpx.HTTPError as exc:
+            raise ModelRuntimeError(
+                "DEPENDENCY_UNAVAILABLE", "LLM Provider 连接失败"
+            ) from exc
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ModelRuntimeError(
+                "MODEL_MALFORMED_OUTPUT", "LLM Provider 返回无法解析的结构化结果"
+            ) from exc
         usage = payload.get("usage", {})
         return ModelResult(
             output=output,
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
-            model=payload.get("model", settings.model_name),
+            model=payload.get("model", runtime.model),
             usage_complete=(
                 "prompt_tokens" in usage and "completion_tokens" in usage
             ),

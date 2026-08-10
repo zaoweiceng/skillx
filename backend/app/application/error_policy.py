@@ -49,6 +49,14 @@ _USER_ERRORS: dict[str, tuple[str, str]] = {
     "TIMEOUT": ("执行超时，请重试或缩小任务范围。", "retry"),
     "RATE_LIMITED": ("服务请求过于频繁，请稍后重试。", "retry_later"),
     "MODEL_NOT_CONFIGURED": ("真实模型尚未配置，请在系统设置中完成配置。", "configure"),
+    "MODEL_RUNTIME_UNAVAILABLE": (
+        "LLM Runtime 与 Agent Runtime 均不可用，请在系统设置中完成配置。",
+        "configure",
+    ),
+    "MODEL_RUNTIME_CONFIG_DRIFT": (
+        "模型 Runtime 配置在运行期间发生变化，请重新发起运行。",
+        "retry",
+    ),
     "MODEL_AUTH_FAILED": ("模型凭据无效或无权访问当前模型。", "configure"),
     "MODEL_CAPABILITY_UNSUPPORTED": (
         "当前模型不支持所需的 function calling 或严格结构化输出。",
@@ -94,6 +102,16 @@ def persisted_error(
     """Build the durable error envelope shared by every runtime."""
 
     raw = dict(error or {})
+    if raw.get("errorEnvelopeVersion") == 1:
+        envelope = {
+            **raw,
+            "technicalDetail": bounded_technical_json(
+                raw.get("technicalDetail", {})
+            ),
+        }
+        if technical_detail_ref is not None:
+            envelope["technicalDetailRef"] = technical_detail_ref
+        return envelope
     code = error_policy(str(raw.get("code", "EXECUTION_FAILED"))).code
     user_message, action = _USER_ERRORS.get(
         code,
@@ -117,6 +135,7 @@ def persisted_error(
             }
         }
     envelope = {
+        "errorEnvelopeVersion": 1,
         "code": code,
         "userMessage": str(raw.get("userMessage") or user_message),
         "technicalDetailRef": technical_detail_ref or raw.get("technicalDetailRef"),

@@ -80,6 +80,21 @@ class WorkflowPolicies(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 
 
+class ModelRuntimePolicy(BaseModel):
+    order: list[Literal["llm_runtime", "agent_runtime"]] = Field(
+        default_factory=lambda: ["llm_runtime", "agent_runtime"]
+    )
+    fallback: Literal["startup_unavailable_only"] = "startup_unavailable_only"
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def fixed_order(self) -> ModelRuntimePolicy:
+        if self.order != ["llm_runtime", "agent_runtime"]:
+            raise ValueError("modelRuntimePolicy.order must be llm_runtime then agent_runtime")
+        return self
+
+
 class WorkflowSpec(BaseModel):
     input_schema: dict[str, Any] = Field(alias="inputSchema")
     ui_schema: dict[str, Any] = Field(default_factory=dict, alias="uiSchema")
@@ -87,6 +102,9 @@ class WorkflowSpec(BaseModel):
     nodes: list[WorkflowNode] = Field(min_length=2)
     edges: list[WorkflowEdge] = Field(default_factory=list)
     policies: WorkflowPolicies = Field(default_factory=WorkflowPolicies)
+    model_runtime_policy: ModelRuntimePolicy = Field(
+        default_factory=ModelRuntimePolicy, alias="modelRuntimePolicy"
+    )
 
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
 

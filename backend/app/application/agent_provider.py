@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
+from app.application.runtime_config import agent_runtime_config, llm_runtime_config
 from app.config import get_settings
 
 _last_probe: dict[str, Any] | None = None
@@ -18,8 +19,8 @@ _probe_expires_at: datetime | None = None
 
 
 def _probe_fingerprints() -> tuple[str, str]:
-    settings = get_settings()
-    command = settings.traex_command or []
+    runtime = agent_runtime_config()
+    command = list(runtime.command)
     sidecar = hashlib.sha256()
     sidecar.update(json.dumps(command, separators=(",", ":")).encode())
     for argument in command[1:]:
@@ -31,8 +32,9 @@ def _probe_fingerprints() -> tuple[str, str]:
                 sidecar.update(b"unreadable-sidecar")
     sidecar_digest = f"sha256:{sidecar.hexdigest()}"
     config = {
-        "endpoint": settings.model_endpoint,
-        "model": settings.model_name,
+        "type": runtime.type,
+        "endpoint": runtime.endpoint,
+        "model": runtime.model,
         "sidecarDigest": sidecar_digest,
     }
     config_digest = "sha256:" + hashlib.sha256(
@@ -42,8 +44,8 @@ def _probe_fingerprints() -> tuple[str, str]:
 
 
 def _protocol_available() -> tuple[bool, str]:
-    settings = get_settings()
-    command = settings.traex_command
+    runtime = agent_runtime_config()
+    command = runtime.command
     if not command:
         return False, "未配置 Agent command"
     executable = Path(command[0])
@@ -54,16 +56,22 @@ def _protocol_available() -> tuple[bool, str]:
     )
     if resolved is None:
         return False, f"Agent executable 不存在: {command[0]}"
-    if executable.name not in settings.traex_allowed_executables:
+    if executable.name not in runtime.allowed_executables:
         return False, f"Agent executable 未在 allowlist: {executable.name}"
     return True, "Host 双向 subprocess 协议可启动"
 
 
 async def provider_readiness() -> dict[str, Any]:
-    settings = get_settings()
-    provider_type = settings.agent_provider_type
+    runtime = agent_runtime_config()
+    provider_type = (
+        "fixture"
+        if runtime.type == "fixture"
+        else "real"
+        if runtime.type in {"traex_managed", "openai_sidecar"}
+        else "unavailable"
+    )
     protocol_available, protocol_summary = _protocol_available()
-    configured = provider_type != "unavailable" and bool(settings.traex_command)
+    configured = runtime.configured
     now = datetime.now(UTC)
     config_digest, _sidecar_digest = _probe_fingerprints()
     cache_valid = bool(
@@ -74,13 +82,17 @@ async def provider_readiness() -> dict[str, Any]:
     )
     summary = protocol_summary
     if provider_type == "real":
-        key_configured = bool(os.environ.get(settings.model_api_key_env))
+        key_configured = bool(os.environ.get(runtime.api_key_env))
         if not protocol_available:
             summary = protocol_summary
-        elif not settings.model_endpoint or not settings.model_name or not key_configured:
-            summary = "真实模型 endpoint、model 或 API key 未完整配置"
+        elif runtime.type == "openai_sidecar" and (
+            not runtime.endpoint or not runtime.model or not key_configured
+        ):
+            summary = "Agent sidecar endpoint、model 或 API key 未完整配置"
+        elif runtime.type == "traex_managed":
+            summary = "TraeX managed Agent 协议已配置，不要求 Host 持有 LLM endpoint"
         elif _last_probe is None:
-            summary = "真实模型已配置，尚未执行同路径主动探测"
+            summary = "Agent Runtime 已配置，尚未执行同路径主动探测"
         elif not cache_valid:
             summary = "最近一次真实模型探测已过期或配置已变化，请重新探测"
         else:
@@ -95,9 +107,10 @@ async def provider_readiness() -> dict[str, Any]:
         summary = "真实语义 Agent 未配置"
     model_available = bool(
         provider_type == "real"
-        and cache_valid
-        and _last_probe
-        and _last_probe.get("ok")
+        and (
+            (runtime.type == "traex_managed" and protocol_available)
+            or (cache_valid and _last_probe and _last_probe.get("ok"))
+        )
     )
     last_probe = (
         {
@@ -120,9 +133,13 @@ async def provider_readiness() -> dict[str, Any]:
     )
     return {
         "type": provider_type,
+        "runtimeType": runtime.type,
         "configured": configured,
         "protocolAvailable": protocol_available,
         "modelAvailable": model_available,
+        "model": runtime.model,
+        "digest": runtime.digest,
+        "source": runtime.source,
         "lastProbe": last_probe,
         "nextProbeAllowedAt": (
             _next_probe_at.isoformat().replace("+00:00", "Z")
@@ -138,6 +155,7 @@ async def probe_provider() -> dict[str, Any]:
     global _last_probe, _next_probe_at, _probe_expires_at
 
     settings = get_settings()
+    runtime = agent_runtime_config()
     now = datetime.now(UTC)
     config_digest, sidecar_digest = _probe_fingerprints()
     if (
@@ -152,16 +170,12 @@ async def probe_provider() -> dict[str, Any]:
             "nextProbeAllowedAt": _next_probe_at.isoformat().replace("+00:00", "Z"),
         }
     protocol_available, protocol_summary = _protocol_available()
-    if settings.agent_provider_type != "real":
+    if runtime.type not in {"traex_managed", "openai_sidecar"}:
         raise ValueError("仅 real Provider 支持付费主动探测")
     if not protocol_available:
         raise ValueError(protocol_summary)
-    if (
-        not settings.model_endpoint
-        or not settings.model_name
-        or not os.environ.get(settings.model_api_key_env)
-    ):
-        raise ValueError("真实模型 endpoint、model 或 API key 未完整配置")
+    if runtime.type == "openai_sidecar" and not runtime.configured:
+        raise ValueError("Agent sidecar endpoint、model 或 API key 未完整配置")
     _next_probe_at = now + timedelta(seconds=settings.provider_probe_cooldown_seconds)
     _probe_expires_at = now + timedelta(seconds=settings.provider_probe_ttl_seconds)
     probe_id = str(uuid4())
@@ -207,7 +221,7 @@ async def probe_provider() -> dict[str, Any]:
             ),
             "kind": "sidecar_host_round_trip",
             "probeId": probe_id,
-            "model": settings.model_name,
+            "model": runtime.model,
             "configDigest": config_digest,
             "sidecarDigest": sidecar_digest,
             "totalTokens": result.total_tokens,
@@ -220,7 +234,7 @@ async def probe_provider() -> dict[str, Any]:
             "summary": f"Provider 兼容性探测失败: {exc.code}",
             "kind": "sidecar_host_round_trip",
             "probeId": probe_id,
-            "model": settings.model_name,
+            "model": runtime.model,
             "configDigest": config_digest,
             "sidecarDigest": sidecar_digest,
             "code": exc.code,
@@ -238,3 +252,29 @@ def reset_provider_probe_cache() -> None:
     _last_probe = None
     _next_probe_at = None
     _probe_expires_at = None
+
+
+async def llm_runtime_readiness() -> dict[str, Any]:
+    runtime = llm_runtime_config()
+    configured = runtime.configured
+    return {
+        "type": runtime.type,
+        "configured": configured,
+        "protocol": (
+            "openai-compatible-http"
+            if runtime.type == "openai_compatible"
+            else "none"
+        ),
+        "model": runtime.model,
+        "probe": {
+            "kind": "configuration_only",
+            "ok": configured,
+            "summary": (
+                "Direct LLM Runtime 已配置；执行中 401/429/timeout 不会切换 Runtime"
+                if configured
+                else "Direct LLM Runtime 未配置，可在 Run 启动前使用 Agent fallback"
+            ),
+        },
+        "digest": runtime.digest,
+        "source": runtime.source,
+    }

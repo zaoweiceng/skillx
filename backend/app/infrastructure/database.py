@@ -191,6 +191,7 @@ class Run(Base, TimestampMixin):
     input_json: Mapped[dict[str, Any]] = mapped_column(JSON)
     output_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    runtime_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     next_event_seq: Mapped[int] = mapped_column(Integer, default=0)
     cancellation_requested_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -711,6 +712,9 @@ class ModelUsage(Base):
     attempt: Mapped[int] = mapped_column(Integer, default=1)
     provider: Mapped[str | None] = mapped_column(String(80), nullable=True)
     model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    runtime_used: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    runtime_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    fallback_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)
     stage: Mapped[str] = mapped_column(String(40))
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)

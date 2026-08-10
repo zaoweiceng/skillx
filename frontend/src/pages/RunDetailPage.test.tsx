@@ -108,21 +108,32 @@ describe('RunDetailPage 可观测性与审批', () => {
     vi.unstubAllGlobals()
   })
 
-  it('使用真实 Zustand store 时空事件快照稳定且 EventSource 不重复创建', async () => {
+  it('终态 Run 不创建 EventSource', async () => {
     getRun.mockResolvedValue(baseRun)
     renderPage()
 
     await waitFor(() => expect(screen.getByText('等待新事件')).toBeInTheDocument())
-    expect(eventSources).toHaveLength(1)
+    expect(eventSources).toHaveLength(0)
+  })
 
-    useRunEvents.getState().add('run-1', {
-      runId: 'run-1',
-      seq: 1,
-      type: 'run.completed',
-      payload: { status: 'succeeded' },
-    })
+  it('收到终态事件后立即关闭 EventSource', async () => {
+    getRun.mockResolvedValue({ ...baseRun, status: 'running', output: null })
+    renderPage()
 
-    await waitFor(() => expect(screen.getByText('run.completed')).toBeInTheDocument())
+    await waitFor(() => expect(eventSources).toHaveLength(1))
+    const stream = eventSources[0]
+    const listener = stream.listeners.get('run.completed')
+    listener?.(
+      new MessageEvent('run.completed', {
+        data: JSON.stringify({
+          runId: 'run-1',
+          seq: 1,
+          payload: { status: 'succeeded' },
+        }),
+      }),
+    )
+
+    await waitFor(() => expect(stream.closed).toBe(true))
     expect(eventSources).toHaveLength(1)
   })
 
