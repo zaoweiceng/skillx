@@ -482,6 +482,11 @@ function CapabilityMetadataEditor({
     })
   }
 
+  function insertPresentationField(field: string) {
+    const current = String(presentation.template ?? '执行结果：{json}')
+    patchPresentation({ template: `${current}{${field}}` })
+  }
+
   function listValue(key: string) {
     return Array.isArray(capability[key]) ? (capability[key] as unknown[]).join(', ') : ''
   }
@@ -593,13 +598,29 @@ function CapabilityMetadataEditor({
             </select>
           </label>
           {String(presentation.producer ?? 'template') === 'template' && (
-            <label>
-              <span>模板（支持 {'{json}'} 和顶层字段）</span>
-              <input
-                value={String(presentation.template ?? '执行结果：{json}')}
-                onChange={(event) => patchPresentation({ template: event.target.value })}
-              />
-            </label>
+            <>
+              <label>
+                <span>模板（支持 {'{json}'} 和顶层字段）</span>
+                <input
+                  value={String(presentation.template ?? '执行结果：{json}')}
+                  onChange={(event) => patchPresentation({ template: event.target.value })}
+                />
+              </label>
+              <div className="presentation-field-chips" aria-label="可插入输出字段">
+                {['json', ...Object.keys(
+                  (definition.spec.outputSchema.properties as Record<string, unknown>) ?? {},
+                )].map((field) => (
+                  <button
+                    className="metric-chip"
+                    type="button"
+                    key={field}
+                    onClick={() => insertPresentationField(field)}
+                  >
+                    {`{${field}}`}
+                  </button>
+                ))}
+              </div>
+            </>
           )}
         </div>
         {fragments.map((fragment, index) => (

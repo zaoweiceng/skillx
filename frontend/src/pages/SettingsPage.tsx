@@ -1,5 +1,5 @@
 import { Bot, Database, KeyRound, PanelsTopLeft, ServerCog } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { api } from '@/api/client'
 
 type Health = Awaited<ReturnType<typeof api.getHealth>>
@@ -13,13 +13,31 @@ function tone(status: string) {
 export default function SettingsPage() {
   const [health, setHealth] = useState<Health | null>(null)
   const [error, setError] = useState('')
+  const [probing, setProbing] = useState(false)
 
-  useEffect(() => {
-    api
+  const refreshHealth = useCallback(() => {
+    return api
       .getHealth()
       .then(setHealth)
       .catch((reason: Error) => setError(reason.message))
   }, [])
+
+  useEffect(() => {
+    void refreshHealth()
+  }, [refreshHealth])
+
+  async function runProbe() {
+    setProbing(true)
+    setError('')
+    try {
+      await api.probeProvider()
+      await refreshHealth()
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Provider 探测失败')
+    } finally {
+      setProbing(false)
+    }
+  }
 
   const provider = health?.selectionProvider
   const runtimeCards = health
@@ -43,7 +61,13 @@ export default function SettingsPage() {
               : provider?.type === 'fixture'
                 ? 'fixture'
                 : 'unconfigured',
-          detail: provider?.lastProbe.summary ?? '未检测',
+          detail: provider
+            ? `${provider.lastProbe.summary}${
+                typeof provider.lastProbe.totalTokens === 'number'
+                  ? ` · operational probe ${provider.lastProbe.totalTokens} Token`
+                  : ''
+              }`
+            : '未检测',
         },
         {
           icon: PanelsTopLeft,
@@ -74,6 +98,22 @@ export default function SettingsPage() {
           当前工作流选择 Provider：<strong>{health.workflowSelectionMode}</strong>
           {health.workflowSelectionMode === 'unavailable' && '。真实语义 Agent 未配置。'}
           {health.workflowSelectionMode === 'fixture' && '。当前仅可验证协议，不代表真实语义能力。'}
+          {provider?.type === 'real' && (
+            <>
+              <span>
+                主动探测会产生真实模型费用，并走 sidecar、function calling 与 Host ToolResult
+                同一路径。
+              </span>
+              <button
+                className="button ghost"
+                type="button"
+                disabled={probing || health.selectionProvider.nextProbeAllowedAt !== null}
+                onClick={runProbe}
+              >
+                {probing ? '探测中…' : '重新探测'}
+              </button>
+            </>
+          )}
         </div>
       )}
       <section className="settings-grid">

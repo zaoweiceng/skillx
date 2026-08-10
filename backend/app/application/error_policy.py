@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
+
+from app.application.security import bounded_technical_json
 
 
 @dataclass(frozen=True)
@@ -28,8 +31,39 @@ _POLICIES = {
     ),
     "TIMEOUT": ErrorPolicy("TIMEOUT", True, 2, 0.05, "timeout"),
     "RATE_LIMITED": ErrorPolicy("RATE_LIMITED", True, 3, 0.1, "transport_error"),
+    "MODEL_AUTH_FAILED": ErrorPolicy("MODEL_AUTH_FAILED", False),
+    "MODEL_CAPABILITY_UNSUPPORTED": ErrorPolicy(
+        "MODEL_CAPABILITY_UNSUPPORTED", False
+    ),
+    "MODEL_MALFORMED_OUTPUT": ErrorPolicy("MODEL_MALFORMED_OUTPUT", False),
+    "MODEL_PROVIDER_ERROR": ErrorPolicy("MODEL_PROVIDER_ERROR", False),
     # Agent/adapter 中断可进入 checkpoint，但不能在 Host 内盲目重启整个 Agent。
     "EXECUTION_FAILED": ErrorPolicy("EXECUTION_FAILED", True),
+}
+
+_USER_ERRORS: dict[str, tuple[str, str]] = {
+    "DEPENDENCY_UNAVAILABLE": (
+        "外部服务暂时不可用，请稍后重试。",
+        "retry",
+    ),
+    "TIMEOUT": ("执行超时，请重试或缩小任务范围。", "retry"),
+    "RATE_LIMITED": ("服务请求过于频繁，请稍后重试。", "retry_later"),
+    "MODEL_NOT_CONFIGURED": ("真实模型尚未配置，请在系统设置中完成配置。", "configure"),
+    "MODEL_AUTH_FAILED": ("模型凭据无效或无权访问当前模型。", "configure"),
+    "MODEL_CAPABILITY_UNSUPPORTED": (
+        "当前模型不支持所需的 function calling 或严格结构化输出。",
+        "configure",
+    ),
+    "MODEL_MALFORMED_OUTPUT": ("模型返回了无法解析的结构化结果。", "view_run"),
+    "MODEL_PROVIDER_ERROR": ("模型服务拒绝了本次请求，请查看兼容性诊断。", "view_run"),
+    "PERMISSION_DENIED": ("当前任务需要未授权的能力。", "review_permissions"),
+    "CONTRACT_VIOLATION": ("执行结果不符合已发布契约，请查看运行。", "view_run"),
+    "INVALID_INPUT": ("输入不符合组件要求，请检查后重试。", "edit_input"),
+    "PRESENTATION_FAILED": ("阅读结果生成失败，结构化结果不受影响。", "view_run"),
+    "CANCELLED": ("运行已取消。", "retry"),
+    "UNKNOWN_OUTCOME": ("无法确认操作是否完成，请先查看运行再决定是否重试。", "view_run"),
+    "EXECUTION_FAILED": ("运行未能完成，请查看运行详情。", "view_run"),
+    "EXECUTOR_INTERNAL_ERROR": ("执行器发生内部错误，请查看运行并重试。", "view_run"),
 }
 
 
@@ -49,6 +83,94 @@ def normalize_error(
         "code": policy.code,
         "message": message,
         "retryable": policy.retryable if retryable is None else retryable,
+    }
+
+
+def persisted_error(
+    error: dict[str, Any] | None,
+    *,
+    technical_detail_ref: str | None = None,
+) -> dict[str, Any]:
+    """Build the durable error envelope shared by every runtime."""
+
+    raw = dict(error or {})
+    code = error_policy(str(raw.get("code", "EXECUTION_FAILED"))).code
+    user_message, action = _USER_ERRORS.get(
+        code,
+        ("运行未能完成，请查看运行详情。", "view_run"),
+    )
+    retryable = bool(raw.get("retryable", error_policy(code).retryable))
+    technical = raw.get("technicalDetail")
+    if technical is None:
+        technical = {
+            key: value
+            for key, value in raw.items()
+            if key
+            not in {
+                "code",
+                "userMessage",
+                "technicalDetailRef",
+                "retryable",
+                "action",
+                "taskCheckpointId",
+                "checkpointId",
+            }
+        }
+    envelope = {
+        "code": code,
+        "userMessage": str(raw.get("userMessage") or user_message),
+        "technicalDetailRef": technical_detail_ref or raw.get("technicalDetailRef"),
+        "retryable": retryable,
+        "action": str(raw.get("action") or action),
+        "technicalDetail": bounded_technical_json(technical),
+    }
+    for key, value in raw.items():
+        if key not in {
+            "code",
+            "message",
+            "userMessage",
+            "technicalDetailRef",
+            "retryable",
+            "action",
+            "technicalDetail",
+        }:
+            envelope[key] = bounded_technical_json(value)
+    for key in ("taskCheckpointId", "checkpointId"):
+        if isinstance(raw.get(key), str):
+            envelope[key] = raw[key]
+    return envelope
+
+
+def public_error(error: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Project a durable error to the default user-safe API contract."""
+
+    if error is None:
+        return None
+    envelope = persisted_error(error)
+    result = {
+        "code": envelope["code"],
+        "userMessage": envelope["userMessage"],
+        # Compatibility for existing clients. This is intentionally the safe text.
+        "message": envelope["userMessage"],
+        "technicalDetailRef": envelope["technicalDetailRef"],
+        "retryable": envelope["retryable"],
+        "action": envelope["action"],
+    }
+    for key in ("taskCheckpointId", "checkpointId"):
+        if isinstance(envelope.get(key), str):
+            result[key] = envelope[key]
+    return result
+
+
+def technical_error(error: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return bounded technical evidence only from an explicit detail endpoint."""
+
+    if error is None:
+        return None
+    envelope = persisted_error(error)
+    return {
+        **public_error(envelope),
+        "technicalDetail": envelope["technicalDetail"],
     }
 
 

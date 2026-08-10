@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import string
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -10,6 +11,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.compiler import digest_json
+from app.application.error_policy import persisted_error, public_error
 from app.application.orchestrator import append_event
 from app.infrastructure.database import (
     ConversationRun,
@@ -23,6 +25,9 @@ from app.infrastructure.database import (
     utcnow,
 )
 from app.runtime.models import OpenAICompatibleAdapter
+
+_FORMATTER = string.Formatter()
+_MAX_PRESENTATION_TEMPLATE_LENGTH = 8000
 
 
 def _aware(value: datetime) -> datetime:
@@ -198,6 +203,7 @@ def normalize_presentation_policy(
     metadata: dict[str, Any],
     *,
     execution_class: str,
+    output_schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw = metadata.get("presentationPolicy", {})
     if not isinstance(raw, dict):
@@ -211,6 +217,14 @@ def normalize_presentation_policy(
         raise ValueError("presentationPolicy.audience 仅支持 internal 或 end_user")
     if enabled and audience != "end_user":
         raise ValueError("只允许为 end_user audience 启用 Presentation")
+    template = str(raw.get("template", "执行结果：{json}"))
+    if len(template) > _MAX_PRESENTATION_TEMPLATE_LENGTH:
+        raise ValueError(
+            "metadata.presentationPolicy.template 最长为 "
+            f"{_MAX_PRESENTATION_TEMPLATE_LENGTH} 个字符"
+        )
+    if enabled and producer == "template":
+        validate_presentation_template(template, output_schema or {})
     if producer == "llm" and execution_class == "zero_llm" and enabled:
         # Presentation 本身是显式、冻结的模型调用，因此发布后的执行分类不再是 zero_llm。
         execution_class = "hybrid"
@@ -218,7 +232,7 @@ def normalize_presentation_policy(
         "enabled": enabled,
         "audience": audience,
         "producer": producer,
-        "template": str(raw.get("template", "执行结果：{json}"))[:8000],
+        "template": template,
         "prompt": str(
             raw.get(
                 "prompt",
@@ -232,6 +246,64 @@ def normalize_presentation_policy(
     }
 
 
+def validate_presentation_template(
+    template: str,
+    output_schema: dict[str, Any],
+) -> tuple[str, ...]:
+    """Validate placeholders and return insertable top-level output fields."""
+
+    properties = output_schema.get("properties", {})
+    properties = properties if isinstance(properties, dict) else {}
+    allowed = {"json", *properties}
+    try:
+        parsed = list(_FORMATTER.parse(template))
+    except ValueError as exc:
+        raise ValueError(
+            f"metadata.presentationPolicy.template 花括号无效: {exc}"
+        ) from exc
+    for _literal, field_name, format_spec, conversion in parsed:
+        if field_name is None:
+            continue
+        if not field_name or field_name not in allowed:
+            raise ValueError(
+                "metadata.presentationPolicy.template 包含未知占位符 "
+                f"{{{field_name}}}；仅允许 {{json}} 或 Output Schema 顶层字段"
+            )
+        if format_spec or conversion:
+            raise ValueError(
+                "metadata.presentationPolicy.template 不支持格式说明或转换: "
+                f"{{{field_name}}}"
+            )
+        field_schema = properties.get(field_name)
+        if (
+            field_name != "json"
+            and isinstance(field_schema, dict)
+            and field_schema.get("type") in {"object", "array"}
+        ):
+            raise ValueError(
+                "metadata.presentationPolicy.template 不能直接格式化对象或数组字段 "
+                f"{{{field_name}}}；请使用 {{json}}"
+            )
+    return tuple(properties)
+
+
+def render_presentation_template(
+    template: str,
+    output: dict[str, Any],
+) -> str:
+    """Render a prevalidated template and reject any runtime contract drift."""
+
+    values = {
+        "json": json.dumps(output, ensure_ascii=False, sort_keys=True),
+        **output,
+    }
+    try:
+        text = _FORMATTER.vformat(template, (), values)
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"Presentation 模板运行时字段不匹配: {exc}") from exc
+    return text
+
+
 def presentation_view(item: RunPresentation) -> dict[str, Any]:
     return {
         "id": item.id,
@@ -240,7 +312,7 @@ def presentation_view(item: RunPresentation) -> dict[str, Any]:
         "text": item.text,
         "producer": item.producer,
         "model": item.model,
-        "error": item.error_json,
+        "error": public_error(item.error_json),
         "startedAt": rfc3339(item.started_at),
         "completedAt": rfc3339(item.completed_at),
         "elapsedMs": item.elapsed_ms,
@@ -320,11 +392,19 @@ class PresentationDriver:
             output = run.output_json or {}
             try:
                 if policy["producer"] == "template":
-                    encoded = json.dumps(output, ensure_ascii=False, sort_keys=True)
-                    text = str(policy["template"]).replace("{json}", encoded)
-                    for key, value in output.items():
-                        text = text.replace(f"{{{key}}}", str(value))
-                    text = text[: policy["maxLength"]]
+                    output_schema = (
+                        version.definition_json.get("spec", {}).get("outputSchema", {})
+                        if version
+                        else {}
+                    )
+                    validate_presentation_template(
+                        str(policy["template"]),
+                        output_schema,
+                    )
+                    text = render_presentation_template(
+                        str(policy["template"]),
+                        output,
+                    )[: policy["maxLength"]]
                     model = None
                     usage: tuple[int | None, int | None, bool] = (None, None, True)
                 elif policy["producer"] == "llm":
@@ -355,10 +435,14 @@ class PresentationDriver:
                         return
                     now = utcnow()
                     item.status = "failed"
-                    item.error_json = {
-                        "code": "PRESENTATION_FAILED",
-                        "message": str(exc),
-                    }
+                    item.error_json = persisted_error(
+                        {
+                            "code": "PRESENTATION_FAILED",
+                            "message": str(exc),
+                            "retryable": False,
+                        },
+                        technical_detail_ref=f"presentation:{item.id}",
+                    )
                     item.completed_at = now
                     item.elapsed_ms = elapsed_ms(item.started_at or now, now)
                     await append_event(

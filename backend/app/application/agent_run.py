@@ -25,7 +25,7 @@ from app.application.artifact_integrity import (
     safe_artifact_path,
 )
 from app.application.compiler import digest_json
-from app.application.error_policy import error_policy
+from app.application.error_policy import error_policy, persisted_error, public_error
 from app.application.product_history import record_model_usage
 from app.config import get_settings
 from app.infrastructure.database import (
@@ -35,6 +35,7 @@ from app.infrastructure.database import (
     ConversationRunEvent,
     SessionLocal,
     TaskCheckpoint,
+    rfc3339,
     utcnow,
 )
 from app.runtime.adapters import TraeXSubprocessAdapter
@@ -141,13 +142,16 @@ async def _append_event(
     )
     if seq is None:
         raise LookupError("conversation run not found")
+    safe_payload = dict(payload)
+    if isinstance(safe_payload.get("error"), dict):
+        safe_payload["error"] = public_error(safe_payload["error"])
     session.add(
         ConversationRunEvent(
             id=str(uuid4()),
             conversation_run_id=run_id,
             seq=seq,
             type=event_type,
-            payload_json=payload,
+            payload_json=safe_payload,
         )
     )
     await session.flush()
@@ -884,28 +888,31 @@ class AgentRunWorker:
                 },
                 status="pending" if error.retryable else "terminal",
             )
-            error_json = {
-                "code": error.code,
-                "message": error.message,
-                "retryable": error.retryable,
-                "effectiveError": error.effective_error,
-                "taskCheckpointId": checkpoint.id,
-                **(
-                    {"reportedError": error.reported_error}
-                    if error.reported_error
-                    else {}
-                ),
-                **(
-                    {"failedCallId": error.failed_call_id}
-                    if error.failed_call_id
-                    else {}
-                ),
-                **(
-                    {"protocolViolation": error.protocol_violation}
-                    if error.protocol_violation
-                    else {}
-                ),
-            }
+            error_json = persisted_error(
+                {
+                    "code": error.code,
+                    "message": error.message,
+                    "retryable": error.retryable,
+                    "effectiveError": error.effective_error,
+                    **(
+                        {"reportedError": error.reported_error}
+                        if error.reported_error
+                        else {}
+                    ),
+                    **(
+                        {"failedCallId": error.failed_call_id}
+                        if error.failed_call_id
+                        else {}
+                    ),
+                    **(
+                        {"protocolViolation": error.protocol_violation}
+                        if error.protocol_violation
+                        else {}
+                    ),
+                },
+                technical_detail_ref=f"conversation-run:{run_id}",
+            )
+            error_json["taskCheckpointId"] = checkpoint.id
             claimed = await session.execute(
                 update(ConversationRun)
                 .where(
@@ -942,11 +949,14 @@ class AgentRunWorker:
         claim_token: str | None,
     ) -> None:
         async with SessionLocal() as session, session.begin():
-            error_json = {
-                "code": "CANCELLED",
-                "message": "Agent 运行已按请求取消",
-                "retryable": False,
-            }
+            error_json = persisted_error(
+                {
+                    "code": "CANCELLED",
+                    "message": "Agent 运行已按请求取消",
+                    "retryable": False,
+                },
+                technical_detail_ref=f"conversation-run:{run_id}",
+            )
             claimed = await session.execute(
                 update(ConversationRun)
                 .where(
@@ -1763,9 +1773,14 @@ def summarize_run(conversation_run: ConversationRun) -> dict[str, Any]:
         "runType": conversation_run.run_type,
         "input": conversation_run.input_json,
         "output": conversation_run.output_json,
-        "error": conversation_run.error_json,
+        "error": public_error(conversation_run.error_json),
         "attempt": conversation_run.attempt,
         "cancellationRequested": conversation_run.cancellation_requested_at is not None,
+        "createdAt": rfc3339(conversation_run.created_at),
+        "updatedAt": rfc3339(conversation_run.updated_at),
+        "queuedAt": rfc3339(conversation_run.queued_at),
+        "startedAt": rfc3339(conversation_run.started_at),
+        "finishedAt": rfc3339(conversation_run.finished_at),
         "browserEvidence": browser_evidence,
         "stepAttempts": plan_lineage.get("stepAttempts", {}),
         "replanBudget": plan_lineage.get("replanBudget"),

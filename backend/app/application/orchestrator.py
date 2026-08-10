@@ -22,7 +22,7 @@ from app.application.artifact_integrity import (
 )
 from app.application.capabilities import CapabilityResolutionError, resolve_skillx_node
 from app.application.compiler import digest_json
-from app.application.error_policy import error_policy
+from app.application.error_policy import error_policy, persisted_error, public_error
 from app.application.expressions import ExpressionError, resolve_mapping
 from app.application.mcp import MCPConfigurationError, MCPLockDriftError, resolve_mcp_node
 from app.application.retries import auto_retry_allowed
@@ -235,13 +235,16 @@ async def append_event(
     )
     if seq is None:
         raise LookupError("run not found")
+    safe_payload = dict(payload)
+    if isinstance(safe_payload.get("error"), dict):
+        safe_payload["error"] = public_error(safe_payload["error"])
     event = RunEvent(
         id=str(uuid4()),
         run_id=run_id,
         node_run_id=node_run_id,
         seq=seq,
         type=event_type,
-        payload_json=event_payload(payload),
+        payload_json=event_payload(safe_payload),
     )
     session.add(event)
     await session.flush()
@@ -634,6 +637,14 @@ class Orchestrator:
         finished_at: datetime | None = None,
     ) -> None:
         node_run_id = str(uuid4())
+        durable_error = (
+            persisted_error(
+                error,
+                technical_detail_ref=f"run:{run.id}:node:{node_run_id}",
+            )
+            if error is not None
+            else None
+        )
         result = await session.execute(
             sqlite_insert(NodeRun)
             .values(
@@ -644,7 +655,7 @@ class Orchestrator:
                 attempt=1,
                 status=status,
                 input_json=inputs,
-                error_json=error,
+                error_json=durable_error,
                 available_at=utcnow(),
                 created_at=utcnow(),
                 updated_at=utcnow(),
@@ -664,7 +675,7 @@ class Orchestrator:
                 session,
                 run.id,
                 event_type,
-                {"nodeId": node.id, "attempt": 1, "error": error},
+                {"nodeId": node.id, "attempt": 1, "error": durable_error},
                 node_run_id,
             )
 
@@ -672,7 +683,10 @@ class Orchestrator:
     async def _finish_failed(session: AsyncSession, run: Run, error: dict[str, Any] | None) -> None:
         run.status = "failed"
         run.finished_at = utcnow()
-        run.error_json = error or {"code": "EXECUTION_FAILED", "message": "运行失败"}
+        run.error_json = persisted_error(
+            error,
+            technical_detail_ref=f"run:{run.id}",
+        )
         await Orchestrator._finalize_recovery_state(session, run, "failed")
         await append_event(
             session,
@@ -1286,10 +1300,20 @@ class WorkerService:
                     "metrics": result.metrics,
                 }
             elif result.status == "waiting_user":
+                error = (
+                    persisted_error(
+                        result.error.model_dump(),
+                        technical_detail_ref=(
+                            f"run:{claimed.run_id}:node:{claimed.node_run_id}"
+                        ),
+                    )
+                    if result.error
+                    else None
+                )
                 values.update(
                     status="waiting_user",
                     output_json=result.output,
-                    error_json=result.error.model_dump() if result.error else None,
+                    error_json=error,
                 )
                 event_type = "approval.requested"
                 event_payload = {
@@ -1298,15 +1322,25 @@ class WorkerService:
                     "error": values["error_json"],
                 }
             elif result.status == "cancelled":
+                error = (
+                    persisted_error(
+                        result.error.model_dump(),
+                        technical_detail_ref=(
+                            f"run:{claimed.run_id}:node:{claimed.node_run_id}"
+                        ),
+                    )
+                    if result.error
+                    else None
+                )
                 values.update(
                     status="cancelled",
-                    error_json=result.error.model_dump() if result.error else None,
+                    error_json=error,
                     finished_at=utcnow(),
                 )
                 event_type = "node.cancelled"
                 event_payload = {"nodeId": claimed.node_id, "attempt": claimed.attempt}
             else:
-                error = (
+                raw_error = (
                     result.error.model_dump()
                     if result.error
                     else {
@@ -1314,6 +1348,12 @@ class WorkerService:
                         "message": "节点执行失败",
                         "retryable": False,
                     }
+                )
+                error = persisted_error(
+                    raw_error,
+                    technical_detail_ref=(
+                        f"run:{claimed.run_id}:node:{claimed.node_run_id}"
+                    ),
                 )
                 values.update(status="failed", error_json=error, finished_at=utcnow())
                 event_type = "node.failed"

@@ -405,10 +405,33 @@ export const api = {
         configured: boolean
         protocolAvailable: boolean
         modelAvailable: boolean
-        lastProbe: { at: string; ok: boolean; summary: string }
+        lastProbe: {
+          at: string | null
+          ok: boolean
+          summary: string
+          kind?: string
+          probeId?: string
+          model?: string
+          totalTokens?: number
+          usageComplete?: boolean
+          code?: string
+        }
+        nextProbeAllowedAt: string | null
       }
       runtimes: Record<string, { status: string; detail: string }>
     }>('/health/ready'),
+  probeProvider: () =>
+    request<{
+      at: string
+      ok: boolean
+      summary: string
+      probeId: string
+      model: string
+      totalTokens?: number
+      usageComplete?: boolean
+      code?: string
+      nextProbeAllowedAt: string
+    }>('/health/provider-probe', { method: 'POST' }),
   listComponents: () => request<ComponentSummary[]>('/components'),
   getComponent: (id: string) => request<ComponentSummary>(`/components/${id}`),
   createRun: (id: string, input: Record<string, unknown>) =>
@@ -432,6 +455,16 @@ export const api = {
     )
   },
   getRun: (id: string) => request<Run>(`/runs/${id}`),
+  getRunTechnicalError: (id: string) =>
+    request<{
+      runId: string
+      error: Record<string, unknown> | null
+      nodes: Array<{
+        nodeId: string
+        attempt: number
+        error: Record<string, unknown> | null
+      }>
+    }>(`/runs/${id}/technical-error`),
   createWorkflowSession: (conversationId?: string) =>
     request<{ id: string; status: string; expiresAt: string }>('/workflow-tools/sessions', {
       method: 'POST',

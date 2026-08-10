@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     model_name: str | None = None
     model_api_key_env: str = "SKILLX_MODEL_API_KEY"
     agent_provider_type: Literal["real", "fixture", "unavailable"] = "unavailable"
+    provider_probe_timeout_seconds: int = 30
+    provider_probe_cooldown_seconds: int = 300
+    provider_probe_ttl_seconds: int = 900
     traex_command: list[str] | None = None
     traex_allowed_executables: list[str] = ["traex"]
     # Agent Host policy：Host 授予的 Tool 集合是安全边界，请求只能取交集缩小范围，

@@ -81,14 +81,17 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             try:
                 browser = playwright.chromium.launch(headless=True)
             except PlaywrightError as exc:
-                reason = str(exc)
-                if any(
-                    marker in reason.lower()
-                    for marker in ("permission", "sandbox", "executable doesn't exist")
-                ):
-                    pytest.skip(f"Chromium 无法在当前环境启动：{reason}")
-                raise
+                pytest.fail(f"Chromium 发布门禁无法启动：{exc}")
             page = browser.new_page()
+            assert page.evaluate(
+                "new Date('2026-08-10T07:12:23Z').getHours()"
+            ) == 15
+            utc_context = browser.new_context(timezone_id="UTC")
+            utc_page = utc_context.new_page()
+            assert utc_page.evaluate(
+                "new Date('2026-08-10T07:12:23Z').getHours()"
+            ) == 7
+            utc_context.close()
             console_errors: list[str] = []
             console_warnings: list[str] = []
             page.on(
@@ -105,6 +108,16 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             stack.set_article("016 UI 首次探索正文")
             page.goto(f"{frontend_url}/chat")
             page.wait_for_url("**/chat/*")
+            for width in (760, 903, 1024, 1280, 1440):
+                page.set_viewport_size({"width": width, "height": 900})
+                message_column = page.locator(".message-column").bounding_box()
+                composer = page.locator(".chat-composer").bounding_box()
+                assert message_column is not None
+                assert composer is not None
+                assert message_column["width"] >= 420
+                assert composer["x"] >= 0
+                assert composer["x"] + composer["width"] <= width
+            page.set_viewport_size({"width": 1280, "height": 900})
             _submit(
                 page,
                 (
@@ -243,17 +256,7 @@ def test_real_ui_agent_failure_handoff_returns_to_original_chat() -> None:
             try:
                 browser = playwright.chromium.launch(headless=True)
             except PlaywrightError as exc:
-                reason = str(exc)
-                if any(
-                    marker in reason.lower()
-                    for marker in (
-                        "permission",
-                        "sandbox",
-                        "executable doesn't exist",
-                    )
-                ):
-                    pytest.skip(f"Chromium 无法在当前环境启动：{reason}")
-                raise
+                pytest.fail(f"Chromium 发布门禁无法启动：{exc}")
             page = browser.new_page()
             console_errors: list[str] = []
             page.on(

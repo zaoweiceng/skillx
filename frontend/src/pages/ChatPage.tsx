@@ -43,6 +43,7 @@ export default function ChatPage() {
   const [history, setHistory] = useState<ConversationSummary[]>([])
   const [historyCursor, setHistoryCursor] = useState<string | null>(null)
   const [historyOpen, setHistoryOpen] = useState(false)
+  const [traceOpen, setTraceOpen] = useState(false)
   const [workflowMode, setWorkflowMode] = useState<'enabled' | 'disabled'>('enabled')
   const [switchingMode, setSwitchingMode] = useState(false)
   const [clock, setClock] = useState(Date.now())
@@ -804,6 +805,15 @@ export default function ChatPage() {
             <History size={14} />
           </button>
           <button
+            className="mobile-history-toggle"
+            type="button"
+            aria-label="打开执行轨迹"
+            aria-expanded={traceOpen}
+            onClick={() => setTraceOpen((current) => !current)}
+          >
+            <Bot size={14} />
+          </button>
+          <button
             className={`workflow-mode-toggle ${workflowMode}`}
             type="button"
             aria-pressed={workflowMode === 'enabled'}
@@ -856,7 +866,8 @@ export default function ChatPage() {
             </button>
           )}
         </aside>
-        <section className="message-stream">
+        <section className="message-column">
+          <div className="message-stream">
           {messages.length === 0 && (
             <div className="chat-empty">
               <span className="chat-empty-icon">
@@ -999,8 +1010,29 @@ export default function ChatPage() {
               </div>
             </article>
           ))}
+          </div>
+          <form className="chat-composer" onSubmit={send}>
+            <span className="composer-mode-note">
+              {workflowMode === 'enabled'
+                ? 'Agent 可按需发现并自动执行工作流'
+                : '下一条消息不会披露或调用任何 workflow.* 工具'}
+              {optimisticStartedAt !== null &&
+                ` · ${((clock - optimisticStartedAt) / 1000).toFixed(1)}s`}
+            </span>
+            <textarea
+              aria-label="对话输入"
+              placeholder="描述一个需要探索或固化的任务..."
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              rows={2}
+            />
+            <button type="submit" disabled={sending || !conversationId}>
+              <CornerDownLeft size={17} />
+              <span>{sending ? '处理中' : '发送'}</span>
+            </button>
+          </form>
         </section>
-        <aside className="trace-drawer">
+        <aside className={`trace-drawer ${traceOpen ? 'open' : ''}`}>
           <div className="panel-heading">
             <div>
               <span className="eyebrow">EXECUTION TRACE</span>
@@ -1016,26 +1048,6 @@ export default function ChatPage() {
           {renderTrace()}
         </aside>
       </div>
-      <form className="chat-composer" onSubmit={send}>
-        <span className="composer-mode-note">
-          {workflowMode === 'enabled'
-            ? 'Agent 可按需发现并自动执行工作流'
-            : '下一条消息不会披露或调用任何 workflow.* 工具'}
-          {optimisticStartedAt !== null &&
-            ` · ${((clock - optimisticStartedAt) / 1000).toFixed(1)}s`}
-        </span>
-        <textarea
-          aria-label="对话输入"
-          placeholder="描述一个需要探索或固化的任务..."
-          value={input}
-          onChange={(event) => setInput(event.target.value)}
-          rows={2}
-        />
-        <button type="submit" disabled={sending || !conversationId}>
-          <CornerDownLeft size={17} />
-          <span>{sending ? '处理中' : '发送'}</span>
-        </button>
-      </form>
       {error && <div className="chat-error">{error}</div>}
     </div>
   )

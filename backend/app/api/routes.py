@@ -23,7 +23,7 @@ from app.application.agent_host import (
     AgentHostRequest,
     resolve_local_demo_capabilities,
 )
-from app.application.agent_provider import provider_readiness
+from app.application.agent_provider import probe_provider, provider_readiness
 from app.application.agent_run import (
     AgentRunConfig,
     build_agent_run_message,
@@ -47,6 +47,7 @@ from app.application.distillation import (
     DistillationError,
     distill_conversation_run,
 )
+from app.application.error_policy import public_error, technical_error
 from app.application.mcp import (
     MCPConfigurationError,
     MCPContractDriftError,
@@ -72,6 +73,7 @@ from app.application.product_history import (
     presentation_view,
     record_model_usage,
     turn_view,
+    validate_presentation_template,
 )
 from app.application.replay import run_isolated_replay, run_replay_proof
 from app.application.retries import auto_retry_allowed
@@ -437,8 +439,8 @@ def workflow_view(item: Workflow) -> dict[str, Any]:
         "draftBaseVersionId": item.draft_base_version_id,
         "draftMetadata": item.draft_metadata_json,
         "definition": item.draft_json,
-        "createdAt": item.created_at,
-        "updatedAt": item.updated_at,
+        "createdAt": rfc3339(item.created_at),
+        "updatedAt": rfc3339(item.updated_at),
     }
 
 
@@ -458,10 +460,10 @@ def run_view(
         "status": run.status,
         "input": redact(run.input_json, input_schema),
         "output": redact(run.output_json, output_schema),
-        "error": redact(run.error_json),
-        "createdAt": run.created_at,
-        "startedAt": run.started_at,
-        "finishedAt": run.finished_at,
+        "error": public_error(redact(run.error_json)),
+        "createdAt": rfc3339(run.created_at),
+        "startedAt": rfc3339(run.started_at),
+        "finishedAt": rfc3339(run.finished_at),
         "durationMs": _duration_ms(run.started_at, run.finished_at),
     }
     if node_runs is not None:
@@ -474,9 +476,11 @@ def run_view(
                 "status": item.status,
                 "input": redact(item.input_json),
                 "output": redact(item.output_json),
-                "error": redact(item.error_json),
-                "startedAt": item.started_at,
-                "finishedAt": item.finished_at,
+                "error": public_error(redact(item.error_json)),
+                "createdAt": rfc3339(item.created_at),
+                "updatedAt": rfc3339(item.updated_at),
+                "startedAt": rfc3339(item.started_at),
+                "finishedAt": rfc3339(item.finished_at),
                 "durationMs": _duration_ms(item.started_at, item.finished_at),
             }
             for item in node_runs
@@ -547,6 +551,34 @@ async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str
     }
 
 
+@router.post("/health/provider-probe")
+async def run_provider_probe(
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Run the explicit, rate-limited paid compatibility probe."""
+
+    try:
+        result = await probe_provider()
+    except ValueError as exc:
+        raise HTTPException(
+            409,
+            detail={"code": "PROVIDER_PROBE_UNAVAILABLE", "message": str(exc)},
+        ) from exc
+    probe_id = result.get("probeId")
+    if isinstance(probe_id, str):
+        await record_model_usage(
+            session,
+            call_id=f"operational-probe:{probe_id}",
+            stage="operational_probe",
+            provider="openai-compatible",
+            model=result.get("model"),
+            total_tokens=result.get("totalTokens"),
+            usage_complete=bool(result.get("usageComplete")),
+        )
+        await session.commit()
+    return result
+
+
 @router.get("/workflows")
 async def list_workflows(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
     rows = (await session.scalars(select(Workflow).order_by(Workflow.updated_at.desc()))).all()
@@ -610,7 +642,7 @@ async def list_workflow_versions(
             "digest": item.digest,
             "definition": item.definition_json,
             "presentationPolicy": item.presentation_policy_json,
-            "createdAt": item.created_at,
+            "createdAt": rfc3339(item.created_at),
         }
         for item in rows
     ]
@@ -680,6 +712,16 @@ async def validate_workflow(
             session, compiled.definition
         )
         mcp_locks = await validate_mcp_nodes(session, compiled.definition.spec.nodes)
+        policy = compiled.definition.metadata.get("presentationPolicy", {})
+        if (
+            isinstance(policy, dict)
+            and policy.get("enabled") is True
+            and policy.get("producer", "template") == "template"
+        ):
+            validate_presentation_template(
+                str(policy.get("template", "执行结果：{json}")),
+                compiled.definition.spec.output_schema,
+            )
         return {
             "valid": True,
             "digest": compiled.digest,
@@ -730,6 +772,18 @@ async def validate_workflow(
                     "level": "error",
                     "code": "MCP_TOOL_INCOMPATIBLE",
                     "path": "spec.nodes",
+                    "message": str(exc),
+                }
+            ],
+        }
+    except (TypeError, ValueError) as exc:
+        return {
+            "valid": False,
+            "diagnostics": [
+                {
+                    "level": "error",
+                    "code": "PRESENTATION_TEMPLATE_INVALID",
+                    "path": "metadata.presentationPolicy.template",
                     "message": str(exc),
                 }
             ],
@@ -953,6 +1007,7 @@ async def publish_workflow(
         frozen_presentation_policy = normalize_presentation_policy(
             compiled.definition.metadata,
             execution_class=execution_class,
+            output_schema=compiled.definition.spec.output_schema,
         )
     except (TypeError, ValueError) as exc:
         raise HTTPException(
@@ -2032,7 +2087,7 @@ async def create_workflow_disclosure_session(
     return {
         "id": item.id,
         "status": item.status,
-        "expiresAt": item.expires_at,
+        "expiresAt": rfc3339(item.expires_at),
         "callBudget": item.call_budget_json,
     }
 
@@ -2362,7 +2417,7 @@ def _plan_view(item: PlanSnapshot) -> dict[str, Any]:
         "id": item.id,
         "digest": item.digest,
         "status": item.status,
-        "expiresAt": item.expires_at,
+        "expiresAt": rfc3339(item.expires_at),
         "sourceRefs": item.source_refs_json,
         "locks": item.locks_json,
         "planSignature": item.plan_signature,
@@ -2884,6 +2939,9 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             "status": item.status,
             "snapshotDigest": item.snapshot_digest,
             "snapshot": redact(item.snapshot_json),
+            "createdAt": rfc3339(item.created_at),
+            "updatedAt": rfc3339(item.updated_at),
+            "decidedAt": rfc3339(item.decided_at),
         }
         for item in approvals
     ]
@@ -2896,6 +2954,8 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             "size": item.size,
             "sha256": item.sha256,
             "downloadUrl": f"/api/artifacts/{item.id}",
+            "createdAt": rfc3339(item.created_at),
+            "updatedAt": rfc3339(item.updated_at),
         }
         for item in artifacts
     ]
@@ -2936,7 +2996,7 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
         "planSnapshotId": run.plan_snapshot_id,
         "planDigest": plan_snapshot.digest if plan_snapshot else None,
         "planStatus": plan_snapshot.status if plan_snapshot else None,
-        "planExpiresAt": plan_snapshot.expires_at if plan_snapshot else None,
+        "planExpiresAt": rfc3339(plan_snapshot.expires_at) if plan_snapshot else None,
         "sourceMap": plan_snapshot.source_map_json if plan_snapshot else {},
         "executionClass": validation.get("executionClass"),
         "capabilityLocks": validation.get("capabilityLocks", []),
@@ -2967,6 +3027,10 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             "recoveryNodeRunId": item.recovery_node_run_id,
             "claimGeneration": item.claim_generation,
             "decision": redact(item.decision_json) if item.decision_json else None,
+            "createdAt": rfc3339(item.created_at),
+            "updatedAt": rfc3339(item.updated_at),
+            "leaseExpiresAt": rfc3339(item.lease_expires_at),
+            "heartbeatAt": rfc3339(item.heartbeat_at),
         }
         for item in checkpoints
     ]
@@ -2989,6 +3053,8 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             "reproductionPolicy": item.reproduction_policy_json,
             "evidenceIds": item.evidence_ids_json,
             "checkpointId": item.last_checkpoint_id,
+            "createdAt": rfc3339(item.created_at),
+            "updatedAt": rfc3339(item.updated_at),
             "replayEvidence": [
                 {
                     "id": evidence.id,
@@ -3003,6 +3069,8 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
                     ),
                     "proposalId": evidence.proposal_id,
                     "humanPatchId": evidence.human_patch_id,
+                    "createdAt": rfc3339(evidence.created_at),
+                    "updatedAt": rfc3339(evidence.updated_at),
                 }
                 for evidence in evidence_by_observation.get(item.id, [])
             ],
@@ -3043,6 +3111,37 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
         for item in usage_rows
     ]
     return result
+
+
+@router.get("/runs/{run_id}/technical-error")
+async def get_run_technical_error(
+    run_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """Return bounded technical evidence only after an explicit detail request."""
+
+    run = await session.get(Run, run_id)
+    if run is None:
+        raise HTTPException(404, "运行不存在")
+    nodes = (
+        await session.scalars(
+            select(NodeRun)
+            .where(NodeRun.run_id == run_id, NodeRun.error_json.is_not(None))
+            .order_by(NodeRun.created_at, NodeRun.attempt)
+        )
+    ).all()
+    return {
+        "runId": run.id,
+        "error": technical_error(run.error_json),
+        "nodes": [
+            {
+                "nodeId": item.node_id,
+                "attempt": item.attempt,
+                "error": technical_error(item.error_json),
+            }
+            for item in nodes
+        ],
+    }
 
 
 @router.post("/runs/{run_id}/cancel", status_code=202)
@@ -3289,7 +3388,7 @@ async def list_events(
             "seq": item.seq,
             "type": item.type,
             "payload": item.payload_json,
-            "createdAt": item.created_at,
+            "createdAt": rfc3339(item.created_at),
         }
         for item in events
     ]
@@ -3319,6 +3418,7 @@ async def stream_events(
                     "runId": run_id,
                     "seq": item.seq,
                     "payload": item.payload_json,
+                    "createdAt": rfc3339(item.created_at),
                 }
                 yield f"id: {item.seq}\nevent: {item.type}\ndata: {digest_safe_json(data)}\n\n"
             if run and run.status in {"succeeded", "failed", "cancelled"} and not events:
@@ -4453,12 +4553,42 @@ def _binding_normalization(value: Any, quote: str) -> str | None:
             return "number"
         return None
     if isinstance(value, list):
-        if value and all(isinstance(item, (str, int, float)) for item in value):
-            return (
-                "list_extraction"
-                if all(str(item) in quote for item in value)
-                else None
-            )
+        try:
+            decoded = json.loads(quote)
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, list) and decoded == value:
+            return "json_array_v1"
+        if value:
+            parts = [
+                item.strip()
+                for item in re.split(r"\s*(?:,|，|、|;|；|\||和)\s*", quote.strip())
+            ]
+            if len(parts) == len(value) and all(parts):
+                rebuilt: list[Any] = []
+                for expected, part in zip(value, parts, strict=True):
+                    if isinstance(expected, bool):
+                        normalized = part.lower()
+                        if normalized not in {"true", "false"}:
+                            break
+                        rebuilt.append(normalized == "true")
+                    elif isinstance(expected, int):
+                        if re.fullmatch(r"[-+]?\d+", part) is None:
+                            break
+                        rebuilt.append(int(part))
+                    elif isinstance(expected, float):
+                        if re.fullmatch(
+                            r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)",
+                            part,
+                        ) is None:
+                            break
+                        rebuilt.append(float(part))
+                    elif isinstance(expected, str):
+                        rebuilt.append(part)
+                    else:
+                        break
+                if rebuilt == value:
+                    return "delimited_array_v1"
     canonical = json.dumps(value, ensure_ascii=False, sort_keys=True)
     return "json" if canonical == quote.strip() else None
 
@@ -4966,7 +5096,7 @@ async def list_conversation_run_events(
             "seq": item.seq,
             "type": item.type,
             "payload": item.payload_json,
-            "createdAt": item.created_at,
+            "createdAt": rfc3339(item.created_at),
         }
         for item in events
     ]
@@ -4996,6 +5126,8 @@ async def list_conversation_run_artifacts(
             "bytes": item.size,
             "mediaType": item.media_type,
             "metadata": redact(item.metadata_json),
+            "createdAt": rfc3339(item.created_at),
+            "updatedAt": rfc3339(item.updated_at),
         }
         for item in artifacts
     ]
@@ -5111,6 +5243,9 @@ async def get_task_checkpoint(
         "sourceDigest": checkpoint.source_digest,
         "status": checkpoint.status,
         "digest": checkpoint.digest,
+        "createdAt": rfc3339(checkpoint.created_at),
+        "updatedAt": rfc3339(checkpoint.updated_at),
+        "leaseExpiresAt": rfc3339(checkpoint.lease_expires_at),
         "outcomeCertainty": snapshot.get("outcomeCertainty"),
         "pendingQuestion": snapshot.get("pendingQuestion"),
         "continuationRunId": continuation_run_id,
@@ -5130,11 +5265,11 @@ async def get_task_checkpoint(
             else None
         ),
         "chainStatus": chain_status,
-        "chainError": chain_error,
+        "chainError": public_error(chain_error),
         "lineage": lineage,
         "planSnapshot": snapshot.get("planSnapshot"),
-        "reportedError": snapshot.get("reportedError"),
-        "effectiveError": snapshot.get("effectiveError"),
+        "reportedError": public_error(snapshot.get("reportedError")),
+        "effectiveError": public_error(snapshot.get("effectiveError")),
         "completedSteps": snapshot.get("completedSteps", []),
         "failedStep": snapshot.get("failedStep"),
         "stepStates": snapshot.get("stepStates", {}),
@@ -5142,7 +5277,7 @@ async def get_task_checkpoint(
         "stepStateDigest": snapshot.get("stepStateDigest"),
         "replanBudget": snapshot.get("replanBudget"),
         "budgetExhausted": snapshot.get("budgetExhausted"),
-        "continuationError": snapshot.get("continuationError"),
+        "continuationError": public_error(snapshot.get("continuationError")),
         "completedActionLedger": snapshot.get("completedActionLedger", []),
         "failedAction": snapshot.get("failedAction"),
         "pendingToolCalls": snapshot.get("pendingToolCalls", []),

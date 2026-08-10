@@ -1,4 +1,4 @@
-.PHONY: demo-check quality-check backend-check browser-install frontend-check migration-check e2e-check browser-ui-check
+.PHONY: demo-check quality-check backend-check browser-install browser-check frontend-check migration-check e2e-check browser-ui-check
 
 UV_CACHE_DIR ?= /tmp/skillx-workflow-uv-cache
 export UV_CACHE_DIR
@@ -16,15 +16,22 @@ backend-check:
 browser-install:
 	cd backend && uv run playwright install chromium
 
+browser-check:
+	@cd backend && location=$$(uv run playwright install --dry-run chromium | \
+		sed -n 's/^  Install location: *//p' | head -1) && \
+		test -n "$$location" && \
+		find "$$location" -type f -perm -111 -print -quit | grep -q . || \
+		(printf '%s\n' 'Chromium 缺失，请先运行 make browser-install' >&2; exit 1)
+
 migration-check:
 	cd backend && DB_PATH=$$(mktemp -u /tmp/skillx-migration.XXXXXX) && \
 		SKILLX_DATABASE_URL=sqlite+aiosqlite:///$$DB_PATH uv run alembic upgrade head
 
 # 真实 API + 独立 Worker 子进程黑盒 E2E。浏览器安装独立执行，避免每次门禁重复下载。
-e2e-check: browser-install
+e2e-check: browser-check
 	cd backend && uv run pytest e2e -q -p no:cacheprovider
 
-browser-ui-check: browser-install
+browser-ui-check: browser-check
 	cd backend && uv run ruff check browser_e2e
 	cd backend && uv run pytest browser_e2e -q -p no:cacheprovider
 

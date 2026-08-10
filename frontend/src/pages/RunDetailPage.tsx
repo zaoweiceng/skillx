@@ -35,6 +35,10 @@ export default function RunDetailPage() {
     publishable: boolean
   }>()
   const [patching, setPatching] = useState(false)
+  const [technicalEvidence, setTechnicalEvidence] = useState<Awaited<
+    ReturnType<typeof api.getRunTechnicalError>
+  > | null>(null)
+  const [loadingTechnicalEvidence, setLoadingTechnicalEvidence] = useState(false)
 
   const refresh = useCallback(() => {
     if (!id) return
@@ -51,6 +55,18 @@ export default function RunDetailPage() {
       refresh()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '审批操作失败')
+    }
+  }
+
+  async function loadTechnicalEvidence() {
+    if (!id || loadingTechnicalEvidence) return
+    setLoadingTechnicalEvidence(true)
+    try {
+      setTechnicalEvidence(await api.getRunTechnicalError(id))
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '技术证据读取失败')
+    } finally {
+      setLoadingTechnicalEvidence(false)
     }
   }
 
@@ -232,6 +248,16 @@ export default function RunDetailPage() {
           <div className="panel-heading">
             <h2>{run.error ? '运行错误' : '结构化结果'}</h2>
             <StatusBadge status={run.status} />
+            {run.error && !technicalEvidence && (
+              <button
+                className="button ghost"
+                type="button"
+                disabled={loadingTechnicalEvidence}
+                onClick={loadTechnicalEvidence}
+              >
+                {loadingTechnicalEvidence ? '读取中…' : '查看技术证据'}
+              </button>
+            )}
             {!run.error && (
               <button
                 className="button ghost"
@@ -245,6 +271,12 @@ export default function RunDetailPage() {
             )}
           </div>
           <JsonBlock value={run.error ?? run.output} />
+          {technicalEvidence && (
+            <details className="technical-evidence">
+              <summary>已脱敏、限长的技术证据</summary>
+              <JsonBlock value={technicalEvidence} />
+            </details>
+          )}
         </section>
       )}
 

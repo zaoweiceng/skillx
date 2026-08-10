@@ -12,6 +12,12 @@ import urllib.request
 from typing import Any
 
 TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "lookup.table": {
+        "type": "object",
+        "properties": {"key": {"type": "string"}},
+        "required": ["key"],
+        "additionalProperties": False,
+    },
     "workflow.search": {
         "type": "object",
         "properties": {
@@ -54,6 +60,13 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "additionalProperties": False,
     },
 }
+
+
+class ProviderError(RuntimeError):
+    def __init__(self, code: str, message: str, *, retryable: bool) -> None:
+        self.code = code
+        self.retryable = retryable
+        super().__init__(message)
 
 
 def emit(event: dict[str, Any]) -> None:
@@ -99,11 +112,51 @@ def post_completion(payload: dict[str, Any]) -> dict[str, Any]:
             decoded = json.loads(response.read())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:1000]
-        raise RuntimeError(f"模型 HTTP {exc.code}: {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"模型请求失败: {exc}") from exc
+        lowered = detail.lower()
+        if exc.code in {401, 403}:
+            code, retryable = "MODEL_AUTH_FAILED", False
+        elif exc.code == 429:
+            code, retryable = "RATE_LIMITED", True
+        elif exc.code in {400, 404, 422} and any(
+            marker in lowered
+            for marker in (
+                "json_schema",
+                "response_format",
+                "tool_choice",
+                "tool_calls",
+                "function calling",
+            )
+        ):
+            code, retryable = "MODEL_CAPABILITY_UNSUPPORTED", False
+        elif exc.code >= 500:
+            code, retryable = "DEPENDENCY_UNAVAILABLE", True
+        else:
+            code, retryable = "MODEL_PROVIDER_ERROR", False
+        raise ProviderError(
+            code,
+            f"模型 HTTP {exc.code}: {detail}",
+            retryable=retryable,
+        ) from exc
+    except TimeoutError as exc:
+        raise ProviderError("TIMEOUT", "模型请求超时", retryable=True) from exc
+    except urllib.error.URLError as exc:
+        raise ProviderError(
+            "DEPENDENCY_UNAVAILABLE",
+            f"模型网络请求失败: {exc.reason}",
+            retryable=True,
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise ProviderError(
+            "MODEL_MALFORMED_OUTPUT",
+            "模型 HTTP 响应不是合法 JSON",
+            retryable=False,
+        ) from exc
     if not isinstance(decoded, dict) or not decoded.get("choices"):
-        raise RuntimeError("模型响应缺少 choices")
+        raise ProviderError(
+            "MODEL_MALFORMED_OUTPUT",
+            "模型响应缺少 choices",
+            retryable=False,
+        )
     return decoded
 
 
@@ -119,9 +172,20 @@ def parse_output(content: Any) -> dict[str, Any]:
     text = str(content or "").strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-    output = json.loads(text)
+    try:
+        output = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ProviderError(
+            "MODEL_MALFORMED_OUTPUT",
+            "模型最终输出不是合法 JSON",
+            retryable=False,
+        ) from exc
     if not isinstance(output, dict):
-        raise RuntimeError("模型最终输出必须为 JSON 对象")
+        raise ProviderError(
+            "MODEL_MALFORMED_OUTPUT",
+            "模型最终输出必须为 JSON 对象",
+            retryable=False,
+        )
     return output
 
 
@@ -323,6 +387,11 @@ def main() -> int:
             print(json.dumps({"ok": bool(response.get("choices")), "model": model}))
             return 0
         return run(args)
+    except ProviderError as exc:
+        if args.probe:
+            print(json.dumps({"ok": False, "code": exc.code, "error": str(exc)}))
+            return 1
+        return fail(exc.code, str(exc), retryable=exc.retryable)
     except Exception as exc:  # noqa: BLE001 - process boundary reports stable failure.
         if args.probe:
             print(json.dumps({"ok": False, "error": str(exc)}))
