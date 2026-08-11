@@ -60,6 +60,10 @@ class AgentHostError(Exception):
         protocol_violation: str | None = None,
         reported_error: dict[str, Any] | None = None,
         request_dispatched: bool = False,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_tokens: int = 0,
+        usage_complete: bool = False,
     ) -> None:
         policy = error_policy(code)
         self.code = policy.code
@@ -71,6 +75,10 @@ class AgentHostError(Exception):
         self.protocol_violation = protocol_violation
         self.reported_error = reported_error
         self.request_dispatched = request_dispatched
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.total_tokens = total_tokens
+        self.usage_complete = usage_complete
         self.effective_error = {
             "code": self.code,
             "message": self.message,
@@ -127,7 +135,7 @@ class AgentHostResult:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
-    usage_complete: bool = True
+    usage_complete: bool = False
     request_dispatched: bool = False
     plan_snapshot: dict[str, Any] | None = None
     accepted_plan_digest: str | None = None
@@ -683,9 +691,6 @@ class AgentHost:
                             self._normalize_action(event_type, started, payload)
                         )
                     elif event_type == "agent.step.completed":
-                        # Backward-compatible managed adapters may not yet emit the
-                        # explicit dispatch event, but a model step proves dispatch.
-                        result.request_dispatched = True
                         result.step_count += 1
                         result.input_tokens += payload.get("inputTokens", 0)
                         result.output_tokens += payload.get("outputTokens", 0)
@@ -794,6 +799,10 @@ class AgentHost:
             exc.request_dispatched = (
                 exc.request_dispatched or result.request_dispatched
             )
+            exc.input_tokens = max(exc.input_tokens, result.input_tokens)
+            exc.output_tokens = max(exc.output_tokens, result.output_tokens)
+            exc.total_tokens = max(exc.total_tokens, result.total_tokens)
+            exc.usage_complete = exc.usage_complete or result.usage_complete
             raise
         except TimeoutError as exc:
             await self._cancel(adapter, request.run_id)

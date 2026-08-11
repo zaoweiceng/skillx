@@ -2,9 +2,9 @@
 
 日期：2026-08-10
 
-依据：[`NEXT_STEPS-023.md`](NEXT_STEPS-023.md)、
-[`review/design-compliance-review-023.md`](review/design-compliance-review-023.md) 和
-[`review/code-review-023.md`](review/code-review-023.md)。
+依据：[`NEXT_STEPS-023.md`](../STEP/NEXT_STEPS-023.md)、
+[`review/design-compliance-review-023.md`](../review/design-compliance-review-023.md) 和
+[`review/code-review-023.md`](../review/code-review-023.md)。
 
 执行基线：`9f9fb43`。范围为单用户 Local Demo。
 

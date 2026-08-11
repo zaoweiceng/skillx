@@ -2,9 +2,9 @@
 
 日期：2026-08-10
 
-依据：[`NEXT_STEPS-020.md`](NEXT_STEPS-020.md)、
-[`review/design-compliance-review-020.md`](review/design-compliance-review-020.md) 和
-[`review/code-review-020.md`](review/code-review-020.md)。
+依据：[`NEXT_STEPS-020.md`](../STEP/NEXT_STEPS-020.md)、
+[`review/design-compliance-review-020.md`](../review/design-compliance-review-020.md) 和
+[`review/code-review-020.md`](../review/code-review-020.md)。
 
 执行基线：`c075ebb`。本报告对应当前未提交工作树；本轮未创建 Git 提交。
 
@@ -34,7 +34,7 @@ Tool Calling、Host ToolResult 回送和最终结构化输出的进程测试。
 
 ## 2. P0-1：真实 Agent Provider
 
-新增 [`examples/openai_agent_sidecar.py`](examples/openai_agent_sidecar.py)：
+新增 [`examples/openai_agent_sidecar.py`](../examples/openai_agent_sidecar.py)：
 
 - 调用 OpenAI-compatible Chat Completions；
 - 支持 function calling；

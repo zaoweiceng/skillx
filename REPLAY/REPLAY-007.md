@@ -1,6 +1,6 @@
 # NEXT_STEPS-007 执行回放（REPLAY-007）
 
-依据：[`NEXT_STEPS-007.md`](NEXT_STEPS-007.md)、[`review/design-compliance-review-007.md`](review/design-compliance-review-007.md)、[`review/code-review-007.md`](review/code-review-007.md)、[`REPLAY-006.md`](REPLAY-006.md)。
+依据：[`NEXT_STEPS-007.md`](../STEP/NEXT_STEPS-007.md)、[`review/design-compliance-review-007.md`](../review/design-compliance-review-007.md)、[`review/code-review-007.md`](../review/code-review-007.md)、[`REPLAY-006.md`](../REPLAY/REPLAY-006.md)。
 执行范围：A（修正 006 的 Distillation、Browser、Recovery 与 Replay 语义）、B（Workflow Capability Manifest）、C（面向 TraeX 的渐进披露）、D（安全 Fragment）、E（引用式组合与 PlanSnapshot）、F（人工固化建议）、G（产品、可观测性与文档）。
 非目标：鉴权、RBAC、多租户、分布式部署和生产级沙箱。
 
@@ -37,45 +37,45 @@ README 没有把上述能力整体提升为 `available`。外部读取 replay fi
 
 ### 2.1 真实 Distillation 闭环
 
-- **逐参数 provenance fail closed**（[`distillation_ir.py`](backend/app/application/distillation_ir.py)）：未显式声明且无法证明来自用户输入的参数标为 `unknown`，Compiler 产生 `MISSING_ARGUMENT_PROVENANCE` error，不能发布；只有 Runtime 明确声明的值才能成为 `constant`。
-- **独立 Distillation Agent**（[`distillation.py`](backend/app/application/distillation.py)）：真实轨迹未携带 Proposal 时，通过零工具 `AgentHost` 请求受 Schema 约束的 `DistillationProposal`。成功时保存 `proposalSource=distillation_agent`、`sourceTrajectoryDigest` 和 `proposalDigest`；Runtime 不支持该 Schema 时记录 `proposalSource=none`，不伪造 Agent 提议事实。
+- **逐参数 provenance fail closed**（[`distillation_ir.py`](../backend/app/application/distillation_ir.py)）：未显式声明且无法证明来自用户输入的参数标为 `unknown`，Compiler 产生 `MISSING_ARGUMENT_PROVENANCE` error，不能发布；只有 Runtime 明确声明的值才能成为 `constant`。
+- **独立 Distillation Agent**（[`distillation.py`](../backend/app/application/distillation.py)）：真实轨迹未携带 Proposal 时，通过零工具 `AgentHost` 请求受 Schema 约束的 `DistillationProposal`。成功时保存 `proposalSource=distillation_agent`、`sourceTrajectoryDigest` 和 `proposalDigest`；Runtime 不支持该 Schema 时记录 `proposalSource=none`，不伪造 Agent 提议事实。
 - **Proposal grouping 真正生效**：`ProposedNode.nodeId/actionIds/strategy` 决定节点边界；每个 action 必须恰好属于一个组。`deterministic | agent | llm` 三种策略均进入 Compiler 裁决；同组多个 action 合并为一个概率节点，组内依赖不泄漏为悬空边，边界 capability 取原动作的最小并集。
-- **Compiler 不再访问私有 Registry 成员**（[`action_compilers.py`](backend/app/application/action_compilers.py)）：新增 `compile_as` 公共入口；Agent fallback 保留原动作最小 capability、输入 bindings、预算和输出 Schema。
+- **Compiler 不再访问私有 Registry 成员**（[`action_compilers.py`](../backend/app/application/action_compilers.py)）：新增 `compile_as` 公共入口；Agent fallback 保留原动作最小 capability、输入 bindings、预算和输出 Schema。
 - **Workflow output provenance**：成功轨迹记录逐字段 `outputProvenance`；Compiler 按 `actionId/path` 生成 output mapping。缺失或引用未知 action 时产生发布错误。上游 `outputSchema` 不存在的字段从 warning 提升为 error。
 - 测试：`test_proposal_groups_multiple_actions_into_one_agent_node`、`test_valid_proposal_participates_in_adjudication`、`test_proposal_not_covering_every_action_is_rejected`、`test_distilled_draft_reuse_varies_with_new_input`。
 
 ### 2.2 Browser 固化与真实 TraeX
 
-- **编译/执行共用契约**（[`action_compilers.py`](backend/app/application/action_compilers.py)、[`browser.py`](backend/app/runtime/browser.py)）：BrowserActionCompiler 直接构造并校验 `BrowserReadContract`；`bodySelector/fields/outputSchema/timeoutMs` 全部归入 `pageContract`。
+- **编译/执行共用契约**（[`action_compilers.py`](../backend/app/application/action_compilers.py)、[`browser.py`](../backend/app/runtime/browser.py)）：BrowserActionCompiler 直接构造并校验 `BrowserReadContract`；`bodySelector/fields/outputSchema/timeoutMs` 全部归入 `pageContract`。
 - **生产 runtime 明确为 Playwright**：固化默认选择 `runtime=playwright`；Compiler 以 `BROWSER_TEST_ADAPTER_FORBIDDEN` 阻止 `observedContent` 测试 adapter 出现在可发布 Read/Extract 图。
-- **redirect 后再次校验 URL**（[`playwright_browser.py`](backend/app/runtime/playwright_browser.py)）：导航完成后重新用 `url_matches` 校验最终 `page.url`，越出 scheme/host/path 契约立即失败。
+- **redirect 后再次校验 URL**（[`playwright_browser.py`](../backend/app/runtime/playwright_browser.py)）：导航完成后重新用 `url_matches` 校验最终 `page.url`，越出 scheme/host/path 契约立即失败。
 - **真实 mixed E2E**：`test_e2e_8b_real_browser_distillation_to_non_fake_agent` 从 Conversation Agent 的 `browser.action.started` 开始，经 Distillation Agent Proposal、draft、publish、页面正文修改，再运行 Playwright Browser → 非 fake AgentHost；断言第二次输出包含新正文。
 
 ### 2.3 Recovery 完整状态机
 
-- **统一租约和取消**（[`recovery.py`](backend/app/application/recovery.py)）：checkpoint 与 Recovery NodeRun 共用 owner/expiry/heartbeat；Agent 执行期间刷新两者租约并轮询 Run 取消，取消信号传给统一 `AgentHost`，可立即停止挂起 subprocess。
+- **统一租约和取消**（[`recovery.py`](../backend/app/application/recovery.py)）：checkpoint 与 Recovery NodeRun 共用 owner/expiry/heartbeat；Agent 执行期间刷新两者租约并轮询 Run 取消，取消信号传给统一 `AgentHost`，可立即停止挂起 subprocess。
 - **崩溃重领**：Driver 回收过期 `running` checkpoint。outcome known 回到 `pending` 并重领；outcome unknown 创建人工确认。标准 `WorkerService.recover_expired` 显式排除 Recovery NodeRun，避免与 RecoveryDriver 竞争。
 - **标准用户问题**：`request_user` 创建 `Approval(effect=recovery.question)`，保存 question、answer 和 checkpoint digest；`POST /approvals/{id}/answer` 恢复同一 checkpoint。
 - **typed replan**：`RecoveryPlanPatch` 必须包含 `remainingNodes/remainingEdges/inputMappings/locks`；校验节点完整覆盖、边界、输出边和能力锁不扩张后创建 `RecoveryAttempt(status=active)`，合并为附加冻结执行源并创建新的失败节点 attempt。空 substitution 不再代表重规划。
 - **正式能力锁**：checkpoint 从 WorkflowVersion 或 PlanSnapshot 的 validation/locks 加载 capability/MCP locks，不再读取 Run 动态私有属性。
-- **fallback target 专用**（[`compiler.py`](backend/app/application/compiler.py)）：普通 incoming/outgoing edge 复用 fallback target 产生 `FALLBACK_TARGET_NOT_DEDICATED` 发布错误。
+- **fallback target 专用**（[`compiler.py`](../backend/app/application/compiler.py)）：普通 incoming/outgoing edge 复用 fallback target 产生 `FALLBACK_TARGET_NOT_DEDICATED` 发布错误。
 - **Context Budget**：大于 16KB 的 completed output 不复制进 checkpoint，改存 digest、字节数、NodeRun handle 和已有标准 Artifact refs；Recovery prompt 限定约 24KB，超限时进一步压缩输入和 Schema。
 - 黑盒：E2E-7b 强杀已领取 Recovery 的 Worker 后由新 Worker 重领；E2E-7c 回答标准问题续跑；E2E-7d 执行 typed replan，新 attempt 成功且旧失败 attempts 不改写。
 
 ### 2.4 可证明的 Patch replay
 
-- **Observation 原子 upsert**（[`workflow_patch.py`](backend/app/application/workflow_patch.py)）：SQLite `ON CONFLICT DO UPDATE` 聚合 occurrence、source Run/checkpoint 和恢复事实，避免并发首次失败 unique 冲突。
+- **Observation 原子 upsert**（[`workflow_patch.py`](../backend/app/application/workflow_patch.py)）：SQLite `ON CONFLICT DO UPDATE` 聚合 occurrence、source Run/checkpoint 和恢复事实，避免并发首次失败 unique 冲突。
 - **occurrence 不再冒充复现**：`FailureObservation.baseline_reproduced` 是独立持久事实；`observation_eligibility` 只认成功的 baseline reproduction，出现次数仅作为热度。
-- **来源强绑定**（[`routes.py`](backend/app/api/routes.py)）：目标 WorkflowVersion、observation、source Run 必须一致；禁止客户端提交替代 `safeInputs`。
-- **双阶段 proof**（[`replay.py`](backend/app/application/replay.py)）：先运行 base 并要求同错误码失败，再运行 patched；依赖失败会阻止下游，最终通过要求原失败点和 Output 均 succeeded。
+- **来源强绑定**（[`routes.py`](../backend/app/api/routes.py)）：目标 WorkflowVersion、observation、source Run 必须一致；禁止客户端提交替代 `safeInputs`。
+- **双阶段 proof**（[`replay.py`](../backend/app/application/replay.py)）：先运行 base 并要求同错误码失败，再运行 patched；依赖失败会阻止下游，最终通过要求原失败点和 Output 均 succeeded。
 - **副作用隔离**：所有 `sideEffect` 节点一律模拟，不因 idempotent 标记执行真实写；MCP/SkillX/Browser/LLM/Agent 外部读取必须提供捕获 fixture，否则返回 `REPLAY_UNSUPPORTED`。
 - **持久证据**：`ReplayEvidence` 保存 baseline snapshot、patched snapshot、diff 和 passed；失败只保存证据，不创建 draft。
 - 黑盒：E2E-9 通过 API 发布确定失败工作流，真实 Worker 形成 observation；Patch API 复现 `DEPENDENCY_UNAVAILABLE`，patched 最终 Output 成功后才创建 draft。
 
 ## 3. B：Workflow Capability Manifest
 
-- **不可变数据模型**（migration 0013，[`database.py`](backend/app/infrastructure/database.py)）：新增 `WorkflowCapabilityManifest`，保存 workflowVersionId、workflow digest、manifest JSON/digest、状态和 search text；每个 WorkflowVersion 至多一个 manifest。
-- **发布即生成**（[`workflow_catalog.py`](backend/app/application/workflow_catalog.py)、[`routes.py`](backend/app/api/routes.py)）：`publish_workflow` 在同一事务中生成 manifest；升级创建新版本和新 manifest，不修改旧记录。
+- **不可变数据模型**（migration 0013，[`database.py`](../backend/app/infrastructure/database.py)）：新增 `WorkflowCapabilityManifest`，保存 workflowVersionId、workflow digest、manifest JSON/digest、状态和 search text；每个 WorkflowVersion 至多一个 manifest。
+- **发布即生成**（[`workflow_catalog.py`](../backend/app/application/workflow_catalog.py)、[`routes.py`](../backend/app/api/routes.py)）：`publish_workflow` 在同一事务中生成 manifest；升级创建新版本和新 manifest，不修改旧记录。
 - **自动派生字段**：I/O synopsis、executionClass、sideEffects、approvalRequired、estimated LLM calls、step summary、capability/MCP locks 和 entrypoints 从冻结版本派生；`summary/useWhen/doNotUseWhen/examples/tags` 从作者审核的 `metadata.capability` 读取。
 - **最小披露**：manifest 不包含完整 prompt、节点 config、Secret 或 Artifact 内容。
 - **可靠性按需计算**：L1 describe 基于精确 version 最近 20 次终态 Run 计算 sample size 和 success rate，不回写不可变 manifest。
@@ -103,7 +103,7 @@ README 没有把上述能力整体提升为 `available`。外部读取 replay fi
 
 ## 6. E：引用式组合与 PlanSnapshot
 
-- **ExecutionPlan IR**（新增 [`plans.py`](backend/app/application/plans.py)）：支持 `workflow | fragment | transform | llm | agent` step、显式 edges、input/output Schema、mappings 和 policies；模型只提交 ref/mapping，不复制 Workflow definition。
+- **ExecutionPlan IR**（新增 [`plans.py`](../backend/app/application/plans.py)）：支持 `workflow | fragment | transform | llm | agent` step、显式 edges、input/output Schema、mappings 和 policies；模型只提交 ref/mapping，不复制 Workflow definition。
 - **PlanCompiler 最终裁决**：
   - 校验 ref/version/digest 和 fragment closure；
   - 校验 required inputs、基础 JSON Schema 类型可赋值、DAG 和输出 required 完整性；
@@ -125,10 +125,10 @@ README 没有把上述能力整体提升为 `available`。外部读取 replay fi
 
 ## 8. G：产品、可观测性和文档
 
-- **对话候选卡片**（[`ChatPage.tsx`](frontend/src/pages/ChatPage.tsx)）：展示 L0、匹配分数、required inputs、副作用、审批、LLM 次数和锁定 ref。
-- **运行详情**（[`RunDetailPage.tsx`](frontend/src/pages/RunDetailPage.tsx)）：区分 WorkflowVersion 与临时 PlanSnapshot，展示 plan id/digest、来源锁、临时标记、检查点和恢复决定。
-- **组件披露预览**（[`ComponentDetailPage.tsx`](frontend/src/pages/ComponentDetailPage.tsx)）：展示 TraeX 的 L0/L1/L2 manifest、useWhen/doNotUseWhen、tags、entrypoints、fragments 和 digest。
-- **单一验收清单**：[`docs/demo-acceptance.md`](docs/demo-acceptance.md) 记录 E2E-1～12、Recovery 分支和 Scale-1；Makefile/README 不再硬编码旧“六条 E2E”口径。
+- **对话候选卡片**（[`ChatPage.tsx`](../frontend/src/pages/ChatPage.tsx)）：展示 L0、匹配分数、required inputs、副作用、审批、LLM 次数和锁定 ref。
+- **运行详情**（[`RunDetailPage.tsx`](../frontend/src/pages/RunDetailPage.tsx)）：区分 WorkflowVersion 与临时 PlanSnapshot，展示 plan id/digest、来源锁、临时标记、检查点和恢复决定。
+- **组件披露预览**（[`ComponentDetailPage.tsx`](../frontend/src/pages/ComponentDetailPage.tsx)）：展示 TraeX 的 L0/L1/L2 manifest、useWhen/doNotUseWhen、tags、entrypoints、fragments 和 digest。
+- **单一验收清单**：[`docs/demo-acceptance.md`](../docs/demo-acceptance.md) 记录 E2E-1～12、Recovery 分支和 Scale-1；Makefile/README 不再硬编码旧“六条 E2E”口径。
 - **能力状态保守同步**：真实 Browser 固化、Recovery 分支、Replay proof 和临时组合已有证据，但仍存在下节扩展项，因此 README 继续使用 `partial`。
 
 ## 9. 007 门禁矩阵

@@ -2,9 +2,9 @@
 
 日期：2026-08-05
 
-依据：[`NEXT_STEPS-013.md`](NEXT_STEPS-013.md)、
-[`review/design-compliance-review-013.md`](review/design-compliance-review-013.md)、
-[`review/code-review-013.md`](review/code-review-013.md)。
+依据：[`NEXT_STEPS-013.md`](../STEP/NEXT_STEPS-013.md)、
+[`review/design-compliance-review-013.md`](../review/design-compliance-review-013.md)、
+[`review/code-review-013.md`](../review/code-review-013.md)。
 
 执行基线：`093ab31`。本报告对应当前未提交工作树；本轮未创建 Git 提交。
 
@@ -35,7 +35,7 @@ failed ToolResult 后即使 Agent 返回非法 `agent.completed`，或子进程�
 
 - Agent 事件协议新增结构化 `agent.failed(code/message/retryable/callId)`；
 - `agent.completed` 继续只表示成功，输出必须通过 Schema 和逐字段 provenance；
-- [`error_policy.py`](backend/app/application/error_policy.py) 统一
+- [`error_policy.py`](../backend/app/application/error_policy.py) 统一
   `DEPENDENCY_UNAVAILABLE/TIMEOUT/RATE_LIMITED` 的标准 code、retryable、budget、
   backoff 和 evidence kind；
 - AgentHost 对只读 Tool 按策略有限重试；确定性 Contract/Permission/Safety/非法事件

@@ -2,9 +2,9 @@
 
 日期：2026-08-05
 
-依据：[`NEXT_STEPS-011.md`](NEXT_STEPS-011.md)、
-[`review/design-compliance-review-011.md`](review/design-compliance-review-011.md)、
-[`review/code-review-011.md`](review/code-review-011.md)。
+依据：[`NEXT_STEPS-011.md`](../STEP/NEXT_STEPS-011.md)、
+[`review/design-compliance-review-011.md`](../review/design-compliance-review-011.md)、
+[`review/code-review-011.md`](../review/code-review-011.md)。
 
 执行基线：`24cca38`。本报告对应当前未提交工作树；本轮未擅自创建 Git 提交。
 
@@ -144,7 +144,7 @@ level、result digest 和剩余预算，不复制完整 Manifest/DAG。测试断
 
 ## 7. F：规范与门禁
 
-[`docs/demo-acceptance.md`](docs/demo-acceptance.md) 已增加：
+[`docs/demo-acceptance.md`](../docs/demo-acceptance.md) 已增加：
 
 - 修订必须保持同一 Workflow 逻辑身份；
 - transport/timeout 与 contract evidence 的不同 reproduction policy；

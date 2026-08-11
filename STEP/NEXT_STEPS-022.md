@@ -1,8 +1,8 @@
 # NEXT_STEPS-022：拆分 Agent Runtime 与 LLM Runtime
 
-依据：[`REPLAY-021.md`](REPLAY-021.md)、
-[`review/design-compliance-review-022.md`](review/design-compliance-review-022.md)、
-[`review/code-review-022.md`](review/code-review-022.md) 和 `docs/` 下设计/规范文档。
+依据：[`REPLAY-021.md`](../REPLAY/REPLAY-021.md)、
+[`review/design-compliance-review-022.md`](../review/design-compliance-review-022.md)、
+[`review/code-review-022.md`](../review/code-review-022.md) 和 `docs/` 下设计/规范文档。
 
 范围：单用户 Local Demo，不增加鉴权、RBAC、多租户或分布式部署。首要目标是保持现有完整流程可运行，同时消除
 Agent 与模型端点的错误耦合，并实现：**LLM Runtime 未配置时，由 Agent Runtime 完成受约束的结构化生成。**

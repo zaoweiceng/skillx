@@ -1,7 +1,7 @@
 # 下一步工作计划（002）
 
-依据：[`review/design-compliance-review-002.md`](review/design-compliance-review-002.md) 与 [`review/code-review-002.md`](review/code-review-002.md)。  
-目标：在单用户 Local Demo 范围内，修完正确性问题并完成 `docs/demo-acceptance.md` 定义的六条真实 E2E。  
+依据：[`review/design-compliance-review-002.md`](../review/design-compliance-review-002.md) 与 [`review/code-review-002.md`](../review/code-review-002.md)。
+目标：在单用户 Local Demo 范围内，修完正确性问题并完成 `docs/demo-acceptance.md` 定义的六条真实 E2E。
 非目标：鉴权、RBAC、多租户、生产级沙箱、分布式数据库。
 
 ## 1. 完成定义

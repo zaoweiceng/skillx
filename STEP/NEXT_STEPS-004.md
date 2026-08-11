@@ -1,7 +1,7 @@
 # 下一步工作计划（004）
 
-依据：[`review/design-compliance-review-004.md`](review/design-compliance-review-004.md) 与 [`review/code-review-004.md`](review/code-review-004.md)。  
-目标：先建立可信的 Agent 长任务与 MCP 不可变契约，再完成真实轨迹提炼和最小可视化编辑闭环。  
+依据：[`review/design-compliance-review-004.md`](../review/design-compliance-review-004.md) 与 [`review/code-review-004.md`](../review/code-review-004.md)。
+目标：先建立可信的 Agent 长任务与 MCP 不可变契约，再完成真实轨迹提炼和最小可视化编辑闭环。
 非目标：鉴权、RBAC、多租户、生产级沙箱和分布式部署。
 
 ## 1. 当前状态与优先级

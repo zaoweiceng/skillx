@@ -2,9 +2,9 @@
 
 日期：2026-08-07
 
-依据：[`NEXT_STEPS-017.md`](NEXT_STEPS-017.md)、
-[`review/design-compliance-review-017.md`](review/design-compliance-review-017.md)、
-[`review/code-review-017.md`](review/code-review-017.md)。
+依据：[`NEXT_STEPS-017.md`](../STEP/NEXT_STEPS-017.md)、
+[`review/design-compliance-review-017.md`](../review/design-compliance-review-017.md)、
+[`review/code-review-017.md`](../review/code-review-017.md)。
 
 执行基线：`0a2237f`。本报告对应当前未提交工作树；本轮未创建 Git 提交。
 

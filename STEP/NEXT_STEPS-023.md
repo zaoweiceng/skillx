@@ -1,8 +1,8 @@
 # NEXT_STEPS-023：让“可配置”变成“真实可用”
 
-依据：[`REPLAY-022.md`](REPLAY-022.md)、
-[`review/design-compliance-review-023.md`](review/design-compliance-review-023.md)、
-[`review/code-review-023.md`](review/code-review-023.md) 和 `docs/` 下设计/规范文档。
+依据：[`REPLAY-022.md`](../REPLAY/REPLAY-022.md)、
+[`review/design-compliance-review-023.md`](../review/design-compliance-review-023.md)、
+[`review/code-review-023.md`](../review/code-review-023.md) 和 `docs/` 下设计/规范文档。
 
 范围：单用户 Local Demo，不增加鉴权、RBAC、多租户或分布式部署。首要目标不是继续扩充框架，而是让用户用一条普通
 自然语言消息完成“Agent 判断是否调用工作流 → 提取参数 → 执行 → 返回结构化和阅读结果”，并让 Settings 只展示有真实证据的

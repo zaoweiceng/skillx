@@ -1,6 +1,6 @@
 # REPLAY-008：TraeX Workflow 工具闭环与执行状态机
 
-依据：[`NEXT_STEPS-008.md`](NEXT_STEPS-008.md)。
+依据：[`NEXT_STEPS-008.md`](../STEP/NEXT_STEPS-008.md)。
 
 ## 1. 结论
 
@@ -9,15 +9,15 @@
 
 ## 2. Recovery fencing 与 Replan
 
-- [`database.py`](backend/app/infrastructure/database.py)：Checkpoint 和 Recovery
+- [`database.py`](../backend/app/infrastructure/database.py)：Checkpoint 和 Recovery
   NodeRun 持久化 `claim_generation/claim_token`。
-- [`recovery.py`](backend/app/application/recovery.py)：claim、heartbeat、Agent 返回提交、
+- [`recovery.py`](../backend/app/application/recovery.py)：claim、heartbeat、Agent 返回提交、
   异常、取消和 NodeRun 终结均校验 `id/status/owner/generation/token`。
 - 过期 claim 先提升 generation；unknown outcome 只保留一个待处理人工确认。
 - `RecoveryPlanPatch` 只接受 `nodePatches/inputMappings/edgePatches`。Agent 不再提交
   完整节点定义或 locks；平台重新运行 Workflow、Capability 和 MCP 校验并保存
   before/after digest、diagnostics 与生成锁。
-- [`test_recovery.py`](backend/tests/test_recovery.py) 覆盖 A 超租约、B 重领、A 迟到返回，
+- [`test_recovery.py`](../backend/tests/test_recovery.py) 覆盖 A 超租约、B 重领、A 迟到返回，
   只允许 B 的替代输出和决定生效。
 
 ## 3. Disclosure 与 Selection-5
@@ -42,7 +42,7 @@
 
 ## 5. Runtime、Replay 与 Observation
 
-- [`state_machine.py`](backend/app/runtime/state_machine.py) 是 Runtime/Replay 共用的
+- [`state_machine.py`](../backend/app/runtime/state_machine.py) 是 Runtime/Replay 共用的
   edge readiness、条件选择、onError、fallback-only、skip 和 Output Schema 纯逻辑。
 - Replay 的外部与副作用节点必须使用捕获 fixture；fixture 不满足输出契约时返回
   `REPLAY_UNSUPPORTED`。Evidence 包含 selected edges、skipped nodes、Schema diagnostics

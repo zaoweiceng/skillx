@@ -1,8 +1,8 @@
 # NEXT_STEPS-016：先闭合用户可见主流程
 
-依据：[`REPLAY-015.md`](REPLAY-015.md)、
-[`review/design-compliance-review-016.md`](review/design-compliance-review-016.md)、
-[`review/code-review-016.md`](review/code-review-016.md)。
+依据：[`REPLAY-015.md`](../REPLAY/REPLAY-015.md)、
+[`review/design-compliance-review-016.md`](../review/design-compliance-review-016.md)、
+[`review/code-review-016.md`](../review/code-review-016.md)。
 
 范围：单用户 Local Demo；不做鉴权/RBAC、多租户和分布式部署。
 

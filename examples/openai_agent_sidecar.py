@@ -85,9 +85,16 @@ def fail(code: str, message: str, *, retryable: bool = False) -> int:
 
 
 def provider_config() -> tuple[str, str, str]:
-    endpoint = os.environ.get("SKILLX_MODEL_ENDPOINT", "")
-    model = os.environ.get("SKILLX_MODEL_NAME", "")
-    key_env = os.environ.get("SKILLX_MODEL_API_KEY_ENV", "SKILLX_MODEL_API_KEY")
+    agent_endpoint = os.environ.get("SKILLX_AGENT_ENDPOINT")
+    endpoint = agent_endpoint or os.environ.get("SKILLX_MODEL_ENDPOINT", "")
+    model = os.environ.get("SKILLX_AGENT_MODEL") or os.environ.get(
+        "SKILLX_MODEL_NAME", ""
+    )
+    key_env = (
+        os.environ.get("SKILLX_AGENT_API_KEY_ENV", "SKILLX_AGENT_API_KEY")
+        if agent_endpoint
+        else os.environ.get("SKILLX_MODEL_API_KEY_ENV", "SKILLX_MODEL_API_KEY")
+    )
     api_key = os.environ.get(key_env, "")
     if not endpoint or not model or not api_key:
         raise RuntimeError(

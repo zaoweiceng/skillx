@@ -163,18 +163,43 @@ describe('RunDetailPage 可观测性与审批', () => {
 
     await waitFor(() => expect(eventSources).toHaveLength(1))
     const stream = eventSources[0]
-    const listener = stream.listeners.get('run.completed')
+    const listener = stream.listeners.get('run.event')
+    for (const [seq, type] of [
+      [1, 'mcp.call.completed'],
+      [2, 'artifact.created'],
+    ] as const) {
+      listener?.(
+        new MessageEvent('run.event', {
+          data: JSON.stringify({ runId: 'run-1', seq, type, payload: {} }),
+        }),
+      )
+    }
     listener?.(
-      new MessageEvent('run.completed', {
+      new MessageEvent('run.event', {
         data: JSON.stringify({
           runId: 'run-1',
-          seq: 1,
+          seq: 3,
+          type: 'run.completed',
           payload: { status: 'succeeded' },
+        }),
+      }),
+    )
+    expect(stream.closed).toBe(false)
+    listener?.(
+      new MessageEvent('run.event', {
+        data: JSON.stringify({
+          runId: 'run-1',
+          seq: 4,
+          type: 'presentation.completed',
+          payload: { status: 'completed' },
         }),
       }),
     )
 
     await waitFor(() => expect(stream.closed).toBe(true))
+    expect(useRunEvents.getState().events['run-1'].map((item) => item.seq)).toEqual([
+      1, 2, 3, 4,
+    ])
     expect(eventSources).toHaveLength(1)
   })
 

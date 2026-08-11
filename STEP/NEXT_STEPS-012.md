@@ -1,6 +1,6 @@
 # NEXT_STEPS-012：把 Replay 证据绑定到最终发布版本
 
-依据：[`REPLAY-011.md`](REPLAY-011.md)、[`review/design-compliance-review-012.md`](review/design-compliance-review-012.md)、[`review/code-review-012.md`](review/code-review-012.md)。
+依据：[`REPLAY-011.md`](../REPLAY/REPLAY-011.md)、[`review/design-compliance-review-012.md`](../review/design-compliance-review-012.md)、[`review/code-review-012.md`](../review/code-review-012.md)。
 
 范围：Local Demo；不做鉴权/RBAC、多租户和分布式部署。
 

@@ -217,6 +217,26 @@ def _semantic_metadata(definition: WorkflowDefinition) -> dict[str, Any]:
     return result
 
 
+def capability_metadata_issues(definition: WorkflowDefinition) -> list[str]:
+    raw = definition.metadata.get("capability")
+    if not isinstance(raw, dict):
+        return ["metadata.capability"]
+    issues: list[str] = []
+    for field in ("summary", "useWhen", "doNotUseWhen", "examples", "tags"):
+        value = raw.get(field)
+        valid = (
+            isinstance(value, str)
+            and bool(value.strip())
+            if field == "summary"
+            else isinstance(value, list)
+            and bool(value)
+            and all(isinstance(item, str) and item.strip() for item in value)
+        )
+        if not valid:
+            issues.append(f"metadata.capability.{field}")
+    return issues
+
+
 _INPUT_REF = re.compile(r"\$\{input\.([^}.]+)(?:\.[^}]*)?}")
 _NODE_REF = re.compile(r"\$\{([a-zA-Z][\w-]*)\.(?:output\.)?[^}]+}")
 
@@ -622,12 +642,6 @@ async def search_manifests(
                 "name",
                 "summary",
                 "tags",
-                "inputSynopsis",
-                "outputSynopsis",
-                "executionClass",
-                "sideEffects",
-                "approvalRequired",
-                "estimatedCost",
             )
         }
         card["manifestDigest"] = row.digest
@@ -709,12 +723,28 @@ async def describe_workflow(session: AsyncSession, ref: str) -> dict[str, Any]:
     ).all()
     terminal = [run for run in recent if run.status in {"succeeded", "failed", "cancelled"}]
     return {
-        **manifest,
+        **{
+            key: manifest[key]
+            for key in (
+                "workflowRef",
+                "name",
+                "summary",
+                "useWhen",
+                "doNotUseWhen",
+                "examples",
+                "tags",
+                "inputSynopsis",
+                "outputSynopsis",
+                "executionClass",
+                "sideEffects",
+                "approvalRequired",
+                "estimatedCost",
+                "entrypoints",
+            )
+        },
+        "fragments": manifest.get("fragments", []),
         "manifestDigest": item.digest,
-        "inputSchema": spec["inputSchema"],
-        "outputSchema": spec["outputSchema"],
         "limits": spec.get("policies", {}),
-        "versionLock": {"versionId": version.id, "digest": version.digest},
         "reliability": {
             "sampleSize": len(terminal),
             "successRate": (

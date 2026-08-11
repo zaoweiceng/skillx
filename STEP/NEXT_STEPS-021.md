@@ -1,8 +1,8 @@
 # NEXT_STEPS-021：真实语义验收与用户界面一致性
 
-依据：[`REPLAY-020.md`](REPLAY-020.md)、
-[`review/design-compliance-review-021.md`](review/design-compliance-review-021.md)、
-[`review/code-review-021.md`](review/code-review-021.md) 和 `docs/` 下设计/规范文档。
+依据：[`REPLAY-020.md`](../REPLAY/REPLAY-020.md)、
+[`review/design-compliance-review-021.md`](../review/design-compliance-review-021.md)、
+[`review/code-review-021.md`](../review/code-review-021.md) 和 `docs/` 下设计/规范文档。
 
 范围：单用户 Local Demo；不增加鉴权、RBAC、多租户和分布式部署。021 首要目标仍是让普通用户在真实模型和常见窗口尺寸下，
 从提问到最终结果完整跑通且信息可信。

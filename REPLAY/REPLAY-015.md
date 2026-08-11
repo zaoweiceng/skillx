@@ -2,9 +2,9 @@
 
 日期：2026-08-06
 
-依据：[`NEXT_STEPS-015.md`](NEXT_STEPS-015.md)、
-[`review/design-compliance-review-015.md`](review/design-compliance-review-015.md)、
-[`review/code-review-015.md`](review/code-review-015.md)。
+依据：[`NEXT_STEPS-015.md`](../STEP/NEXT_STEPS-015.md)、
+[`review/design-compliance-review-015.md`](../review/design-compliance-review-015.md)、
+[`review/code-review-015.md`](../review/code-review-015.md)。
 
 执行基线：`c57de5c`（`feat: 实现通配型计划接力功能`）。本报告对应当前未提交工作树；
 本轮未创建 Git 提交。

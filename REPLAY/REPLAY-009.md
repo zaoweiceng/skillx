@@ -2,9 +2,9 @@
 
 执行日期：2026-08-04
 
-依据：[`NEXT_STEPS-009.md`](NEXT_STEPS-009.md)、
-[`review/design-compliance-review-009.md`](review/design-compliance-review-009.md)、
-[`review/code-review-009.md`](review/code-review-009.md)。
+依据：[`NEXT_STEPS-009.md`](../STEP/NEXT_STEPS-009.md)、
+[`review/design-compliance-review-009.md`](../review/design-compliance-review-009.md)、
+[`review/code-review-009.md`](../review/code-review-009.md)。
 
 范围：Local Demo；不包含鉴权/RBAC、多租户和分布式部署。
 
@@ -37,7 +37,7 @@ Browser completed 事件重写结果；Browser 与非网页 lookup/read 都由 H
 
 ## 3. B：双向通用 Tool Broker
 
-新增 [`tool_broker.py`](backend/app/application/tool_broker.py)，统一 Adapter 契约包含：
+新增 [`tool_broker.py`](../backend/app/application/tool_broker.py)，统一 Adapter 契约包含：
 
 - `capability_ref`；
 - input/output Schema；
@@ -73,7 +73,7 @@ ConversationRun 最终回答和正文 sha256 全部来自 Playwright 返回值�
 
 ## 4. C：渐进 Workflow Tool Broker 与 Selection-5
 
-新增 [`workflow_tool_broker.py`](backend/app/application/workflow_tool_broker.py)，把以下应用
+新增 [`workflow_tool_broker.py`](../backend/app/application/workflow_tool_broker.py)，把以下应用
 服务注册为同一 AgentHost 的受控工具，而不是内部 HTTP 或数据库直访：
 
 - `workflow.search`：L0 top-k；

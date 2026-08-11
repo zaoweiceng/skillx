@@ -1,8 +1,8 @@
 # NEXT_STEPS-013：闭合首次探索中的真实失败接力
 
-依据：[`REPLAY-012.md`](REPLAY-012.md)、
-[`review/design-compliance-review-013.md`](review/design-compliance-review-013.md)、
-[`review/code-review-013.md`](review/code-review-013.md)。
+依据：[`REPLAY-012.md`](../REPLAY/REPLAY-012.md)、
+[`review/design-compliance-review-013.md`](../review/design-compliance-review-013.md)、
+[`review/code-review-013.md`](../review/code-review-013.md)。
 
 范围：Local Demo；不做鉴权/RBAC、多租户和分布式部署。
 

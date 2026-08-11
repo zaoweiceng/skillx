@@ -1,7 +1,7 @@
 # 下一步工作计划（003）
 
-依据：[`review/design-compliance-review-003.md`](review/design-compliance-review-003.md) 与 [`review/code-review-003.md`](review/code-review-003.md)。  
-目标：补齐真实 Agent 固化与真实 Browser 黑盒验收，修复 MCP 副作用语义，再完成最小可视化编辑闭环。  
+依据：[`review/design-compliance-review-003.md`](../review/design-compliance-review-003.md) 与 [`review/code-review-003.md`](../review/code-review-003.md)。
+目标：补齐真实 Agent 固化与真实 Browser 黑盒验收，修复 MCP 副作用语义，再完成最小可视化编辑闭环。
 非目标：鉴权、RBAC、多租户、生产级沙箱和分布式部署。
 
 ## 1. 当前状态

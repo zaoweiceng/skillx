@@ -2,9 +2,9 @@
 
 日期：2026-08-05
 
-依据：[`NEXT_STEPS-010.md`](NEXT_STEPS-010.md)、
-[`review/design-compliance-review-010.md`](review/design-compliance-review-010.md)、
-[`review/code-review-010.md`](review/code-review-010.md)。
+依据：[`NEXT_STEPS-010.md`](../STEP/NEXT_STEPS-010.md)、
+[`review/design-compliance-review-010.md`](../review/design-compliance-review-010.md)、
+[`review/code-review-010.md`](../review/code-review-010.md)。
 
 执行基线：`24cca38`；本报告对应其上的当前工作区修复，尚未创建新提交。
 

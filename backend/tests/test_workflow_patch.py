@@ -114,7 +114,16 @@ def _definition() -> dict:
     return {
         "apiVersion": "workflow.platform/v1",
         "kind": "Workflow",
-        "metadata": {"name": "patchable"},
+        "metadata": {
+            "name": "patchable",
+            "capability": {
+                "summary": "处理可修订的结构化输入",
+                "useWhen": ["需要验证受控工作流修订"],
+                "doNotUseWhen": ["任务超出冻结能力范围"],
+                "examples": ["处理输入 x"],
+                "tags": ["修订", "测试"],
+            },
+        },
         "spec": {
             "inputSchema": {"type": "object", "properties": {"x": {"type": "string"}}},
             "outputSchema": {"type": "object", "properties": {"y": {"type": "string"}}},
@@ -422,7 +431,16 @@ def _browser_contract_failure_definition(url: str) -> dict:
     return {
         "apiVersion": "workflow.platform/v1",
         "kind": "Workflow",
-        "metadata": {"name": "external-browser-contract"},
+        "metadata": {
+            "name": "external-browser-contract",
+            "capability": {
+                "summary": "按页面契约读取外部正文",
+                "useWhen": ["需要验证浏览器契约修订"],
+                "doNotUseWhen": ["目标页面不在允许范围"],
+                "examples": ["读取测试文章正文"],
+                "tags": ["浏览器", "契约"],
+            },
+        },
         "spec": {
             "inputSchema": {
                 "type": "object",

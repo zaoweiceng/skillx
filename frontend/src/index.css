@@ -624,10 +624,6 @@ select:focus-visible {
   background: #0b1419;
 }
 
-.workflow-graph.compact {
-  height: 420px;
-}
-
 .graph-node-label {
   display: flex;
   flex-direction: column;

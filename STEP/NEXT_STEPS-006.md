@@ -1,6 +1,6 @@
 # NEXT_STEPS-006：把通配骨架变成可证明的复用与恢复闭环
 
-依据：[`REPLAY-005.md`](REPLAY-005.md)、[`review/design-compliance-review-006.md`](review/design-compliance-review-006.md)、[`review/code-review-006.md`](review/code-review-006.md)。  
+依据：[`REPLAY-005.md`](../REPLAY/REPLAY-005.md)、[`review/design-compliance-review-006.md`](../review/design-compliance-review-006.md)、[`review/code-review-006.md`](../review/code-review-006.md)。
 范围：Local Demo；不做鉴权/RBAC、多租户和分布式部署。能力最小化、版本锁、恢复幂等、审计和升级正确性不能以 Demo 为由省略，因为它们直接决定工作流是否可复用。
 
 ## 1. 目标与不变量

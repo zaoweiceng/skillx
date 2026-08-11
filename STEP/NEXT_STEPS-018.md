@@ -1,8 +1,8 @@
 # NEXT_STEPS-018：主流程通过后的保通清单
 
-依据：[`REPLAY-017.md`](REPLAY-017.md)、
-[`review/design-compliance-review-018.md`](review/design-compliance-review-018.md)、
-[`review/code-review-018.md`](review/code-review-018.md)。
+依据：[`REPLAY-017.md`](../REPLAY/REPLAY-017.md)、
+[`review/design-compliance-review-018.md`](../review/design-compliance-review-018.md)、
+[`review/code-review-018.md`](../review/code-review-018.md)。
 
 范围：单用户 Local Demo；不做鉴权/RBAC、多租户和分布式部署。
 

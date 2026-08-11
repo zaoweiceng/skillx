@@ -90,6 +90,7 @@ Local Demo 的真实语义 Agent 可使用 TraeX managed，不要求 Host 配置
 export SKILLX_AGENT_RUNTIME_TYPE=traex_managed
 export SKILLX_AGENT_COMMAND='["/path/to/traex-managed-adapter"]'
 export SKILLX_AGENT_ALLOWED_EXECUTABLES='["traex-managed-adapter"]'
+export SKILLX_AGENT_TRUSTED_ADAPTER_DIGESTS='["sha256:<adapter-digest>"]'
 ```
 
 该 command 必须实现本仓库 Agent Host 的双向 NDJSON/ToolResult 协议；普通交互式 `traex`
@@ -105,10 +106,13 @@ export SKILLX_AGENT_ALLOWED_EXECUTABLES='["python3"]'
 export SKILLX_AGENT_ENDPOINT='https://provider.example/v1/chat/completions'
 export SKILLX_AGENT_MODEL='provider-agent-model'
 export SKILLX_AGENT_API_KEY_ENV='SKILLX_AGENT_API_KEY'
+export SKILLX_AGENT_API_KEY='<provider-api-key>'
 ```
 
 `fixture` 只用于协议和故障测试，并标记为 `protocolTestOnly`；它不会让 Chat 的自动工作流
-选择进入可用状态。Secret 值不得写入工作流定义、事件或 Artifact。
+选择进入可用状态。仓库内 `openai_agent_sidecar.py` 按内容 digest 自动受信；其他 adapter
+必须单独配置可信 digest。配置完成后在 Settings 显式执行会产生真实费用的 Provider 探测，
+探测成功且未过期时才开放语义选择。Secret 值不得写入工作流定义、事件或 Artifact。
 
 ## 验证
 

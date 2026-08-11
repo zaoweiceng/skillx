@@ -51,7 +51,12 @@ export const useRunEvents = create<EventState>((set) => ({
 }))
 
 const TERMINAL_STATUSES = new Set(['succeeded', 'failed', 'cancelled'])
-const TERMINAL_EVENTS = new Set(['run.completed', 'run.failed', 'run.cancelled'])
+const TERMINAL_EVENTS = new Set([
+  'run.failed',
+  'run.cancelled',
+  'presentation.completed',
+  'presentation.failed',
+])
 
 export function useRunStream(
   runId: string | undefined,
@@ -70,57 +75,21 @@ export function useRunStream(
       TERMINAL_STATUSES.has(runStatus)
     ) return
     const stream = new EventSource(eventStreamUrl(runId, after))
-    const eventTypes = [
-      'run.created',
-      'run.started',
-      'run.completed',
-      'run.failed',
-      'run.cancelled',
-      'node.ready',
-      'node.started',
-      'node.completed',
-      'node.failed',
-      'node.cancelled',
-      'node.skipped',
-      'node.retry_scheduled',
-      'node.stale_result_ignored',
-      'node.takeover_ready',
-      'node.unknown_outcome',
-      'approval.requested',
-      'approval.resolved',
-      'presentation.started',
-      'presentation.delta',
-      'presentation.completed',
-      'presentation.failed',
-      'recovery.attempt_started',
-      'recovery.question',
-      'recovery.user_answered',
-      'run.cancellation_requested',
-      'run.recovery_approval_requested',
-      'run.recovery_rejected',
-      'run.recovery_requested',
-      'run.timeout_requested',
-    ]
     let closed = false
-    let listeners: Array<{ type: string; listener: (message: MessageEvent<string>) => void }> = []
+    const eventType = 'run.event'
+    const listener = (message: MessageEvent<string>) => {
+      const data = JSON.parse(message.data) as StoredRunEvent
+      add(runId, { ...data, runId })
+      onEvent()
+      if (TERMINAL_EVENTS.has(data.type)) close()
+    }
     const close = () => {
       if (closed) return
       closed = true
-      listeners.forEach(({ type, listener }) =>
-        stream.removeEventListener(type, listener as EventListener),
-      )
+      stream.removeEventListener(eventType, listener as EventListener)
       stream.close()
     }
-    listeners = eventTypes.map((type) => {
-      const listener = (message: MessageEvent<string>) => {
-        const data = JSON.parse(message.data) as Omit<StoredRunEvent, 'type'>
-        add(runId, { ...data, type })
-        onEvent()
-        if (TERMINAL_EVENTS.has(type)) close()
-      }
-      stream.addEventListener(type, listener as EventListener)
-      return { type, listener }
-    })
+    stream.addEventListener(eventType, listener as EventListener)
     return close
   }, [add, after, historyLoaded, onEvent, runId, runStatus])
 }

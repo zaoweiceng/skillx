@@ -13,7 +13,6 @@ import {
   type WorkflowVersionSummary,
 } from '@/api/client'
 import { EditableCanvas } from '@/components/EditableCanvas'
-import { WorkflowGraph } from '@/components/WorkflowGraph'
 import { outputVariables, reachableUpstream } from '@/lib/variablePicker'
 import {
   addNode,
@@ -371,9 +370,6 @@ export default function WorkflowEditorPage() {
           </div>
         </section>
       )}
-
-      {/* 只读小图便于总览 */}
-      {!showJson && <WorkflowGraph definition={definition} compact />}
 
       <section className="detail-grid published-version-panel">
         <div className="panel result-panel">

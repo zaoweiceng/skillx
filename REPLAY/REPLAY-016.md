@@ -2,9 +2,9 @@
 
 日期：2026-08-06
 
-依据：[`NEXT_STEPS-016.md`](NEXT_STEPS-016.md)、
-[`review/design-compliance-review-016.md`](review/design-compliance-review-016.md)、
-[`review/code-review-016.md`](review/code-review-016.md)。
+依据：[`NEXT_STEPS-016.md`](../STEP/NEXT_STEPS-016.md)、
+[`review/design-compliance-review-016.md`](../review/design-compliance-review-016.md)、
+[`review/code-review-016.md`](../review/code-review-016.md)。
 
 执行基线：`0a146a0`（`feat: 完成 REPLAY-015 冻结计划成为 Host 执行事实`）。
 本报告对应当前未提交工作树；本轮未创建 Git 提交。

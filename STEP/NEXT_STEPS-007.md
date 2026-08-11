@@ -1,6 +1,6 @@
 # NEXT_STEPS-007：修正 006 语义，并实现可渐进披露、可裁剪组合的 Workflow 能力
 
-依据：[`REPLAY-006.md`](REPLAY-006.md)、[`review/design-compliance-review-007.md`](review/design-compliance-review-007.md)、[`review/code-review-007.md`](review/code-review-007.md)。  
+依据：[`REPLAY-006.md`](../REPLAY/REPLAY-006.md)、[`review/design-compliance-review-007.md`](../review/design-compliance-review-007.md)、[`review/code-review-007.md`](../review/code-review-007.md)。
 范围：Local Demo，不做鉴权/RBAC、多租户和分布式部署。版本锁、副作用边界、临时计划审计和恢复活性属于功能正确性，不能省略。
 
 ## 1. 目标与不变量
@@ -184,7 +184,7 @@ ExecutionPlan = plan input/output Schema + steps + mappings + policies
 - [ ] 对话展示 Workflow 候选卡片、匹配理由、已加载层级、锁定版本、缺失输入和执行/继续 Agent 选择。
 - [ ] 组合前展示 Plan 预览；运行详情支持 source Workflow/Fragment 折叠、临时标记、TTL、版本锁和恢复点。
 - [ ] 组件页可维护 manifest 和 callable fragments；发布前预览 TraeX 的 L0/L1/L2 内容。
-- [ ] 更新 [`demo-acceptance.md`](docs/demo-acceptance.md) 为唯一 E2E 清单，README 的数量和能力状态从该清单生成或同步校验。
+- [ ] 更新 [`demo-acceptance.md`](../docs/demo-acceptance.md) 为唯一 E2E 清单，README 的数量和能力状态从该清单生成或同步校验。
 - [ ] 在 A 全部完成前，将通用固化、恢复、Patch replay 和“交给 TraeX”降为 `partial`。
 
 ## 9. 新增验收门禁

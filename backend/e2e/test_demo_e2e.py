@@ -632,7 +632,16 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
         transient_definition = {
             "apiVersion": "workflow.platform/v1",
             "kind": "Workflow",
-            "metadata": {"name": "transient-control"},
+            "metadata": {
+                "name": "transient-control",
+                "capability": {
+                    "summary": "读取测试端点并验证瞬态失败治理",
+                    "useWhen": ["需要验证 Browser 传输失败不会产生修订"],
+                    "doNotUseWhen": ["需要读取非测试端点或执行写操作"],
+                    "examples": ["读取瞬态测试端点"],
+                    "tags": ["浏览器", "瞬态失败", "测试"],
+                },
+            },
             "spec": {
                 "inputSchema": {
                     "type": "object",
@@ -785,7 +794,16 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
         browser_definition = {
             "apiVersion": "workflow.platform/v1",
             "kind": "Workflow",
-            "metadata": {"name": "revision-browser"},
+            "metadata": {
+                "name": "revision-browser",
+                "capability": {
+                    "summary": "按冻结页面契约读取文章正文",
+                    "useWhen": ["需要验证可复现 Browser 契约漂移修订"],
+                    "doNotUseWhen": ["目标 URL 超出测试页面范围"],
+                    "examples": ["读取测试文章正文"],
+                    "tags": ["浏览器", "契约", "修订"],
+                },
+            },
             "spec": {
                 "inputSchema": {
                     "type": "object",
@@ -997,9 +1015,9 @@ def test_e2e_9_reproducible_failure_gated_patch(stack: DemoStack) -> None:
             },
         )
         assert old_resolved.status_code == 200, old_resolved.text
-        assert old_resolved.json()["workflow"]["versionLock"][
-            "versionId"
-        ] == published_v1["id"]
+        old_workflow = old_resolved.json()["workflow"]
+        assert old_workflow["workflowRef"] == published_v1["workflowRef"]
+        assert old_workflow["workflowRef"] != published_v2["workflowRef"]
 
 
 def test_agent_run_handoff_public_api_and_completed_action_ledger(
@@ -1729,8 +1747,10 @@ def test_e2e_10_progressive_catalog_composition_and_version_pinning(
         )
         assert described.status_code == 200, described.text
         detail = described.json()["workflow"]
-        assert detail["versionLock"]["digest"] in card["workflowRef"]
-        assert "inputSchema" in detail
+        assert detail["workflowRef"] == card["workflowRef"]
+        assert detail["inputSynopsis"]["required"] == ["name"]
+        assert detail["outputSynopsis"]["properties"]["message"] == "string"
+        assert "inputSchema" not in detail
         assert "definition" not in detail
 
         plan = client.post(
@@ -1839,6 +1859,8 @@ def test_e2e_11_fragment_disclosure_and_slice_safety(stack: DemoStack) -> None:
             "capability": {
                 "summary": "可组合的问候片段",
                 "useWhen": ["需要问候片段"],
+                "doNotUseWhen": ["需要发送消息或执行其他副作用"],
+                "examples": ["生成一个问候片段"],
                 "tags": ["fragment"],
             },
             "callableFragments": [

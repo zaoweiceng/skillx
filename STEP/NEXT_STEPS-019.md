@@ -1,9 +1,9 @@
 # NEXT_STEPS-019：人工体验问题修复与产品化交互
 
 依据：人工审阅的修改要求、两张现场截图，以及
-[`docs/workflow-design-doc.md`](docs/workflow-design-doc.md)、
-[`docs/workflow-dev-doc.md`](docs/workflow-dev-doc.md)、
-[`docs/schema.md`](docs/schema.md) 和当前代码。
+[`docs/workflow-design-doc.md`](../docs/workflow-design-doc.md)、
+[`docs/workflow-dev-doc.md`](../docs/workflow-dev-doc.md)、
+[`docs/schema.md`](../docs/schema.md) 和当前代码。
 
 范围：单用户 Local Demo；本轮仍不做鉴权、RBAC、多租户和分布式部署。019 的首要目标不是继续扩展闭环能力，
 而是让已经跑通的闭环以普通用户能理解、能复查、能稳定调用的方式呈现。
@@ -102,9 +102,9 @@ P0/P1 只表示推荐实施顺序，本章所有项目都是 019 通过条件，
   必须做最终 fencing，防止模型构造调用绕过 UI。
 - [ ] 每条用户消息创建 Turn 时保存 `workflowModeSnapshot`；轨迹与历史消息展示该轮实际模式，避免用户切换后误解旧记录。
 - [ ] 模式从开启切到关闭时闭合未执行的 PendingSelection；活动 Run 保持原状态并明确提示“切换将在下一条消息生效”。
-- [ ] 删除 [`routes.py`](backend/app/api/routes.py) 中未配置 `traex_command` 时“取 Registry 第一项并直接
+- [ ] 删除 [`routes.py`](../backend/app/api/routes.py) 中未配置 `traex_command` 时“取 Registry 第一项并直接
   `ask_user/run_full`”的语义降级路径。
-- [ ] 删除 [`traex_stub.py`](examples/traex_stub.py) 中只识别 URL 和 `qN` 的 `concrete_input` 规则对产品验收的
+- [ ] 删除 [`traex_stub.py`](../examples/traex_stub.py) 中只识别 URL 和 `qN` 的 `concrete_input` 规则对产品验收的
   依赖；stub 仅可用于协议测试，不能作为“模型已判断”的证据。
 - [ ] 扩展 `WorkflowSelection`，让 Agent 返回下列可审计信息：候选 ref、action、bindings、每个 binding 的
   用户文本/历史消息来源、置信度或“不确定”标记、未绑定字段和选择理由。
@@ -215,7 +215,7 @@ Conversation
 
 ### P1-1：完成亮色/暗色主题
 
-- [ ] 在应用根节点接入现有 [`useTheme.ts`](frontend/src/hooks/useTheme.ts)，提供可见的亮/暗切换按钮和文字/图标状态。
+- [ ] 在应用根节点接入现有 [`useTheme.ts`](../frontend/src/hooks/useTheme.ts)，提供可见的亮/暗切换按钮和文字/图标状态。
 - [ ] 统一使用 `data-theme` 或等价单一机制；首次访问跟随 `prefers-color-scheme`，用户选择写 localStorage 并优先于系统值。
 - [ ] 在首屏 React 挂载前应用已保存主题，避免主题闪烁。
 - [ ] 把背景、面板、输入框、边框、正文、弱文本、代码块、成功/警告/错误、图节点和焦点环全部改为语义 token；

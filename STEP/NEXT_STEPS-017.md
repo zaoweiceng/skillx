@@ -1,8 +1,8 @@
 # NEXT_STEPS-017：闭合失败接力的最后一跳
 
-依据：[`REPLAY-016.md`](REPLAY-016.md)、
-[`review/design-compliance-review-017.md`](review/design-compliance-review-017.md)、
-[`review/code-review-017.md`](review/code-review-017.md)。
+依据：[`REPLAY-016.md`](../REPLAY/REPLAY-016.md)、
+[`review/design-compliance-review-017.md`](../review/design-compliance-review-017.md)、
+[`review/code-review-017.md`](../review/code-review-017.md)。
 
 范围：单用户 Local Demo；不做鉴权/RBAC、多租户和分布式部署。
 

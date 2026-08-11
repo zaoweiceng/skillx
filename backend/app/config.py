@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     )
     agent_command: list[str] | None = None
     agent_allowed_executables: list[str] = ["traex"]
+    agent_trusted_adapter_digests: list[str] = []
     agent_endpoint: str | None = None
     agent_model: str | None = None
     agent_api_key_env: str = "SKILLX_AGENT_API_KEY"

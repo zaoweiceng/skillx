@@ -80,7 +80,18 @@ export default function RunDetailPage() {
       cancelled = true
     }
   }, [addManyEvents, id])
-  useRunStream(id, run?.status, historyLoaded, streamAfter, refresh)
+  const awaitingPresentation = Boolean(
+    run?.status === 'succeeded' &&
+      run.presentationExpected &&
+      !['completed', 'failed'].includes(run.presentation?.status ?? ''),
+  )
+  useRunStream(
+    id,
+    awaitingPresentation ? 'running' : run?.status,
+    historyLoaded,
+    streamAfter,
+    refresh,
+  )
 
   async function decide(approval: Approval, approved: boolean) {
     try {
@@ -133,7 +144,9 @@ export default function RunDetailPage() {
 
   if (error && !run) return <div className="page error-panel">{error}</div>
   if (!run) return <div className="page loading-panel">正在读取持久化运行状态...</div>
-  const terminal = ['succeeded', 'failed', 'cancelled'].includes(run.status)
+  const terminal =
+    ['succeeded', 'failed', 'cancelled'].includes(run.status) &&
+    !awaitingPresentation
 
   return (
     <div className="page">

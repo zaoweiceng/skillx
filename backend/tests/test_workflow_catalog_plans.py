@@ -119,11 +119,23 @@ async def test_catalog_search_is_bounded_and_progressively_disclosed() -> None:
         cards = await search_manifests(session, "问候", limit=8)
         assert len(cards) == 8
         assert len(json.dumps(cards, ensure_ascii=False).encode()) < 24_000
-        assert all("stepSummary" not in card and "definition" not in card for card in cards)
+        assert all(
+            set(card)
+            == {
+                "workflowRef",
+                "name",
+                "summary",
+                "tags",
+                "manifestDigest",
+                "matchReason",
+            }
+            for card in cards
+        )
 
         l1 = await describe_workflow(session, manifest.manifest_json["workflowRef"])
-        assert l1["versionLock"] == {"versionId": version.id, "digest": version.digest}
-        assert "inputSchema" in l1 and "definition" not in l1
+        assert "inputSchema" not in l1 and "versionLock" not in l1
+        assert l1["inputSynopsis"]["required"] == ["name"]
+        assert l1["useWhen"] and l1["doNotUseWhen"]
         fragment_ref = l1["fragments"][0]["fragmentRef"]
         l2 = await describe_fragment(session, fragment_ref)
         assert l2["sourceWorkflowDigest"] == version.digest

@@ -1,8 +1,8 @@
 # NEXT_STEPS-020：真实 Agent 主路径与前端终态一致性
 
-依据：[`REPLAY-019.md`](REPLAY-019.md)、
-[`review/design-compliance-review-020.md`](review/design-compliance-review-020.md)、
-[`review/code-review-020.md`](review/code-review-020.md) 和 `docs/` 下设计/规范文档。
+依据：[`REPLAY-019.md`](../REPLAY/REPLAY-019.md)、
+[`review/design-compliance-review-020.md`](../review/design-compliance-review-020.md)、
+[`review/code-review-020.md`](../review/code-review-020.md) 和 `docs/` 下设计/规范文档。
 
 范围：单用户 Local Demo；不增加鉴权、RBAC、多租户或分布式部署。020 的第一目标仍是让用户从自然语言提问到最终答复的
 完整流程真实跑通，其次才是补齐视觉和次要交互。

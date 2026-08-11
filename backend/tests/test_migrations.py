@@ -91,7 +91,7 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
         model_usage_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(model_usage)")
         }
-    assert revision == ("0021",)
+    assert revision == ("0022",)
     assert {
         "runs",
         "capability_versions",
@@ -120,6 +120,7 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
         "attempted_at",
         "request_dispatched_at",
         "completed_at",
+        "error_code",
     } <= model_usage_columns
     assert "run_type" in run_type_columns
     assert "error_json" in run_type_columns

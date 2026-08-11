@@ -1,7 +1,7 @@
 # NEXT_STEPS-005：通配型固化、检查点接力与 005 审查修复计划
 
-依据：[`REPLAY-004.md`](REPLAY-004.md)、[`review/design-compliance-review-005.md`](review/design-compliance-review-005.md)、[`review/code-review-005.md`](review/code-review-005.md)。  
-目标：修复 005 代码审查问题，并让“首次 Agent 探索 → 部分/整体固化 → 任意类型任务复用 → 显式失败后 TraeX 从检查点接力 → 可复现时提出新版本草稿”在 Local Demo 中成立。  
+依据：[`REPLAY-004.md`](../REPLAY/REPLAY-004.md)、[`review/design-compliance-review-005.md`](../review/design-compliance-review-005.md)、[`review/code-review-005.md`](../review/code-review-005.md)。
+目标：修复 005 代码审查问题，并让“首次 Agent 探索 → 部分/整体固化 → 任意类型任务复用 → 显式失败后 TraeX 从检查点接力 → 可复现时提出新版本草稿”在 Local Demo 中成立。
 非目标：鉴权、RBAC、多租户、生产级沙箱、分布式部署。
 
 ## 1. 先确定系统不变量

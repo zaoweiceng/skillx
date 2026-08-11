@@ -73,6 +73,7 @@ from app.application.plans import (
     verify_plan_snapshot,
 )
 from app.application.product_history import (
+    finalize_turn,
     normalize_presentation_policy,
     presentation_policy,
     presentation_view,
@@ -95,6 +96,7 @@ from app.application.tool_broker import ToolAdapterRegistry
 from app.application.workflow_catalog import (
     CatalogError,
     build_manifest,
+    capability_metadata_issues,
     consume_session_call,
     create_disclosure_session,
     create_private_fragment_snapshot,
@@ -589,8 +591,13 @@ async def run_provider_probe(
             session,
             call_id=f"operational-probe:{probe_id}",
             stage="operational_probe",
-            provider="openai-compatible",
+            provider=result.get("provider"),
             model=result.get("model"),
+            runtime_used="agent_runtime",
+            runtime_digest=result.get("sidecarDigest"),
+            error_code=result.get("code"),
+            input_tokens=result.get("inputTokens"),
+            output_tokens=result.get("outputTokens"),
             total_tokens=result.get("totalTokens"),
             usage_complete=bool(result.get("usageComplete")),
             dispatched=bool(result.get("requestDispatched")),
@@ -729,6 +736,20 @@ async def validate_workflow(
         raise HTTPException(404, "工作流不存在")
     try:
         compiled = compiler.compile(item.draft_json)
+        metadata_issues = capability_metadata_issues(compiled.definition)
+        if metadata_issues:
+            return {
+                "valid": False,
+                "diagnostics": [
+                    {
+                        "level": "error",
+                        "code": "CAPABILITY_METADATA_REQUIRED",
+                        "path": path,
+                        "message": "可发布能力必须提供完整、非空的语义目录元数据",
+                    }
+                    for path in metadata_issues
+                ],
+            }
         execution_class, capability_locks = await validate_workflow_capabilities(
             session, compiled.definition
         )
@@ -822,6 +843,16 @@ async def publish_workflow(
         raise HTTPException(404, "工作流不存在")
     try:
         compiled = compiler.compile(item.draft_json)
+        metadata_issues = capability_metadata_issues(compiled.definition)
+        if metadata_issues:
+            raise HTTPException(
+                422,
+                detail={
+                    "code": "CAPABILITY_METADATA_REQUIRED",
+                    "message": "目录公开前必须补充完整语义元数据",
+                    "fields": metadata_issues,
+                },
+            )
         execution_class, capability_locks = await validate_workflow_capabilities(
             session, compiled.definition
         )
@@ -1006,24 +1037,6 @@ async def publish_workflow(
     lineage = dict(
         compiled.definition.metadata.get("revisionLineage", {})
     )
-    capability_metadata = compiled.definition.metadata.get("capability")
-    if isinstance(capability_metadata, dict):
-        missing_metadata = [
-            field
-            for field in ("summary", "useWhen")
-            if not capability_metadata.get(field)
-        ]
-        if missing_metadata:
-            raise HTTPException(
-                422,
-                detail={
-                    "code": "CAPABILITY_METADATA_REQUIRED",
-                    "message": "目录公开前必须补充能力摘要和适用场景",
-                    "fields": [
-                        f"metadata.capability.{field}" for field in missing_metadata
-                    ],
-                },
-            )
     try:
         frozen_presentation_policy = normalize_presentation_policy(
             compiled.definition.metadata,
@@ -3128,6 +3141,7 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             "runtimeUsed": item.runtime_used,
             "runtimeDigest": item.runtime_digest,
             "fallbackReason": item.fallback_reason,
+            "errorCode": item.error_code,
             "inputTokens": item.input_tokens,
             "outputTokens": item.output_tokens,
             "totalTokens": item.total_tokens,
@@ -3516,16 +3530,41 @@ async def stream_events(
                     )
                 ).all()
                 run = await session.get(Run, run_id)
+                presentation_settled = True
+                if run and run.status == "succeeded" and run.workflow_version_id:
+                    version = await session.get(
+                        WorkflowVersion, run.workflow_version_id
+                    )
+                    if presentation_policy(version)["enabled"]:
+                        presentation = await session.scalar(
+                            select(RunPresentation)
+                            .where(RunPresentation.run_id == run.id)
+                            .order_by(RunPresentation.revision.desc())
+                            .limit(1)
+                        )
+                        presentation_settled = bool(
+                            presentation
+                            and presentation.status in {"completed", "failed"}
+                        )
             for item in events:
                 cursor = item.seq
                 data = {
                     "runId": run_id,
                     "seq": item.seq,
+                    "type": item.type,
                     "payload": item.payload_json,
                     "createdAt": rfc3339(item.created_at),
                 }
-                yield f"id: {item.seq}\nevent: {item.type}\ndata: {digest_safe_json(data)}\n\n"
-            if run and run.status in {"succeeded", "failed", "cancelled"} and not events:
+                yield (
+                    f"id: {item.seq}\nevent: run.event\n"
+                    f"data: {digest_safe_json(data)}\n\n"
+                )
+            if (
+                run
+                and run.status in {"succeeded", "failed", "cancelled"}
+                and presentation_settled
+                and not events
+            ):
                 break
             if not events:
                 yield ": keep-alive\n\n"
@@ -4458,6 +4497,7 @@ async def _select_workflow_candidate(
         max_total_tokens=8000,
         max_duration_seconds=60,
     )
+    result = None
     try:
         registry = ToolAdapterRegistry()
         for adapter in workflow_tool_adapters(session, session_id):
@@ -4496,18 +4536,82 @@ async def _select_workflow_candidate(
                 }
             )
         if turn_id:
+            runtime = agent_runtime_config()
             await record_model_usage(
                 session,
                 call_id=request.run_id,
                 stage="workflow_selection",
                 turn_id=turn_id,
-                provider="traex",
-                total_tokens=(
-                    result.total_tokens if result.usage_complete else None
+                provider=(
+                    "openai-compatible"
+                    if runtime.type == "openai_sidecar"
+                    else runtime.type
                 ),
+                model=runtime.model,
+                runtime_used="agent_runtime",
+                runtime_digest=runtime.digest,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                total_tokens=result.total_tokens or None,
                 usage_complete=result.usage_complete,
+                dispatched=result.request_dispatched,
+                completed=True,
             )
     except (AgentHostError, ValueError) as exc:
+        runtime = agent_runtime_config()
+        dispatched = (
+            result.request_dispatched
+            if result is not None
+            else bool(getattr(exc, "request_dispatched", False))
+        )
+        input_tokens = (
+            result.input_tokens
+            if result is not None
+            else int(getattr(exc, "input_tokens", 0))
+        )
+        output_tokens = (
+            result.output_tokens
+            if result is not None
+            else int(getattr(exc, "output_tokens", 0))
+        )
+        total_tokens = (
+            result.total_tokens
+            if result is not None
+            else int(getattr(exc, "total_tokens", 0))
+        )
+        usage_complete = (
+            result.usage_complete
+            if result is not None
+            else bool(getattr(exc, "usage_complete", False))
+        )
+        error_code = (
+            exc.code
+            if isinstance(exc, AgentHostError)
+            else "WORKFLOW_SELECTION_INVALID"
+        )
+        await record_model_usage(
+            session,
+            call_id=request.run_id,
+            stage="workflow_selection",
+            turn_id=turn_id,
+            provider=(
+                "openai-compatible"
+                if runtime.type == "openai_sidecar"
+                else runtime.type
+            ),
+            model=runtime.model,
+            runtime_used="agent_runtime",
+            runtime_digest=runtime.digest,
+            error_code=error_code,
+            input_tokens=input_tokens or None,
+            output_tokens=output_tokens or None,
+            total_tokens=total_tokens or None,
+            usage_complete=usage_complete,
+            dispatched=dispatched,
+            completed=False,
+        )
+        await finalize_turn(session, turn_id, "error")
+        await session.commit()
         raise HTTPException(
             502,
             detail={"code": "WORKFLOW_SELECTION_FAILED", "message": str(exc)},
@@ -4579,9 +4683,9 @@ def _bounded_disclosure_result(
                     key: item.get(key)
                     for key in (
                         "workflowRef",
+                        "name",
                         "summary",
-                        "inputSynopsis",
-                        "outputSynopsis",
+                        "tags",
                         "matchReason",
                     )
                 }
@@ -4597,9 +4701,12 @@ def _bounded_disclosure_result(
             "level": "L1",
             "workflowRef": workflow.get("workflowRef"),
             "summary": workflow.get("summary"),
+            "useWhen": workflow.get("useWhen", [])[:8],
+            "doNotUseWhen": workflow.get("doNotUseWhen", [])[:8],
+            "examples": workflow.get("examples", [])[:6],
+            "tags": workflow.get("tags", [])[:12],
             "inputSynopsis": workflow.get("inputSynopsis"),
             "outputSynopsis": workflow.get("outputSynopsis"),
-            "doNotUseWhen": workflow.get("doNotUseWhen", [])[:8],
             "fragments": [
                 {
                     "fragmentRef": item.get("fragmentRef"),
@@ -4830,8 +4937,11 @@ async def _prepare_selection(
         )
         if level not in {"L1", "L2"}:
             raise CatalogError("run_full 必须先披露 Workflow L1")
-        workflow = await describe_workflow(session, selection.refs[0])
-        schema = workflow["inputSchema"]
+        manifest = await resolve_workflow_manifest(session, selection.refs[0])
+        version = await session.get(WorkflowVersion, manifest.workflow_version_id)
+        if version is None:
+            raise CatalogError("WorkflowVersion 不存在")
+        schema = version.definition_json["spec"]["inputSchema"]
         required = list(schema.get("required", []))
     elif effective_action == "run_fragment":
         level = await require_disclosed_ref(

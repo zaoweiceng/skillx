@@ -20,23 +20,21 @@ async def test_seed_is_idempotent() -> None:
     assert count == 5
 
 
-async def test_seed_weather_manifest_has_semantic_catalog_metadata() -> None:
+async def test_all_seed_manifests_have_semantic_catalog_metadata() -> None:
     await seed()
 
     async with SessionLocal() as session:
-        component = await session.scalar(
-            select(Component).where(Component.name == "本地天气查询")
-        )
-        assert component is not None
-        manifest = await session.scalar(
-            select(WorkflowCapabilityManifest).where(
-                WorkflowCapabilityManifest.workflow_version_id
-                == component.default_version_id
-            )
-        )
+        components = (await session.scalars(select(Component))).all()
+        manifests = (
+            await session.scalars(select(WorkflowCapabilityManifest))
+        ).all()
 
-    assert manifest is not None
-    assert manifest.manifest_json["summary"]
-    assert manifest.manifest_json["useWhen"]
-    assert manifest.manifest_json["doNotUseWhen"]
-    assert manifest.manifest_json["examples"]
+    assert len(manifests) == len(components)
+    for manifest in manifests:
+        assert manifest.manifest_json["summary"]
+        assert manifest.manifest_json["useWhen"]
+        assert manifest.manifest_json["doNotUseWhen"]
+        assert manifest.manifest_json["examples"]
+        assert manifest.manifest_json["tags"]
+        assert manifest.manifest_json["inputSynopsis"]
+        assert manifest.manifest_json["outputSynopsis"]

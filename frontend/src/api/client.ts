@@ -123,6 +123,7 @@ export type Run = {
     runtimeUsed: 'direct_llm' | 'agent_fallback' | 'agent_runtime' | 'fake_structured' | null
     runtimeDigest: string | null
     fallbackReason: string | null
+    errorCode: string | null
     inputTokens: number | null
     outputTokens: number | null
     totalTokens: number | null
@@ -443,6 +444,9 @@ export const api = {
         modelAvailable: boolean
         model?: string | null
         digest?: string
+        adapterDigest?: string
+        adapterVersion?: string
+        adapterTrusted?: boolean
         source?: string
         lastProbe: {
           at: string | null
@@ -453,6 +457,7 @@ export const api = {
           model?: string
           totalTokens?: number
           usageComplete?: boolean
+          requestDispatched?: boolean
           code?: string
         }
         nextProbeAllowedAt: string | null
@@ -466,6 +471,9 @@ export const api = {
         modelAvailable: boolean
         model: string | null
         digest: string
+        adapterDigest?: string
+        adapterVersion?: string
+        adapterTrusted?: boolean
         source: string
         lastProbe: {
           at: string | null

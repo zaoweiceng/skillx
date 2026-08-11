@@ -2,9 +2,9 @@
 
 日期：2026-08-05
 
-依据：[`NEXT_STEPS-012.md`](NEXT_STEPS-012.md)、
-[`review/design-compliance-review-012.md`](review/design-compliance-review-012.md)、
-[`review/code-review-012.md`](review/code-review-012.md)。
+依据：[`NEXT_STEPS-012.md`](../STEP/NEXT_STEPS-012.md)、
+[`review/design-compliance-review-012.md`](../review/design-compliance-review-012.md)、
+[`review/code-review-012.md`](../review/code-review-012.md)。
 
 执行基线：`bd2e45c`。本报告对应当前未提交工作树；本轮未创建 Git 提交。
 
@@ -29,7 +29,7 @@ Replay 后定义发生变化会进入 `dirty_after_replay`。旧审核快照和�
 
 ## 2. 持久化与状态机
 
-迁移 [`0017_replay_publish_binding.py`](backend/migrations/versions/0017_replay_publish_binding.py)
+迁移 [`0017_replay_publish_binding.py`](../backend/migrations/versions/0017_replay_publish_binding.py)
 新增：
 
 - `revision_proposals`：observation/base version、Agent run、prompt version、fixture/baseline、

@@ -2,9 +2,9 @@
 
 日期：2026-08-10
 
-依据：[`NEXT_STEPS-022.md`](NEXT_STEPS-022.md)、
-[`review/design-compliance-review-022.md`](review/design-compliance-review-022.md) 和
-[`review/code-review-022.md`](review/code-review-022.md)。
+依据：[`NEXT_STEPS-022.md`](../STEP/NEXT_STEPS-022.md)、
+[`review/design-compliance-review-022.md`](../review/design-compliance-review-022.md) 和
+[`review/code-review-022.md`](../review/code-review-022.md)。
 
 执行基线：`1c9c7e3`。本报告所述改动已提交于 `9f9fb43`。
 

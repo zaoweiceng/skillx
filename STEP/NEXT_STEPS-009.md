@@ -1,8 +1,8 @@
 # NEXT_STEPS-009：闭合通配型探索、固化、复用、接力与修订
 
-依据：[`REPLAY-008.md`](REPLAY-008.md)、
-[`review/design-compliance-review-009.md`](review/design-compliance-review-009.md)、
-[`review/code-review-009.md`](review/code-review-009.md)。
+依据：[`REPLAY-008.md`](../REPLAY/REPLAY-008.md)、
+[`review/design-compliance-review-009.md`](../review/design-compliance-review-009.md)、
+[`review/code-review-009.md`](../review/code-review-009.md)。
 
 范围：Local Demo；不做鉴权/RBAC、多租户和分布式部署。
 

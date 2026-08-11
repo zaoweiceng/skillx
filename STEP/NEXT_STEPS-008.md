@@ -1,6 +1,6 @@
 # NEXT_STEPS-008：闭合 TraeX Workflow 工具循环与执行状态机
 
-依据：[`REPLAY-007.md`](REPLAY-007.md)、[`review/design-compliance-review-008.md`](review/design-compliance-review-008.md)、[`review/code-review-008.md`](review/code-review-008.md)。  
+依据：[`REPLAY-007.md`](../REPLAY/REPLAY-007.md)、[`review/design-compliance-review-008.md`](../review/design-compliance-review-008.md)、[`review/code-review-008.md`](../review/code-review-008.md)。
 范围：Local Demo；不做鉴权/RBAC、多租户和分布式部署。目标不是增加更多独立 API，而是把已有 Registry、Compiler、Runtime 接成一个可证明的闭环。
 
 ## 1. 008 目标
@@ -145,7 +145,7 @@
 - [x] Plan 编译失败展示结构化 diagnostics，并允许继续 Agent 修正或返回普通对话。
 - [x] Run detail 按 source step 折叠 namespaced nodes，显示 sourceRefs、Plan status/expiry、Recovery generation 和 Replay evidence。
 - [x] Component/Workflow 编辑器提供 capability metadata 与 callable fragment 端口表单，不要求手写 JSON。
-- [x] README 和 [`docs/demo-acceptance.md`](docs/demo-acceptance.md) 按可证明范围同步；首次 Browser fixture 与真实访问明确区分。
+- [x] README 和 [`docs/demo-acceptance.md`](../docs/demo-acceptance.md) 按可证明范围同步；首次 Browser fixture 与真实访问明确区分。
 
 ## 8. 008 门禁矩阵
 

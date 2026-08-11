@@ -245,10 +245,10 @@ async def test_llm_unconfigured_uses_toolless_agent_structured_fallback(
     assert usage.input_tokens == 12
     assert usage.output_tokens == 8
     assert usage.total_tokens == 20
-    assert usage.request_dispatched_at is not None
+    assert usage.request_dispatched_at is None
     assert usage.completed_at is not None
     assert "tool.requested" not in event_types
-    assert detail["runtimeSnapshot"]["modelCalled"] is True
+    assert detail["runtimeSnapshot"]["modelCalled"] is False
 
 
 async def test_both_model_runtimes_unavailable_fails_stably(

@@ -289,7 +289,16 @@ def _hybrid_workflow() -> dict:
     return {
         "apiVersion": "workflow.platform/v1",
         "kind": "Workflow",
-        "metadata": {"name": "feedback-classify"},
+        "metadata": {
+            "name": "feedback-classify",
+            "capability": {
+                "summary": "将用户反馈归类为结构化类别。",
+                "useWhen": ["需要对一段反馈文本进行分类"],
+                "doNotUseWhen": ["需要回复反馈、执行操作或处理非文本输入"],
+                "examples": ["把这条产品反馈分类"],
+                "tags": ["反馈", "分类", "文本"],
+            },
+        },
         "spec": {
             "inputSchema": {
                 "type": "object",
@@ -337,7 +346,16 @@ def _agent_workflow() -> dict:
     return {
         "apiVersion": "workflow.platform/v1",
         "kind": "Workflow",
-        "metadata": {"name": "agent-summary"},
+        "metadata": {
+            "name": "agent-summary",
+            "capability": {
+                "summary": "使用受限 Agent 对明确主题生成简短摘要。",
+                "useWhen": ["需要对给定主题生成结构化摘要"],
+                "doNotUseWhen": ["需要访问未授权数据或执行写操作"],
+                "examples": ["总结季度经营主题"],
+                "tags": ["摘要", "Agent", "文本"],
+            },
+        },
         "spec": {
             "inputSchema": {
                 "type": "object",
@@ -389,7 +407,16 @@ def _recovery_workflow() -> dict:
     return {
         "apiVersion": "workflow.platform/v1",
         "kind": "Workflow",
-        "metadata": {"name": "checkpoint-recovery"},
+        "metadata": {
+            "name": "checkpoint-recovery",
+            "capability": {
+                "summary": "演示可重试失败后的检查点接力恢复。",
+                "useWhen": ["需要验证失败恢复且不得重放已完成副作用"],
+                "doNotUseWhen": ["需要真实业务提交或不允许注入演示失败"],
+                "examples": ["运行检查点接力演示"],
+                "tags": ["检查点", "恢复", "演示"],
+            },
+        },
         "spec": {
             "inputSchema": {
                 "type": "object",
@@ -467,7 +494,16 @@ def _browser_workflow() -> dict:
     return {
         "apiVersion": "workflow.platform/v1",
         "kind": "Workflow",
-        "metadata": {"name": "expense-submit"},
+        "metadata": {
+            "name": "expense-submit",
+            "capability": {
+                "summary": "按冻结页面契约填写并提交费用申请。",
+                "useWhen": ["页面身份与费用表单契约已验证且用户确认提交"],
+                "doNotUseWhen": ["仅查询费用信息或页面身份、字段契约不一致"],
+                "examples": ["提交金额为 100 的费用申请"],
+                "tags": ["费用", "表单", "提交"],
+            },
+        },
         "spec": {
             "inputSchema": {
                 "type": "object",
@@ -546,7 +582,16 @@ def _playwright_browser_workflow(form_url: str) -> dict:
     return {
         "apiVersion": "workflow.platform/v1",
         "kind": "Workflow",
-        "metadata": {"name": "expense-submit-playwright"},
+        "metadata": {
+            "name": "expense-submit-playwright",
+            "capability": {
+                "summary": "使用真实浏览器按冻结契约提交费用表单。",
+                "useWhen": ["需要在已授权本地费用页面填写金额并提交"],
+                "doNotUseWhen": ["页面不在允许范围或用户未确认副作用"],
+                "examples": ["在费用页面提交 100 元申请"],
+                "tags": ["费用", "浏览器", "提交"],
+            },
+        },
         "spec": {
             "inputSchema": {
                 "type": "object",
@@ -634,7 +679,16 @@ def _web_summary_workflow(article_url: str) -> dict:
     return {
         "apiVersion": "workflow.platform/v1",
         "kind": "Workflow",
-        "metadata": {"name": "web-summary"},
+        "metadata": {
+            "name": "web-summary",
+            "capability": {
+                "summary": "读取允许范围内网页的当前正文并生成结构化摘要。",
+                "useWhen": ["需要基于目标网页最新正文进行总结"],
+                "doNotUseWhen": ["目标不是网页或 URL 超出允许范围"],
+                "examples": ["读取这篇文章并总结正文"],
+                "tags": ["网页", "读取", "摘要"],
+            },
+        },
         "spec": {
             "inputSchema": {
                 "type": "object",

@@ -1,8 +1,8 @@
 # NEXT_STEPS-014：把“场景恢复”升级为通配型计划接力
 
-依据：[`REPLAY-013.md`](REPLAY-013.md)、
-[`review/design-compliance-review-014.md`](review/design-compliance-review-014.md)、
-[`review/code-review-014.md`](review/code-review-014.md)。
+依据：[`REPLAY-013.md`](../REPLAY/REPLAY-013.md)、
+[`review/design-compliance-review-014.md`](../review/design-compliance-review-014.md)、
+[`review/code-review-014.md`](../review/code-review-014.md)。
 
 范围：Local Demo；不做鉴权/RBAC、多租户和分布式部署。
 

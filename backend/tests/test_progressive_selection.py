@@ -5,6 +5,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import func, select
 
 from app.api.routes import (
@@ -13,6 +14,7 @@ from app.api.routes import (
     _verify_binding_sources,
     create_message,
 )
+from app.application.agent_host import AgentHostError
 from app.application.agent_run import AgentRunWorker
 from app.application.compiler import WorkflowCompiler
 from app.application.orchestrator import WorkerService
@@ -24,6 +26,7 @@ from app.infrastructure.database import (
     Conversation,
     ConversationRun,
     Message,
+    ModelUsage,
     PendingSelection,
     PlanSnapshot,
     Run,
@@ -163,6 +166,44 @@ async def test_product_message_rejects_protocol_fixture(
     assert assistant["state"] == "unavailable"
     assert assistant["code"] == "WORKFLOW_SELECTION_UNAVAILABLE"
     assert assistant["selectionMode"] == "unavailable"
+
+
+async def test_workflow_selection_failure_persists_dispatched_usage(
+    traex_stub: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation_id = await _seed()
+
+    async def fail_after_dispatch(*_args: object, **_kwargs: object) -> None:
+        raise AgentHostError(
+            "RATE_LIMITED",
+            "rate limited",
+            request_dispatched=True,
+            input_tokens=12,
+            output_tokens=3,
+            total_tokens=15,
+            usage_complete=True,
+        )
+
+    monkeypatch.setattr("app.api.routes.AgentHost.execute", fail_after_dispatch)
+    async with SessionLocal() as session:
+        with pytest.raises(HTTPException) as error:
+            await create_message(
+                conversation_id,
+                MessageCreate(content="上海天气如何"),
+                session,
+            )
+    assert error.value.status_code == 502
+
+    async with SessionLocal() as session:
+        usage = await session.scalar(
+            select(ModelUsage).where(ModelUsage.stage == "workflow_selection")
+        )
+    assert usage is not None
+    assert usage.error_code == "RATE_LIMITED"
+    assert usage.request_dispatched_at is not None
+    assert usage.completed_at is None
+    assert usage.total_tokens == 15
 
 
 async def _seed() -> str:

@@ -1000,9 +1000,14 @@ export default function ChatPage() {
                   </button>
                 )}
                 {message.content.code === 'WORKFLOW_SELECTION_UNAVAILABLE' && (
-                  <button className="button ghost" type="button" onClick={toggleWorkflowMode}>
-                    关闭工作流，下一条交给通用 Agent
-                  </button>
+                  <>
+                    <Link className="button ghost" to="/settings">
+                      前往运行时设置并探测
+                    </Link>
+                    <button className="button ghost" type="button" onClick={toggleWorkflowMode}>
+                      关闭工作流，下一条交给通用 Agent
+                    </button>
+                  </>
                 )}
                 {message.content.runId && (
                   <>

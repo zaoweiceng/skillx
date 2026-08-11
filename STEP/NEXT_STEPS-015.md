@@ -1,8 +1,8 @@
 # NEXT_STEPS-015：让冻结计划成为 Host 的执行事实
 
-依据：[`REPLAY-014.md`](REPLAY-014.md)、
-[`review/design-compliance-review-015.md`](review/design-compliance-review-015.md)、
-[`review/code-review-015.md`](review/code-review-015.md)。
+依据：[`REPLAY-014.md`](../REPLAY/REPLAY-014.md)、
+[`review/design-compliance-review-015.md`](../review/design-compliance-review-015.md)、
+[`review/code-review-015.md`](../review/code-review-015.md)。
 
 范围：Local Demo；不做鉴权/RBAC、多租户和分布式部署。
 

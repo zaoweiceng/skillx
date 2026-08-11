@@ -1,6 +1,6 @@
 # NEXT_STEPS-010：先打通真实二次复用，再闭合接力与修订
 
-依据：[`REPLAY-009.md`](REPLAY-009.md)、[`review/design-compliance-review-010.md`](review/design-compliance-review-010.md)、[`review/code-review-010.md`](review/code-review-010.md)。
+依据：[`REPLAY-009.md`](../REPLAY/REPLAY-009.md)、[`review/design-compliance-review-010.md`](../review/design-compliance-review-010.md)、[`review/code-review-010.md`](../review/code-review-010.md)。
 
 范围：Local Demo；不做鉴权/RBAC、多租户和分布式部署。
 

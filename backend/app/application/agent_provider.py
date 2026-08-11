@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -11,6 +12,7 @@ from uuid import uuid4
 
 from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
 from app.application.runtime_config import agent_runtime_config, llm_runtime_config
+from app.application.tool_broker import ToolAdapterRegistry, ToolExecutionContext
 from app.config import get_settings
 
 _last_probe: dict[str, Any] | None = None
@@ -22,14 +24,20 @@ def _probe_fingerprints() -> tuple[str, str]:
     runtime = agent_runtime_config()
     command = list(runtime.command)
     sidecar = hashlib.sha256()
-    sidecar.update(json.dumps(command, separators=(",", ":")).encode())
-    for argument in command[1:]:
-        path = Path(argument)
-        if path.is_file():
+    adapter_paths = [Path(argument) for argument in command[1:] if Path(argument).is_file()]
+    if not adapter_paths and command:
+        resolved = shutil.which(command[0])
+        executable = Path(resolved) if resolved else Path(command[0])
+        if executable.is_file():
+            adapter_paths = [executable]
+    if adapter_paths:
+        for path in adapter_paths:
             try:
                 sidecar.update(path.read_bytes())
             except OSError:
-                sidecar.update(b"unreadable-sidecar")
+                sidecar.update(b"unreadable-adapter")
+    else:
+        sidecar.update(json.dumps(command, separators=(",", ":")).encode())
     sidecar_digest = f"sha256:{sidecar.hexdigest()}"
     config = {
         "type": runtime.type,
@@ -41,6 +49,55 @@ def _probe_fingerprints() -> tuple[str, str]:
         json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     return config_digest, sidecar_digest
+
+
+def _adapter_trust(sidecar_digest: str) -> tuple[bool, str]:
+    runtime = agent_runtime_config()
+    configured = set(get_settings().agent_trusted_adapter_digests)
+    bundled = Path(__file__).resolve().parents[3] / "examples" / "openai_agent_sidecar.py"
+    bundled_digest = (
+        "sha256:" + hashlib.sha256(bundled.read_bytes()).hexdigest()
+        if bundled.is_file()
+        else None
+    )
+    if runtime.type == "openai_sidecar" and sidecar_digest == bundled_digest:
+        return True, "openai-agent-sidecar/v1"
+    if sidecar_digest in configured:
+        return True, f"{runtime.type}/configured"
+    return False, f"{runtime.type}/untrusted"
+
+
+class _ProbeLookupAdapter:
+    capability_ref = "lookup.table"
+    input_schema = {
+        "type": "object",
+        "properties": {"key": {"type": "string"}},
+        "required": ["key"],
+        "additionalProperties": False,
+    }
+    output_schema = {
+        "type": "object",
+        "properties": {
+            "table": {"type": "object"},
+            "value": {"type": "string"},
+        },
+        "required": ["table", "value"],
+        "additionalProperties": False,
+    }
+    effect = "none"
+    idempotent = True
+    fixture_policy = "do_not_capture"
+
+    def __init__(self, key: str, value: str) -> None:
+        self.key = key
+        self.value = value
+
+    async def execute(
+        self, _context: ToolExecutionContext, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        if arguments["key"] != self.key:
+            return {"table": {self.key: self.value}, "value": "challenge-key-mismatch"}
+        return {"table": {self.key: self.value}, "value": self.value}
 
 
 def _protocol_available() -> tuple[bool, str]:
@@ -73,7 +130,8 @@ async def provider_readiness() -> dict[str, Any]:
     protocol_available, protocol_summary = _protocol_available()
     configured = runtime.configured
     now = datetime.now(UTC)
-    config_digest, _sidecar_digest = _probe_fingerprints()
+    config_digest, sidecar_digest = _probe_fingerprints()
+    adapter_trusted, adapter_version = _adapter_trust(sidecar_digest)
     cache_valid = bool(
         _last_probe
         and _probe_expires_at
@@ -89,13 +147,15 @@ async def provider_readiness() -> dict[str, Any]:
             not runtime.endpoint or not runtime.model or not key_configured
         ):
             summary = "Agent sidecar endpoint、model 或 API key 未完整配置"
-        elif runtime.type == "traex_managed":
+        elif not adapter_trusted:
+            summary = "Agent adapter 可执行，但 digest 未受信，语义选择保持不可用"
+        elif _last_probe is None:
             summary = (
                 "TraeX managed Agent 协议已配置；需完成 Host ToolResult 能力探测后"
                 "才开放语义选择"
+                if runtime.type == "traex_managed"
+                else "Agent Runtime 已配置，尚未执行同路径主动探测"
             )
-        elif _last_probe is None:
-            summary = "Agent Runtime 已配置，尚未执行同路径主动探测"
         elif not cache_valid:
             summary = "最近一次真实模型探测已过期或配置已变化，请重新探测"
         else:
@@ -111,8 +171,10 @@ async def provider_readiness() -> dict[str, Any]:
     model_available = bool(
         provider_type == "real"
         and cache_valid
+        and adapter_trusted
         and _last_probe
         and _last_probe.get("ok")
+        and _last_probe.get("adapterTrusted")
     )
     last_probe = (
         {
@@ -142,6 +204,9 @@ async def provider_readiness() -> dict[str, Any]:
         "modelAvailable": model_available,
         "model": runtime.model,
         "digest": runtime.digest,
+        "adapterDigest": sidecar_digest,
+        "adapterVersion": adapter_version,
+        "adapterTrusted": adapter_trusted,
         "source": runtime.source,
         "lastProbe": last_probe,
         "nextProbeAllowedAt": (
@@ -161,6 +226,7 @@ async def probe_provider() -> dict[str, Any]:
     runtime = agent_runtime_config()
     now = datetime.now(UTC)
     config_digest, sidecar_digest = _probe_fingerprints()
+    adapter_trusted, adapter_version = _adapter_trust(sidecar_digest)
     if (
         _next_probe_at is not None
         and now < _next_probe_at
@@ -179,17 +245,26 @@ async def probe_provider() -> dict[str, Any]:
         raise ValueError(protocol_summary)
     if runtime.type == "openai_sidecar" and not runtime.configured:
         raise ValueError("Agent sidecar endpoint、model 或 API key 未完整配置")
+    if not adapter_trusted:
+        raise ValueError("Agent adapter digest 未在可信列表，不能执行付费语义探测")
     _next_probe_at = now + timedelta(seconds=settings.provider_probe_cooldown_seconds)
     _probe_expires_at = now + timedelta(seconds=settings.provider_probe_ttl_seconds)
     probe_id = str(uuid4())
     working_directory = settings.artifact_root.resolve()
     working_directory.mkdir(parents=True, exist_ok=True)
+    challenge_key = f"probe-{secrets.token_hex(8)}"
+    challenge_value = f"challenge-{secrets.token_urlsafe(18)}"
     try:
-        result = await AgentHost().execute(
+        result = await AgentHost(
+            tool_registry=ToolAdapterRegistry(
+                [_ProbeLookupAdapter(challenge_key, challenge_value)]
+            )
+        ).execute(
             AgentHostRequest(
                 run_id=f"provider-probe-{probe_id}",
                 prompt=(
-                    "这是运行时兼容性探测。必须调用 lookup.table，参数 key=q1；"
+                    "这是运行时兼容性探测。必须调用 lookup.table，参数 "
+                    f"key={challenge_key}；"
                     "收到 Host ToolResult 后，把 value 原样作为 reply 返回。"
                 ),
                 output_schema={
@@ -197,7 +272,7 @@ async def probe_provider() -> dict[str, Any]:
                     "properties": {
                         "reply": {
                             "type": "string",
-                            "const": "第一季度：营收增长 12%",
+                            "const": challenge_value,
                         }
                     },
                     "required": ["reply"],
@@ -213,20 +288,37 @@ async def probe_provider() -> dict[str, Any]:
         tool_round_trip = {
             item["type"] for item in result.runtime_events
         }.issuperset({"tool.requested", "tool.result"})
-        ok = result.output == {"reply": "第一季度：营收增长 12%"} and tool_round_trip
+        explicit_dispatch = any(
+            item["type"] == "model.request.dispatched"
+            for item in result.runtime_events
+        )
+        real_usage = result.usage_complete and result.total_tokens > 0
+        ok = (
+            result.output == {"reply": challenge_value}
+            and tool_round_trip
+            and explicit_dispatch
+            and result.request_dispatched
+            and real_usage
+        )
         _last_probe = {
             "at": now.isoformat().replace("+00:00", "Z"),
             "ok": ok,
             "summary": (
                 "同一 sidecar/function calling/Host ToolResult/strict output 探测成功"
                 if ok
-                else "Provider 未完成 Host ToolResult round-trip"
+                else "Provider 未完成显式 dispatch、真实 Usage 或 ToolResult round-trip"
             ),
             "kind": "sidecar_host_round_trip",
             "probeId": probe_id,
             "model": runtime.model,
+            "provider": "openai-compatible",
             "configDigest": config_digest,
             "sidecarDigest": sidecar_digest,
+            "adapterVersion": adapter_version,
+            "adapterTrusted": adapter_trusted,
+            "challenge": challenge_key,
+            "inputTokens": result.input_tokens,
+            "outputTokens": result.output_tokens,
             "totalTokens": result.total_tokens,
             "usageComplete": result.usage_complete,
             "requestDispatched": result.request_dispatched,
@@ -240,9 +332,17 @@ async def probe_provider() -> dict[str, Any]:
             "kind": "sidecar_host_round_trip",
             "probeId": probe_id,
             "model": runtime.model,
+            "provider": "openai-compatible",
             "configDigest": config_digest,
             "sidecarDigest": sidecar_digest,
+            "adapterVersion": adapter_version,
+            "adapterTrusted": adapter_trusted,
+            "challenge": challenge_key,
             "code": exc.code,
+            "inputTokens": exc.input_tokens or None,
+            "outputTokens": exc.output_tokens or None,
+            "totalTokens": exc.total_tokens or None,
+            "usageComplete": exc.usage_complete,
             "requestDispatched": exc.request_dispatched,
             "completed": False,
         }

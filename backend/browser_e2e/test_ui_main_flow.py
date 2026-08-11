@@ -171,6 +171,20 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             expect(presentation_panel).to_contain_text(
                 "016 UI 第二次复用正文", timeout=60_000
             )
+            expect(
+                page.get_by_role("link", name="browser-read-summary.json")
+            ).to_be_visible()
+            run_id = page.url.rstrip("/").rsplit("/", 1)[-1]
+            live_sequences = [
+                int(value)
+                for value in page.locator(".event-item > span").all_inner_texts()
+            ]
+            with stack.client() as client:
+                persisted_events = client.get(
+                    f"/runs/{run_id}/events", params={"limit": 500}
+                ).json()
+            assert live_sequences == [item["seq"] for item in persisted_events]
+            assert live_sequences == list(range(1, len(live_sequences) + 1))
             page.reload()
             presentation_panel = page.locator("section").filter(
                 has=page.get_by_role("heading", name="阅读结果")

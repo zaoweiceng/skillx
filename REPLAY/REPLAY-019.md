@@ -2,11 +2,11 @@
 
 日期：2026-08-10
 
-依据：[`NEXT_STEPS-019.md`](NEXT_STEPS-019.md)、
-[`NEXT_STEPS-018.md`](NEXT_STEPS-018.md)、
-[`docs/workflow-design-doc.md`](docs/workflow-design-doc.md)、
-[`docs/workflow-dev-doc.md`](docs/workflow-dev-doc.md) 和
-[`docs/schema.md`](docs/schema.md)。
+依据：[`NEXT_STEPS-019.md`](../STEP/NEXT_STEPS-019.md)、
+[`NEXT_STEPS-018.md`](../STEP/NEXT_STEPS-018.md)、
+[`docs/workflow-design-doc.md`](../docs/workflow-design-doc.md)、
+[`docs/workflow-dev-doc.md`](../docs/workflow-dev-doc.md) 和
+[`docs/schema.md`](../docs/schema.md)。
 
 执行基线：`f87ed67`。本报告对应当前未提交工作树；本轮未创建 Git 提交。
 

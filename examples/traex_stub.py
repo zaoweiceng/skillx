@@ -304,7 +304,9 @@ def main() -> int:
         )
         describe_result = read_tool_result("workflow-describe")
         workflow = (describe_result.get("output") or {}).get("workflow", {})
-        required = workflow.get("inputSchema", {}).get("required", [])
+        input_synopsis = workflow.get("inputSynopsis", {})
+        output_synopsis = workflow.get("outputSynopsis", {})
+        required = input_synopsis.get("required", [])
         url_match = re.search(r"https?://[^\s]+", user_text)
         lookup_match = re.search(r"\bq\d+\b", user_text)
         concrete_input = (
@@ -384,8 +386,21 @@ def main() -> int:
                     "missingInputs": [],
                 }
         elif action == "compose":
-            input_schema = workflow.get("inputSchema", {"type": "object"})
-            output_schema = workflow.get("outputSchema", {"type": "object"})
+            input_schema = {
+                "type": "object",
+                "properties": {
+                    key: {"type": value}
+                    for key, value in input_synopsis.get("properties", {}).items()
+                },
+                "required": required,
+            }
+            output_schema = {
+                "type": "object",
+                "properties": {
+                    key: {"type": value}
+                    for key, value in output_synopsis.get("properties", {}).items()
+                },
+            }
             plan = {
                 "inputSchema": input_schema,
                 "outputSchema": output_schema,

@@ -733,6 +733,7 @@ class ModelUsage(Base):
     runtime_used: Mapped[str | None] = mapped_column(String(32), nullable=True)
     runtime_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
     fallback_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
     stage: Mapped[str] = mapped_column(String(40))
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)

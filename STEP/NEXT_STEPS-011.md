@@ -1,6 +1,6 @@
 # NEXT_STEPS-011：闭合修订版本身份、接力 fencing 与失败判定
 
-依据：[`REPLAY-010.md`](REPLAY-010.md)、[`review/design-compliance-review-011.md`](review/design-compliance-review-011.md)、[`review/code-review-011.md`](review/code-review-011.md)。
+依据：[`REPLAY-010.md`](../REPLAY/REPLAY-010.md)、[`review/design-compliance-review-011.md`](../review/design-compliance-review-011.md)、[`review/code-review-011.md`](../review/code-review-011.md)。
 
 范围：Local Demo；不做鉴权/RBAC、多租户和分布式部署。
 
