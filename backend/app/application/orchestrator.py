@@ -1422,6 +1422,10 @@ class WorkerService:
                         )
                     ),
                     model=result.metrics.get("model"),
+                    protocol=result.metrics.get("protocol"),
+                    runtime_type=result.metrics.get("runtimeType"),
+                    adapter_version=result.metrics.get("adapterVersion"),
+                    adapter_digest=result.metrics.get("adapterDigest"),
                     runtime_used=(
                         str(result.metrics["runtimeUsed"])
                         if "runtimeUsed" in result.metrics

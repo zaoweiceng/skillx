@@ -30,6 +30,7 @@ from app.application.tool_broker import (
 )
 from app.config import get_settings
 from app.runtime.adapters import AdapterError, AgentRunRequest, TraeXSubprocessAdapter
+from app.runtime.traex_builtin import TraeXBridgeError, TraeXBuiltinAdapter
 
 # 005-A：唯一的 Agent 信任边界。
 #
@@ -137,6 +138,12 @@ class AgentHostResult:
     total_tokens: int = 0
     usage_complete: bool = False
     request_dispatched: bool = False
+    provider: str | None = None
+    model: str | None = None
+    protocol: str | None = None
+    runtime_type: str | None = None
+    adapter_version: str | None = None
+    adapter_digest: str | None = None
     plan_snapshot: dict[str, Any] | None = None
     accepted_plan_digest: str | None = None
     accepted_plan_revision: int | None = None
@@ -204,18 +211,28 @@ class AgentHost:
 
     def __init__(
         self,
-        adapter: TraeXSubprocessAdapter | None = None,
+        adapter: TraeXSubprocessAdapter | TraeXBuiltinAdapter | None = None,
         tool_registry: ToolAdapterRegistry | None = None,
     ) -> None:
         self._adapter = adapter
         self._tool_registry = tool_registry or ToolAdapterRegistry()
 
-    def _resolve_adapter(self) -> TraeXSubprocessAdapter:
+    def _resolve_adapter(self) -> TraeXSubprocessAdapter | TraeXBuiltinAdapter:
         if self._adapter is not None:
             return self._adapter
         runtime = agent_runtime_config()
         if not runtime.configured or not runtime.command:
+            if runtime.source == "auto_discovery_missing":
+                raise AgentHostError(
+                    "TRAE_NOT_INSTALLED",
+                    "PATH 中未发现受支持的 traex，请先安装 TraeX",
+                )
             raise AgentHostError("MODEL_NOT_CONFIGURED", "TraeX Runtime 尚未配置")
+        if runtime.type == "traex_builtin":
+            try:
+                return TraeXBuiltinAdapter(list(runtime.command))
+            except TraeXBridgeError as exc:
+                raise AgentHostError(exc.code, str(exc)) from exc
         return TraeXSubprocessAdapter(
             list(runtime.command),
             set(runtime.allowed_executables),
@@ -252,11 +269,28 @@ class AgentHost:
             working_directory=request.working_directory,
             output_schema=request.output_schema,
             allowed_tools=effective,
+            tool_descriptors=(
+                [
+                    self._tool_registry.describe(capability)
+                    for capability in effective
+                ]
+                if isinstance(adapter, TraeXBuiltinAdapter)
+                else []
+            ),
             max_steps=request.max_steps,
             max_tokens=request.max_total_tokens,
         )
 
-        result = AgentHostResult(output={})
+        runtime = agent_runtime_config()
+        result = AgentHostResult(
+            output={},
+            provider=runtime.provider,
+            model=runtime.model,
+            protocol=runtime.protocol,
+            runtime_type=runtime.type,
+            adapter_version=runtime.adapter_version,
+            adapter_digest=runtime.adapter_digest,
+        )
         open_calls: dict[str, dict[str, Any]] = {}
         broker_results: set[str] = set()
         broker_payloads: dict[str, dict[str, Any]] = {}
@@ -709,6 +743,12 @@ class AgentHost:
                             )
                     elif event_type == "agent.completed":
                         output = payload.get("output")
+                        result.provider = str(
+                            payload.get("provider") or result.provider or ""
+                        ) or None
+                        result.model = str(
+                            payload.get("model") or result.model or ""
+                        ) or None
                         result.usage_complete = payload.get("usageComplete", True)
                         if broker_results:
                             try:
@@ -811,14 +851,14 @@ class AgentHost:
                 "Agent 运行超时，已取消",
                 request_dispatched=result.request_dispatched,
             ) from exc
-        except AdapterError as exc:
+        except (AdapterError, TraeXBridgeError) as exc:
             if failed_tool_result is not None:
                 raise self._failed_tool_error(
                     failed_tool_result,
                     protocol_violation=f"Agent 子进程提前退出: {exc}",
                 ) from exc
             raise AgentHostError(
-                "EXECUTION_FAILED",
+                getattr(exc, "code", "EXECUTION_FAILED"),
                 str(exc),
                 request_dispatched=result.request_dispatched,
             ) from exc
@@ -1318,7 +1358,10 @@ class AgentHost:
             await asyncio.sleep(0.1)
 
     @staticmethod
-    async def _cancel(adapter: TraeXSubprocessAdapter, run_id: str) -> None:
+    async def _cancel(
+        adapter: TraeXSubprocessAdapter | TraeXBuiltinAdapter,
+        run_id: str,
+    ) -> None:
         try:
             await adapter.cancel(run_id)
         except Exception:  # noqa: BLE001 - 取消失败不应掩盖原始终态。

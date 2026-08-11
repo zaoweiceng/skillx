@@ -8,6 +8,7 @@ from alembic import command
 from alembic.config import Config
 
 os.environ["SKILLX_DATABASE_URL"] = "sqlite+aiosqlite:////tmp/skillx-workflow-tests.db"
+os.environ["SKILLX_AGENT_BUILTIN_ENABLED"] = "false"
 
 from app.infrastructure.database import Base, engine  # noqa: E402
 

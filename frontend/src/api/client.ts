@@ -120,6 +120,10 @@ export type Run = {
     stage: string
     provider: string | null
     model: string | null
+    protocol?: string | null
+    runtimeType?: string | null
+    adapterVersion?: string | null
+    adapterDigest?: string | null
     runtimeUsed: 'direct_llm' | 'agent_fallback' | 'agent_runtime' | 'fake_structured' | null
     runtimeDigest: string | null
     fallbackReason: string | null
@@ -150,6 +154,10 @@ export type Run = {
     runtimeKind?: 'llm_runtime' | 'agent_runtime' | null
     provider?: string | null
     identity?: string | null
+    protocol?: string | null
+    runtimeType?: string | null
+    adapterVersion?: string | null
+    adapterDigest?: string | null
     runtimeDigest?: string
     policyDigest?: string
     fallbackReason?: string | null
@@ -240,6 +248,10 @@ export type TokenSummary = {
     stage: string
     provider: string | null
     model: string | null
+    protocol?: string | null
+    runtimeType?: string | null
+    adapterVersion?: string | null
+    adapterDigest?: string | null
     totalTokens: number | null
     complete: boolean
   }>
@@ -437,7 +449,15 @@ export const api = {
       workflowSelectionMode: 'real' | 'fixture' | 'unavailable'
       selectionProvider: {
         type: 'real' | 'fixture' | 'unavailable'
-        runtimeType?: 'traex_managed' | 'openai_sidecar' | 'fixture' | 'unavailable'
+        runtimeType?:
+          | 'traex_builtin'
+          | 'traex_managed'
+          | 'openai_sidecar'
+          | 'fixture'
+          | 'unavailable'
+        protocol?: string
+        provider?: string
+        authStatus?: 'logged_in_unverified' | 'auth_required' | 'unknown' | 'not_applicable'
         protocolTestOnly?: boolean
         configured: boolean
         protocolAvailable: boolean
@@ -464,7 +484,15 @@ export const api = {
       }
       agentRuntime?: {
         type: 'real' | 'fixture' | 'unavailable'
-        runtimeType: 'traex_managed' | 'openai_sidecar' | 'fixture' | 'unavailable'
+        runtimeType:
+          | 'traex_builtin'
+          | 'traex_managed'
+          | 'openai_sidecar'
+          | 'fixture'
+          | 'unavailable'
+        protocol?: string
+        provider?: string
+        authStatus?: 'logged_in_unverified' | 'auth_required' | 'unknown' | 'not_applicable'
         protocolTestOnly?: boolean
         configured: boolean
         protocolAvailable: boolean

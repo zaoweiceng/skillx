@@ -33,6 +33,10 @@ class StructuredGenerationRuntime:
     runtime_kind: Literal["llm_runtime", "agent_runtime"]
     provider: str
     identity: str | None
+    protocol: str
+    runtime_type: str
+    adapter_version: str | None
+    adapter_digest: str | None
     digest: str
     policy_digest: str
     fallback_reason: str | None = None
@@ -43,6 +47,10 @@ class StructuredGenerationRuntime:
             "runtimeKind": self.runtime_kind,
             "provider": self.provider,
             "identity": self.identity,
+            "protocol": self.protocol,
+            "runtimeType": self.runtime_type,
+            "adapterVersion": self.adapter_version,
+            "adapterDigest": self.adapter_digest,
             "runtimeDigest": self.digest,
             "policyDigest": self.policy_digest,
             "fallbackReason": self.fallback_reason,
@@ -83,6 +91,10 @@ def resolve_structured_generation_runtime(
             runtime_kind="llm_runtime",
             provider="openai-compatible",
             identity=llm.model,
+            protocol="openai-compatible-http",
+            runtime_type=llm.type,
+            adapter_version=None,
+            adapter_digest=None,
             digest=llm.digest,
             policy_digest=policy_digest,
         )
@@ -91,8 +103,12 @@ def resolve_structured_generation_runtime(
         return StructuredGenerationRuntime(
             runtime_used="agent_fallback",
             runtime_kind="agent_runtime",
-            provider=agent.type,
-            identity=agent.model or agent.type,
+            provider=agent.provider,
+            identity=agent.model,
+            protocol=agent.protocol,
+            runtime_type=agent.type,
+            adapter_version=agent.adapter_version,
+            adapter_digest=agent.adapter_digest,
             digest=agent.digest,
             policy_digest=policy_digest,
             fallback_reason="LLM_RUNTIME_UNCONFIGURED",
@@ -124,6 +140,10 @@ def frozen_runtime_from_snapshot(
         runtime_kind=snapshot["runtimeKind"],
         provider=snapshot["provider"],
         identity=snapshot.get("identity"),
+        protocol=str(snapshot.get("protocol") or "unknown"),
+        runtime_type=str(snapshot.get("runtimeType") or snapshot["runtimeKind"]),
+        adapter_version=snapshot.get("adapterVersion"),
+        adapter_digest=snapshot.get("adapterDigest"),
         digest=snapshot["runtimeDigest"],
         policy_digest=snapshot["policyDigest"],
         fallback_reason=snapshot.get("fallbackReason"),

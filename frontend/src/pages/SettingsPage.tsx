@@ -69,7 +69,9 @@ export default function SettingsPage() {
                 ? 'fixture'
                 : 'unconfigured',
           detail: agentRuntime
-            ? `${agentRuntime.lastProbe.summary}${
+            ? `${agentRuntime.runtimeType === 'traex_builtin' ? '内置 TraeX · ' : ''}${
+                agentRuntime.lastProbe.summary
+              }${
                 typeof agentRuntime.lastProbe.totalTokens === 'number'
                   ? ` · operational probe ${agentRuntime.lastProbe.totalTokens} Token`
                   : ''
@@ -142,8 +144,9 @@ export default function SettingsPage() {
           {provider?.type === 'real' && (
             <>
               <span>
-                主动探测会产生真实模型费用，并走 sidecar、function calling 与 Host ToolResult
-                同一路径。
+                主动探测会产生真实模型费用，并走当前 Agent Runtime 与 Host ToolResult 同一路径。
+                {provider.authStatus === 'auth_required' &&
+                  ' 请先在本机终端运行 traex login；应用不会读取或保存登录 token。'}
               </span>
               <button
                 className="button ghost"

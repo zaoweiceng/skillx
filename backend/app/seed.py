@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.application.compiler import WorkflowCompiler
 from app.application.mcp import classify_snapshot, discover_tools, register_server
@@ -18,6 +19,9 @@ from app.infrastructure.database import (
     Workflow,
     WorkflowVersion,
 )
+
+logger = logging.getLogger(__name__)
+MANAGED_REVISION = 2
 
 
 async def seed() -> str:
@@ -32,6 +36,21 @@ async def seed() -> str:
                 name="确定性问候",
                 description="输入姓名，Direct 节点生成结构化问候 greeting 欢迎语，不加载模型。",
                 workflow_name="问候工作流",
+                definition=definition,
+                validation={
+                    "topologicalOrder": compiled.topological_order,
+                    "diagnostics": [],
+                    "executionClass": "zero_llm",
+                },
+                seed_key="deterministic-greeting",
+                managed_revision=MANAGED_REVISION,
+            )
+        else:
+            await _upgrade_managed_component(
+                session,
+                component,
+                seed_key="deterministic-greeting",
+                managed_revision=MANAGED_REVISION,
                 definition=definition,
                 validation={
                     "topologicalOrder": compiled.topological_order,
@@ -83,14 +102,55 @@ async def seed() -> str:
                         }
                     ],
                 },
+                seed_key="local-weather",
+                managed_revision=MANAGED_REVISION,
             )
-        if await session.scalar(select(Component).where(Component.name == "反馈分类")) is None:
-            hybrid = _hybrid_workflow()
-            await _create_component(
+        else:
+            version = await session.get(
+                WorkflowVersion, weather_component.default_version_id
+            )
+            weather_node = next(
+                item
+                for item in version.definition_json["spec"]["nodes"]
+                if item["id"] == "weather"
+            )
+            snapshot_id = weather_node["config"]["mcpToolSnapshotId"]
+            weather_definition = _weather_workflow(snapshot_id)
+            weather_compiled = WorkflowCompiler().compile(weather_definition)
+            await _upgrade_managed_component(
+                session,
+                weather_component,
+                seed_key="local-weather",
+                managed_revision=MANAGED_REVISION,
+                definition=weather_definition,
+                validation={
+                    **version.validation_json,
+                    "topologicalOrder": weather_compiled.topological_order,
+                    "diagnostics": [],
+                    "executionClass": "zero_llm",
+                },
+            )
+        hybrid_component = await session.scalar(
+            select(Component).where(Component.name == "反馈分类")
+        )
+        hybrid = _hybrid_workflow()
+        if hybrid_component is None:
+            hybrid_component = await _create_component(
                 session,
                 name="反馈分类",
                 description="固定 DAG 中单个 LLM 节点做分类，仅显式节点产生 Token。",
                 workflow_name="反馈分类工作流",
+                definition=hybrid,
+                validation={"diagnostics": [], "executionClass": "hybrid"},
+                seed_key="feedback-classification",
+                managed_revision=MANAGED_REVISION,
+            )
+        else:
+            await _upgrade_managed_component(
+                session,
+                hybrid_component,
+                seed_key="feedback-classification",
+                managed_revision=MANAGED_REVISION,
                 definition=hybrid,
                 validation={"diagnostics": [], "executionClass": "hybrid"},
             )
@@ -106,14 +166,39 @@ async def seed() -> str:
                 workflow_name="Agent 摘要工作流",
                 definition=agent,
                 validation={"diagnostics": [], "executionClass": "agent"},
+                seed_key="restricted-agent-summary",
+                managed_revision=MANAGED_REVISION,
             )
-        if await session.scalar(select(Component).where(Component.name == "费用提交")) is None:
-            browser = _browser_workflow()
-            await _create_component(
+        else:
+            await _upgrade_managed_component(
+                session,
+                agent_exists,
+                seed_key="restricted-agent-summary",
+                managed_revision=MANAGED_REVISION,
+                definition=_agent_workflow(),
+                validation={"diagnostics": [], "executionClass": "agent"},
+            )
+        browser_component = await session.scalar(
+            select(Component).where(Component.name == "费用提交")
+        )
+        browser = _browser_workflow()
+        if browser_component is None:
+            browser_component = await _create_component(
                 session,
                 name="费用提交",
                 description="浏览器契约填写并提交，需一次性授权；页面/身份变化即失效。",
                 workflow_name="费用提交工作流",
+                definition=browser,
+                validation={"diagnostics": [], "executionClass": "zero_llm"},
+                seed_key="expense-submit",
+                managed_revision=MANAGED_REVISION,
+            )
+        else:
+            await _upgrade_managed_component(
+                session,
+                browser_component,
+                seed_key="expense-submit",
+                managed_revision=MANAGED_REVISION,
                 definition=browser,
                 validation={"diagnostics": [], "executionClass": "zero_llm"},
             )
@@ -184,6 +269,8 @@ async def _create_component(
     workflow_name: str,
     definition: dict,
     validation: dict,
+    seed_key: str | None = None,
+    managed_revision: int | None = None,
 ) -> Component:
     compiled = WorkflowCompiler().compile(definition)
     workflow = Workflow(
@@ -192,6 +279,15 @@ async def _create_component(
         owner_id="local-user",
         draft_revision=1,
         draft_json=definition,
+        draft_metadata_json=(
+            {
+                "seedKey": seed_key,
+                "managedRevision": managed_revision,
+                "managedDigest": compiled.digest,
+            }
+            if seed_key
+            else {}
+        ),
     )
     session.add(workflow)
     await session.flush()
@@ -202,6 +298,14 @@ async def _create_component(
         definition_json=definition,
         digest=compiled.digest,
         validation_json=validation,
+        revision_lineage_json=(
+            {"seedKey": seed_key, "managedRevision": managed_revision}
+            if seed_key
+            else {}
+        ),
+        presentation_policy_json=definition.get("metadata", {}).get(
+            "presentationPolicy", {}
+        ),
     )
     session.add(version)
     await session.flush()
@@ -214,9 +318,106 @@ async def _create_component(
         default_version_id=version.id,
         visibility="public",
         execution_class=validation.get("executionClass", "zero_llm"),
+        seed_key=seed_key,
+        managed_revision=managed_revision,
     )
     session.add(component)
     return component
+
+
+async def _upgrade_managed_component(
+    session,
+    component: Component,
+    *,
+    seed_key: str,
+    managed_revision: int,
+    definition: dict,
+    validation: dict,
+) -> None:
+    if component.seed_key not in {None, seed_key}:
+        return
+    workflow = await session.get(Workflow, component.workflow_id)
+    current = await session.get(WorkflowVersion, component.default_version_id)
+    if workflow is None or current is None:
+        return
+    if component.seed_key is None:
+        version_count = await session.scalar(
+            select(func.count())
+            .select_from(WorkflowVersion)
+            .where(WorkflowVersion.workflow_id == workflow.id)
+        )
+        if (
+            version_count != 1
+            or current.version != 1
+            or workflow.draft_revision != 1
+            or workflow.draft_json != current.definition_json
+        ):
+            logger.warning("跳过已由用户接管的系统样例: %s", component.name)
+            return
+        component.seed_key = seed_key
+        component.managed_revision = 1
+        workflow.draft_metadata_json = {
+            **(workflow.draft_metadata_json or {}),
+            "seedKey": seed_key,
+            "managedRevision": 1,
+            "managedDigest": current.digest,
+        }
+    if (component.managed_revision or 0) >= managed_revision:
+        return
+    managed_metadata = workflow.draft_metadata_json or {}
+    if (
+        component.managed_revision != 1
+        and (
+            managed_metadata.get("seedKey") != seed_key
+            or managed_metadata.get("managedRevision") != component.managed_revision
+            or managed_metadata.get("managedDigest") != current.digest
+        )
+    ) or workflow.draft_json != current.definition_json:
+        logger.warning("跳过存在用户草稿或默认版本变更的系统样例: %s", component.name)
+        return
+    compiled = WorkflowCompiler().compile(definition)
+    existing = await session.scalar(
+        select(WorkflowVersion).where(
+            WorkflowVersion.workflow_id == workflow.id,
+            WorkflowVersion.digest == compiled.digest,
+        )
+    )
+    if existing is None:
+        latest = await session.scalar(
+            select(func.max(WorkflowVersion.version)).where(
+                WorkflowVersion.workflow_id == workflow.id
+            )
+        )
+        existing = WorkflowVersion(
+            id=str(uuid4()),
+            workflow_id=workflow.id,
+            version=int(latest or 0) + 1,
+            definition_json=definition,
+            digest=compiled.digest,
+            validation_json=validation,
+            revision_lineage_json={
+                "seedKey": seed_key,
+                "managedRevision": managed_revision,
+                "previousVersionId": current.id,
+            },
+            presentation_policy_json=definition.get("metadata", {}).get(
+                "presentationPolicy", {}
+            ),
+        )
+        session.add(existing)
+        await session.flush()
+        await build_manifest(session, workflow, existing)
+    component.default_version_id = existing.id
+    component.managed_revision = managed_revision
+    component.execution_class = validation.get("executionClass", component.execution_class)
+    workflow.draft_json = definition
+    workflow.draft_revision += 1
+    workflow.draft_metadata_json = {
+        **(workflow.draft_metadata_json or {}),
+        "seedKey": seed_key,
+        "managedRevision": managed_revision,
+        "managedDigest": existing.digest,
+    }
 
 
 def _weather_workflow(snapshot_id: str) -> dict:
@@ -235,6 +436,14 @@ def _weather_workflow(snapshot_id: str) -> dict:
         "kind": "Workflow",
         "metadata": {
             "name": "local-weather",
+            "presentationPolicy": {
+                "enabled": True,
+                "audience": "end_user",
+                "producer": "template",
+                "template": "{city}当前{condition}，温度{temperature}℃。",
+                "language": "zh-CN",
+                "maxLength": 200,
+            },
             "capability": {
                 "summary": "查询指定城市的本地天气并返回天气状况与温度。",
                 "useWhen": ["用户明确询问某个城市的天气、天气状况或温度"],

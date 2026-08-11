@@ -464,6 +464,10 @@ class LLMExecutor:
                 runtime_digest = generated.runtime.digest
                 fallback_reason = generated.runtime.fallback_reason or ""
                 provider = generated.runtime.provider
+                protocol = generated.runtime.protocol
+                runtime_type = generated.runtime.runtime_type
+                adapter_version = generated.runtime.adapter_version
+                adapter_digest = generated.runtime.adapter_digest
                 usage_complete = generated.usage_complete
                 tool_request_count = generated.tool_request_count
                 request_dispatched = generated.request_dispatched
@@ -477,6 +481,26 @@ class LLMExecutor:
                     "totalTokens": input_tokens + output_tokens,
                     "model": model,
                     "provider": provider,
+                    "protocol": (
+                        protocol
+                        if node.config.get("modelProfile") != "fake"
+                        else "fixture"
+                    ),
+                    "runtimeType": (
+                        runtime_type
+                        if node.config.get("modelProfile") != "fake"
+                        else "fixture"
+                    ),
+                    "adapterVersion": (
+                        adapter_version or ""
+                        if node.config.get("modelProfile") != "fake"
+                        else ""
+                    ),
+                    "adapterDigest": (
+                        adapter_digest or ""
+                        if node.config.get("modelProfile") != "fake"
+                        else ""
+                    ),
                     "runtimeUsed": runtime_used,
                     "runtimeDigest": runtime_digest,
                     "fallbackReason": fallback_reason,
@@ -625,6 +649,7 @@ class AgentExecutor:
         # 得到一致的权限交集、事件契约、预算与取消语义；差异只在事件 sink。
         runtime_events: list[dict[str, Any]] = []
         audit_events: list[dict[str, Any]] = []
+        runtime = agent_runtime_config()
 
         async def event_sink(runtime_event: dict[str, Any], audit_event: dict[str, Any]) -> None:
             runtime_events.append(runtime_event)
@@ -661,7 +686,13 @@ class AgentExecutor:
                 error=ExecutionError(code=exc.code, message=exc.message),
                 events=audit_events,
                 metrics={
-                    "provider": "traex",
+                    "provider": runtime.provider,
+                    "model": runtime.model or "",
+                    "protocol": runtime.protocol,
+                    "runtimeType": runtime.type,
+                    "adapterVersion": runtime.adapter_version,
+                    "adapterDigest": runtime.adapter_digest,
+                    "runtimeDigest": runtime.digest,
                     "runtimeUsed": "agent_runtime",
                     "requestDispatched": exc.request_dispatched,
                 },
@@ -682,7 +713,13 @@ class AgentExecutor:
             metrics={
                 "agentSteps": result.step_count or len(audit_events),
                 "totalTokens": result.total_tokens,
-                "provider": "traex",
+                "provider": result.provider or runtime.provider,
+                "model": result.model or "",
+                "protocol": result.protocol or runtime.protocol,
+                "runtimeType": result.runtime_type or runtime.type,
+                "adapterVersion": result.adapter_version or runtime.adapter_version,
+                "adapterDigest": result.adapter_digest or runtime.adapter_digest,
+                "runtimeDigest": runtime.digest,
                 "runtimeUsed": "agent_runtime",
                 "requestDispatched": result.request_dispatched,
             },

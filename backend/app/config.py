@@ -30,9 +30,14 @@ class Settings(BaseSettings):
     llm_endpoint: str | None = None
     llm_model: str | None = None
     llm_api_key_env: str = "SKILLX_LLM_API_KEY"
-    agent_runtime_type: Literal["traex_managed", "openai_sidecar", "fixture", "unavailable"] = (
-        "unavailable"
-    )
+    agent_runtime_type: Literal[
+        "traex_builtin",
+        "traex_managed",
+        "openai_sidecar",
+        "fixture",
+        "unavailable",
+    ] = "unavailable"
+    agent_builtin_enabled: bool = True
     agent_command: list[str] | None = None
     agent_allowed_executables: list[str] = ["traex"]
     agent_trusted_adapter_digests: list[str] = []

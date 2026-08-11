@@ -84,7 +84,15 @@ SkillX 注册只接受 `SKILLX_CAPABILITY_ROOT` 下的相对路径。Secret API 
 `permissions.secrets.use` 声明的句柄会注入 SkillXContext。MCP STDIO 的
 `environment` 同样只接受 `{"API_KEY": {"secretRef": "name"}}`，禁止明文值。
 
-Local Demo 的真实语义 Agent 可使用 TraeX managed，不要求 Host 配置 LLM endpoint：
+Local Demo 未显式配置 `SKILLX_AGENT_*` 时，会自动发现 PATH 中的 `traex`，使用仓库内
+受信 bridge 接入原生 JSONL 与每次 Run 隔离的 loopback MCP；不需要额外 LLM endpoint：
+
+```bash
+traex login
+```
+
+应用不读取或保存 TraeX token。Settings 主动探测成功且未过期后才开放语义选择。显式
+Agent 配置优先于自动发现；外部 managed adapter 仍可按原协议配置：
 
 ```bash
 export SKILLX_AGENT_RUNTIME_TYPE=traex_managed
@@ -93,8 +101,8 @@ export SKILLX_AGENT_ALLOWED_EXECUTABLES='["traex-managed-adapter"]'
 export SKILLX_AGENT_TRUSTED_ADAPTER_DIGESTS='["sha256:<adapter-digest>"]'
 ```
 
-该 command 必须实现本仓库 Agent Host 的双向 NDJSON/ToolResult 协议；普通交互式 `traex`
-CLI 不能直接代替 managed adapter。
+该 managed command 必须实现本仓库 Agent Host 的双向 NDJSON/ToolResult 协议；原生
+`traex` 由内置 bridge 接入，不能作为 managed command 直接替代。
 
 也可使用 `openai_sidecar`，其 endpoint/model/key 只属于 Agent Runtime；Direct LLM
 通过独立的 `SKILLX_LLM_*` 配置，二者不共享 endpoint 或 key：

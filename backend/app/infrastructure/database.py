@@ -102,6 +102,10 @@ class Component(Base, TimestampMixin):
     default_version_id: Mapped[str] = mapped_column(ForeignKey("workflow_versions.id"))
     visibility: Mapped[str] = mapped_column(String(20), default="private")
     execution_class: Mapped[str] = mapped_column(String(20), default="zero_llm")
+    seed_key: Mapped[str | None] = mapped_column(
+        String(120), nullable=True, unique=True
+    )
+    managed_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 class WorkflowCapabilityManifest(Base, TimestampMixin):
@@ -730,6 +734,10 @@ class ModelUsage(Base):
     attempt: Mapped[int] = mapped_column(Integer, default=1)
     provider: Mapped[str | None] = mapped_column(String(80), nullable=True)
     model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    protocol: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    runtime_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    adapter_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    adapter_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
     runtime_used: Mapped[str | None] = mapped_column(String(32), nullable=True)
     runtime_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
     fallback_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)

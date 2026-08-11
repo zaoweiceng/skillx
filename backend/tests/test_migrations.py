@@ -91,7 +91,10 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
         model_usage_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(model_usage)")
         }
-    assert revision == ("0022",)
+        component_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(components)")
+        }
+    assert revision == ("0023",)
     assert {
         "runs",
         "capability_versions",
@@ -121,7 +124,12 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
         "request_dispatched_at",
         "completed_at",
         "error_code",
+        "protocol",
+        "runtime_type",
+        "adapter_version",
+        "adapter_digest",
     } <= model_usage_columns
+    assert {"seed_key", "managed_revision"} <= component_columns
     assert "run_type" in run_type_columns
     assert "error_json" in run_type_columns
     assert {

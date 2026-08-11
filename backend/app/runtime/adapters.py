@@ -278,6 +278,7 @@ class AgentRunRequest:
     working_directory: Path
     output_schema: dict[str, Any] = field(default_factory=dict)
     allowed_tools: list[str] = field(default_factory=list)
+    tool_descriptors: list[dict[str, Any]] = field(default_factory=list)
     max_steps: int = 8
     max_tokens: int = 30000
 

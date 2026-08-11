@@ -593,6 +593,10 @@ async def run_provider_probe(
             stage="operational_probe",
             provider=result.get("provider"),
             model=result.get("model"),
+            protocol=result.get("protocol"),
+            runtime_type=result.get("runtimeType"),
+            adapter_version=result.get("adapterVersion"),
+            adapter_digest=result.get("sidecarDigest"),
             runtime_used="agent_runtime",
             runtime_digest=result.get("sidecarDigest"),
             error_code=result.get("code"),
@@ -3138,6 +3142,10 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)) -> 
             "stage": item.stage,
             "provider": item.provider,
             "model": item.model,
+            "protocol": item.protocol,
+            "runtimeType": item.runtime_type,
+            "adapterVersion": item.adapter_version,
+            "adapterDigest": item.adapter_digest,
             "runtimeUsed": item.runtime_used,
             "runtimeDigest": item.runtime_digest,
             "fallbackReason": item.fallback_reason,
@@ -4542,12 +4550,12 @@ async def _select_workflow_candidate(
                 call_id=request.run_id,
                 stage="workflow_selection",
                 turn_id=turn_id,
-                provider=(
-                    "openai-compatible"
-                    if runtime.type == "openai_sidecar"
-                    else runtime.type
-                ),
-                model=runtime.model,
+                provider=result.provider or runtime.provider,
+                model=result.model,
+                protocol=runtime.protocol,
+                runtime_type=runtime.type,
+                adapter_version=runtime.adapter_version,
+                adapter_digest=runtime.adapter_digest,
                 runtime_used="agent_runtime",
                 runtime_digest=runtime.digest,
                 input_tokens=result.input_tokens,
@@ -4594,12 +4602,12 @@ async def _select_workflow_candidate(
             call_id=request.run_id,
             stage="workflow_selection",
             turn_id=turn_id,
-            provider=(
-                "openai-compatible"
-                if runtime.type == "openai_sidecar"
-                else runtime.type
-            ),
+            provider=runtime.provider,
             model=runtime.model,
+            protocol=runtime.protocol,
+            runtime_type=runtime.type,
+            adapter_version=runtime.adapter_version,
+            adapter_digest=runtime.adapter_digest,
             runtime_used="agent_runtime",
             runtime_digest=runtime.digest,
             error_code=error_code,

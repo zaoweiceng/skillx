@@ -27,6 +27,7 @@ from app.application.artifact_integrity import (
 from app.application.compiler import digest_json
 from app.application.error_policy import error_policy, persisted_error, public_error
 from app.application.product_history import record_model_usage
+from app.application.runtime_config import agent_runtime_config
 from app.config import get_settings
 from app.infrastructure.database import (
     Artifact,
@@ -39,6 +40,7 @@ from app.infrastructure.database import (
     utcnow,
 )
 from app.runtime.adapters import TraeXSubprocessAdapter
+from app.runtime.traex_builtin import TraeXBuiltinAdapter
 
 FINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
 
@@ -250,7 +252,7 @@ class AgentRunWorker:
         self,
         worker_id: str = "agent-worker",
         *,
-        adapter: TraeXSubprocessAdapter | None = None,
+        adapter: TraeXSubprocessAdapter | TraeXBuiltinAdapter | None = None,
         lease_seconds: int | None = None,
     ) -> None:
         self.worker_id = worker_id
@@ -561,6 +563,12 @@ class AgentRunWorker:
             max_revisions=result.max_revisions,
             used_revisions=result.used_revisions,
             remaining_revisions=result.remaining_revisions,
+            provider=result.provider,
+            model=result.model,
+            protocol=result.protocol,
+            runtime_type=result.runtime_type,
+            adapter_version=result.adapter_version,
+            adapter_digest=result.adapter_digest,
         )
 
     async def _watch(
@@ -939,13 +947,22 @@ class AgentRunWorker:
             if claimed.rowcount != 1:
                 await session.delete(checkpoint)
                 return
+            runtime = agent_runtime_config()
             await record_model_usage(
                 session,
                 call_id=f"conversation-agent:{run_id}:{claim_generation}",
                 stage="general_agent",
                 turn_id=run.turn_id,
                 conversation_run_id=run_id,
-                provider="traex",
+                provider=runtime.provider,
+                model=runtime.model,
+                protocol=runtime.protocol,
+                runtime_type=runtime.type,
+                adapter_version=runtime.adapter_version,
+                adapter_digest=runtime.adapter_digest,
+                runtime_used="agent_runtime",
+                runtime_digest=runtime.digest,
+                error_code=error.code,
                 usage_complete=False,
                 dispatched=error.request_dispatched,
                 completed=False,
@@ -1022,6 +1039,12 @@ class AgentRunWorker:
         max_revisions: int = 1,
         used_revisions: int = 0,
         remaining_revisions: int = 1,
+        provider: str | None = None,
+        model: str | None = None,
+        protocol: str | None = None,
+        runtime_type: str | None = None,
+        adapter_version: str | None = None,
+        adapter_digest: str | None = None,
     ) -> None:
         # 先把原始轨迹写入 staging（不落最终目录），DB 只保存受控 artifact:// 引用与 hash。
         staged = self._stage_trajectory(
@@ -1088,7 +1111,14 @@ class AgentRunWorker:
                     ),
                     turn_id=run_record.turn_id if run_record else None,
                     conversation_run_id=run_id,
-                    provider="traex",
+                    provider=provider or agent_runtime_config().provider,
+                    model=model,
+                    protocol=protocol,
+                    runtime_type=runtime_type,
+                    adapter_version=adapter_version,
+                    adapter_digest=adapter_digest,
+                    runtime_used="agent_runtime",
+                    runtime_digest=agent_runtime_config().digest,
                     total_tokens=total_tokens if usage_complete else None,
                     usage_complete=usage_complete,
                     dispatched=request_dispatched,

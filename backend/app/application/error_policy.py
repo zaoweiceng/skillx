@@ -37,6 +37,12 @@ _POLICIES = {
     ),
     "MODEL_MALFORMED_OUTPUT": ErrorPolicy("MODEL_MALFORMED_OUTPUT", False),
     "MODEL_PROVIDER_ERROR": ErrorPolicy("MODEL_PROVIDER_ERROR", False),
+    "TRAE_NOT_INSTALLED": ErrorPolicy("TRAE_NOT_INSTALLED", False),
+    "TRAE_AUTH_REQUIRED": ErrorPolicy("TRAE_AUTH_REQUIRED", False),
+    "TRAE_MODEL_UNAVAILABLE": ErrorPolicy("TRAE_MODEL_UNAVAILABLE", False),
+    "AGENT_PROTOCOL_INCOMPATIBLE": ErrorPolicy(
+        "AGENT_PROTOCOL_INCOMPATIBLE", False
+    ),
     # Agent/adapter 中断可进入 checkpoint，但不能在 Host 内盲目重启整个 Agent。
     "EXECUTION_FAILED": ErrorPolicy("EXECUTION_FAILED", True),
 }
@@ -64,6 +70,16 @@ _USER_ERRORS: dict[str, tuple[str, str]] = {
     ),
     "MODEL_MALFORMED_OUTPUT": ("模型返回了无法解析的结构化结果。", "view_run"),
     "MODEL_PROVIDER_ERROR": ("模型服务拒绝了本次请求，请查看兼容性诊断。", "view_run"),
+    "TRAE_NOT_INSTALLED": ("未安装 TraeX，请先安装后重试。", "configure"),
+    "TRAE_AUTH_REQUIRED": (
+        "TraeX 登录已失效，请在终端运行 traex login 后重试。",
+        "configure",
+    ),
+    "TRAE_MODEL_UNAVAILABLE": ("TraeX 当前模型不可用，请切换模型后重试。", "configure"),
+    "AGENT_PROTOCOL_INCOMPATIBLE": (
+        "当前 TraeX 版本与内置 bridge 不兼容，请升级后重试。",
+        "configure",
+    ),
     "PERMISSION_DENIED": ("当前任务需要未授权的能力。", "review_permissions"),
     "CONTRACT_VIOLATION": ("执行结果不符合已发布契约，请查看运行。", "view_run"),
     "INVALID_INPUT": ("输入不符合组件要求，请检查后重试。", "edit_input"),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -22,6 +23,18 @@ _probe_expires_at: datetime | None = None
 
 def _probe_fingerprints() -> tuple[str, str]:
     runtime = agent_runtime_config()
+    if runtime.adapter_digest:
+        sidecar_digest = runtime.adapter_digest
+        config = {
+            "type": runtime.type,
+            "endpoint": runtime.endpoint,
+            "model": runtime.model,
+            "sidecarDigest": sidecar_digest,
+        }
+        config_digest = "sha256:" + hashlib.sha256(
+            json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        return config_digest, sidecar_digest
     command = list(runtime.command)
     sidecar = hashlib.sha256()
     adapter_paths = [Path(argument) for argument in command[1:] if Path(argument).is_file()]
@@ -53,6 +66,8 @@ def _probe_fingerprints() -> tuple[str, str]:
 
 def _adapter_trust(sidecar_digest: str) -> tuple[bool, str]:
     runtime = agent_runtime_config()
+    if runtime.type == "traex_builtin" and sidecar_digest == runtime.adapter_digest:
+        return True, runtime.adapter_version
     configured = set(get_settings().agent_trusted_adapter_digests)
     bundled = Path(__file__).resolve().parents[3] / "examples" / "openai_agent_sidecar.py"
     bundled_digest = (
@@ -115,7 +130,51 @@ def _protocol_available() -> tuple[bool, str]:
         return False, f"Agent executable 不存在: {command[0]}"
     if executable.name not in runtime.allowed_executables:
         return False, f"Agent executable 未在 allowlist: {executable.name}"
-    return True, "Host 双向 subprocess 协议可启动"
+    return True, (
+        "原生 TraeX JSONL + 本轮 loopback MCP bridge 可启动"
+        if runtime.type == "traex_builtin"
+        else "Host 双向 subprocess 协议可启动"
+    )
+
+
+async def _native_login_status() -> tuple[str, str]:
+    runtime = agent_runtime_config()
+    if runtime.type != "traex_builtin" or not runtime.command:
+        return "not_applicable", ""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            runtime.command[0],
+            "login",
+            "status",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key
+                in {
+                    "HOME",
+                    "PATH",
+                    "TMPDIR",
+                    "LANG",
+                    "LC_ALL",
+                    "CODEX_HOME",
+                    "TRAE_HOME",
+                }
+            },
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=5)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+            return "unknown", "无法确认 TraeX 登录状态"
+    except OSError:
+        return "unknown", "无法确认 TraeX 登录状态"
+    text = stdout.decode(errors="replace").strip()
+    if process.returncode == 0 and "logged in" in text.lower():
+        return "logged_in_unverified", "TraeX 已登录，需执行兼容性探测"
+    return "auth_required", "请在终端运行 traex login 完成本机登录"
 
 
 async def provider_readiness() -> dict[str, Any]:
@@ -124,7 +183,7 @@ async def provider_readiness() -> dict[str, Any]:
         "fixture"
         if runtime.type == "fixture"
         else "real"
-        if runtime.type in {"traex_managed", "openai_sidecar"}
+        if runtime.type in {"traex_builtin", "traex_managed", "openai_sidecar"}
         else "unavailable"
     )
     protocol_available, protocol_summary = _protocol_available()
@@ -132,6 +191,7 @@ async def provider_readiness() -> dict[str, Any]:
     now = datetime.now(UTC)
     config_digest, sidecar_digest = _probe_fingerprints()
     adapter_trusted, adapter_version = _adapter_trust(sidecar_digest)
+    auth_status, auth_summary = await _native_login_status()
     cache_valid = bool(
         _last_probe
         and _probe_expires_at
@@ -143,6 +203,8 @@ async def provider_readiness() -> dict[str, Any]:
         key_configured = bool(os.environ.get(runtime.api_key_env))
         if not protocol_available:
             summary = protocol_summary
+        elif runtime.type == "traex_builtin" and auth_status == "auth_required":
+            summary = auth_summary
         elif runtime.type == "openai_sidecar" and (
             not runtime.endpoint or not runtime.model or not key_configured
         ):
@@ -151,7 +213,10 @@ async def provider_readiness() -> dict[str, Any]:
             summary = "Agent adapter 可执行，但 digest 未受信，语义选择保持不可用"
         elif _last_probe is None:
             summary = (
-                "TraeX managed Agent 协议已配置；需完成 Host ToolResult 能力探测后"
+                "内置 TraeX Runtime 已自动发现；需完成 Host ToolResult 能力探测后"
+                "才开放语义选择"
+                if runtime.type == "traex_builtin"
+                else "TraeX managed Agent 协议已配置；需完成 Host ToolResult 能力探测后"
                 "才开放语义选择"
                 if runtime.type == "traex_managed"
                 else "Agent Runtime 已配置，尚未执行同路径主动探测"
@@ -167,7 +232,11 @@ async def provider_readiness() -> dict[str, Any]:
             else protocol_summary
         )
     else:
-        summary = "真实语义 Agent 未配置"
+        summary = (
+            "PATH 中未发现 TraeX，请先安装并运行 traex login"
+            if runtime.source == "auto_discovery_missing"
+            else "真实语义 Agent 未配置"
+        )
     model_available = bool(
         provider_type == "real"
         and cache_valid
@@ -198,6 +267,9 @@ async def provider_readiness() -> dict[str, Any]:
     return {
         "type": provider_type,
         "runtimeType": runtime.type,
+        "protocol": runtime.protocol,
+        "provider": runtime.provider,
+        "authStatus": auth_status,
         "protocolTestOnly": provider_type == "fixture",
         "configured": configured,
         "protocolAvailable": protocol_available,
@@ -239,7 +311,7 @@ async def probe_provider() -> dict[str, Any]:
             "nextProbeAllowedAt": _next_probe_at.isoformat().replace("+00:00", "Z"),
         }
     protocol_available, protocol_summary = _protocol_available()
-    if runtime.type not in {"traex_managed", "openai_sidecar"}:
+    if runtime.type not in {"traex_builtin", "traex_managed", "openai_sidecar"}:
         raise ValueError("仅 real Provider 支持付费主动探测")
     if not protocol_available:
         raise ValueError(protocol_summary)
@@ -310,8 +382,10 @@ async def probe_provider() -> dict[str, Any]:
             ),
             "kind": "sidecar_host_round_trip",
             "probeId": probe_id,
-            "model": runtime.model,
-            "provider": "openai-compatible",
+            "model": result.model,
+            "provider": runtime.provider,
+            "protocol": runtime.protocol,
+            "runtimeType": runtime.type,
             "configDigest": config_digest,
             "sidecarDigest": sidecar_digest,
             "adapterVersion": adapter_version,
@@ -332,7 +406,9 @@ async def probe_provider() -> dict[str, Any]:
             "kind": "sidecar_host_round_trip",
             "probeId": probe_id,
             "model": runtime.model,
-            "provider": "openai-compatible",
+            "provider": runtime.provider,
+            "protocol": runtime.protocol,
+            "runtimeType": runtime.type,
             "configDigest": config_digest,
             "sidecarDigest": sidecar_digest,
             "adapterVersion": adapter_version,

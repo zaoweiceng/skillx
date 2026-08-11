@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import shutil
@@ -45,12 +46,22 @@ class LLMRuntimeConfig:
 
 @dataclass(frozen=True)
 class AgentRuntimeConfig:
-    type: Literal["traex_managed", "openai_sidecar", "fixture", "unavailable"]
+    type: Literal[
+        "traex_builtin",
+        "traex_managed",
+        "openai_sidecar",
+        "fixture",
+        "unavailable",
+    ]
     command: tuple[str, ...]
     allowed_executables: tuple[str, ...]
     endpoint: str | None
     model: str | None
     api_key_env: str
+    protocol: str
+    provider: str
+    adapter_version: str
+    adapter_digest: str
     source: str = "split"
 
     @property
@@ -71,6 +82,10 @@ class AgentRuntimeConfig:
                 "endpoint": self.endpoint,
                 "model": self.model,
                 "apiKeyEnv": self.api_key_env,
+                "protocol": self.protocol,
+                "provider": self.provider,
+                "adapterVersion": self.adapter_version,
+                "adapterDigest": self.adapter_digest,
             }
         )
 
@@ -100,30 +115,101 @@ def llm_runtime_config() -> LLMRuntimeConfig:
 def agent_runtime_config() -> AgentRuntimeConfig:
     settings = get_settings()
     if settings.agent_runtime_type != "unavailable" or settings.agent_command is not None:
+        runtime_type = settings.agent_runtime_type
+        command = tuple(settings.agent_command or ())
+        adapter_digest = ""
+        if command:
+            paths = [Path(item) for item in command[1:] if Path(item).is_file()]
+            if paths:
+                content = hashlib.sha256()
+                for path in paths:
+                    content.update(path.read_bytes())
+                adapter_digest = f"sha256:{content.hexdigest()}"
         return AgentRuntimeConfig(
-            type=settings.agent_runtime_type,
-            command=tuple(settings.agent_command or ()),
+            type=runtime_type,
+            command=command,
             allowed_executables=tuple(settings.agent_allowed_executables),
             endpoint=settings.agent_endpoint,
             model=settings.agent_model,
             api_key_env=settings.agent_api_key_env,
+            protocol=(
+                "openai-compatible-sidecar"
+                if runtime_type == "openai_sidecar"
+                else "host-ndjson"
+            ),
+            provider=(
+                "openai-compatible"
+                if runtime_type == "openai_sidecar"
+                else "fixture"
+                if runtime_type == "fixture"
+                else "traex"
+            ),
+            adapter_version=f"{runtime_type}/configured",
+            adapter_digest=adapter_digest,
         )
 
     if settings.agent_provider_type != "unavailable" or settings.traex_command:
         _log_legacy_mapping()
-        runtime_type: Literal["traex_managed", "openai_sidecar", "fixture", "unavailable"] = {
+        runtime_type: Literal[
+            "traex_builtin",
+            "traex_managed",
+            "openai_sidecar",
+            "fixture",
+            "unavailable",
+        ] = {
             "real": "openai_sidecar",
             "fixture": "fixture",
             "unavailable": "unavailable",
         }[settings.agent_provider_type]
+        command = tuple(settings.traex_command or ())
+        paths = [Path(item) for item in command[1:] if Path(item).is_file()]
+        content = hashlib.sha256()
+        for path in paths:
+            content.update(path.read_bytes())
         return AgentRuntimeConfig(
             type=runtime_type,
-            command=tuple(settings.traex_command or ()),
+            command=command,
             allowed_executables=tuple(settings.traex_allowed_executables),
             endpoint=settings.model_endpoint if runtime_type == "openai_sidecar" else None,
             model=settings.model_name if runtime_type == "openai_sidecar" else None,
             api_key_env=settings.model_api_key_env,
+            protocol=(
+                "openai-compatible-sidecar"
+                if runtime_type == "openai_sidecar"
+                else "host-ndjson"
+            ),
+            provider=(
+                "openai-compatible"
+                if runtime_type == "openai_sidecar"
+                else "fixture"
+            ),
+            adapter_version=f"{runtime_type}/legacy",
+            adapter_digest=(
+                f"sha256:{content.hexdigest()}" if paths else ""
+            ),
             source="legacy_explicit_agent_mapping",
+        )
+
+    traex = shutil.which("traex") if settings.agent_builtin_enabled else None
+    if traex:
+        bridge = Path(__file__).resolve().parents[1] / "runtime" / "traex_builtin.py"
+        bridge_digest = (
+            "sha256:" + hashlib.sha256(bridge.read_bytes()).hexdigest()
+            if bridge.is_file()
+            else "sha256:missing"
+        )
+        return AgentRuntimeConfig(
+            type="traex_builtin",
+            command=(traex,),
+            allowed_executables=(Path(traex).name,),
+            endpoint=None,
+            model=settings.agent_model,
+            api_key_env=settings.agent_api_key_env,
+            protocol="traex-cli-jsonl+mcp",
+            provider="traex",
+            adapter_version="traex-builtin/v1",
+            adapter_digest=bridge_digest,
+            source="auto_discovered",
         )
 
     return AgentRuntimeConfig(
@@ -133,6 +219,15 @@ def agent_runtime_config() -> AgentRuntimeConfig:
         endpoint=None,
         model=None,
         api_key_env=settings.agent_api_key_env,
+        protocol="none",
+        provider="unavailable",
+        adapter_version="unavailable",
+        adapter_digest="",
+        source=(
+            "auto_discovery_missing"
+            if settings.agent_builtin_enabled
+            else "split"
+        ),
     )
 
 
@@ -159,7 +254,7 @@ def semantic_workflow_selection_available(*, probe_verified: bool = False) -> bo
     runtime = agent_runtime_config()
     if (
         not runtime.configured
-        or runtime.type not in {"traex_managed", "openai_sidecar"}
+        or runtime.type not in {"traex_builtin", "traex_managed", "openai_sidecar"}
         or not runtime.command
     ):
         return False

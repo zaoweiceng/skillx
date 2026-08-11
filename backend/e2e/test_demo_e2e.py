@@ -150,8 +150,21 @@ def test_e2e_2_mcp_component(stack: DemoStack) -> None:
         run = _run_component(client, "本地天气查询", {"city": "成都"})
         assert run["status"] == "succeeded"
         assert run["output"]["city"] == "成都"
+        deadline = time.time() + 30
+        detail = run
+        while time.time() < deadline:
+            detail = client.get(f"/runs/{run['id']}").json()
+            if (detail.get("presentation") or {}).get("status") == "completed":
+                break
+            time.sleep(0.2)
+        assert detail["presentation"]["text"] == (
+            f"成都当前{run['output']['condition']}，"
+            f"温度{run['output']['temperature']}℃。"
+        )
+        assert detail["modelUsage"] == []
         types = _events(client, run["id"])
         assert "mcp.call.completed" in types
+        assert "presentation.completed" in types
         # 锁定 MCP ToolSnapshot，模型调用为 0。
         assert "llm.call.completed" not in types
 
