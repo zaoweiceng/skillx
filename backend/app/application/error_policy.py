@@ -40,6 +40,7 @@ _POLICIES = {
     "TRAE_NOT_INSTALLED": ErrorPolicy("TRAE_NOT_INSTALLED", False),
     "TRAE_AUTH_REQUIRED": ErrorPolicy("TRAE_AUTH_REQUIRED", False),
     "TRAE_MODEL_UNAVAILABLE": ErrorPolicy("TRAE_MODEL_UNAVAILABLE", False),
+    "TRAE_WORKDIR_UNTRUSTED": ErrorPolicy("TRAE_WORKDIR_UNTRUSTED", False),
     "AGENT_PROTOCOL_INCOMPATIBLE": ErrorPolicy(
         "AGENT_PROTOCOL_INCOMPATIBLE", False
     ),
@@ -76,6 +77,10 @@ _USER_ERRORS: dict[str, tuple[str, str]] = {
         "configure",
     ),
     "TRAE_MODEL_UNAVAILABLE": ("TraeX 当前模型不可用，请切换模型后重试。", "configure"),
+    "TRAE_WORKDIR_UNTRUSTED": (
+        "内置 Agent 工作目录未通过平台隔离校验，请重试运行；若持续出现请联系维护者。",
+        "view_run",
+    ),
     "AGENT_PROTOCOL_INCOMPATIBLE": (
         "当前 TraeX 版本与内置 bridge 不兼容，请升级后重试。",
         "configure",

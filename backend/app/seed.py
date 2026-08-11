@@ -436,14 +436,6 @@ def _weather_workflow(snapshot_id: str) -> dict:
         "kind": "Workflow",
         "metadata": {
             "name": "local-weather",
-            "presentationPolicy": {
-                "enabled": True,
-                "audience": "end_user",
-                "producer": "template",
-                "template": "{city}当前{condition}，温度{temperature}℃。",
-                "language": "zh-CN",
-                "maxLength": 200,
-            },
             "capability": {
                 "summary": "查询指定城市的本地天气并返回天气状况与温度。",
                 "useWhen": ["用户明确询问某个城市的天气、天气状况或温度"],

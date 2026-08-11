@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -14,6 +15,8 @@ from uuid import uuid4
 import uvicorn
 from fastapi import FastAPI, Request, Response
 
+from app.config import get_settings
+
 
 class TraeXBridgeError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
@@ -21,8 +24,61 @@ class TraeXBridgeError(RuntimeError):
         super().__init__(message)
 
 
+def _trusted_working_directory(working_directory: Path) -> Path:
+    """Resolve the per-run working directory and confirm it stays inside the
+    platform artifact root.
+
+    平台为每一轮创建的隔离目录才可作为 TraeX ``-C`` 与 subprocess cwd。任何越界路径、
+    symlink 逃逸或任意外部 cwd 都 fail closed（``TRAE_WORKDIR_UNTRUSTED``），不改由仓库或
+    用户目录执行，也不放宽沙箱。``resolve()`` 会展开全部 symlink 组件，逃逸出根目录的软链因此
+    在此被拒。
+    """
+
+    root = get_settings().artifact_root.resolve()
+    resolved = working_directory.resolve()
+    if resolved != root and not resolved.is_relative_to(root):
+        raise TraeXBridgeError(
+            "TRAE_WORKDIR_UNTRUSTED",
+            "TraeX 工作目录不在平台本轮隔离根目录内，已拒绝执行",
+        )
+    return resolved
+
+
 def _tool_name(capability_ref: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9_-]", "_", capability_ref)
+    """Build a stable, MCP/TraeX-safe tool name that is one-to-one with the ref.
+
+    非字母数字字符被规范化后可能碰撞（``a.b`` 与 ``a_b``），因此再附加 capability ref 的
+    digest 后缀，使名称与原始 ref 一一对应，同时仍满足 MCP/TraeX 的字符与长度限制。
+    """
+
+    slug = re.sub(r"[^a-zA-Z0-9_-]", "_", capability_ref)[:48].strip("_") or "cap"
+    suffix = hashlib.sha256(capability_ref.encode("utf-8")).hexdigest()[:12]
+    return f"{slug}__{suffix}"
+
+
+def _tool_descriptor_map(
+    tool_descriptors: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Build the ``toolName → descriptor`` map with an explicit reverse mapping.
+
+    构建时检测重复：即便加了 digest 后缀，任何名称碰撞都 fail closed，不允许字典推导静默
+    覆盖能力。Tool call/ToolResult/provenance 仍使用 descriptor 内原始 ``capabilityRef``。
+    """
+
+    descriptors: dict[str, dict[str, Any]] = {}
+    reverse: dict[str, str] = {}
+    for item in tool_descriptors:
+        capability_ref = str(item["capabilityRef"])
+        name = _tool_name(capability_ref)
+        existing = reverse.get(name)
+        if existing is not None and existing != capability_ref:
+            raise TraeXBridgeError(
+                "AGENT_PROTOCOL_INCOMPATIBLE",
+                f"MCP tool 名称碰撞: {existing!r} 与 {capability_ref!r} 归一化为同名 {name!r}",
+            )
+        descriptors[name] = item
+        reverse[name] = capability_ref
+    return descriptors
 
 
 def _safe_environment() -> dict[str, str]:
@@ -51,6 +107,11 @@ def _error_code(stderr: str, events: list[dict[str, Any]]) -> str:
     ).lower()
     if any(marker in text for marker in ("401", "unauthorized", "access token expired")):
         return "TRAE_AUTH_REQUIRED"
+    if any(
+        marker in text
+        for marker in ("trusted directory", "skip-git-repo-check", "not inside a")
+    ):
+        return "TRAE_WORKDIR_UNTRUSTED"
     if any(marker in text for marker in ("model unavailable", "model not found")):
         return "TRAE_MODEL_UNAVAILABLE"
     if any(marker in text for marker in ("429", "rate limit", "too many requests")):
@@ -91,7 +152,8 @@ class TraeXBuiltinAdapter:
         self._tool_evidence: dict[str, list[dict[str, Any]]] = {}
 
     async def events(self, run_id: str, request: Any) -> AsyncIterator[dict[str, Any]]:
-        working_directory = request.working_directory.resolve()
+        # 只信任平台本轮 artifact 根目录内的隔离目录；越界/symlink 逃逸 fail closed。
+        working_directory = _trusted_working_directory(request.working_directory)
         working_directory.mkdir(parents=True, exist_ok=True)
         run_key = re.sub(r"[^a-zA-Z0-9_-]", "_", run_id)[-80:]
         schema_path = working_directory / f".traex-schema-{run_key}.json"
@@ -100,10 +162,7 @@ class TraeXBuiltinAdapter:
             json.dumps(request.output_schema, ensure_ascii=False),
             encoding="utf-8",
         )
-        descriptors = {
-            _tool_name(item["capabilityRef"]): item
-            for item in request.tool_descriptors
-        }
+        descriptors = _tool_descriptor_map(request.tool_descriptors)
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         app = self._mcp_app(run_id, descriptors, queue)
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -148,6 +207,10 @@ class TraeXBuiltinAdapter:
             "read-only",
             "--ignore-user-config",
             "--ignore-rules",
+            # 工作目录已确认位于平台本轮隔离根目录内（非 Git 仓库）：显式跳过 Git 仓库检查，
+            # 但保留 read-only sandbox、忽略用户配置/规则、空 hooks/plugins/skills 与 allowlist；
+            # 跳过 Git 检查不等于放宽文件或工具权限。
+            "--skip-git-repo-check",
             "--output-schema",
             str(schema_path),
             "--output-last-message",
@@ -239,15 +302,9 @@ class TraeXBuiltinAdapter:
             stderr = (await stderr_task).decode(errors="replace")
             if code != 0:
                 error_code = _error_code(stderr, raw_events)
-                if not dispatched and error_code in {
-                    "TRAE_AUTH_REQUIRED",
-                    "TRAE_MODEL_UNAVAILABLE",
-                    "RATE_LIMITED",
-                }:
-                    yield {
-                        "type": "model.request.dispatched",
-                        "payload": {"attempt": 1},
-                    }
+                # 认证失败、模型不可用、限流或工作目录不受信都可能发生在任何模型请求之前
+                # （甚至在网关预检阶段）。没有 TraeX 明确 dispatch 事件时不得伪造
+                # model.request.dispatched：dispatched 保持 false，attempted 由上层单独记录。
                 raise TraeXBridgeError(
                     error_code,
                     stderr.strip() or f"TraeX 进程退出码: {code}",

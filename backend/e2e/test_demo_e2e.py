@@ -145,24 +145,61 @@ def test_e2e_1_deterministic_component(stack: DemoStack) -> None:
         assert not {"llm.call.completed", "agent.completed"} & types
 
 
-def test_e2e_2_mcp_component(stack: DemoStack) -> None:
-    with stack.client() as client:
+def test_e2e_2_mcp_component(isolated_stack: DemoStack) -> None:
+    """天气仅作真实样本：seed 不含任何领域 Presentation；可读文本经通用编辑/发布入口建立。"""
+
+    with isolated_stack.client() as client:
+        # 1) seed 版本只产出规范 JSON，通用平台 seed 不内置任何领域 Presentation 模板。
         run = _run_component(client, "本地天气查询", {"city": "成都"})
         assert run["status"] == "succeeded"
         assert run["output"]["city"] == "成都"
+        assert run["output"].get("presentation") in (None, {})
+        assert (run.get("presentation") or {}) == {}
+        assert run["modelUsage"] == []
+        seed_types = _events(client, run["id"])
+        assert "mcp.call.completed" in seed_types
+        assert "presentation.completed" not in seed_types
+
+        # 2) 通过通用 draft 编辑/发布入口建立“简单结构化结果 → 模板文本”策略，
+        #    不检查 seed 中存在任何天气字面量。
+        component = _component(client, "本地天气查询")
+        workflow = client.get(f"/workflows/{component['workflowId']}").json()
+        definition = workflow["definition"]
+        definition["metadata"]["presentationPolicy"] = {
+            "enabled": True,
+            "audience": "end_user",
+            "producer": "template",
+            "template": "{city}当前{condition}，温度{temperature}℃。",
+            "language": "zh-CN",
+            "maxLength": 200,
+        }
+        updated = client.put(
+            f"/workflows/{component['workflowId']}/draft",
+            json={"revision": workflow["draftRevision"], "definition": definition},
+        )
+        assert updated.status_code == 200, updated.text
+        published = _publish_workflow(client, component["workflowId"])
+        assert published.status_code == 201, published.text
+        created = client.post(
+            f"/workflow-versions/{published.json()['id']}/runs",
+            json={"input": {"city": "成都"}},
+        )
+        assert created.status_code == 202, created.text
+        presented = poll_run(client, created.json()["id"])
+        assert presented["status"] == "succeeded"
         deadline = time.time() + 30
-        detail = run
+        detail = presented
         while time.time() < deadline:
-            detail = client.get(f"/runs/{run['id']}").json()
+            detail = client.get(f"/runs/{presented['id']}").json()
             if (detail.get("presentation") or {}).get("status") == "completed":
                 break
             time.sleep(0.2)
         assert detail["presentation"]["text"] == (
-            f"成都当前{run['output']['condition']}，"
-            f"温度{run['output']['temperature']}℃。"
+            f"成都当前{presented['output']['condition']}，"
+            f"温度{presented['output']['temperature']}℃。"
         )
         assert detail["modelUsage"] == []
-        types = _events(client, run["id"])
+        types = _events(client, presented["id"])
         assert "mcp.call.completed" in types
         assert "presentation.completed" in types
         # 锁定 MCP ToolSnapshot，模型调用为 0。

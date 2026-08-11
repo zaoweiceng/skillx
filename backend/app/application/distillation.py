@@ -397,6 +397,87 @@ def compile_agent_trajectory(
     return definition, analysis
 
 
+def _propose_presentation_policy(
+    definition: dict[str, Any],
+    *,
+    machine_only: bool,
+) -> dict[str, Any]:
+    """通用 Presentation 固化提议：只依据任务目的与数据流，不做任何领域判断。
+
+    规范结构化输出始终是事实源，Presentation 只是可选派生结果。决策仅看运行框架无关的
+    数据流事实：
+    - 业务节点是否只是数据变换/文件搬运等机器流水线（→ 结果为机器消费/中间值）；
+    - 若结果直接面向用户，输出 schema 能否用字段无歧义、稳定地拼接（→ template），还是含
+      嵌套对象/数组等需要摘要/解释的复杂结构（→ llm）。
+
+    默认规则：机器消费/组合中间结果关闭；直接面向用户且可读文本有价值时开启；简单稳定的标量
+    字段映射选 template；复杂结构才选 llm。这里不识别任何领域名称、tag 或字段名。返回值同时
+    用作可发布的 ``presentationPolicy`` 与可审阅的 ``presentationPolicyProposal``（后者多携带
+    理由/证据/置信度）。
+    """
+
+    output_schema = definition["spec"]["outputSchema"]
+    properties = output_schema.get("properties", {})
+    properties = properties if isinstance(properties, dict) else {}
+    scalar_fields = [
+        name
+        for name, schema in properties.items()
+        if isinstance(schema, dict)
+        and schema.get("type") in {"string", "number", "integer", "boolean"}
+    ]
+    complex_fields = [
+        name
+        for name, schema in properties.items()
+        if isinstance(schema, dict) and schema.get("type") in {"object", "array"}
+    ]
+    evidence: list[str] = []
+    # 业务节点仅做数据变换/文件搬运：结果面向机器消费或作为组合中间值，默认关闭。
+    if machine_only:
+        evidence.append("业务节点仅为数据变换/文件操作，结果面向机器消费而非直接展示")
+        return {
+            "enabled": False,
+            "audience": "internal",
+            "producer": "template",
+            "template": "执行结果：{json}",
+            "language": "zh-CN",
+            "maxLength": 2000,
+            "reason": "作为组合中间步骤/机器消费结果，无需面向用户的可读文本",
+            "evidence": evidence,
+            "confidence": 0.9,
+        }
+    # 面向用户的终端结果：可读文本有价值 → 开启。
+    if scalar_fields and not complex_fields:
+        # 简单稳定的标量字段：用字段模板无歧义拼接，零模型成本。
+        template = "；".join(f"{name}={{{name}}}" for name in sorted(scalar_fields)) + "。"
+        evidence.append(f"输出仅含可无歧义拼接的标量字段: {sorted(scalar_fields)}")
+        return {
+            "enabled": True,
+            "audience": "end_user",
+            "producer": "template",
+            "template": template,
+            "language": "zh-CN",
+            "maxLength": 2000,
+            "reason": "结果直接面向用户且为稳定标量字段，可用模板稳定拼接为可读文本",
+            "evidence": evidence,
+            "confidence": 0.75,
+        }
+    # 复杂结构（嵌套对象/数组/长文本）：需要摘要/解释 → LLM/Agent Runtime。
+    evidence.append(
+        f"输出包含需要摘要/解释的复杂结构: {sorted(complex_fields) or '非标量结果'}"
+    )
+    return {
+        "enabled": True,
+        "audience": "end_user",
+        "producer": "llm",
+        "prompt": "请把以下规范 JSON 整理为简洁、准确的中文说明，不得增加 JSON 中没有的事实：",
+        "language": "zh-CN",
+        "maxLength": 2000,
+        "reason": "结果直接面向用户但结构复杂，需选定 LLM/Agent Runtime 生成摘要/解释",
+        "evidence": evidence,
+        "confidence": 0.6,
+    }
+
+
 def _enrich_distilled_definition(
     definition: dict[str, Any],
     trajectory: dict[str, Any],
@@ -499,6 +580,26 @@ def _enrich_distilled_definition(
                 "nodeIds": [node["id"] for node in business_nodes],
             }
         ]
+    # 通用 Presentation 固化提议：仅依据数据流事实（业务节点是否为机器流水线、输出 schema
+    # 形态），不识别任何领域。producer 节点集合仅由数据变换/文件/工件/条件等机器消费类节点
+    # 组成时视为机器/中间结果，Presentation 默认关闭。
+    producer_nodes = [node for node in business_nodes if node["id"] != recovery_id]
+    machine_kinds = {"transform", "file", "artifact", "condition"}
+    machine_only = bool(producer_nodes) and all(
+        node["type"] in machine_kinds for node in producer_nodes
+    )
+    proposal = _propose_presentation_policy(definition, machine_only=machine_only)
+    # metadata.presentationPolicy 是发布时冻结的可执行策略；presentationPolicyProposal 携带
+    # 提议来源/理由/证据/置信度，供固化审阅 UI 展示并允许用户确认或修改后再发布。
+    definition["metadata"]["presentationPolicy"] = {
+        key: value
+        for key, value in proposal.items()
+        if key not in {"reason", "evidence", "confidence"}
+    }
+    definition["metadata"]["presentationPolicyProposal"] = {
+        **proposal,
+        "source": "distillation_dataflow",
+    }
     return definition
 
 
@@ -692,6 +793,9 @@ async def distill_conversation_run(
         "capabilityDescriptorSource": capability_source,
         "logicalWorkflowId": definition["metadata"]["logicalWorkflowId"],
         "fragmentProposals": definition["metadata"].get("callableFragments", []),
+        "presentationPolicyProposal": definition["metadata"].get(
+            "presentationPolicyProposal", {}
+        ),
         "recoverableNodes": [
             node["id"]
             for node in definition["spec"]["nodes"]

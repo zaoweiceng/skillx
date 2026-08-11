@@ -7,6 +7,7 @@ from app.api.routes import PublishRequest, publish_workflow
 from app.application.compiler import WorkflowCompiler, digest_json
 from app.application.distillation import (
     DistillationError,
+    _propose_presentation_policy,
     compile_agent_trajectory,
     distill_conversation_run,
 )
@@ -347,3 +348,119 @@ async def test_distillation_creates_editable_draft_without_publishing() -> None:
             .where(WorkflowVersion.workflow_id == workflow.id)
         )
         assert versions == 0
+
+
+def _definition_with_output(output_schema: dict) -> dict:
+    return {
+        "apiVersion": "workflow.platform/v1",
+        "kind": "Workflow",
+        "metadata": {"name": "任务"},
+        "spec": {
+            "inputSchema": INPUT_SCHEMA,
+            "outputSchema": output_schema,
+            "nodes": [],
+            "edges": [],
+        },
+    }
+
+
+def test_presentation_proposal_simple_structured_uses_template() -> None:
+    """简单结构化结果（标量字段，直接面向用户）→ 可选模板文本；无任何领域判断。"""
+
+    definition = _definition_with_output(
+        {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "condition": {"type": "string"},
+                "temperature": {"type": "number"},
+            },
+        }
+    )
+    proposal = _propose_presentation_policy(definition, machine_only=False)
+    assert proposal["enabled"] is True
+    assert proposal["audience"] == "end_user"
+    assert proposal["producer"] == "template"
+    # 模板只由 output schema 字段拼接而成，不含任何领域字面量。
+    assert "{city}" in proposal["template"] and "{temperature}" in proposal["template"]
+    assert proposal["reason"] and proposal["evidence"]
+
+
+def test_presentation_proposal_complex_result_uses_llm() -> None:
+    """复杂结果（嵌套对象/数组，如网页/长文本总结）→ LLM/Agent Presentation。"""
+
+    definition = _definition_with_output(
+        {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "sections": {"type": "array", "items": {"type": "string"}},
+                "meta": {"type": "object"},
+            },
+        }
+    )
+    proposal = _propose_presentation_policy(definition, machine_only=False)
+    assert proposal["enabled"] is True
+    assert proposal["producer"] == "llm"
+    assert "prompt" in proposal
+
+
+def test_presentation_proposal_machine_result_is_disabled() -> None:
+    """机器消费/组合中间结果（数据转换、Fragment）→ Presentation 默认关闭。"""
+
+    definition = _definition_with_output(
+        {
+            "type": "object",
+            "properties": {"records": {"type": "array"}, "count": {"type": "integer"}},
+        }
+    )
+    proposal = _propose_presentation_policy(definition, machine_only=True)
+    assert proposal["enabled"] is False
+    assert proposal["audience"] == "internal"
+
+
+def test_presentation_no_domain_specific_branch_in_generic_runtime() -> None:
+    """静态检查：通用固化/展示运行时不得出现天气等领域专用分支或字面量。"""
+
+    import re as _re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "app" / "application"
+    forbidden = ("天气", "weather", "温度", "℃")
+    for name in ("distillation.py", "product_history.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        for token in forbidden:
+            assert token not in text, f"{name} 不得包含领域专用字面量 {token!r}"
+    # Presentation 决策只依据数据流形态与节点类型，不得按能力名称/tag 分支到领域特判。
+    distillation_text = (root / "distillation.py").read_text(encoding="utf-8")
+    assert not _re.search(
+        r'capability\.name\s*==|\.tags\s*==|in\s+capability\.tags', distillation_text
+    )
+
+
+async def test_distillation_freezes_generic_presentation_proposal() -> None:
+    """固化产出通用 presentationPolicy 与可审阅 proposal，且不含领域专用分支。"""
+
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="Presentation 提议")
+        session.add(conversation)
+        await session.flush()
+        conversation_run = ConversationRun(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            status="succeeded",
+            run_type="agent_run",
+            input_json={"message": "q1"},
+            output_json={"reply": LOOKUP_TABLE["q1"]},
+            trajectory_json=_base_trajectory([_lookup_action("q1")], message="q1"),
+        )
+        session.add(conversation_run)
+        await session.flush()
+        result = await distill_conversation_run(session, conversation_run)
+        workflow = await session.get(Workflow, result.draft_workflow_id)
+        metadata = workflow.draft_json["metadata"]
+        # 固化阶段按数据流通用提出 Presentation，并把可审阅提议写入 analysis。
+        assert "presentationPolicy" in metadata
+        proposal = result.analysis_json["presentationPolicyProposal"]
+        assert proposal["source"] == "distillation_dataflow"
+        assert proposal["reason"] and proposal["confidence"] > 0

@@ -457,7 +457,18 @@ export const api = {
           | 'unavailable'
         protocol?: string
         provider?: string
-        authStatus?: 'logged_in_unverified' | 'auth_required' | 'unknown' | 'not_applicable'
+        authStatus?:
+          | 'credential_present_unverified'
+          | 'auth_required'
+          | 'unknown'
+          | 'not_applicable'
+        capabilityStates?: {
+          installed: boolean
+          credentialPresent: boolean
+          activeProbeAuthenticated: boolean
+          protocolCompatible: boolean
+          usable: boolean
+        }
         protocolTestOnly?: boolean
         configured: boolean
         protocolAvailable: boolean
@@ -492,7 +503,18 @@ export const api = {
           | 'unavailable'
         protocol?: string
         provider?: string
-        authStatus?: 'logged_in_unverified' | 'auth_required' | 'unknown' | 'not_applicable'
+        authStatus?:
+          | 'credential_present_unverified'
+          | 'auth_required'
+          | 'unknown'
+          | 'not_applicable'
+        capabilityStates?: {
+          installed: boolean
+          credentialPresent: boolean
+          activeProbeAuthenticated: boolean
+          protocolCompatible: boolean
+          usable: boolean
+        }
         protocolTestOnly?: boolean
         configured: boolean
         protocolAvailable: boolean
@@ -845,6 +867,19 @@ export const api = {
         estimatedLlmCallsAfter: number
         publishable: boolean
         diagnostics: Array<{ level: string; code: string; message: string }>
+        presentationPolicyProposal?: {
+          enabled: boolean
+          audience: string
+          producer: string
+          template?: string
+          prompt?: string
+          language?: string
+          maxLength?: number
+          reason?: string
+          evidence?: string[]
+          confidence?: number
+          source?: string
+        }
       }
     }>(`/conversation-runs/${id}/distill`, { method: 'POST' }),
 }

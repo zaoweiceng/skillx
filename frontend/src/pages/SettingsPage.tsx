@@ -135,9 +135,11 @@ export default function SettingsPage() {
                 ? ' LLM Runtime'
                 : agentRuntime?.protocolTestOnly
                   ? ' 协议测试 Agent fallback'
-                  : agentRuntime?.configured
-                  ? ' Agent fallback'
-                  : ' unavailable'}
+                  : agentRuntime?.modelAvailable
+                    ? ' 已验证可用 Agent Runtime'
+                    : agentRuntime?.configured
+                      ? ' 候选 Agent Runtime（未验证可用）'
+                      : ' unavailable'}
             </strong>
             。
           </span>
@@ -147,6 +149,8 @@ export default function SettingsPage() {
                 主动探测会产生真实模型费用，并走当前 Agent Runtime 与 Host ToolResult 同一路径。
                 {provider.authStatus === 'auth_required' &&
                   ' 请先在本机终端运行 traex login；应用不会读取或保存登录 token。'}
+                {provider.authStatus === 'credential_present_unverified' &&
+                  ' 本地凭据已存在但未验证：登录状态不等于可用，请执行主动探测确认协议与 Host ToolResult 可用。'}
               </span>
               <button
                 className="button ghost"

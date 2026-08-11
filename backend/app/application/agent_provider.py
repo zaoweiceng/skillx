@@ -173,7 +173,11 @@ async def _native_login_status() -> tuple[str, str]:
         return "unknown", "无法确认 TraeX 登录状态"
     text = stdout.decode(errors="replace").strip()
     if process.returncode == 0 and "logged in" in text.lower():
-        return "logged_in_unverified", "TraeX 已登录，需执行兼容性探测"
+        # 登录状态只证明本地存在凭据，不代表 Runtime 可用；usable 由主动探测单独判定。
+        return (
+            "credential_present_unverified",
+            "TraeX 本地凭据已存在（未验证），需执行兼容性探测确认可用",
+        )
     return "auth_required", "请在终端运行 traex login 完成本机登录"
 
 
@@ -264,12 +268,26 @@ async def provider_readiness() -> dict[str, Any]:
             "kind": "protocol_only" if provider_type == "fixture" else "not_run",
         }
     )
+    probe_ok = bool(_last_probe and _last_probe.get("ok"))
+    # 分离展示与持久化的运行时事实：installed（已安装且协议可启动）、
+    # credentialPresent（本地凭据存在但未验证）、activeProbeAuthenticated（主动探测已认证）、
+    # protocolCompatible（strict output + ToolResult round-trip 通过）、usable（新鲜且可用）。
+    # 只有真实主动探测成功且未过期才标记 usable，login 状态本身绝不代表 usable。
+    capability_states = {
+        "installed": provider_type == "real" and protocol_available,
+        "credentialPresent": provider_type == "real"
+        and auth_status == "credential_present_unverified",
+        "activeProbeAuthenticated": provider_type == "real" and probe_ok,
+        "protocolCompatible": provider_type == "real" and probe_ok,
+        "usable": model_available,
+    }
     return {
         "type": provider_type,
         "runtimeType": runtime.type,
         "protocol": runtime.protocol,
         "provider": runtime.provider,
         "authStatus": auth_status,
+        "capabilityStates": capability_states,
         "protocolTestOnly": provider_type == "fixture",
         "configured": configured,
         "protocolAvailable": protocol_available,

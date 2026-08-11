@@ -56,12 +56,18 @@ async def test_seed_upgrades_pre_025_weather_without_losing_history() -> None:
         version = await session.get(WorkflowVersion, component.default_version_id)
         workflow = await session.get(Workflow, component.workflow_id)
         assert version is not None and workflow is not None
+        # 构造一个与当前受管理 seed 存在通用差异（节点显示名）的旧版本，触发原位升级；
+        # 不依赖任何领域字面量（如天气 Presentation 模板）。
         old_definition = {
             **version.definition_json,
-            "metadata": {
-                key: value
-                for key, value in version.definition_json["metadata"].items()
-                if key != "presentationPolicy"
+            "spec": {
+                **version.definition_json["spec"],
+                "nodes": [
+                    {**node, "displayName": "查询天气（历史版本）"}
+                    if node["id"] == "weather"
+                    else node
+                    for node in version.definition_json["spec"]["nodes"]
+                ],
             },
         }
         old_digest = WorkflowCompiler().compile(old_definition).digest
@@ -109,14 +115,9 @@ async def test_seed_upgrades_pre_025_weather_without_losing_history() -> None:
     assert component.seed_key == "local-weather"
     assert component.managed_revision == 2
     assert upgraded is not None
-    assert upgraded.presentation_policy_json == {
-        "enabled": True,
-        "audience": "end_user",
-        "producer": "template",
-        "template": "{city}当前{condition}，温度{temperature}℃。",
-        "language": "zh-CN",
-        "maxLength": 200,
-    }
+    # 通用平台 seed 不再内置任何领域专用 Presentation：升级后的版本无天气模板等字面量。
+    assert upgraded.presentation_policy_json == {}
+    assert "presentationPolicy" not in upgraded.definition_json.get("metadata", {})
 
 
 async def test_seed_does_not_overwrite_user_weather_draft() -> None:
