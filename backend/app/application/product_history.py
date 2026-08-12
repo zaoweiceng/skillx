@@ -294,6 +294,34 @@ def normalize_presentation_policy(
 _PRESENTATION_DECISIONS = {"accepted", "modified", "rejected"}
 
 
+def _policy_from_presentation_proposal(proposal: dict[str, Any]) -> dict[str, Any]:
+    enabled = bool(proposal.get("enabled", False))
+    return {
+        "enabled": enabled,
+        "audience": "end_user" if enabled else "internal",
+        "producer": str(proposal.get("producer", "template")),
+        "template": str(proposal.get("template", "执行结果：{json}")),
+        "prompt": str(proposal.get("prompt", "")),
+        "language": str(proposal.get("language", "zh-CN")),
+        "maxLength": int(proposal.get("maxLength", 2000)),
+    }
+
+
+def _normalized_presentation_policy_shape(policy: dict[str, Any]) -> dict[str, Any]:
+    enabled = bool(policy.get("enabled", False))
+    return {
+        "enabled": enabled,
+        "audience": str(
+            policy.get("audience", "end_user" if enabled else "internal")
+        ),
+        "producer": str(policy.get("producer", "template")),
+        "template": str(policy.get("template", "执行结果：{json}")),
+        "prompt": str(policy.get("prompt", "")),
+        "language": str(policy.get("language", "zh-CN")),
+        "maxLength": int(policy.get("maxLength", 2000)),
+    }
+
+
 def bind_presentation_decision(metadata: dict[str, Any]) -> None:
     """Bind an explicit reviewer action to the exact proposal and policy bytes.
 
@@ -311,6 +339,14 @@ def bind_presentation_decision(metadata: dict[str, Any]) -> None:
     policy = metadata.get("presentationPolicy")
     if not isinstance(policy, dict):
         raise ValueError("Presentation decision 缺少最终 presentationPolicy")
+    normalized_policy = _normalized_presentation_policy_shape(policy)
+    proposal_policy = _policy_from_presentation_proposal(proposal)
+    if decision.get("status") == "accepted" and normalized_policy != proposal_policy:
+        raise ValueError("accepted 必须应用规范化 proposal 原值；编辑后请使用 modified")
+    if decision.get("status") == "modified" and normalized_policy == proposal_policy:
+        raise ValueError("policy 未变化时必须记录 accepted，不能误标为 modified")
+    if decision.get("status") == "rejected" and policy.get("enabled") is not False:
+        raise ValueError("rejected Presentation policy 必须关闭")
     expected_proposal = digest_json(proposal)
     expected_policy = digest_json(policy)
     existing_proposal = decision.get("proposalDigest")
@@ -341,6 +377,17 @@ def validate_presentation_decision(metadata: dict[str, Any]) -> None:
         raise ValueError("Presentation proposal digest 与审阅决定不一致")
     if decision.get("policyDigest") != digest_json(policy):
         raise ValueError("Presentation policy digest 与审阅决定不一致")
+    status = decision.get("status")
+    proposal_policy = _policy_from_presentation_proposal(
+        metadata["presentationPolicyProposal"]
+    )
+    normalized_policy = _normalized_presentation_policy_shape(policy)
+    if status == "accepted" and normalized_policy != proposal_policy:
+        raise ValueError("accepted Presentation policy 与规范化 proposal 不一致")
+    if status == "modified" and normalized_policy == proposal_policy:
+        raise ValueError("modified Presentation policy 实际未修改")
+    if status == "rejected" and policy.get("enabled") is not False:
+        raise ValueError("rejected Presentation policy 必须关闭")
 
 
 def validate_presentation_template(

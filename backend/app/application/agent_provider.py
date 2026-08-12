@@ -278,6 +278,7 @@ async def provider_readiness() -> dict[str, Any]:
         "credentialPresent": provider_type == "real"
         and auth_status == "credential_present_unverified",
         "activeProbeAuthenticated": provider_type == "real"
+        and cache_valid
         and bool(_last_probe and _last_probe.get("activeAuthenticated")),
         "modelReachable": provider_type == "real"
         and bool(_last_probe and _last_probe.get("modelReachable")),
@@ -315,6 +316,13 @@ async def provider_readiness() -> dict[str, Any]:
             "maxInputTokens": settings.provider_probe_max_input_tokens,
             "maxOutputTokens": settings.provider_probe_max_output_tokens,
             "maxBillableTokens": settings.provider_probe_max_billable_tokens,
+        },
+        "workflowSelectionBudgetProfile": {
+            "maxSteps": settings.agent_max_steps,
+            "maxInputTokens": settings.agent_max_input_tokens,
+            "maxOutputTokens": settings.agent_max_output_tokens,
+            "maxBillableTokens": settings.agent_max_billable_tokens,
+            "catalogDescriptors": 1,
         },
     }
 

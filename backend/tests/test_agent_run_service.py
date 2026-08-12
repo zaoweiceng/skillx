@@ -25,6 +25,7 @@ from app.application.agent_host import AgentHostError
 from app.application.agent_run import (
     AgentRunConfig,
     AgentRunWorker,
+    build_trajectory,
     enqueue_agent_run,
     resolve_effective_capabilities,
 )
@@ -44,6 +45,29 @@ from app.infrastructure.database import (
 )
 
 STUB = Path(__file__).resolve().parents[2] / "examples" / "traex_stub.py"
+
+
+def test_success_trajectory_preserves_auditable_result_consumer_facts() -> None:
+    trajectory = build_trajectory(
+        AgentRunConfig.default(),
+        "task",
+        {"reply": "done"},
+        [],
+        1,
+        semantic_context={
+            "resultConsumer": "composition",
+            "entrypointKind": "fragment",
+            "topLevelReply": False,
+            "intendedAsFragment": True,
+        },
+    )
+
+    assert trajectory["semanticContext"] == {
+        "resultConsumer": "composition",
+        "entrypointKind": "fragment",
+        "topLevelReply": False,
+        "intendedAsFragment": True,
+    }
 
 
 @pytest.fixture

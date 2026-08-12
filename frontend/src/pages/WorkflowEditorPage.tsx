@@ -469,6 +469,23 @@ function CapabilityMetadataEditor({
   const presentationDraft =
     Object.keys(presentation).length > 0 ? presentation : presentationProposal
 
+  function policyFrom(source: Record<string, unknown>) {
+    const enabled = source.enabled === true
+    return {
+      enabled,
+      audience: enabled ? 'end_user' : 'internal',
+      producer: String(source.producer ?? 'template'),
+      template: String(source.template ?? '执行结果：{json}'),
+      prompt: String(source.prompt ?? ''),
+      language: String(source.language ?? 'zh-CN'),
+      maxLength: Number(source.maxLength ?? 2000),
+    }
+  }
+
+  const proposalPolicy = policyFrom(presentationProposal)
+  const draftPolicy = policyFrom(presentationDraft)
+  const presentationEdited = JSON.stringify(proposalPolicy) !== JSON.stringify(draftPolicy)
+
   function patchMetadata(nextCapability: Record<string, unknown>, nextFragments = fragments) {
     onChange({
       ...definition,
@@ -503,15 +520,9 @@ function CapabilityMetadataEditor({
             language: String(presentationDraft.language ?? 'zh-CN'),
             maxLength: Number(presentationDraft.maxLength ?? 2000),
           }
-        : {
-            enabled: presentationDraft.enabled === true,
-            audience: presentationDraft.enabled === true ? 'end_user' : 'internal',
-            producer: String(presentationDraft.producer ?? 'template'),
-            template: String(presentationDraft.template ?? '执行结果：{json}'),
-            prompt: String(presentationDraft.prompt ?? ''),
-            language: String(presentationDraft.language ?? 'zh-CN'),
-            maxLength: Number(presentationDraft.maxLength ?? 2000),
-          }
+        : status === 'accepted'
+          ? proposalPolicy
+          : draftPolicy
     onChange({
       ...definition,
       metadata: {
@@ -715,7 +726,12 @@ function CapabilityMetadataEditor({
           </label>
           {Object.keys(presentationProposal).length > 0 && (
             <div className="button-row presentation-decision-actions">
-              <button className="button secondary" type="button" onClick={() => decidePresentation('accepted')}>
+              <button
+                className="button secondary"
+                type="button"
+                disabled={presentationEdited}
+                onClick={() => decidePresentation('accepted')}
+              >
                 接受提议
               </button>
               <button className="button secondary" type="button" onClick={() => decidePresentation('modified')}>

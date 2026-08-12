@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { WorkflowDefinition } from '@/api/client'
-import { layerNodes } from '@/lib/workflowLayout'
+import { edgeLabel, layerNodes } from '@/lib/workflowLayout'
 
 function definition(edges: WorkflowDefinition['spec']['edges']): WorkflowDefinition {
   return {
@@ -22,6 +22,11 @@ function definition(edges: WorkflowDefinition['spec']['edges']): WorkflowDefinit
 }
 
 describe('layerNodes', () => {
+  it('null 与 undefined 条件边都不生成可见标签', () => {
+    expect(edgeLabel(null)).toBeUndefined()
+    expect(edgeLabel(undefined)).toBeUndefined()
+    expect(edgeLabel(false)).toBe('false')
+  })
   it('为 DAG 计算有界层级', () => {
     const result = layerNodes(
       definition([

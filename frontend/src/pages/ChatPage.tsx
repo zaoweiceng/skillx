@@ -54,6 +54,7 @@ export default function ChatPage() {
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
   const [error, setError] = useState('')
+  const [copyFeedback, setCopyFeedback] = useState('')
   const [drafts, setDrafts] = useState<Record<string, string>>({})
   // 候选卡片补参状态，按消息 id 索引。
   const [candidateInputs, setCandidateInputs] = useState<Record<string, Record<string, unknown>>>({})
@@ -71,6 +72,15 @@ export default function ChatPage() {
   const [activeCheckpointIds, setActiveCheckpointIds] = useState('')
   const [workflowRuns, setWorkflowRuns] = useState<Record<string, Run>>({})
   const [activeWorkflowRunIds, setActiveWorkflowRunIds] = useState('')
+
+  async function copyResult(value: string, kind: 'json' | 'text') {
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopyFeedback(`${kind}:ok`)
+    } catch {
+      setCopyFeedback(`${kind}:failed`)
+    }
+  }
 
   // conversationId 写入路由：新对话创建后导航到 /chat/:id，刷新可恢复同一会话。
   useEffect(() => {
@@ -717,11 +727,13 @@ export default function ChatPage() {
               <button
                 className="button ghost"
                 type="button"
-                onClick={() =>
-                  navigator.clipboard.writeText(JSON.stringify(run.output, null, 2))
-                }
+                onClick={() => void copyResult(JSON.stringify(run.output, null, 2), 'json')}
               >
-                复制 JSON
+                {copyFeedback === 'json:ok'
+                  ? '已复制 JSON'
+                  : copyFeedback === 'json:failed'
+                    ? '复制失败'
+                    : '复制 JSON'}
               </button>
             </div>
             {typeof run.output?.reply === 'string' && (
@@ -736,11 +748,13 @@ export default function ChatPage() {
                 <button
                   className="button ghost"
                   type="button"
-                  onClick={() =>
-                    navigator.clipboard.writeText(run.presentation?.text ?? '')
-                  }
+                  onClick={() => void copyResult(run.presentation?.text ?? '', 'text')}
                 >
-                  复制文本
+                  {copyFeedback === 'text:ok'
+                    ? '已复制文本'
+                    : copyFeedback === 'text:failed'
+                      ? '复制失败'
+                      : '复制文本'}
                 </button>
               </div>
               <p className="presentation-text">{run.presentation.text}</p>

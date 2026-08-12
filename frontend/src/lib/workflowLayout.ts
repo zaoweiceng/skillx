@@ -1,5 +1,9 @@
 import type { WorkflowDefinition } from '@/api/client'
 
+export function edgeLabel(when: unknown): string | undefined {
+  return when == null ? undefined : String(when)
+}
+
 export function layerNodes(definition: WorkflowDefinition): {
   layers: Map<string, number>
   cyclic: boolean

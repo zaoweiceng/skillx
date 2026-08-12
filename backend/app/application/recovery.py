@@ -435,7 +435,21 @@ async def run_recovery_agent(
         working_directory=settings.artifact_root / "recovery" / checkpoint.id,
         requested_capabilities=tuple(fallback_config.get("allowedCapabilities", [])),
         max_steps=int(fallback_config.get("maxSteps", 4)),
-        max_total_tokens=int(fallback_config.get("maxTotalTokens", 20000)),
+        max_total_tokens=max(
+            int(fallback_config.get("maxTotalTokens", 0)),
+            settings.agent_max_total_tokens,
+        ),
+        max_input_tokens=int(
+            fallback_config.get("maxInputTokens", settings.agent_max_input_tokens)
+        ),
+        max_output_tokens=int(
+            fallback_config.get("maxOutputTokens", settings.agent_max_output_tokens)
+        ),
+        max_billable_tokens=int(
+            fallback_config.get(
+                "maxBillableTokens", settings.agent_max_billable_tokens
+            )
+        ),
         max_duration_seconds=int(fallback_config.get("maxDurationSeconds", 60)),
     )
     try:

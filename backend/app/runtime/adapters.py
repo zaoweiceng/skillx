@@ -280,10 +280,10 @@ class AgentRunRequest:
     allowed_tools: list[str] = field(default_factory=list)
     tool_descriptors: list[dict[str, Any]] = field(default_factory=list)
     max_steps: int = 8
-    max_tokens: int = 30000
-    max_input_tokens: int = 40000
-    max_output_tokens: int = 8000
-    max_billable_tokens: int = 48000
+    max_tokens: int = 1250000
+    max_input_tokens: int = 1000000
+    max_output_tokens: int = 250000
+    max_billable_tokens: int = 1250000
 
 
 class TraeXSubprocessAdapter:

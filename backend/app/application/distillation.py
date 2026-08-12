@@ -523,41 +523,8 @@ def _enrich_distilled_definition(
     }
 
     nodes = definition["spec"]["nodes"]
-    recoverable = [
-        node
-        for node in nodes
-        if node["type"] in {"browser", "mcp", "skillx"}
-        and not node.get("sideEffect", False)
-    ]
     recovery_id = "recovery-agent"
-    if recoverable and not any(node["id"] == recovery_id for node in nodes):
-        nodes.insert(
-            -1,
-            {
-                "id": recovery_id,
-                "type": "agent",
-                "displayName": "受限恢复 Agent",
-                "input": {},
-                "config": {
-                    "maxSteps": 4,
-                    "maxTotalTokens": 12000,
-                    "maxDurationSeconds": 60,
-                    "allowedCapabilities": [],
-                    "outputSchema": {"type": "object"},
-                },
-            },
-        )
-        for node in recoverable:
-            node["fallback"] = {
-                "on": [
-                    "DEPENDENCY_UNAVAILABLE",
-                    "TIMEOUT",
-                    "PAGE_DRIFT",
-                    "MCP_CONTRACT_DRIFT",
-                ],
-                "target": recovery_id,
-                "requireUserApproval": False,
-            }
+    _ensure_recovery_node(definition)
 
     business_nodes = [
         node
@@ -573,15 +540,10 @@ def _enrich_distilled_definition(
         for node in business_nodes
         if node["id"] != recovery_id
     ]
-    if business_nodes and not any(node.get("sideEffect", False) for node in business_nodes):
-        definition["metadata"]["callableFragments"] = [
-            {
-                "name": "verified-task",
-                "summary": capability.summary,
-                "useWhen": capability.use_when,
-                "nodeIds": [node["id"] for node in business_nodes],
-            }
-        ]
+    if "callableFragments" not in definition["metadata"]:
+        definition["metadata"]["callableFragments"] = _callable_fragment_proposals(
+            definition, capability
+        )
     proposal = _propose_presentation_policy(
         definition, agent_proposal=presentation_proposal
     )
@@ -590,6 +552,68 @@ def _enrich_distilled_definition(
     definition["metadata"]["presentationPolicyProposal"] = proposal
     definition["metadata"]["presentationPolicyDecision"] = {"status": "pending"}
     return definition
+
+
+def _callable_fragment_proposals(
+    definition: dict[str, Any], capability: CapabilityDescriptor
+) -> list[dict[str, Any]]:
+    business_nodes = [
+        node
+        for node in definition["spec"]["nodes"]
+        if node["type"] not in {"input", "output"}
+    ]
+    if not business_nodes or any(
+        node.get("sideEffect", False) for node in business_nodes
+    ):
+        return []
+    return [
+        {
+            "name": "verified-task",
+            "summary": capability.summary,
+            "useWhen": capability.use_when,
+            "nodeIds": [node["id"] for node in business_nodes],
+        }
+    ]
+
+
+def _ensure_recovery_node(definition: dict[str, Any]) -> None:
+    nodes = definition["spec"]["nodes"]
+    recoverable = [
+        node
+        for node in nodes
+        if node["type"] in {"browser", "mcp", "skillx"}
+        and not node.get("sideEffect", False)
+    ]
+    recovery_id = "recovery-agent"
+    if not recoverable or any(node["id"] == recovery_id for node in nodes):
+        return
+    nodes.insert(
+        -1,
+        {
+            "id": recovery_id,
+            "type": "agent",
+            "displayName": "受限恢复 Agent",
+            "input": {},
+            "config": {
+                "maxSteps": 4,
+                "maxTotalTokens": 12000,
+                "maxDurationSeconds": 60,
+                "allowedCapabilities": [],
+                "outputSchema": {"type": "object"},
+            },
+        },
+    )
+    for node in recoverable:
+        node["fallback"] = {
+            "on": [
+                "DEPENDENCY_UNAVAILABLE",
+                "TIMEOUT",
+                "PAGE_DRIFT",
+                "MCP_CONTRACT_DRIFT",
+            ],
+            "target": recovery_id,
+            "requireUserApproval": False,
+        }
 
 
 def _node_output_ref(node_id: str, node: dict[str, Any]) -> str:
@@ -746,6 +770,10 @@ async def distill_conversation_run(
         if proposed_capability is not None:
             capability = proposed_capability
             capability_source = "distillation_agent"
+    _ensure_recovery_node(definition)
+    definition.setdefault("metadata", {})["callableFragments"] = (
+        _callable_fragment_proposals(definition, capability)
+    )
     presentation_proposal: PresentationPolicyProposal | None = None
     if distillation_runtime_available:
         presentation_proposal = await _request_presentation_proposal(
@@ -838,6 +866,7 @@ async def _request_capability_descriptor(
         for action in trajectory.get("actions", [])
         if isinstance(action, dict)
     ]
+    settings = get_settings()
     request = AgentHostRequest(
         run_id=f"capability-{run_id}",
         prompt=(
@@ -849,10 +878,10 @@ async def _request_capability_descriptor(
         working_directory=get_settings().artifact_root / "distillation" / run_id,
         requested_capabilities=(),
         max_steps=1,
-        max_total_tokens=43000,
-        max_input_tokens=40000,
-        max_output_tokens=3000,
-        max_billable_tokens=43000,
+        max_total_tokens=settings.agent_max_total_tokens,
+        max_input_tokens=settings.agent_max_input_tokens,
+        max_output_tokens=settings.agent_max_output_tokens,
+        max_billable_tokens=settings.agent_max_billable_tokens,
         max_duration_seconds=60,
     )
     try:
@@ -889,10 +918,10 @@ async def _request_distillation_proposal(
         working_directory=settings.artifact_root / "distillation" / run_id,
         requested_capabilities=(),
         max_steps=1,
-        max_total_tokens=43000,
-        max_input_tokens=40000,
-        max_output_tokens=3000,
-        max_billable_tokens=43000,
+        max_total_tokens=settings.agent_max_total_tokens,
+        max_input_tokens=settings.agent_max_input_tokens,
+        max_output_tokens=settings.agent_max_output_tokens,
+        max_billable_tokens=settings.agent_max_billable_tokens,
         max_duration_seconds=60,
     )
     try:
@@ -918,11 +947,19 @@ async def _request_presentation_proposal(
             if isinstance(action, dict)
         }
     )
+    trajectory_semantics = trajectory.get("semanticContext")
+    trajectory_semantics = (
+        trajectory_semantics if isinstance(trajectory_semantics, dict) else {}
+    )
     semantic_context = {
         "taskIntent": capability.summary,
         "useWhen": capability.use_when,
-        "consumer": "human_or_composition_unknown",
-        "entrypoint": "top_level_with_optional_fragments",
+        "consumer": trajectory_semantics.get("resultConsumer", "unknown"),
+        "entrypoint": trajectory_semantics.get("entrypointKind", "unknown"),
+        "topLevelReply": trajectory_semantics.get("topLevelReply", "unknown"),
+        "intendedAsFragment": trajectory_semantics.get(
+            "intendedAsFragment", "unknown"
+        ),
         "inputSchema": definition["spec"]["inputSchema"],
         "outputSchema": definition["spec"]["outputSchema"],
         "dataFlow": {
@@ -932,6 +969,7 @@ async def _request_presentation_proposal(
             ),
         },
     }
+    settings = get_settings()
     request = AgentHostRequest(
         run_id=f"presentation-{run_id}",
         prompt=(
@@ -945,10 +983,10 @@ async def _request_presentation_proposal(
         working_directory=get_settings().artifact_root / "distillation" / run_id,
         requested_capabilities=(),
         max_steps=1,
-        max_total_tokens=8000,
-        max_input_tokens=40000,
-        max_output_tokens=3000,
-        max_billable_tokens=43000,
+        max_total_tokens=settings.agent_max_total_tokens,
+        max_input_tokens=settings.agent_max_input_tokens,
+        max_output_tokens=settings.agent_max_output_tokens,
+        max_billable_tokens=settings.agent_max_billable_tokens,
         max_duration_seconds=60,
     )
     try:

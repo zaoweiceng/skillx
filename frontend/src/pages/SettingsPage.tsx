@@ -47,6 +47,9 @@ export default function SettingsPage() {
   const provider = health?.selectionProvider
   const agentRuntime = health?.agentRuntime ?? provider
   const llmRuntime = health?.llmRuntime
+  const activeProbeAuthenticated =
+    provider?.capabilityStates?.activeProbeAuthenticated === true
+  const credentialPresent = provider?.capabilityStates?.credentialPresent === true
   const runtimeCards = health
     ? [
         {
@@ -145,26 +148,41 @@ export default function SettingsPage() {
           </span>
           {agentRuntime?.probeBudgetProfile && (
             <span>
-              付费探测预计约 {agentRuntime.probeBudgetProfile.estimatedInputTokens.toLocaleString()}
-              {' '}输入 Token；冻结上限为输入{' '}
+              兼容性探测预计基线约 {agentRuntime.probeBudgetProfile.estimatedInputTokens.toLocaleString()}
+              {' '}输入 Token；Local Demo 为长任务保留的宽松上限为输入{' '}
               {agentRuntime.probeBudgetProfile.maxInputTokens.toLocaleString()}、输出{' '}
               {agentRuntime.probeBudgetProfile.maxOutputTokens.toLocaleString()}、总计{' '}
               {agentRuntime.probeBudgetProfile.maxBillableTokens.toLocaleString()}。
             </span>
           )}
+          {agentRuntime?.workflowSelectionBudgetProfile && (
+            <span>
+              WorkflowSelection 独立 profile：单一目录描述符，最多{' '}
+              {agentRuntime.workflowSelectionBudgetProfile.maxSteps} 步；输入{' '}
+              {agentRuntime.workflowSelectionBudgetProfile.maxInputTokens.toLocaleString()}、输出{' '}
+              {agentRuntime.workflowSelectionBudgetProfile.maxOutputTokens.toLocaleString()}、总计{' '}
+              {agentRuntime.workflowSelectionBudgetProfile.maxBillableTokens.toLocaleString()} Token。
+            </span>
+          )}
           {provider?.type === 'real' && (
             <>
               <span>
-                主动探测会产生真实模型费用，并走当前 Agent Runtime 与 Host ToolResult 同一路径。
+                主动探测会调用真实模型，并走当前 Agent Runtime 与 Host ToolResult 同一路径。
                 {provider.authStatus === 'auth_required' &&
                   ' 请先在本机终端运行 traex login；应用不会读取或保存登录 token。'}
-                {provider.authStatus === 'credential_present_unverified' &&
+                {activeProbeAuthenticated &&
+                  ' 当前主动探测仍在有效期内，认证、协议与 Host ToolResult 已验证成功。'}
+                {!activeProbeAuthenticated && credentialPresent &&
                   ' 本地凭据已存在但未验证：登录状态不等于可用，请执行主动探测确认协议与 Host ToolResult 可用。'}
               </span>
               <button
                 className="button ghost"
                 type="button"
-                disabled={probing || health.selectionProvider.nextProbeAllowedAt !== null}
+                disabled={
+                  probing ||
+                  activeProbeAuthenticated ||
+                  health.selectionProvider.nextProbeAllowedAt !== null
+                }
                 onClick={runProbe}
               >
                 {probing ? '探测中…' : '重新探测'}

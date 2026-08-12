@@ -500,6 +500,13 @@ export const api = {
           maxOutputTokens: number
           maxBillableTokens: number
         }
+        workflowSelectionBudgetProfile?: {
+          maxSteps: number
+          maxInputTokens: number
+          maxOutputTokens: number
+          maxBillableTokens: number
+          catalogDescriptors: number
+        }
       }
       agentRuntime?: {
         type: 'real' | 'fixture' | 'unavailable'
@@ -542,6 +549,13 @@ export const api = {
           totalTokens?: number
         }
         nextProbeAllowedAt: string | null
+        workflowSelectionBudgetProfile?: {
+          maxSteps: number
+          maxInputTokens: number
+          maxOutputTokens: number
+          maxBillableTokens: number
+          catalogDescriptors: number
+        }
         probeBudgetProfile?: {
           estimatedInputTokens: number
           maxInputTokens: number

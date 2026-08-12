@@ -119,7 +119,7 @@ from app.application.workflow_patch import (
     apply_workflow_patch,
     observation_eligibility,
 )
-from app.application.workflow_tool_broker import workflow_tool_adapters
+from app.application.workflow_tool_broker import workflow_catalog_adapter
 from app.config import get_settings
 from app.infrastructure.database import (
     Approval,
@@ -1440,6 +1440,7 @@ async def propose_failure_revision(
     )
     agent_run_id = f"revision-{observation.id}-{uuid4()}"
     prompt_version = "revision-agent-v1"
+    settings = get_settings()
     request = AgentHostRequest(
         run_id=agent_run_id,
         prompt=(
@@ -1457,7 +1458,10 @@ async def propose_failure_revision(
         working_directory=get_settings().artifact_root / "revisions" / observation.id,
         requested_capabilities=(),
         max_steps=1,
-        max_total_tokens=8000,
+        max_total_tokens=settings.agent_max_total_tokens,
+        max_input_tokens=settings.agent_max_input_tokens,
+        max_output_tokens=settings.agent_max_output_tokens,
+        max_billable_tokens=settings.agent_max_billable_tokens,
         max_duration_seconds=60,
     )
     try:
@@ -4510,11 +4514,13 @@ async def _select_workflow_candidate(
     selection_schema["required"] = [
         item for item in selection_schema.get("required", []) if item != "sessionId"
     ]
+    settings = get_settings()
     request = AgentHostRequest(
         run_id=f"workflow-selection-{uuid4()}",
         prompt=(
-            "Progressive WorkflowSelection。你必须先调用 workflow.search 获取 L0，"
-            "只在需要时调用 workflow.describe/describe_fragment/slice/compile_plan。"
+            "Progressive WorkflowSelection。你必须先调用 workflow.catalog(action=search) "
+            "获取 L0，只在需要时通过同一窄工具请求 describe/describe_fragment/slice/"
+            "compile_plan。"
             "不得选择未披露 ref，不得假设 Schema/DAG；编译失败时根据 diagnostics 修正。"
             "比较 useWhen/doNotUseWhen、输入输出、副作用和成本后输出 WorkflowSelection。"
             "从用户明确表达提取 bindings，并为每个字段返回 bindingSources（原文 quote、"
@@ -4525,22 +4531,18 @@ async def _select_workflow_candidate(
         ),
         output_schema=selection_schema,
         working_directory=get_settings().artifact_root / "workflow-selections",
-        requested_capabilities=(
-            "workflow.search",
-            "workflow.describe",
-            "workflow.describe_fragment",
-            "workflow.slice",
-            "workflow.compile_plan",
-        ),
+        requested_capabilities=("workflow.catalog",),
         max_steps=6,
-        max_total_tokens=8000,
+        max_total_tokens=settings.agent_max_total_tokens,
+        max_input_tokens=settings.agent_max_input_tokens,
+        max_output_tokens=settings.agent_max_output_tokens,
+        max_billable_tokens=settings.agent_max_billable_tokens,
         max_duration_seconds=60,
     )
     result = None
     try:
         registry = ToolAdapterRegistry()
-        for adapter in workflow_tool_adapters(session, session_id):
-            registry.register(adapter)
+        registry.register(workflow_catalog_adapter(session, session_id))
         result = await AgentHost(tool_registry=registry).execute(request)
         try:
             selection = WorkflowSelection.model_validate(
@@ -4658,6 +4660,7 @@ async def _select_workflow_candidate(
     timeline = []
     tool_evidence: dict[str, dict[str, Any]] = {}
     level_by_capability = {
+        "workflow.catalog": None,
         "workflow.search": "L0",
         "workflow.describe": "L1",
         "workflow.describe_fragment": "L2",
@@ -4680,13 +4683,32 @@ async def _select_workflow_candidate(
             and isinstance(output, dict)
         ):
             tool_evidence[call_id] = output
-        bounded_result = _bounded_disclosure_result(capability, output)
+        concrete_capability = capability
+        if capability == "workflow.catalog":
+            action = (
+                output.get("action")
+                if isinstance(output, dict)
+                else (payload.get("arguments") or {}).get("action")
+            )
+            concrete_capability = {
+                "search": "workflow.search",
+                "describe": "workflow.describe",
+                "describe_fragment": "workflow.describe_fragment",
+                "slice": "workflow.slice",
+                "compile_plan": "workflow.compile_plan",
+            }.get(str(action), capability)
+        bounded_result = _bounded_disclosure_result(concrete_capability, output)
+        level = (
+            output.get("level")
+            if isinstance(output, dict) and output.get("level")
+            else level_by_capability.get(concrete_capability)
+        )
         timeline.append(
             {
                 "type": event["type"],
                 "callId": payload.get("callId"),
-                "capabilityRef": capability,
-                "level": level_by_capability[capability],
+                "capabilityRef": concrete_capability,
+                "level": level,
                 "status": payload.get("status", "pending"),
                 **(
                     {
@@ -5261,6 +5283,9 @@ async def start_agent_run(
         output_schema=default_config.output_schema,
         max_steps=min(body.max_steps or default_config.max_steps, default_config.max_steps),
         max_total_tokens=default_config.max_total_tokens,
+        max_input_tokens=default_config.max_input_tokens,
+        max_output_tokens=default_config.max_output_tokens,
+        max_billable_tokens=default_config.max_billable_tokens,
         allowed_capabilities=requested_capabilities,
         max_duration_seconds=default_config.max_duration_seconds,
     )

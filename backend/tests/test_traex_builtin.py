@@ -300,6 +300,35 @@ async def test_native_context_output_and_billable_budgets_are_separate(
     assert result.total_tokens == 31605
 
 
+async def test_local_demo_default_budget_allows_long_agent_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host defaults must not turn long Demo tasks into budget failures."""
+
+    monkeypatch.setattr(get_settings(), "artifact_root", tmp_path)
+    executable = _fake_native_terminal(
+        tmp_path,
+        event_type="turn.completed",
+        output='{"reply":"long-task-ok"}',
+        input_tokens=600000,
+        output_tokens=100000,
+    )
+    result = await AgentHost(
+        adapter=TraeXBuiltinAdapter([str(executable)])
+    ).execute(
+        AgentHostRequest(
+            run_id="native-long-task-default",
+            prompt="long task",
+            output_schema=OUTPUT_SCHEMA,
+            working_directory=tmp_path / "long-task-default",
+        )
+    )
+
+    assert result.output == {"reply": "long-task-ok"}
+    assert result.total_tokens == 700000
+
+
 async def test_builtin_bridge_rejects_untrusted_working_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

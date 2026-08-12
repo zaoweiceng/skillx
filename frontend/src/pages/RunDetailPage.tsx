@@ -42,6 +42,16 @@ export default function RunDetailPage() {
     ReturnType<typeof api.getRunTechnicalError>
   > | null>(null)
   const [loadingTechnicalEvidence, setLoadingTechnicalEvidence] = useState(false)
+  const [copyFeedback, setCopyFeedback] = useState('')
+
+  async function copyResult(value: string, kind: 'json' | 'text') {
+    try {
+      await navigator.clipboard.writeText(value)
+      setCopyFeedback(`${kind}:ok`)
+    } catch {
+      setCopyFeedback(`${kind}:failed`)
+    }
+  }
 
   const refresh = useCallback(() => {
     if (!id) return
@@ -321,11 +331,14 @@ export default function RunDetailPage() {
               <button
                 className="button ghost"
                 type="button"
-                onClick={() =>
-                  navigator.clipboard.writeText(JSON.stringify(run.output, null, 2))
-                }
+                onClick={() => void copyResult(JSON.stringify(run.output, null, 2), 'json')}
               >
-                <Copy size={13} /> 复制 JSON
+                <Copy size={13} />{' '}
+                {copyFeedback === 'json:ok'
+                  ? '已复制 JSON'
+                  : copyFeedback === 'json:failed'
+                    ? '复制失败'
+                    : '复制 JSON'}
               </button>
             )}
           </div>
@@ -376,11 +389,14 @@ export default function RunDetailPage() {
               <button
                 className="button ghost"
                 type="button"
-                onClick={() =>
-                  navigator.clipboard.writeText(run.presentation?.text ?? '')
-                }
+                onClick={() => void copyResult(run.presentation?.text ?? '', 'text')}
               >
-                <Copy size={13} /> 复制文本
+                <Copy size={13} />{' '}
+                {copyFeedback === 'text:ok'
+                  ? '已复制文本'
+                  : copyFeedback === 'text:failed'
+                    ? '复制失败'
+                    : '复制文本'}
               </button>
             )}
           </div>

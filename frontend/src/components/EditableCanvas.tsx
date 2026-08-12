@@ -14,7 +14,7 @@ import {
 import { useCallback, useMemo } from 'react'
 
 import type { NodeDefinition, WorkflowDefinition } from '@/api/client'
-import { layerNodes } from '@/lib/workflowLayout'
+import { edgeLabel, layerNodes } from '@/lib/workflowLayout'
 
 import '@xyflow/react/dist/style.css'
 
@@ -90,7 +90,7 @@ export function EditableCanvas({
       id: `${edge.source}-${edge.target}-${index}`,
       source: edge.source,
       target: edge.target,
-      label: edge.when === undefined ? undefined : String(edge.when),
+      label: edgeLabel(edge.when),
       markerEnd: { type: MarkerType.ArrowClosed, color: '#72838a' },
       style: { stroke: '#72838a', strokeWidth: 1.5 },
     }))

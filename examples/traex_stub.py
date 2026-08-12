@@ -240,12 +240,25 @@ def main() -> int:
     parser.add_argument("--output-schema", default="{}")
     args = parser.parse_args()
 
+    terminal_task = re.search(r"(?:^|\n)taskData=(\"(?:\\.|[^\"])*\")", args.prompt)
+    if terminal_task:
+        args.prompt = json.loads(terminal_task.group(1))
+
     mode = _directive(args.prompt, "MODE", "ok")
     reply = _directive(args.prompt, "REPLY", "已完成任务")
     allowed = json.loads(args.allowed_tools) if args.allowed_tools else []
     output_schema = json.loads(args.output_schema) if args.output_schema else {}
 
     if "Progressive WorkflowSelection" in args.prompt:
+        use_catalog = "workflow.catalog" in allowed
+
+        def catalog_call(
+            legacy_capability: str, action: str, arguments: dict[str, Any]
+        ) -> tuple[str, dict[str, Any]]:
+            if use_catalog:
+                return "workflow.catalog", {"action": action, **arguments}
+            return legacy_capability, arguments
+
         user_match = re.search(r"user=(.*)", args.prompt)
         user_text = user_match.group(1).strip() if user_match else _clean_message(args.prompt)
         message_id_match = re.search(r"userMessageId=([^\s]+)", args.prompt)
@@ -254,13 +267,16 @@ def main() -> int:
         )
         requested_action = _directive(args.prompt, "SELECTION", "auto")
         emit({"type": "agent.plan", "payload": {"summary": "渐进发现 Workflow"}})
+        search_capability, search_arguments = catalog_call(
+            "workflow.search", "search", {"query": user_text, "limit": 5}
+        )
         emit(
             {
                 "type": "tool.requested",
                 "payload": {
                     "callId": "workflow-search",
-                    "capabilityRef": "workflow.search",
-                    "arguments": {"query": user_text, "limit": 5},
+                    "capabilityRef": search_capability,
+                    "arguments": search_arguments,
                 },
             }
         )
@@ -292,13 +308,16 @@ def main() -> int:
             )
             return 0
         workflow_ref = cards[0]["workflowRef"]
+        describe_capability, describe_arguments = catalog_call(
+            "workflow.describe", "describe", {"ref": workflow_ref}
+        )
         emit(
             {
                 "type": "tool.requested",
                 "payload": {
                     "callId": "workflow-describe",
-                    "capabilityRef": "workflow.describe",
-                    "arguments": {"ref": workflow_ref},
+                    "capabilityRef": describe_capability,
+                    "arguments": describe_arguments,
                 },
             }
         )
@@ -353,13 +372,18 @@ def main() -> int:
                 }
             else:
                 fragment_ref = fragments[0]["fragmentRef"]
+                fragment_capability, fragment_arguments = catalog_call(
+                    "workflow.describe_fragment",
+                    "describe_fragment",
+                    {"ref": fragment_ref},
+                )
                 emit(
                     {
                         "type": "tool.requested",
                         "payload": {
                             "callId": "workflow-describe-fragment",
-                            "capabilityRef": "workflow.describe_fragment",
-                            "arguments": {"ref": fragment_ref},
+                            "capabilityRef": fragment_capability,
+                            "arguments": fragment_arguments,
                         },
                     }
                 )
@@ -420,13 +444,16 @@ def main() -> int:
                     for key in output_schema.get("properties", {})
                 },
             }
+            compile_capability, compile_arguments = catalog_call(
+                "workflow.compile_plan", "compile_plan", {"plan": plan}
+            )
             emit(
                 {
                     "type": "tool.requested",
                     "payload": {
                         "callId": "workflow-compile",
-                        "capabilityRef": "workflow.compile_plan",
-                        "arguments": {"plan": plan},
+                        "capabilityRef": compile_capability,
+                        "arguments": compile_arguments,
                     },
                 }
             )

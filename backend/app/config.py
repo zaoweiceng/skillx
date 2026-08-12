@@ -57,6 +57,7 @@ class Settings(BaseSettings):
         "read.local",
         "lookup.table",
         "summarize.text",
+        "workflow.catalog",
         "workflow.search",
         "workflow.describe",
         "workflow.describe_fragment",
@@ -64,13 +65,17 @@ class Settings(BaseSettings):
         "workflow.compile_plan",
     ]
     agent_max_steps: int = 6
-    agent_max_total_tokens: int = 30000
-    agent_max_input_tokens: int = 40000
-    agent_max_output_tokens: int = 8000
-    agent_max_billable_tokens: int = 48000
-    provider_probe_max_input_tokens: int = 40000
-    provider_probe_max_output_tokens: int = 1000
-    provider_probe_max_billable_tokens: int = 41000
+    # Local Demo prioritizes long-running task completion over cost control.
+    # These remain finite fail-closed guards, but are intentionally far above
+    # TraeX's observed ~31k fixed input context so Host policy is not the
+    # practical bottleneck. Provider/model context limits may still be lower.
+    agent_max_total_tokens: int = 1250000
+    agent_max_input_tokens: int = 1000000
+    agent_max_output_tokens: int = 250000
+    agent_max_billable_tokens: int = 1250000
+    provider_probe_max_input_tokens: int = 1000000
+    provider_probe_max_output_tokens: int = 250000
+    provider_probe_max_billable_tokens: int = 1250000
     provider_probe_estimated_input_tokens: int = 32000
     agent_max_duration_seconds: int = 120
     agent_max_event_payload_bytes: int = 65536

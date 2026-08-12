@@ -216,6 +216,9 @@ class TaskCheckpointDriver:
                 output_schema=source_config.output_schema,
                 max_steps=max(1, source_config.max_steps - len(completed)),
                 max_total_tokens=source_config.max_total_tokens,
+                max_input_tokens=source_config.max_input_tokens,
+                max_output_tokens=source_config.max_output_tokens,
+                max_billable_tokens=source_config.max_billable_tokens,
                 allowed_capabilities=allowed,
                 max_duration_seconds=source_config.max_duration_seconds,
             )

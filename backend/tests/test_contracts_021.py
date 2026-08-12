@@ -150,6 +150,39 @@ def test_presentation_decision_is_explicit_and_digest_bound() -> None:
         validate_presentation_decision(metadata)
 
 
+def test_presentation_decision_status_matches_actual_policy_change() -> None:
+    proposal = {
+        "enabled": True,
+        "producer": "template",
+        "template": "结果：{message}",
+        "prompt": "",
+        "language": "zh-CN",
+        "maxLength": 2000,
+        "reason": "direct human result",
+    }
+    proposal_policy = {
+        "enabled": True,
+        "audience": "end_user",
+        "producer": "template",
+        "template": "结果：{message}",
+        "prompt": "",
+        "language": "zh-CN",
+        "maxLength": 2000,
+    }
+    metadata = {
+        "presentationPolicyProposal": proposal,
+        "presentationPolicy": {**proposal_policy, "template": "修改：{message}"},
+        "presentationPolicyDecision": {"status": "accepted"},
+    }
+    with pytest.raises(ValueError, match="modified"):
+        bind_presentation_decision(metadata)
+
+    metadata["presentationPolicy"] = proposal_policy
+    metadata["presentationPolicyDecision"] = {"status": "modified"}
+    with pytest.raises(ValueError, match="accepted"):
+        bind_presentation_decision(metadata)
+
+
 def test_public_error_hides_and_technical_view_bounds_diagnostics() -> None:
     durable = persisted_error(
         {

@@ -94,10 +94,10 @@ class AgentRunConfig:
 
     output_schema: dict[str, Any]
     max_steps: int = 6
-    max_total_tokens: int = 30000
-    max_input_tokens: int = 40000
-    max_output_tokens: int = 8000
-    max_billable_tokens: int = 48000
+    max_total_tokens: int = 1250000
+    max_input_tokens: int = 1000000
+    max_output_tokens: int = 250000
+    max_billable_tokens: int = 1250000
     allowed_capabilities: tuple[str, ...] = ()
     max_duration_seconds: int = 120
 
@@ -191,6 +191,7 @@ async def enqueue_agent_run(
     config: AgentRunConfig | None = None,
     prompt: str | None = None,
     turn_id: str | None = None,
+    semantic_context: dict[str, Any] | None = None,
 ) -> ConversationRun:
     """先持久化、后执行：在短事务内创建 ``queued`` run 与 created 事件并返回 handle。
 
@@ -206,7 +207,17 @@ async def enqueue_agent_run(
         turn_id=turn_id,
         status="queued",
         run_type="agent_run",
-        input_json={"message": content, "prompt": prompt if prompt is not None else content},
+        input_json={
+            "message": content,
+            "prompt": prompt if prompt is not None else content,
+            "semanticContext": semantic_context
+            or {
+                "resultConsumer": "human",
+                "entrypointKind": "top_level",
+                "topLevelReply": True,
+                "intendedAsFragment": False,
+            },
+        },
         output_json={},
         trajectory_json={},
         config_json=config.to_dict(),
@@ -583,6 +594,7 @@ class AgentRunWorker:
             result.total_tokens,
             claim_generation,
             claim_token,
+            semantic_context=dict(run.input_json.get("semanticContext") or {}),
             usage_complete=result.usage_complete,
             request_dispatched=result.request_dispatched,
             accepted_plan_digest=result.accepted_plan_digest,
@@ -1062,6 +1074,7 @@ class AgentRunWorker:
         claim_generation: int,
         claim_token: str | None,
         *,
+        semantic_context: dict[str, Any] | None = None,
         usage_complete: bool = True,
         request_dispatched: bool = True,
         accepted_plan_digest: str | None = None,
@@ -1082,7 +1095,15 @@ class AgentRunWorker:
         staged = self._stage_trajectory(
             run_id, raw_events, output, claim_token or "unclaimed"
         )
-        trajectory = build_trajectory(config, prompt, output, actions, step_count, staged["uri"])
+        trajectory = build_trajectory(
+            config,
+            prompt,
+            output,
+            actions,
+            step_count,
+            staged["uri"],
+            semantic_context=semantic_context,
+        )
         trajectory["planLineage"] = {
             "acceptedPlanDigest": accepted_plan_digest,
             "acceptedPlanRevision": accepted_plan_revision,
@@ -1751,6 +1772,8 @@ def build_trajectory(
     actions: list[dict[str, Any]],
     step_count: int,
     artifact_uri: str | None = None,
+    *,
+    semantic_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """把一次成功的 Agent 运行归一化为可提炼的规范化轨迹（脱敏后入库）。
 
@@ -1799,6 +1822,20 @@ def build_trajectory(
         "actions": cleaned_actions,
         "output": redact(output),
         "outputProvenance": output_provenance,
+        "semanticContext": {
+            "resultConsumer": str(
+                (semantic_context or {}).get("resultConsumer", "unknown")
+            ),
+            "entrypointKind": str(
+                (semantic_context or {}).get("entrypointKind", "unknown")
+            ),
+            "topLevelReply": (semantic_context or {}).get(
+                "topLevelReply", "unknown"
+            ),
+            "intendedAsFragment": (semantic_context or {}).get(
+                "intendedAsFragment", "unknown"
+            ),
+        },
         "config": {
             "maxSteps": config.max_steps,
             "maxTotalTokens": config.max_total_tokens,

@@ -122,6 +122,25 @@ async def consume_session_call(
     return call
 
 
+async def require_catalog_action(
+    session: AsyncSession, session_id: str, action: str
+) -> None:
+    """Enforce the narrow catalog tool's server-owned disclosure state.
+
+    A fresh session can only search. Later operations are additionally guarded
+    by the existing disclosed-ref checks in their concrete adapters.
+    """
+
+    await _active_disclosure_session(session, session_id)
+    previous_calls = await session.scalar(
+        select(func.count())
+        .select_from(WorkflowDisclosureCall)
+        .where(WorkflowDisclosureCall.session_id == session_id)
+    )
+    if not previous_calls and action != "search":
+        raise CatalogError("新 disclosure session 的第一个 action 必须是 search")
+
+
 async def record_disclosure_response(
     session: AsyncSession,
     call_id: str,

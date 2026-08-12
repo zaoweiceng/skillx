@@ -658,6 +658,7 @@ class AgentExecutor:
         async def cancellation() -> bool:
             return context.cancellation.cancelled
 
+        settings = get_settings()
         request = AgentHostRequest(
             run_id=context.node_run_id,
             prompt=node.config.get("prompt", "")
@@ -667,7 +668,21 @@ class AgentExecutor:
             working_directory=get_settings().artifact_root / context.run_id / f"agent-{node.id}",
             requested_capabilities=tuple(node.config.get("allowedCapabilities", [])),
             max_steps=int(node.config["maxSteps"]),
-            max_total_tokens=int(node.config.get("maxTotalTokens", 30000)),
+            max_total_tokens=max(
+                int(node.config.get("maxTotalTokens", 0)),
+                settings.agent_max_total_tokens,
+            ),
+            max_input_tokens=int(
+                node.config.get("maxInputTokens", settings.agent_max_input_tokens)
+            ),
+            max_output_tokens=int(
+                node.config.get("maxOutputTokens", settings.agent_max_output_tokens)
+            ),
+            max_billable_tokens=int(
+                node.config.get(
+                    "maxBillableTokens", settings.agent_max_billable_tokens
+                )
+            ),
             max_duration_seconds=int(node.config.get("maxDurationSeconds", node.timeout_seconds)),
         )
         try:

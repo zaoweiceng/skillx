@@ -20,7 +20,13 @@ from app.application.compiler import WorkflowCompiler
 from app.application.orchestrator import WorkerService
 from app.application.plans import WorkflowSelection
 from app.application.runtime_config import semantic_workflow_selection_available
-from app.application.workflow_catalog import build_manifest, create_disclosure_session
+from app.application.tool_broker import ToolExecutionContext
+from app.application.workflow_catalog import (
+    CatalogError,
+    build_manifest,
+    create_disclosure_session,
+)
+from app.application.workflow_tool_broker import workflow_catalog_adapter
 from app.config import get_settings
 from app.infrastructure.database import (
     Conversation,
@@ -37,6 +43,29 @@ from app.infrastructure.database import (
 )
 
 STUB = Path(__file__).resolve().parents[2] / "examples" / "traex_stub.py"
+
+
+async def test_narrow_catalog_requires_search_as_first_server_action() -> None:
+    async with SessionLocal() as session, session.begin():
+        disclosure = await create_disclosure_session(session)
+        adapter = workflow_catalog_adapter(session, disclosure.id)
+        assert adapter.capability_ref == "workflow.catalog"
+        assert adapter.input_schema["properties"]["action"]["enum"] == [
+            "search",
+            "describe",
+            "describe_fragment",
+            "slice",
+            "compile_plan",
+        ]
+        with pytest.raises(CatalogError, match="第一个 action 必须是 search"):
+            await adapter.execute(
+                ToolExecutionContext(
+                    run_id="selection-test",
+                    call_id="describe-first",
+                    working_directory=Path("."),
+                ),
+                {"action": "describe", "ref": "workflow:invented"},
+            )
 
 
 def greeting_definition() -> dict:

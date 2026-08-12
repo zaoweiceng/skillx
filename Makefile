@@ -1,4 +1,4 @@
-.PHONY: demo-check quality-check backend-check browser-install browser-check frontend-check migration-check e2e-check browser-ui-check doc-chain-check traex-real-check
+.PHONY: demo-check quality-check backend-check browser-install browser-check frontend-check migration-check e2e-check browser-ui-check doc-chain-check traex-real-check traex-real-product-check
 
 UV_CACHE_DIR ?= /tmp/skillx-workflow-uv-cache
 export UV_CACHE_DIR
@@ -35,10 +35,15 @@ browser-ui-check: browser-check
 	cd backend && uv run ruff check browser_e2e
 	cd backend && uv run pytest browser_e2e -q -p no:cacheprovider
 
-# Opt-in, potentially billable gate. It only accepts the actual `traex` from PATH;
+# Opt-in real-provider gate. It only accepts the actual `traex` from PATH;
 # missing/expired login is reported as skipped and is never replaced by a fixture.
 traex-real-check:
-	cd backend && SKILLX_RUN_TRAEX_REAL_CHECK=1 uv run pytest real_provider_tests -q -rs -p no:cacheprovider
+	cd backend && SKILLX_RUN_TRAEX_REAL_CHECK=1 uv run pytest real_provider_tests/test_traex_real.py -q -rs -p no:cacheprovider
+
+# Opt-in product gate: actual PATH traex + fresh SQLite + independent API/Worker.
+# It is deliberately separate from the quick protocol probe.
+traex-real-product-check:
+	cd backend && SKILLX_RUN_TRAEX_REAL_PRODUCT_CHECK=1 uv run pytest real_provider_tests/test_traex_product_real.py -q -rs -p no:cacheprovider
 
 frontend-check:
 	cd frontend && npm run check

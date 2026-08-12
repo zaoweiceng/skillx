@@ -16,6 +16,7 @@ from app.application.workflow_catalog import (
     describe_workflow,
     disclose_refs,
     record_disclosure_response,
+    require_catalog_action,
     require_disclosed_ref,
     require_plan_refs_disclosed,
     resolve_workflow_manifest,
@@ -268,6 +269,83 @@ class WorkflowCompilePlanAdapter(_WorkflowToolBase):
         return response
 
 
+class WorkflowCatalogAdapter(_WorkflowToolBase):
+    """One narrow descriptor; disclosure depth remains server controlled."""
+
+    capability_ref = "workflow.catalog"
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "search",
+                    "describe",
+                    "describe_fragment",
+                    "slice",
+                    "compile_plan",
+                ],
+            },
+            "query": {"type": "string", "minLength": 1, "maxLength": 2000},
+            "constraints": {"type": "object"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 8},
+            "ref": {"type": "string", "minLength": 1},
+            "workflowRef": {"type": "string", "minLength": 1},
+            "intent": {"type": "string", "minLength": 1, "maxLength": 500},
+            "candidateNodeIds": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": 20,
+            },
+            "plan": {"type": "object"},
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+        "allOf": [
+            {
+                "if": {"properties": {"action": {"const": "search"}}},
+                "then": {"required": ["query"]},
+            },
+            {
+                "if": {
+                    "properties": {
+                        "action": {"enum": ["describe", "describe_fragment"]}
+                    }
+                },
+                "then": {"required": ["ref"]},
+            },
+            {
+                "if": {"properties": {"action": {"const": "slice"}}},
+                "then": {"required": ["workflowRef", "intent"]},
+            },
+            {
+                "if": {"properties": {"action": {"const": "compile_plan"}}},
+                "then": {"required": ["plan"]},
+            },
+        ],
+    }
+
+    async def execute(
+        self, context: ToolExecutionContext, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        action = str(arguments["action"])
+        await require_catalog_action(self.session, self.disclosure_session_id, action)
+        adapters: dict[str, _WorkflowToolBase] = {
+            "search": WorkflowSearchAdapter(self.session, self.disclosure_session_id),
+            "describe": WorkflowDescribeAdapter(self.session, self.disclosure_session_id),
+            "describe_fragment": WorkflowDescribeFragmentAdapter(
+                self.session, self.disclosure_session_id
+            ),
+            "slice": WorkflowSliceAdapter(self.session, self.disclosure_session_id),
+            "compile_plan": WorkflowCompilePlanAdapter(
+                self.session, self.disclosure_session_id
+            ),
+        }
+        payload = {key: value for key, value in arguments.items() if key != "action"}
+        output = await adapters[action].execute(context, payload)
+        return {"action": action, **output}
+
+
 def workflow_tool_adapters(
     session: AsyncSession, disclosure_session_id: str
 ) -> list[_WorkflowToolBase]:
@@ -278,3 +356,9 @@ def workflow_tool_adapters(
         WorkflowSliceAdapter(session, disclosure_session_id),
         WorkflowCompilePlanAdapter(session, disclosure_session_id),
     ]
+
+
+def workflow_catalog_adapter(
+    session: AsyncSession, disclosure_session_id: str
+) -> WorkflowCatalogAdapter:
+    return WorkflowCatalogAdapter(session, disclosure_session_id)

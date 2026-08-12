@@ -119,7 +119,7 @@ export SKILLX_AGENT_API_KEY='<provider-api-key>'
 
 `fixture` 只用于协议和故障测试，并标记为 `protocolTestOnly`；它不会让 Chat 的自动工作流
 选择进入可用状态。仓库内 `openai_agent_sidecar.py` 按内容 digest 自动受信；其他 adapter
-必须单独配置可信 digest。配置完成后在 Settings 显式执行会产生真实费用的 Provider 探测，
+必须单独配置可信 digest。配置完成后在 Settings 显式执行真实 Provider 探测，
 探测成功且未过期时才开放语义选择。Secret 值不得写入工作流定义、事件或 Artifact。
 
 ## 验证
@@ -145,8 +145,10 @@ npm run build
   验证 fixture 协议 Agent（工作流关闭）、固化发布、显式组件复用、terminal output、
   成功/失败运行详情，以及真实 Browser 503 接力结果自动返回原 Conversation。真实语义
   自动选择需另行配置 `traex_managed` 或 `openai_sidecar`，fixture 不计作该项证据。
-- `make traex-real-check`：显式授权可能产生费用的真实 PATH `traex` 探测；未安装或登录失效只报告
+- `make traex-real-check`：执行真实 PATH `traex` 探测；未安装或登录失效只报告
   skipped/blocked，绝不以 fixture 替代。
+- `make traex-real-product-check`：在全新 SQLite、独立 API/Worker 中验证真实 TraeX 的
+  workflow-on、workflow-off 与运行中取消；未显式执行时不计作通过。
 
 测试覆盖双 Worker fencing/CAS、原子并发配额、取消、超时、并行汇聚、SkillX 版本锁定、
 MCP STDIO/HTTP 与契约漂移、Hybrid/真实 TraeX Agent、轨迹固化与发布复用、浏览器一次性

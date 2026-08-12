@@ -178,10 +178,10 @@ class AgentStructuredGenerationAdapter:
                     working_directory=request.working_directory,
                     requested_capabilities=(),
                     max_steps=1,
-                    max_total_tokens=min(
-                        settings.agent_max_total_tokens,
-                        max(1, request.max_output_tokens * 8),
-                    ),
+                    max_total_tokens=settings.agent_max_total_tokens,
+                    max_input_tokens=settings.agent_max_input_tokens,
+                    max_output_tokens=settings.agent_max_output_tokens,
+                    max_billable_tokens=settings.agent_max_billable_tokens,
                     max_duration_seconds=settings.agent_max_duration_seconds,
                 )
             )
