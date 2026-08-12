@@ -119,6 +119,12 @@ class AgentHostRequest:
     requested_capabilities: tuple[str, ...] = ()
     max_steps: int = 6
     max_total_tokens: int = 30000
+    # Native runtimes may carry a large, mostly fixed system/tool context. Keep
+    # context, generated output and billable total as separate frozen limits.
+    # ``max_total_tokens`` remains the legacy ceiling for existing callers.
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    max_billable_tokens: int | None = None
     max_duration_seconds: int = 120
     completed_actions: tuple[dict[str, Any], ...] = ()
     expected_plan: ExpectedPlanContract | None = None
@@ -279,7 +285,26 @@ class AgentHost:
             ),
             max_steps=request.max_steps,
             max_tokens=request.max_total_tokens,
+            max_input_tokens=(
+                request.max_input_tokens
+                if request.max_input_tokens is not None
+                else request.max_total_tokens
+            ),
+            max_output_tokens=(
+                request.max_output_tokens
+                if request.max_output_tokens is not None
+                else request.max_total_tokens
+            ),
+            max_billable_tokens=(
+                request.max_billable_tokens
+                if request.max_billable_tokens is not None
+                else request.max_total_tokens
+            ),
         )
+
+        max_input_tokens = run_request.max_input_tokens
+        max_output_tokens = run_request.max_output_tokens
+        max_billable_tokens = run_request.max_billable_tokens
 
         runtime = agent_runtime_config()
         result = AgentHostResult(
@@ -735,11 +760,23 @@ class AgentHost:
                                 "STEP_BUDGET_EXCEEDED",
                                 f"Agent 步数超过 Host 上限 {request.max_steps}",
                             )
-                        if result.total_tokens > request.max_total_tokens:
+                        if result.input_tokens > max_input_tokens:
                             await self._cancel(adapter, request.run_id)
                             raise AgentHostError(
                                 "TOKEN_BUDGET_EXCEEDED",
-                                f"Agent Token 超过 Host 上限 {request.max_total_tokens}",
+                                f"Agent 输入上下文超过 Host 上限 {max_input_tokens}",
+                            )
+                        if result.output_tokens > max_output_tokens:
+                            await self._cancel(adapter, request.run_id)
+                            raise AgentHostError(
+                                "TOKEN_BUDGET_EXCEEDED",
+                                f"Agent 输出 Token 超过 Host 上限 {max_output_tokens}",
+                            )
+                        if result.total_tokens > max_billable_tokens:
+                            await self._cancel(adapter, request.run_id)
+                            raise AgentHostError(
+                                "TOKEN_BUDGET_EXCEEDED",
+                                f"Agent 可计费 Token 超过 Host 上限 {max_billable_tokens}",
                             )
                     elif event_type == "agent.completed":
                         output = payload.get("output")
@@ -781,12 +818,12 @@ class AgentHost:
                                     "AGENT_EVENT_INVALID",
                                     "agent.completed.totalTokens 小于步骤累计值，审计不一致",
                                 )
-                            if final_tokens > request.max_total_tokens:
+                            if final_tokens > max_billable_tokens:
                                 await self._cancel(adapter, request.run_id)
                                 raise AgentHostError(
                                     "TOKEN_BUDGET_EXCEEDED",
                                     f"终态 Token {final_tokens} 超过 Host 上限 "
-                                    f"{request.max_total_tokens}",
+                                    f"{max_billable_tokens}",
                                 )
                             result.total_tokens = final_tokens
                     elif event_type == "agent.failed":
@@ -861,6 +898,10 @@ class AgentHost:
                 getattr(exc, "code", "EXECUTION_FAILED"),
                 str(exc),
                 request_dispatched=result.request_dispatched,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                total_tokens=result.total_tokens,
+                usage_complete=result.usage_complete,
             ) from exc
 
         if output is None and failed_tool_result is not None:

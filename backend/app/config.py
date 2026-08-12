@@ -65,6 +65,13 @@ class Settings(BaseSettings):
     ]
     agent_max_steps: int = 6
     agent_max_total_tokens: int = 30000
+    agent_max_input_tokens: int = 40000
+    agent_max_output_tokens: int = 8000
+    agent_max_billable_tokens: int = 48000
+    provider_probe_max_input_tokens: int = 40000
+    provider_probe_max_output_tokens: int = 1000
+    provider_probe_max_billable_tokens: int = 41000
+    provider_probe_estimated_input_tokens: int = 32000
     agent_max_duration_seconds: int = 120
     agent_max_event_payload_bytes: int = 65536
     agent_lease_seconds: int = 30

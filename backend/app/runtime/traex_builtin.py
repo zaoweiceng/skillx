@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import uvicorn
 from fastapi import FastAPI, Request, Response
+from jsonschema import Draft202012Validator
 
 from app.config import get_settings
 
@@ -119,6 +120,58 @@ def _error_code(stderr: str, events: list[dict[str, Any]]) -> str:
     if "timed out" in text or "timeout" in text:
         return "TIMEOUT"
     return "AGENT_PROTOCOL_INCOMPATIBLE"
+
+
+def _usage(event: dict[str, Any]) -> dict[str, int]:
+    raw = event.get("usage")
+    if not isinstance(raw, dict):
+        return {}
+    input_tokens = int(raw.get("input_tokens") or raw.get("inputTokens") or 0)
+    output_tokens = int(raw.get("output_tokens") or raw.get("outputTokens") or 0)
+    total_tokens = int(
+        raw.get("total_tokens")
+        or raw.get("totalTokens")
+        or input_tokens + output_tokens
+    )
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _safe_event_summary(event: dict[str, Any]) -> dict[str, Any]:
+    """Keep protocol evidence without retaining prompts, messages or tool payloads."""
+
+    summary: dict[str, Any] = {"type": str(event.get("type") or "<missing>")[:80]}
+    for key in ("version", "thread_id", "turn_id", "request_id"):
+        value = event.get(key)
+        if isinstance(value, (str, int)):
+            summary[key] = str(value)[:120]
+    item = event.get("item")
+    if isinstance(item, dict):
+        summary["itemType"] = str(item.get("type") or "<missing>")[:80]
+        for key in ("id", "request_id"):
+            value = item.get(key)
+            if isinstance(value, (str, int)):
+                summary[f"item_{key}"] = str(value)[:120]
+    if isinstance(event.get("usage"), dict):
+        summary["usage"] = _usage(event)
+    return summary
+
+
+def _native_error_message(event: dict[str, Any]) -> str:
+    error = event.get("error")
+    if isinstance(error, dict):
+        for key in ("message", "detail", "code"):
+            if error.get(key):
+                return str(error[key])[:2000]
+    if isinstance(error, str):
+        return error[:2000]
+    for key in ("message", "detail"):
+        if event.get(key):
+            return str(event[key])[:2000]
+    return "TraeX 原生事件报告运行失败"
 
 
 def _runtime_identity(events: list[dict[str, Any]]) -> tuple[str | None, str | None]:
@@ -241,10 +294,14 @@ class TraeXBuiltinAdapter:
         self._processes[run_id] = process
         self._tool_evidence[run_id] = []
         raw_events: list[dict[str, Any]] = []
+        safe_event_summaries: list[dict[str, Any]] = []
         stderr_task = asyncio.create_task(process.stderr.read())
         dispatched = False
         usage: dict[str, int] = {}
         last_message = ""
+        turn_completed = False
+        native_failure: dict[str, Any] | None = None
+        recognized_events = 0
         try:
             if process.stdout is None:
                 raise TraeXBridgeError(
@@ -273,16 +330,29 @@ class TraeXBuiltinAdapter:
                         "AGENT_PROTOCOL_INCOMPATIBLE",
                         "TraeX JSONL 包含无法解析的事件",
                     ) from exc
+                if not isinstance(event, dict):
+                    raise TraeXBridgeError(
+                        "AGENT_PROTOCOL_INCOMPATIBLE",
+                        "TraeX JSONL 事件不是对象",
+                    )
                 raw_events.append(event)
+                safe_event_summaries.append(_safe_event_summary(event))
                 event_type = event.get("type")
                 item = event.get("item") or {}
+                if event_type in {
+                    "thread.started",
+                    "turn.started",
+                    "item.started",
+                    "item.completed",
+                    "turn.completed",
+                    "turn.failed",
+                    "error",
+                }:
+                    recognized_events += 1
                 if (
-                    event_type in {"item.started", "item.completed", "turn.completed"}
-                    and (
-                        event_type == "turn.completed"
-                        or item.get("type")
-                        in {"agent_message", "reasoning", "mcp_tool_call"}
-                    )
+                    event_type in {"item.started", "item.completed"}
+                    and item.get("type")
+                    in {"agent_message", "reasoning", "mcp_tool_call"}
                     and not dispatched
                 ):
                     dispatched = True
@@ -291,7 +361,13 @@ class TraeXBuiltinAdapter:
                         "payload": {"attempt": 1},
                     }
                 if event_type == "turn.completed":
-                    usage = dict(event.get("usage") or {})
+                    turn_completed = True
+                    usage = _usage(event)
+                elif event_type in {"turn.failed", "error"}:
+                    # Native failed terminals are authoritative even when the
+                    # CLI exits 0 or happened to leave an output file behind.
+                    native_failure = event
+                    usage = _usage(event) or usage
                 elif event_type == "item.completed":
                     if item.get("type") == "agent_message":
                         last_message = str(item.get("text") or "")
@@ -300,27 +376,6 @@ class TraeXBuiltinAdapter:
                 await tool_task
             code = await process.wait()
             stderr = (await stderr_task).decode(errors="replace")
-            if code != 0:
-                error_code = _error_code(stderr, raw_events)
-                # 认证失败、模型不可用、限流或工作目录不受信都可能发生在任何模型请求之前
-                # （甚至在网关预检阶段）。没有 TraeX 明确 dispatch 事件时不得伪造
-                # model.request.dispatched：dispatched 保持 false，attempted 由上层单独记录。
-                raise TraeXBridgeError(
-                    error_code,
-                    stderr.strip() or f"TraeX 进程退出码: {code}",
-                )
-            output_text = (
-                output_path.read_text(encoding="utf-8")
-                if output_path.is_file()
-                else last_message
-            )
-            try:
-                output = json.loads(output_text)
-            except json.JSONDecodeError as exc:
-                raise TraeXBridgeError(
-                    "AGENT_PROTOCOL_INCOMPATIBLE",
-                    "TraeX 未返回严格 JSON 终态",
-                ) from exc
             input_tokens = int(usage.get("input_tokens") or 0)
             output_tokens = int(usage.get("output_tokens") or 0)
             total_tokens = int(
@@ -335,6 +390,62 @@ class TraeXBuiltinAdapter:
                         "outputTokens": output_tokens,
                     },
                 }
+            if native_failure is not None:
+                native_message = _native_error_message(native_failure)
+                seen_types = ",".join(
+                    str(item.get("type")) for item in safe_event_summaries[-12:]
+                )
+                message = (
+                    f"{native_message} [nativeTerminal={native_failure.get('type')};"
+                    f" events={seen_types}]"
+                )
+                error_code = _error_code(
+                    f"{stderr}\n{message}", safe_event_summaries
+                )
+                raise TraeXBridgeError(error_code, message)
+            if code != 0:
+                error_code = _error_code(stderr, safe_event_summaries)
+                # 认证失败、模型不可用、限流或工作目录不受信都可能发生在任何模型请求之前
+                # （甚至在网关预检阶段）。没有 TraeX 明确 dispatch 事件时不得伪造
+                # model.request.dispatched：dispatched 保持 false，attempted 由上层单独记录。
+                raise TraeXBridgeError(
+                    error_code,
+                    stderr.strip() or f"TraeX 进程退出码: {code}",
+                )
+            if not turn_completed:
+                evidence = ", ".join(
+                    str(item.get("type")) for item in safe_event_summaries[-8:]
+                )
+                raise TraeXBridgeError(
+                    "AGENT_PROTOCOL_INCOMPATIBLE",
+                    "TraeX 未报告受支持的 turn.completed 终态"
+                    + (f"；已见事件: {evidence}" if recognized_events else ""),
+                )
+            output_text = (
+                output_path.read_text(encoding="utf-8")
+                if output_path.is_file()
+                else last_message
+            )
+            try:
+                output = json.loads(output_text)
+            except json.JSONDecodeError as exc:
+                raise TraeXBridgeError(
+                    "MODEL_MALFORMED_OUTPUT",
+                    "TraeX 未返回严格 JSON 终态",
+                ) from exc
+            if not isinstance(output, dict):
+                raise TraeXBridgeError(
+                    "MODEL_MALFORMED_OUTPUT",
+                    "TraeX 严格 JSON 终态不是对象",
+                )
+            schema_errors = list(
+                Draft202012Validator(request.output_schema).iter_errors(output)
+            )
+            if schema_errors:
+                raise TraeXBridgeError(
+                    "MODEL_MALFORMED_OUTPUT",
+                    f"TraeX JSON 终态不符合 output schema: {schema_errors[0].message}",
+                )
             evidence = self._tool_evidence.get(run_id, [])
             provider, model = _runtime_identity(raw_events)
             provenance = {
@@ -358,6 +469,10 @@ class TraeXBuiltinAdapter:
                     "outputProvenance": provenance,
                     "provider": provider or "traex",
                     "model": model,
+                    "nativeProtocol": {
+                        "terminal": "turn.completed",
+                        "events": safe_event_summaries[-40:],
+                    },
                 },
             }
         finally:

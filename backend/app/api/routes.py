@@ -73,12 +73,14 @@ from app.application.plans import (
     verify_plan_snapshot,
 )
 from app.application.product_history import (
+    bind_presentation_decision,
     finalize_turn,
     normalize_presentation_policy,
     presentation_policy,
     presentation_view,
     record_model_usage,
     turn_view,
+    validate_presentation_decision,
     validate_presentation_template,
 )
 from app.application.replay import run_isolated_replay, run_replay_proof
@@ -709,6 +711,15 @@ async def update_draft(
                 ],
             },
         ) from exc
+    definition = compiled.definition.model_dump(by_alias=True, mode="json")
+    try:
+        bind_presentation_decision(definition["metadata"])
+    except ValueError as exc:
+        raise HTTPException(
+            422,
+            detail={"code": "PRESENTATION_DECISION_INVALID", "message": str(exc)},
+        ) from exc
+    compiled = compiler.compile(definition)
     current_digest = item.draft_digest or compiler.compile(item.draft_json).digest
     if compiled.digest == current_digest:
         if item.draft_digest is None:
@@ -758,6 +769,20 @@ async def validate_workflow(
             session, compiled.definition
         )
         mcp_locks = await validate_mcp_nodes(session, compiled.definition.spec.nodes)
+        try:
+            validate_presentation_decision(compiled.definition.metadata)
+        except ValueError as exc:
+            return {
+                "valid": False,
+                "diagnostics": [
+                    {
+                        "level": "error",
+                        "code": "PRESENTATION_DECISION_REQUIRED",
+                        "path": "metadata.presentationPolicyDecision",
+                        "message": str(exc),
+                    }
+                ],
+            }
         policy = compiled.definition.metadata.get("presentationPolicy", {})
         if (
             isinstance(policy, dict)
@@ -861,6 +886,7 @@ async def publish_workflow(
             session, compiled.definition
         )
         mcp_locks = await validate_mcp_nodes(session, compiled.definition.spec.nodes)
+        validate_presentation_decision(compiled.definition.metadata)
     except WorkflowValidationError as exc:
         raise HTTPException(
             422,
@@ -881,6 +907,11 @@ async def publish_workflow(
         raise HTTPException(
             422,
             detail={"code": "CAPABILITY_INCOMPATIBLE", "message": str(exc)},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            422,
+            detail={"code": "PRESENTATION_DECISION_REQUIRED", "message": str(exc)},
         ) from exc
 
     async def published_response(version: WorkflowVersion) -> dict[str, Any]:

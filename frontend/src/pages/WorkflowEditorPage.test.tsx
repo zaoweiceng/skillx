@@ -121,6 +121,66 @@ describe('WorkflowEditorPage 可视化编辑', () => {
     await waitFor(() => expect(screen.getByTestId('canvas')).toBeInTheDocument())
   })
 
+  it('展示 Presentation 提议依据并记录明确接受决定', async () => {
+    const withProposal: WorkflowDefinition = {
+      ...definition,
+      metadata: {
+        ...definition.metadata,
+        presentationPolicyProposal: {
+          source: 'distillation_agent',
+          resultAudience: 'end_user',
+          consumer: 'human',
+          terminalOrFragment: 'terminal',
+          enabled: true,
+          producer: 'llm',
+          prompt: '只整理规范 JSON',
+          language: 'zh-CN',
+          maxLength: 1200,
+          reason: '任务结果直接交给用户阅读',
+          evidence: ['consumer=human'],
+          confidence: 0.88,
+        },
+        presentationPolicyDecision: { status: 'pending' },
+      },
+    }
+    getWorkflow.mockResolvedValue({
+      id: 'wf-1',
+      name: 'greeting',
+      draftRevision: 1,
+      definition: withProposal,
+      createdAt: '',
+      updatedAt: '',
+    })
+    updateDraft.mockImplementation(
+      (_id: string, _revision: number, nextDefinition: WorkflowDefinition) =>
+        Promise.resolve({
+          id: 'wf-1',
+          name: 'greeting',
+          draftRevision: 2,
+          definition: nextDefinition,
+          createdAt: '',
+          updatedAt: '',
+        }),
+    )
+
+    renderPage()
+    await waitFor(() => expect(screen.getByText('固化 Agent 提议')).toBeInTheDocument())
+    expect(screen.getByText('任务结果直接交给用户阅读')).toBeInTheDocument()
+    expect(screen.getByText('consumer=human')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '接受提议' }))
+    fireEvent.click(screen.getByRole('button', { name: /^保存$/ }))
+    await waitFor(() => expect(updateDraft).toHaveBeenCalled())
+    const saved = updateDraft.mock.calls.at(-1)?.[2] as WorkflowDefinition
+    expect(saved.metadata.presentationPolicyDecision).toMatchObject({
+      status: 'accepted',
+      reviewer: 'local-user',
+    })
+    expect(saved.metadata.presentationPolicy).toMatchObject({
+      enabled: true,
+      producer: 'llm',
+    })
+  })
+
   it('为执行节点配置显式 fallback（勾选错误码后写入 target=agent 节点）', async () => {
     // 含 agent 节点的定义：transform 可选择 fallback 目标。
     const withAgent: WorkflowDefinition = {

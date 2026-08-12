@@ -182,6 +182,7 @@ async def _native_login_status() -> tuple[str, str]:
 
 
 async def provider_readiness() -> dict[str, Any]:
+    settings = get_settings()
     runtime = agent_runtime_config()
     provider_type = (
         "fixture"
@@ -268,7 +269,6 @@ async def provider_readiness() -> dict[str, Any]:
             "kind": "protocol_only" if provider_type == "fixture" else "not_run",
         }
     )
-    probe_ok = bool(_last_probe and _last_probe.get("ok"))
     # 分离展示与持久化的运行时事实：installed（已安装且协议可启动）、
     # credentialPresent（本地凭据存在但未验证）、activeProbeAuthenticated（主动探测已认证）、
     # protocolCompatible（strict output + ToolResult round-trip 通过）、usable（新鲜且可用）。
@@ -277,8 +277,14 @@ async def provider_readiness() -> dict[str, Any]:
         "installed": provider_type == "real" and protocol_available,
         "credentialPresent": provider_type == "real"
         and auth_status == "credential_present_unverified",
-        "activeProbeAuthenticated": provider_type == "real" and probe_ok,
-        "protocolCompatible": provider_type == "real" and probe_ok,
+        "activeProbeAuthenticated": provider_type == "real"
+        and bool(_last_probe and _last_probe.get("activeAuthenticated")),
+        "modelReachable": provider_type == "real"
+        and bool(_last_probe and _last_probe.get("modelReachable")),
+        "protocolCompatible": provider_type == "real"
+        and bool(_last_probe and _last_probe.get("protocolCompatible")),
+        "toolRoundTrip": provider_type == "real"
+        and bool(_last_probe and _last_probe.get("toolRoundTrip")),
         "usable": model_available,
     }
     return {
@@ -304,6 +310,12 @@ async def provider_readiness() -> dict[str, Any]:
             if _next_probe_at and _next_probe_at > now
             else None
         ),
+        "probeBudgetProfile": {
+            "estimatedInputTokens": settings.provider_probe_estimated_input_tokens,
+            "maxInputTokens": settings.provider_probe_max_input_tokens,
+            "maxOutputTokens": settings.provider_probe_max_output_tokens,
+            "maxBillableTokens": settings.provider_probe_max_billable_tokens,
+        },
     }
 
 
@@ -371,7 +383,10 @@ async def probe_provider() -> dict[str, Any]:
                 working_directory=working_directory,
                 requested_capabilities=("lookup.table",),
                 max_steps=3,
-                max_total_tokens=2000,
+                max_total_tokens=settings.provider_probe_max_billable_tokens,
+                max_input_tokens=settings.provider_probe_max_input_tokens,
+                max_output_tokens=settings.provider_probe_max_output_tokens,
+                max_billable_tokens=settings.provider_probe_max_billable_tokens,
                 max_duration_seconds=settings.provider_probe_timeout_seconds,
             )
         )
@@ -414,6 +429,15 @@ async def probe_provider() -> dict[str, Any]:
             "totalTokens": result.total_tokens,
             "usageComplete": result.usage_complete,
             "requestDispatched": result.request_dispatched,
+            "activeAuthenticated": True,
+            "modelReachable": True,
+            "protocolCompatible": ok,
+            "toolRoundTrip": tool_round_trip,
+            "budgetProfile": {
+                "maxInputTokens": settings.provider_probe_max_input_tokens,
+                "maxOutputTokens": settings.provider_probe_max_output_tokens,
+                "maxBillableTokens": settings.provider_probe_max_billable_tokens,
+            },
             "completed": True,
         }
     except AgentHostError as exc:
@@ -438,6 +462,16 @@ async def probe_provider() -> dict[str, Any]:
             "totalTokens": exc.total_tokens or None,
             "usageComplete": exc.usage_complete,
             "requestDispatched": exc.request_dispatched,
+            "activeAuthenticated": exc.code != "TRAE_AUTH_REQUIRED"
+            and exc.request_dispatched,
+            "modelReachable": exc.request_dispatched or exc.total_tokens > 0,
+            "protocolCompatible": False,
+            "toolRoundTrip": False,
+            "budgetProfile": {
+                "maxInputTokens": settings.provider_probe_max_input_tokens,
+                "maxOutputTokens": settings.provider_probe_max_output_tokens,
+                "maxBillableTokens": settings.provider_probe_max_billable_tokens,
+            },
             "completed": False,
         }
     return {

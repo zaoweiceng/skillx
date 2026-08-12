@@ -7,11 +7,13 @@ from app.api.routes import PublishRequest, publish_workflow
 from app.application.compiler import WorkflowCompiler, digest_json
 from app.application.distillation import (
     DistillationError,
+    PresentationPolicyProposal,
     _propose_presentation_policy,
     compile_agent_trajectory,
     distill_conversation_run,
 )
 from app.application.orchestrator import Orchestrator, WorkerService
+from app.application.product_history import bind_presentation_decision
 from app.infrastructure.database import (
     Conversation,
     ConversationRun,
@@ -293,6 +295,19 @@ async def test_distilled_draft_reuse_varies_with_new_input() -> None:
 
     async with SessionLocal() as session:
         workflow = await session.get(Workflow, draft_workflow_id)
+        metadata = workflow.draft_json["metadata"]
+        metadata["presentationPolicy"] = {
+            "enabled": False,
+            "audience": "internal",
+            "producer": "template",
+            "template": "执行结果：{json}",
+        }
+        metadata["presentationPolicyDecision"] = {
+            "status": "rejected",
+            "reviewer": "test-reviewer",
+            "reviewedAt": "2026-08-11T10:00:00Z",
+        }
+        bind_presentation_decision(metadata)
         published = await publish_workflow(
             draft_workflow_id,
             PublishRequest(
@@ -364,8 +379,8 @@ def _definition_with_output(output_schema: dict) -> dict:
     }
 
 
-def test_presentation_proposal_simple_structured_uses_template() -> None:
-    """简单结构化结果（标量字段，直接面向用户）→ 可选模板文本；无任何领域判断。"""
+def test_presentation_fallback_does_not_guess_audience_from_schema() -> None:
+    """Without Agent evidence, static schema/node facts cannot decide audience."""
 
     definition = _definition_with_output(
         {
@@ -377,17 +392,15 @@ def test_presentation_proposal_simple_structured_uses_template() -> None:
             },
         }
     )
-    proposal = _propose_presentation_policy(definition, machine_only=False)
-    assert proposal["enabled"] is True
-    assert proposal["audience"] == "end_user"
+    proposal = _propose_presentation_policy(definition)
+    assert proposal["enabled"] is False
+    assert proposal["resultAudience"] == "unknown"
     assert proposal["producer"] == "template"
-    # 模板只由 output schema 字段拼接而成，不含任何领域字面量。
-    assert "{city}" in proposal["template"] and "{temperature}" in proposal["template"]
+    assert proposal["needsHumanDecision"] is True
     assert proposal["reason"] and proposal["evidence"]
 
 
-def test_presentation_proposal_complex_result_uses_llm() -> None:
-    """复杂结果（嵌套对象/数组，如网页/长文本总结）→ LLM/Agent Presentation。"""
+def test_presentation_agent_proposal_is_preserved_for_review() -> None:
 
     definition = _definition_with_output(
         {
@@ -399,14 +412,31 @@ def test_presentation_proposal_complex_result_uses_llm() -> None:
             },
         }
     )
-    proposal = _propose_presentation_policy(definition, machine_only=False)
+    agent_proposal = PresentationPolicyProposal.model_validate(
+        {
+            "resultAudience": "end_user",
+            "consumer": "human",
+            "terminalOrFragment": "terminal",
+            "enabled": True,
+            "producer": "llm",
+            "prompt": "请整理规范 JSON，不增加事实",
+            "language": "zh-CN",
+            "maxLength": 1200,
+            "reason": "任务意图要求向人解释复杂结果",
+            "evidence": ["consumer=human", "terminalOrFragment=terminal"],
+            "confidence": 0.86,
+        }
+    )
+    proposal = _propose_presentation_policy(
+        definition, agent_proposal=agent_proposal
+    )
     assert proposal["enabled"] is True
     assert proposal["producer"] == "llm"
-    assert "prompt" in proposal
+    assert proposal["source"] == "distillation_agent"
+    assert proposal["needsHumanDecision"] is False
 
 
-def test_presentation_proposal_machine_result_is_disabled() -> None:
-    """机器消费/组合中间结果（数据转换、Fragment）→ Presentation 默认关闭。"""
+def test_presentation_agent_can_disable_machine_fragment() -> None:
 
     definition = _definition_with_output(
         {
@@ -414,9 +444,24 @@ def test_presentation_proposal_machine_result_is_disabled() -> None:
             "properties": {"records": {"type": "array"}, "count": {"type": "integer"}},
         }
     )
-    proposal = _propose_presentation_policy(definition, machine_only=True)
+    agent_proposal = PresentationPolicyProposal.model_validate(
+        {
+            "resultAudience": "internal",
+            "consumer": "composition",
+            "terminalOrFragment": "fragment",
+            "enabled": False,
+            "producer": "template",
+            "template": "{json}",
+            "reason": "该输出供组合中的下游机器步骤消费",
+            "evidence": ["consumer=composition", "terminalOrFragment=fragment"],
+            "confidence": 0.91,
+        }
+    )
+    proposal = _propose_presentation_policy(
+        definition, agent_proposal=agent_proposal
+    )
     assert proposal["enabled"] is False
-    assert proposal["audience"] == "internal"
+    assert proposal["resultAudience"] == "internal"
 
 
 def test_presentation_no_domain_specific_branch_in_generic_runtime() -> None:
@@ -431,7 +476,7 @@ def test_presentation_no_domain_specific_branch_in_generic_runtime() -> None:
         text = (root / name).read_text(encoding="utf-8")
         for token in forbidden:
             assert token not in text, f"{name} 不得包含领域专用字面量 {token!r}"
-    # Presentation 决策只依据数据流形态与节点类型，不得按能力名称/tag 分支到领域特判。
+    # Presentation 决策不得按能力名称/tag 分支到领域特判。
     distillation_text = (root / "distillation.py").read_text(encoding="utf-8")
     assert not _re.search(
         r'capability\.name\s*==|\.tags\s*==|in\s+capability\.tags', distillation_text
@@ -439,7 +484,7 @@ def test_presentation_no_domain_specific_branch_in_generic_runtime() -> None:
 
 
 async def test_distillation_freezes_generic_presentation_proposal() -> None:
-    """固化产出通用 presentationPolicy 与可审阅 proposal，且不含领域专用分支。"""
+    """固化产出可审阅 proposal，且不在决定前冻结最终 policy。"""
 
     async with SessionLocal() as session, session.begin():
         conversation = Conversation(id=str(uuid4()), title="Presentation 提议")
@@ -459,8 +504,9 @@ async def test_distillation_freezes_generic_presentation_proposal() -> None:
         result = await distill_conversation_run(session, conversation_run)
         workflow = await session.get(Workflow, result.draft_workflow_id)
         metadata = workflow.draft_json["metadata"]
-        # 固化阶段按数据流通用提出 Presentation，并把可审阅提议写入 analysis。
-        assert "presentationPolicy" in metadata
+        # Agent 不可用时保守关闭并等待人工决定，不自动冻结最终策略。
+        assert "presentationPolicy" not in metadata
+        assert metadata["presentationPolicyDecision"]["status"] == "pending"
         proposal = result.analysis_json["presentationPolicyProposal"]
-        assert proposal["source"] == "distillation_dataflow"
-        assert proposal["reason"] and proposal["confidence"] > 0
+        assert proposal["source"] == "platform_fallback"
+        assert proposal["reason"] and proposal["confidence"] == 0

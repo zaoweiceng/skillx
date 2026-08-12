@@ -150,6 +150,15 @@ async def test_provider_probe_requires_explicit_dispatch_usage_and_random_challe
     assert result["adapterTrusted"] is True
     assert result["adapterVersion"] == "openai-agent-sidecar/v1"
     assert result["challenge"].startswith("probe-")
+    assert result["budgetProfile"] == {
+        "maxInputTokens": settings.provider_probe_max_input_tokens,
+        "maxOutputTokens": settings.provider_probe_max_output_tokens,
+        "maxBillableTokens": settings.provider_probe_max_billable_tokens,
+    }
+    assert result["activeAuthenticated"] is True
+    assert result["modelReachable"] is True
+    assert result["protocolCompatible"] is True
+    assert result["toolRoundTrip"] is True
 
 
 async def test_provider_probe_does_not_infer_dispatch_from_agent_step(

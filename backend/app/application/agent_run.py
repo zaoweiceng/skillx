@@ -58,6 +58,10 @@ class AgentRunError(Exception):
         protocol_violation: str | None = None,
         reported_error: dict[str, Any] | None = None,
         request_dispatched: bool = False,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_tokens: int = 0,
+        usage_complete: bool = False,
     ) -> None:
         policy = error_policy(code)
         self.code = policy.code
@@ -67,6 +71,10 @@ class AgentRunError(Exception):
         self.protocol_violation = protocol_violation
         self.reported_error = reported_error
         self.request_dispatched = request_dispatched
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.total_tokens = total_tokens
+        self.usage_complete = usage_complete
         self.effective_error = {
             "code": self.code,
             "message": self.message,
@@ -87,6 +95,9 @@ class AgentRunConfig:
     output_schema: dict[str, Any]
     max_steps: int = 6
     max_total_tokens: int = 30000
+    max_input_tokens: int = 40000
+    max_output_tokens: int = 8000
+    max_billable_tokens: int = 48000
     allowed_capabilities: tuple[str, ...] = ()
     max_duration_seconds: int = 120
 
@@ -103,6 +114,9 @@ class AgentRunConfig:
             },
             max_steps=settings.agent_max_steps,
             max_total_tokens=settings.agent_max_total_tokens,
+            max_input_tokens=settings.agent_max_input_tokens,
+            max_output_tokens=settings.agent_max_output_tokens,
+            max_billable_tokens=settings.agent_max_billable_tokens,
             allowed_capabilities=allowed_capabilities,
             max_duration_seconds=settings.agent_max_duration_seconds,
         )
@@ -112,6 +126,9 @@ class AgentRunConfig:
             "outputSchema": self.output_schema,
             "maxSteps": self.max_steps,
             "maxTotalTokens": self.max_total_tokens,
+            "maxInputTokens": self.max_input_tokens,
+            "maxOutputTokens": self.max_output_tokens,
+            "maxBillableTokens": self.max_billable_tokens,
             "allowedCapabilities": list(self.allowed_capabilities),
             "maxDurationSeconds": self.max_duration_seconds,
         }
@@ -123,6 +140,11 @@ class AgentRunConfig:
             output_schema=data.get("outputSchema", default.output_schema),
             max_steps=int(data.get("maxSteps", default.max_steps)),
             max_total_tokens=int(data.get("maxTotalTokens", default.max_total_tokens)),
+            max_input_tokens=int(data.get("maxInputTokens", default.max_input_tokens)),
+            max_output_tokens=int(data.get("maxOutputTokens", default.max_output_tokens)),
+            max_billable_tokens=int(
+                data.get("maxBillableTokens", default.max_billable_tokens)
+            ),
             allowed_capabilities=tuple(data.get("allowedCapabilities", [])),
             max_duration_seconds=int(
                 data.get("maxDurationSeconds", default.max_duration_seconds)
@@ -493,6 +515,9 @@ class AgentRunWorker:
             requested_capabilities=config.allowed_capabilities,
             max_steps=config.max_steps,
             max_total_tokens=config.max_total_tokens,
+            max_input_tokens=config.max_input_tokens,
+            max_output_tokens=config.max_output_tokens,
+            max_billable_tokens=config.max_billable_tokens,
             max_duration_seconds=config.max_duration_seconds,
             completed_actions=tuple(
                 run.input_json.get("completedActionLedger", [])
@@ -515,6 +540,10 @@ class AgentRunWorker:
                 protocol_violation=exc.protocol_violation,
                 reported_error=exc.reported_error,
                 request_dispatched=exc.request_dispatched,
+                input_tokens=exc.input_tokens,
+                output_tokens=exc.output_tokens,
+                total_tokens=exc.total_tokens,
+                usage_complete=exc.usage_complete,
             )
         except asyncio.CancelledError:
             terminal = None  # 由 signal 决定 cancelled/lost
@@ -963,7 +992,10 @@ class AgentRunWorker:
                 runtime_used="agent_runtime",
                 runtime_digest=runtime.digest,
                 error_code=error.code,
-                usage_complete=False,
+                input_tokens=error.input_tokens,
+                output_tokens=error.output_tokens,
+                total_tokens=error.total_tokens,
+                usage_complete=error.usage_complete,
                 dispatched=error.request_dispatched,
                 completed=False,
             )
@@ -1770,6 +1802,9 @@ def build_trajectory(
         "config": {
             "maxSteps": config.max_steps,
             "maxTotalTokens": config.max_total_tokens,
+            "maxInputTokens": config.max_input_tokens,
+            "maxOutputTokens": config.max_output_tokens,
+            "maxBillableTokens": config.max_billable_tokens,
             "allowedCapabilities": list(config.allowed_capabilities),
         },
         "originalModelCalls": max(step_count, 1),

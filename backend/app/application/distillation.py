@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -20,6 +20,7 @@ from app.application.distillation_ir import (
     TrajectoryAnalysisError,
     build_action_ir,
 )
+from app.application.runtime_config import agent_runtime_config
 from app.config import get_settings
 from app.infrastructure.database import ConversationRun, Distillation, Workflow
 
@@ -62,6 +63,43 @@ class CapabilityDescriptor(BaseModel):
             re.I,
         ):
             raise ValueError("CapabilityDescriptor 禁止包含 URL、Secret 或测试指令")
+        return value
+
+
+class PresentationPolicyProposal(BaseModel):
+    """Restricted Agent proposal. It is evidence, never the published policy."""
+
+    result_audience: Literal["end_user", "internal", "unknown"] = Field(
+        alias="resultAudience"
+    )
+    consumer: Literal["human", "machine", "composition", "unknown"]
+    terminal_or_fragment: Literal["terminal", "fragment", "both", "unknown"] = Field(
+        alias="terminalOrFragment"
+    )
+    enabled: bool
+    producer: Literal["template", "llm"]
+    template: str = Field(default="执行结果：{json}", max_length=8000)
+    prompt: str = Field(
+        default="请把以下规范 JSON 整理为简洁、准确的中文说明，不得增加 JSON 中没有的事实：",
+        max_length=8000,
+    )
+    language: str = Field(default="zh-CN", min_length=1, max_length=20)
+    max_length: int = Field(default=2000, alias="maxLength", ge=64, le=8000)
+    reason: str = Field(min_length=1, max_length=1000)
+    evidence: list[str] = Field(min_length=1, max_length=8)
+    confidence: float = Field(ge=0, le=1)
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    @field_validator("reason", "evidence", "template", "prompt")
+    @classmethod
+    def reject_sensitive_data(cls, value: Any) -> Any:
+        if re.search(
+            r"https?://|(?:api[_-]?key|token|password|secret)\s*[:=]",
+            str(value),
+            re.I,
+        ):
+            raise ValueError("Presentation proposal 禁止包含 URL 或 Secret")
         return value
 
 
@@ -400,81 +438,44 @@ def compile_agent_trajectory(
 def _propose_presentation_policy(
     definition: dict[str, Any],
     *,
-    machine_only: bool,
+    agent_proposal: PresentationPolicyProposal | None = None,
 ) -> dict[str, Any]:
-    """通用 Presentation 固化提议：只依据任务目的与数据流，不做任何领域判断。
+    """Return an Agent proposal or a conservative, explicitly undecided fallback.
 
-    规范结构化输出始终是事实源，Presentation 只是可选派生结果。决策仅看运行框架无关的
-    数据流事实：
-    - 业务节点是否只是数据变换/文件搬运等机器流水线（→ 结果为机器消费/中间值）；
-    - 若结果直接面向用户，输出 schema 能否用字段无歧义、稳定地拼接（→ template），还是含
-      嵌套对象/数组等需要摘要/解释的复杂结构（→ llm）。
-
-    默认规则：机器消费/组合中间结果关闭；直接面向用户且可读文本有价值时开启；简单稳定的标量
-    字段映射选 template；复杂结构才选 llm。这里不识别任何领域名称、tag 或字段名。返回值同时
-    用作可发布的 ``presentationPolicy`` 与可审阅的 ``presentationPolicyProposal``（后者多携带
-    理由/证据/置信度）。
+    Node types and schema shape cannot reveal who consumes a result. When the
+    restricted Agent is unavailable, static code does not guess: Presentation
+    stays disabled until a human makes the decision.
     """
 
-    output_schema = definition["spec"]["outputSchema"]
-    properties = output_schema.get("properties", {})
-    properties = properties if isinstance(properties, dict) else {}
-    scalar_fields = [
-        name
-        for name, schema in properties.items()
-        if isinstance(schema, dict)
-        and schema.get("type") in {"string", "number", "integer", "boolean"}
-    ]
-    complex_fields = [
-        name
-        for name, schema in properties.items()
-        if isinstance(schema, dict) and schema.get("type") in {"object", "array"}
-    ]
-    evidence: list[str] = []
-    # 业务节点仅做数据变换/文件搬运：结果面向机器消费或作为组合中间值，默认关闭。
-    if machine_only:
-        evidence.append("业务节点仅为数据变换/文件操作，结果面向机器消费而非直接展示")
+    if agent_proposal is None:
         return {
+            "resultAudience": "unknown",
+            "consumer": "unknown",
+            "terminalOrFragment": "unknown",
             "enabled": False,
-            "audience": "internal",
             "producer": "template",
             "template": "执行结果：{json}",
+            "prompt": "请把以下规范 JSON 整理为简洁、准确的中文说明，不得增加 JSON 中没有的事实：",
             "language": "zh-CN",
             "maxLength": 2000,
-            "reason": "作为组合中间步骤/机器消费结果，无需面向用户的可读文本",
-            "evidence": evidence,
-            "confidence": 0.9,
+            "reason": "受限固化 Agent 不可用，静态代码无法从节点类型推断结果受众",
+            "evidence": ["仅有 I/O Schema 与数据流，缺少可信受众判断"],
+            "confidence": 0.0,
+            "source": "platform_fallback",
+            "needsHumanDecision": True,
         }
-    # 面向用户的终端结果：可读文本有价值 → 开启。
-    if scalar_fields and not complex_fields:
-        # 简单稳定的标量字段：用字段模板无歧义拼接，零模型成本。
-        template = "；".join(f"{name}={{{name}}}" for name in sorted(scalar_fields)) + "。"
-        evidence.append(f"输出仅含可无歧义拼接的标量字段: {sorted(scalar_fields)}")
-        return {
-            "enabled": True,
-            "audience": "end_user",
-            "producer": "template",
-            "template": template,
-            "language": "zh-CN",
-            "maxLength": 2000,
-            "reason": "结果直接面向用户且为稳定标量字段，可用模板稳定拼接为可读文本",
-            "evidence": evidence,
-            "confidence": 0.75,
-        }
-    # 复杂结构（嵌套对象/数组/长文本）：需要摘要/解释 → LLM/Agent Runtime。
-    evidence.append(
-        f"输出包含需要摘要/解释的复杂结构: {sorted(complex_fields) or '非标量结果'}"
-    )
+    proposal = agent_proposal.model_dump(by_alias=True)
+    # Static enforcement is limited to schema/safety/cost validity.
+    if proposal["producer"] == "template" and proposal["enabled"]:
+        from app.application.product_history import validate_presentation_template
+
+        validate_presentation_template(
+            str(proposal["template"]), definition["spec"]["outputSchema"]
+        )
     return {
-        "enabled": True,
-        "audience": "end_user",
-        "producer": "llm",
-        "prompt": "请把以下规范 JSON 整理为简洁、准确的中文说明，不得增加 JSON 中没有的事实：",
-        "language": "zh-CN",
-        "maxLength": 2000,
-        "reason": "结果直接面向用户但结构复杂，需选定 LLM/Agent Runtime 生成摘要/解释",
-        "evidence": evidence,
-        "confidence": 0.6,
+        **proposal,
+        "source": "distillation_agent",
+        "needsHumanDecision": proposal["confidence"] < 0.7,
     }
 
 
@@ -487,6 +488,7 @@ def _enrich_distilled_definition(
     distillation_id: str,
     source_trajectory_digest: str,
     proposal_digest: str | None,
+    presentation_proposal: PresentationPolicyProposal | None,
 ) -> dict[str, Any]:
     """派生可发现、可拆取、可恢复且带完整来源的固化 metadata。"""
 
@@ -580,26 +582,13 @@ def _enrich_distilled_definition(
                 "nodeIds": [node["id"] for node in business_nodes],
             }
         ]
-    # 通用 Presentation 固化提议：仅依据数据流事实（业务节点是否为机器流水线、输出 schema
-    # 形态），不识别任何领域。producer 节点集合仅由数据变换/文件/工件/条件等机器消费类节点
-    # 组成时视为机器/中间结果，Presentation 默认关闭。
-    producer_nodes = [node for node in business_nodes if node["id"] != recovery_id]
-    machine_kinds = {"transform", "file", "artifact", "condition"}
-    machine_only = bool(producer_nodes) and all(
-        node["type"] in machine_kinds for node in producer_nodes
+    proposal = _propose_presentation_policy(
+        definition, agent_proposal=presentation_proposal
     )
-    proposal = _propose_presentation_policy(definition, machine_only=machine_only)
-    # metadata.presentationPolicy 是发布时冻结的可执行策略；presentationPolicyProposal 携带
-    # 提议来源/理由/证据/置信度，供固化审阅 UI 展示并允许用户确认或修改后再发布。
-    definition["metadata"]["presentationPolicy"] = {
-        key: value
-        for key, value in proposal.items()
-        if key not in {"reason", "evidence", "confidence"}
-    }
-    definition["metadata"]["presentationPolicyProposal"] = {
-        **proposal,
-        "source": "distillation_dataflow",
-    }
+    # Proposal and reviewer decision are distinct. No executable policy exists
+    # until the editor records accept / modified / rejected.
+    definition["metadata"]["presentationPolicyProposal"] = proposal
+    definition["metadata"]["presentationPolicyDecision"] = {"status": "pending"}
     return definition
 
 
@@ -728,12 +717,13 @@ async def distill_conversation_run(
     proposal: DistillationProposal | None = None
     raw_proposal = conversation_run.trajectory_json.get("proposal")
     proposal_source = "runtime" if isinstance(raw_proposal, dict) else "none"
+    distillation_runtime_available = agent_runtime_config().configured
     if isinstance(raw_proposal, dict):
         try:
             proposal = DistillationProposal.model_validate(raw_proposal)
         except Exception as exc:  # noqa: BLE001 - 非法提议按固化失败返回 422。
             raise DistillationError(f"非法 DistillationProposal: {exc}") from exc
-    elif get_settings().traex_command:
+    elif distillation_runtime_available:
         proposal = await _request_distillation_proposal(
             conversation_run.id, conversation_run.trajectory_json
         )
@@ -748,7 +738,7 @@ async def distill_conversation_run(
     distillation_id = str(uuid4())
     capability = _default_capability_descriptor(conversation_run.trajectory_json)
     capability_source = "platform_fallback"
-    if get_settings().traex_command:
+    if distillation_runtime_available:
         proposed_capability = await _request_capability_descriptor(
             conversation_run.id,
             conversation_run.trajectory_json,
@@ -756,6 +746,14 @@ async def distill_conversation_run(
         if proposed_capability is not None:
             capability = proposed_capability
             capability_source = "distillation_agent"
+    presentation_proposal: PresentationPolicyProposal | None = None
+    if distillation_runtime_available:
+        presentation_proposal = await _request_presentation_proposal(
+            conversation_run.id,
+            conversation_run.trajectory_json,
+            capability,
+            definition,
+        )
     definition = _enrich_distilled_definition(
         definition,
         conversation_run.trajectory_json,
@@ -764,6 +762,7 @@ async def distill_conversation_run(
         distillation_id=distillation_id,
         source_trajectory_digest=source_trajectory_digest,
         proposal_digest=proposal_digest,
+        presentation_proposal=presentation_proposal,
     )
     try:
         compiled = WorkflowCompiler().compile(definition)
@@ -850,7 +849,10 @@ async def _request_capability_descriptor(
         working_directory=get_settings().artifact_root / "distillation" / run_id,
         requested_capabilities=(),
         max_steps=1,
-        max_total_tokens=4000,
+        max_total_tokens=43000,
+        max_input_tokens=40000,
+        max_output_tokens=3000,
+        max_billable_tokens=43000,
         max_duration_seconds=60,
     )
     try:
@@ -887,7 +889,10 @@ async def _request_distillation_proposal(
         working_directory=settings.artifact_root / "distillation" / run_id,
         requested_capabilities=(),
         max_steps=1,
-        max_total_tokens=8000,
+        max_total_tokens=43000,
+        max_input_tokens=40000,
+        max_output_tokens=3000,
+        max_billable_tokens=43000,
         max_duration_seconds=60,
     )
     try:
@@ -895,4 +900,59 @@ async def _request_distillation_proposal(
         return DistillationProposal.model_validate(result.output)
     except (AgentHostError, ValueError):
         # Runtime 不支持该 Schema 时不伪造 Agent 提议；Compiler 仍可生成带阻断诊断的草稿。
+        return None
+
+
+async def _request_presentation_proposal(
+    run_id: str,
+    trajectory: dict[str, Any],
+    capability: CapabilityDescriptor,
+    definition: dict[str, Any],
+) -> PresentationPolicyProposal | None:
+    """Ask about audience using de-instantiated intent and structural facts only."""
+
+    action_kinds = sorted(
+        {
+            str(action.get("kind") or "agent")
+            for action in trajectory.get("actions", [])
+            if isinstance(action, dict)
+        }
+    )
+    semantic_context = {
+        "taskIntent": capability.summary,
+        "useWhen": capability.use_when,
+        "consumer": "human_or_composition_unknown",
+        "entrypoint": "top_level_with_optional_fragments",
+        "inputSchema": definition["spec"]["inputSchema"],
+        "outputSchema": definition["spec"]["outputSchema"],
+        "dataFlow": {
+            "actionKinds": action_kinds,
+            "hasCallableFragments": bool(
+                definition.get("metadata", {}).get("callableFragments")
+            ),
+        },
+    }
+    request = AgentHostRequest(
+        run_id=f"presentation-{run_id}",
+        prompt=(
+            "你是受限 Presentation 决策 Agent。只根据去实例化任务意图、消费者、顶层/"
+            "Fragment 位置、I/O Schema 与数据流提出阅读结果策略。不得复制实例值、Secret、"
+            "页面正文或 URL；证据不足时 resultAudience/consumer 使用 unknown、关闭 enabled，"
+            "并降低 confidence。template 只能引用 outputSchema 顶层字段或 {json}。\n"
+            f"context={semantic_context}"
+        ),
+        output_schema=PresentationPolicyProposal.model_json_schema(by_alias=True),
+        working_directory=get_settings().artifact_root / "distillation" / run_id,
+        requested_capabilities=(),
+        max_steps=1,
+        max_total_tokens=8000,
+        max_input_tokens=40000,
+        max_output_tokens=3000,
+        max_billable_tokens=43000,
+        max_duration_seconds=60,
+    )
+    try:
+        result = await AgentHost().execute(request)
+        return PresentationPolicyProposal.model_validate(result.output)
+    except (AgentHostError, ValueError):
         return None

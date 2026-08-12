@@ -291,6 +291,58 @@ def normalize_presentation_policy(
     }
 
 
+_PRESENTATION_DECISIONS = {"accepted", "modified", "rejected"}
+
+
+def bind_presentation_decision(metadata: dict[str, Any]) -> None:
+    """Bind an explicit reviewer action to the exact proposal and policy bytes.
+
+    The editor deliberately omits digests when the user clicks a decision. The
+    server supplies them once. Existing, mismatched digests are never silently
+    refreshed, so editing an accepted policy requires another explicit action.
+    """
+
+    proposal = metadata.get("presentationPolicyProposal")
+    if not isinstance(proposal, dict):
+        return
+    decision = metadata.get("presentationPolicyDecision")
+    if not isinstance(decision, dict) or decision.get("status") not in _PRESENTATION_DECISIONS:
+        return
+    policy = metadata.get("presentationPolicy")
+    if not isinstance(policy, dict):
+        raise ValueError("Presentation decision 缺少最终 presentationPolicy")
+    expected_proposal = digest_json(proposal)
+    expected_policy = digest_json(policy)
+    existing_proposal = decision.get("proposalDigest")
+    existing_policy = decision.get("policyDigest")
+    if existing_proposal is not None and existing_proposal != expected_proposal:
+        raise ValueError("Presentation proposal 已变化，必须重新审阅")
+    if existing_policy is not None and existing_policy != expected_policy:
+        raise ValueError("Presentation policy 已在审阅后变化，必须重新接受或拒绝")
+    decision["proposalDigest"] = expected_proposal
+    decision["policyDigest"] = expected_policy
+    metadata["presentationPolicyDecision"] = decision
+
+
+def validate_presentation_decision(metadata: dict[str, Any]) -> None:
+    """Require an explicit, digest-bound decision for distilled proposals."""
+
+    if not isinstance(metadata.get("presentationPolicyProposal"), dict):
+        return
+    decision = metadata.get("presentationPolicyDecision")
+    if not isinstance(decision, dict) or decision.get("status") not in _PRESENTATION_DECISIONS:
+        raise ValueError("Presentation proposal 尚未接受、修改后接受或拒绝")
+    policy = metadata.get("presentationPolicy")
+    if not isinstance(policy, dict):
+        raise ValueError("Presentation decision 缺少最终 presentationPolicy")
+    if decision.get("proposalDigest") != digest_json(
+        metadata["presentationPolicyProposal"]
+    ):
+        raise ValueError("Presentation proposal digest 与审阅决定不一致")
+    if decision.get("policyDigest") != digest_json(policy):
+        raise ValueError("Presentation policy digest 与审阅决定不一致")
+
+
 def validate_presentation_template(
     template: str,
     output_schema: dict[str, Any],

@@ -358,6 +358,10 @@ class AgentEventValidator:
             }
             if payload.get("output") is not None:
                 audit["output"] = summarize_value(payload["output"])
+            if isinstance(payload.get("nativeProtocol"), dict):
+                # The builtin bridge supplies only bounded event type/id/version
+                # summaries; prompts, message text and tool payloads are excluded.
+                audit["nativeProtocol"] = payload["nativeProtocol"]
             return {"type": event_type, "payload": audit}
         if event_type == "agent.failed":
             return {

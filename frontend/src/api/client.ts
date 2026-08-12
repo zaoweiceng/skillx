@@ -466,7 +466,9 @@ export const api = {
           installed: boolean
           credentialPresent: boolean
           activeProbeAuthenticated: boolean
+          modelReachable: boolean
           protocolCompatible: boolean
+          toolRoundTrip: boolean
           usable: boolean
         }
         protocolTestOnly?: boolean
@@ -492,6 +494,12 @@ export const api = {
           code?: string
         }
         nextProbeAllowedAt: string | null
+        probeBudgetProfile?: {
+          estimatedInputTokens: number
+          maxInputTokens: number
+          maxOutputTokens: number
+          maxBillableTokens: number
+        }
       }
       agentRuntime?: {
         type: 'real' | 'fixture' | 'unavailable'
@@ -512,7 +520,9 @@ export const api = {
           installed: boolean
           credentialPresent: boolean
           activeProbeAuthenticated: boolean
+          modelReachable: boolean
           protocolCompatible: boolean
+          toolRoundTrip: boolean
           usable: boolean
         }
         protocolTestOnly?: boolean
@@ -532,6 +542,12 @@ export const api = {
           totalTokens?: number
         }
         nextProbeAllowedAt: string | null
+        probeBudgetProfile?: {
+          estimatedInputTokens: number
+          maxInputTokens: number
+          maxOutputTokens: number
+          maxBillableTokens: number
+        }
       }
       llmRuntime?: {
         type: 'openai_compatible' | 'unavailable'

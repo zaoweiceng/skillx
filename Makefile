@@ -1,4 +1,4 @@
-.PHONY: demo-check quality-check backend-check browser-install browser-check frontend-check migration-check e2e-check browser-ui-check doc-chain-check
+.PHONY: demo-check quality-check backend-check browser-install browser-check frontend-check migration-check e2e-check browser-ui-check doc-chain-check traex-real-check
 
 UV_CACHE_DIR ?= /tmp/skillx-workflow-uv-cache
 export UV_CACHE_DIR
@@ -10,7 +10,7 @@ demo-check: quality-check e2e-check
 quality-check: backend-check migration-check frontend-check doc-chain-check
 
 backend-check:
-	cd backend && uv run ruff check app tests migrations e2e ../examples/local_weather_mcp.py ../examples/traex_stub.py ../examples/openai_agent_sidecar.py ../examples/local_form_site.py
+	cd backend && uv run ruff check app tests real_provider_tests migrations e2e ../examples/local_weather_mcp.py ../examples/traex_stub.py ../examples/openai_agent_sidecar.py ../examples/local_form_site.py
 	cd backend && uv run pytest -q
 
 browser-install:
@@ -34,6 +34,11 @@ e2e-check: browser-check
 browser-ui-check: browser-check
 	cd backend && uv run ruff check browser_e2e
 	cd backend && uv run pytest browser_e2e -q -p no:cacheprovider
+
+# Opt-in, potentially billable gate. It only accepts the actual `traex` from PATH;
+# missing/expired login is reported as skipped and is never replaced by a fixture.
+traex-real-check:
+	cd backend && SKILLX_RUN_TRAEX_REAL_CHECK=1 uv run pytest real_provider_tests -q -rs -p no:cacheprovider
 
 frontend-check:
 	cd frontend && npm run check

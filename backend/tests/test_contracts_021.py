@@ -12,8 +12,10 @@ from app.application.agent_provider import (
 )
 from app.application.error_policy import persisted_error, public_error, technical_error
 from app.application.product_history import (
+    bind_presentation_decision,
     normalize_presentation_policy,
     render_presentation_template,
+    validate_presentation_decision,
     validate_presentation_template,
 )
 from app.application.security import sanitize_technical_detail
@@ -115,6 +117,37 @@ def test_presentation_template_is_schema_checked_and_rendered() -> None:
                 "properties": {"details": {"type": "object"}},
             },
         )
+
+
+def test_presentation_decision_is_explicit_and_digest_bound() -> None:
+    metadata = {
+        "presentationPolicyProposal": {
+            "enabled": True,
+            "producer": "template",
+            "template": "结果：{message}",
+            "reason": "direct human result",
+        },
+        "presentationPolicyDecision": {"status": "pending"},
+    }
+    with pytest.raises(ValueError, match="尚未"):
+        validate_presentation_decision(metadata)
+
+    metadata["presentationPolicy"] = {
+        "enabled": True,
+        "audience": "end_user",
+        "producer": "template",
+        "template": "结果：{message}",
+    }
+    metadata["presentationPolicyDecision"] = {
+        "status": "accepted",
+        "reviewer": "local-user",
+        "reviewedAt": "2026-08-11T10:00:00Z",
+    }
+    bind_presentation_decision(metadata)
+    validate_presentation_decision(metadata)
+    metadata["presentationPolicy"]["template"] = "已修改：{message}"
+    with pytest.raises(ValueError, match="digest"):
+        validate_presentation_decision(metadata)
 
 
 def test_public_error_hides_and_technical_view_bounds_diagnostics() -> None:

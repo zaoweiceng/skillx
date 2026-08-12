@@ -123,6 +123,32 @@ def _publish_workflow(
     workflow = client.get(f"/workflows/{workflow_id}")
     assert workflow.status_code == 200, workflow.text
     snapshot = workflow.json()
+    definition = deepcopy(snapshot["definition"])
+    proposal = definition.get("metadata", {}).get("presentationPolicyProposal")
+    decision = definition.get("metadata", {}).get("presentationPolicyDecision")
+    if isinstance(proposal, dict) and (decision or {}).get("status") == "pending":
+        # Publishing a distilled draft now requires the same explicit reviewer
+        # action as the UI. These generic reuse scenarios reject Presentation;
+        # dedicated UI/contract tests cover accept and modified decisions.
+        definition["metadata"]["presentationPolicy"] = {
+            "enabled": False,
+            "audience": "internal",
+            "producer": "template",
+            "template": "执行结果：{json}",
+            "language": "zh-CN",
+            "maxLength": 2000,
+        }
+        definition["metadata"]["presentationPolicyDecision"] = {
+            "status": "rejected",
+            "reviewer": "e2e-local-user",
+            "reviewedAt": "2026-08-11T10:00:00Z",
+        }
+        updated = client.put(
+            f"/workflows/{workflow_id}/draft",
+            json={"revision": snapshot["draftRevision"], "definition": definition},
+        )
+        assert updated.status_code == 200, updated.text
+        snapshot = updated.json()
     metadata = snapshot.get("draftMetadata") or {}
     return client.post(
         f"/workflows/{workflow_id}/publish",

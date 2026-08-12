@@ -147,6 +147,7 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             page.get_by_role(
                 "checkbox", name="面向最终用户生成阅读结果"
             ).check()
+            page.get_by_role("button", name="修改后接受").click()
             page.get_by_role("button", name="静态检查").click()
             with page.expect_response(
                 lambda response: response.url.endswith("/publish")

@@ -143,6 +143,15 @@ export default function SettingsPage() {
             </strong>
             。
           </span>
+          {agentRuntime?.probeBudgetProfile && (
+            <span>
+              付费探测预计约 {agentRuntime.probeBudgetProfile.estimatedInputTokens.toLocaleString()}
+              {' '}输入 Token；冻结上限为输入{' '}
+              {agentRuntime.probeBudgetProfile.maxInputTokens.toLocaleString()}、输出{' '}
+              {agentRuntime.probeBudgetProfile.maxOutputTokens.toLocaleString()}、总计{' '}
+              {agentRuntime.probeBudgetProfile.maxBillableTokens.toLocaleString()}。
+            </span>
+          )}
           {provider?.type === 'real' && (
             <>
               <span>

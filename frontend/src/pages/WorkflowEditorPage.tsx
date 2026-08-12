@@ -456,6 +456,18 @@ function CapabilityMetadataEditor({
     definition.metadata.presentationPolicy
       ? (definition.metadata.presentationPolicy as Record<string, unknown>)
       : {}
+  const presentationProposal =
+    typeof definition.metadata.presentationPolicyProposal === 'object' &&
+    definition.metadata.presentationPolicyProposal
+      ? (definition.metadata.presentationPolicyProposal as Record<string, unknown>)
+      : {}
+  const presentationDecision =
+    typeof definition.metadata.presentationPolicyDecision === 'object' &&
+    definition.metadata.presentationPolicyDecision
+      ? (definition.metadata.presentationPolicyDecision as Record<string, unknown>)
+      : {}
+  const presentationDraft =
+    Object.keys(presentation).length > 0 ? presentation : presentationProposal
 
   function patchMetadata(nextCapability: Record<string, unknown>, nextFragments = fragments) {
     onChange({
@@ -473,13 +485,49 @@ function CapabilityMetadataEditor({
       ...definition,
       metadata: {
         ...definition.metadata,
-        presentationPolicy: { ...presentation, ...patch },
+        presentationPolicy: { ...presentationDraft, ...patch },
+        presentationPolicyDecision: { status: 'pending' },
+      },
+    })
+  }
+
+  function decidePresentation(status: 'accepted' | 'modified' | 'rejected') {
+    const policy =
+      status === 'rejected'
+        ? {
+            enabled: false,
+            audience: 'internal',
+            producer: 'template',
+            template: '执行结果：{json}',
+            prompt: String(presentationDraft.prompt ?? ''),
+            language: String(presentationDraft.language ?? 'zh-CN'),
+            maxLength: Number(presentationDraft.maxLength ?? 2000),
+          }
+        : {
+            enabled: presentationDraft.enabled === true,
+            audience: presentationDraft.enabled === true ? 'end_user' : 'internal',
+            producer: String(presentationDraft.producer ?? 'template'),
+            template: String(presentationDraft.template ?? '执行结果：{json}'),
+            prompt: String(presentationDraft.prompt ?? ''),
+            language: String(presentationDraft.language ?? 'zh-CN'),
+            maxLength: Number(presentationDraft.maxLength ?? 2000),
+          }
+    onChange({
+      ...definition,
+      metadata: {
+        ...definition.metadata,
+        presentationPolicy: policy,
+        presentationPolicyDecision: {
+          status,
+          reviewer: 'local-user',
+          reviewedAt: new Date().toISOString(),
+        },
       },
     })
   }
 
   function insertPresentationField(field: string) {
-    const current = String(presentation.template ?? '执行结果：{json}')
+    const current = String(presentationDraft.template ?? '执行结果：{json}')
     patchPresentation({ template: `${current}{${field}}` })
   }
 
@@ -570,10 +618,31 @@ function CapabilityMetadataEditor({
           />
         </label>
         <div className="presentation-policy-editor">
+          {Object.keys(presentationProposal).length > 0 && (
+            <div className="notice-panel presentation-proposal-evidence">
+              <strong>固化 Agent 提议</strong>
+              <span>
+                来源：{String(presentationProposal.source ?? 'unknown')} · 受众：
+                {String(presentationProposal.resultAudience ?? 'unknown')} · 消费者：
+                {String(presentationProposal.consumer ?? 'unknown')} · 位置：
+                {String(presentationProposal.terminalOrFragment ?? 'unknown')} · 置信度：
+                {Number(presentationProposal.confidence ?? 0).toFixed(2)}
+              </span>
+              <span>{String(presentationProposal.reason ?? '')}</span>
+              {Array.isArray(presentationProposal.evidence) && (
+                <ul>
+                  {presentationProposal.evidence.map((item) => (
+                    <li key={String(item)}>{String(item)}</li>
+                  ))}
+                </ul>
+              )}
+              <span>审阅状态：{String(presentationDecision.status ?? 'pending')}</span>
+            </div>
+          )}
           <label>
             <input
               type="checkbox"
-              checked={presentation.enabled === true}
+              checked={presentationDraft.enabled === true}
               onChange={(event) =>
                 patchPresentation({
                   enabled: event.target.checked,
@@ -586,19 +655,19 @@ function CapabilityMetadataEditor({
           <label>
             <span>生成方式</span>
             <select
-              value={String(presentation.producer ?? 'template')}
+              value={String(presentationDraft.producer ?? 'template')}
               onChange={(event) => patchPresentation({ producer: event.target.value })}
             >
               <option value="template">稳定模板（零 LLM）</option>
               <option value="llm">LLM 整理</option>
             </select>
           </label>
-          {String(presentation.producer ?? 'template') === 'template' && (
+          {String(presentationDraft.producer ?? 'template') === 'template' && (
             <>
               <label>
                 <span>模板（支持 {'{json}'} 和顶层字段）</span>
                 <input
-                  value={String(presentation.template ?? '执行结果：{json}')}
+                  value={String(presentationDraft.template ?? '执行结果：{json}')}
                   onChange={(event) => patchPresentation({ template: event.target.value })}
                 />
               </label>
@@ -617,6 +686,45 @@ function CapabilityMetadataEditor({
                 ))}
               </div>
             </>
+          )}
+          {String(presentationDraft.producer ?? 'template') === 'llm' && (
+            <label>
+              <span>LLM Prompt</span>
+              <textarea
+                value={String(presentationDraft.prompt ?? '')}
+                onChange={(event) => patchPresentation({ prompt: event.target.value })}
+              />
+            </label>
+          )}
+          <label>
+            <span>语言</span>
+            <input
+              value={String(presentationDraft.language ?? 'zh-CN')}
+              onChange={(event) => patchPresentation({ language: event.target.value })}
+            />
+          </label>
+          <label>
+            <span>最大长度</span>
+            <input
+              type="number"
+              min={64}
+              max={8000}
+              value={Number(presentationDraft.maxLength ?? 2000)}
+              onChange={(event) => patchPresentation({ maxLength: Number(event.target.value) })}
+            />
+          </label>
+          {Object.keys(presentationProposal).length > 0 && (
+            <div className="button-row presentation-decision-actions">
+              <button className="button secondary" type="button" onClick={() => decidePresentation('accepted')}>
+                接受提议
+              </button>
+              <button className="button secondary" type="button" onClick={() => decidePresentation('modified')}>
+                修改后接受
+              </button>
+              <button className="button ghost" type="button" onClick={() => decidePresentation('rejected')}>
+                拒绝并关闭
+              </button>
+            </div>
           )}
         </div>
         {fragments.map((fragment, index) => (
