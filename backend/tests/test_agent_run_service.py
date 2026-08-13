@@ -41,6 +41,7 @@ from app.infrastructure.database import (
     Message,
     SessionLocal,
     TaskCheckpoint,
+    Workflow,
     utcnow,
 )
 
@@ -866,7 +867,7 @@ async def test_agent_endpoint_returns_202_and_is_distillable(traex_stub: None) -
     async with SessionLocal() as session:
         response = await start_agent_run(
             conversation_id,
-            AgentRunCreate(content="完成任务 [[MODE:ok]][[REPLY:探索结果]]"),
+            AgentRunCreate(content="查询 q1 [[MODE:deterministic]]"),
             session,
         )
     assert response["status"] == "queued"
@@ -882,12 +883,43 @@ async def test_agent_endpoint_returns_202_and_is_distillable(traex_stub: None) -
     async with SessionLocal() as session:
         summary = await get_conversation_run(conversation_run_id, session)
     assert summary["runType"] == "agent_run"
-    assert summary["output"] == {"reply": "探索结果"}
+    assert summary["output"] == {"reply": "第一季度：营收增长 12%"}
 
     async with SessionLocal() as session:
         distilled = await distill_run(conversation_run_id, session)
     assert distilled["status"] == "draft_created"
     assert distilled["analysis"]["sourceRunType"] == "agent_run"
+
+
+async def test_host_generative_lookup_trajectory_creates_publishable_draft(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _conversation()
+    async with SessionLocal() as session:
+        response = await start_agent_run(
+            conversation_id,
+            AgentRunCreate(
+                content="查询 q1 [[MODE:deterministic_generative]]",
+                allowedCapabilities=["lookup.table"],
+            ),
+            session,
+        )
+    run_id = response["conversationRunId"]
+    run = await _drive(run_id)
+    assert run.status == "succeeded"
+    assert run.trajectory_json["actions"][0]["kind"] == "transform"
+    assert run.trajectory_json["inputSchema"]["required"] == ["key"]
+    assert run.trajectory_json["outputProvenance"]["reply"]["mode"] == "generative"
+
+    async with SessionLocal() as session:
+        distilled = await distill_run(run_id, session)
+        workflow = await session.get(Workflow, distilled["draftWorkflowId"])
+
+    assert distilled["status"] == "draft_created"
+    assert distilled["analysis"]["publishable"] is True
+    assert workflow is not None
+    node_types = [node["type"] for node in workflow.draft_json["spec"]["nodes"]]
+    assert node_types == ["input", "transform", "llm", "output"]
 
 
 async def test_run_not_configured_records_failure() -> None:

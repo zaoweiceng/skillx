@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import func, select
 
 from app.api.routes import PublishRequest, publish_workflow
+from app.application.agent_run import AgentRunConfig, build_trajectory
 from app.application.compiler import WorkflowCompiler, digest_json
 from app.application.distillation import (
     DistillationError,
@@ -11,6 +12,7 @@ from app.application.distillation import (
     _propose_presentation_policy,
     compile_agent_trajectory,
     distill_conversation_run,
+    distillation_eligibility,
 )
 from app.application.orchestrator import Orchestrator, WorkerService
 from app.application.product_history import bind_presentation_decision
@@ -80,6 +82,48 @@ def _lookup_action(message: str = "q1") -> dict:
     }
 
 
+@pytest.mark.parametrize(
+    ("status", "action_count", "existing", "eligible", "reason"),
+    [
+        ("succeeded", 0, False, False, "NO_REUSABLE_ACTIONS"),
+        ("succeeded", 1, False, True, "ELIGIBLE"),
+        ("succeeded", 2, False, True, "ELIGIBLE"),
+        ("failed", 1, False, False, "RUN_NOT_SUCCEEDED"),
+        ("cancelled", 1, False, False, "RUN_NOT_SUCCEEDED"),
+        ("succeeded", 1, True, False, "DRAFT_ALREADY_EXISTS"),
+    ],
+)
+def test_distillation_eligibility_is_server_owned(
+    status: str,
+    action_count: int,
+    existing: bool,
+    eligible: bool,
+    reason: str,
+) -> None:
+    run = ConversationRun(
+        id=str(uuid4()),
+        conversation_id=str(uuid4()),
+        status=status,
+        run_type="agent_run",
+        input_json={},
+        output_json={},
+        trajectory_json={
+            "actions": [
+                {"callId": f"call-{index}", "status": "succeeded"}
+                for index in range(action_count)
+            ]
+        },
+    )
+
+    result = distillation_eligibility(run, has_existing_draft=existing)
+
+    assert result == {
+        "eligible": eligible,
+        "actionCount": action_count,
+        "reasonCode": reason,
+    }
+
+
 def test_lookup_action_with_evidence_becomes_deterministic_node() -> None:
     first, analysis = compile_agent_trajectory(_base_trajectory([_lookup_action()]))
 
@@ -91,6 +135,63 @@ def test_lookup_action_with_evidence_becomes_deterministic_node() -> None:
     node = first["spec"]["nodes"][1]
     assert node["type"] == "transform"
     assert node["config"]["operation"] == "lookup"
+
+
+def test_host_lookup_facts_and_generative_output_compile_to_publishable_graph() -> None:
+    action = {
+        "callId": "lookup-1",
+        "kind": "transform",
+        "capability": "lookup.table",
+        "arguments": {"key": "q1"},
+        "result": {"table": dict(LOOKUP_TABLE), "value": LOOKUP_TABLE["q1"]},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {"table": {"type": "object"}, "value": {"type": "string"}},
+            "required": ["table", "value"],
+            "additionalProperties": False,
+        },
+        "argumentBindings": {
+            "key": {"source": "user_input", "inputKey": "key"}
+        },
+        "effect": "none",
+        "idempotent": True,
+        "replayability": "deterministic",
+        "observations": {"operation": "lookup", "table": dict(LOOKUP_TABLE)},
+    }
+    trajectory = build_trajectory(
+        AgentRunConfig.default(),
+        "查询 q1",
+        {"reply": f"查询结果是 {LOOKUP_TABLE['q1']}"},
+        [action],
+        1,
+        output_provenance={
+            "reply": {
+                "mode": "generative",
+                "sourceCallIds": ["lookup-1"],
+                "evidenceDigests": ["sha256:evidence"],
+                "promptVersion": "real-agent-v1",
+            }
+        },
+    )
+
+    definition, analysis = compile_agent_trajectory(trajectory)
+
+    assert trajectory["inputSchema"]["required"] == ["key"]
+    assert analysis["publishable"] is True, analysis["diagnostics"]
+    business = [
+        node for node in definition["spec"]["nodes"] if node["type"] not in {"input", "output"}
+    ]
+    assert [node["type"] for node in business] == ["transform", "llm"]
+    assert business[0]["input"] == {"key": "${input.key}"}
+    assert definition["spec"]["nodes"][-1]["input"] == {
+        "reply": "${final-response.output.reply}"
+    }
 
 
 def test_plain_tool_dict_result_is_not_auto_lookup() -> None:

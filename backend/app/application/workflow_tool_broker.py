@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.compiler import WorkflowValidationError, digest_json
 from app.application.plans import PlanCompileError, compile_plan
-from app.application.tool_broker import ToolExecutionContext
+from app.application.tool_broker import ToolBrokerError, ToolExecutionContext
 from app.application.workflow_catalog import (
     CatalogError,
     consume_session_call,
@@ -15,6 +15,7 @@ from app.application.workflow_catalog import (
     describe_fragment,
     describe_workflow,
     disclose_refs,
+    record_disclosure_failure,
     record_disclosure_response,
     require_catalog_action,
     require_disclosed_ref,
@@ -51,7 +52,7 @@ class WorkflowSearchAdapter(_WorkflowToolBase):
     }
 
     async def execute(
-        self, _context: ToolExecutionContext, arguments: dict[str, Any]
+        self, context: ToolExecutionContext, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         call = await consume_session_call(
             self.session,
@@ -60,6 +61,8 @@ class WorkflowSearchAdapter(_WorkflowToolBase):
             {
                 "queryDigest": digest_json(arguments["query"]),
                 "limit": arguments.get("limit", 5),
+                "modelCallId": context.run_id,
+                "toolCallId": context.call_id,
             },
         )
         items = await search_manifests(
@@ -89,14 +92,18 @@ class WorkflowDescribeAdapter(_WorkflowToolBase):
     }
 
     async def execute(
-        self, _context: ToolExecutionContext, arguments: dict[str, Any]
+        self, context: ToolExecutionContext, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         ref = arguments["ref"]
         call = await consume_session_call(
             self.session,
             self.disclosure_session_id,
             "describe",
-            {"refDigest": digest_json(ref)},
+            {
+                "refDigest": digest_json(ref),
+                "modelCallId": context.run_id,
+                "toolCallId": context.call_id,
+            },
         )
         await require_disclosed_ref(self.session, self.disclosure_session_id, ref)
         result = await describe_workflow(self.session, ref)
@@ -123,14 +130,18 @@ class WorkflowDescribeFragmentAdapter(_WorkflowToolBase):
     input_schema = WorkflowDescribeAdapter.input_schema
 
     async def execute(
-        self, _context: ToolExecutionContext, arguments: dict[str, Any]
+        self, context: ToolExecutionContext, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         ref = arguments["ref"]
         call = await consume_session_call(
             self.session,
             self.disclosure_session_id,
             "describe",
-            {"refDigest": digest_json(ref)},
+            {
+                "refDigest": digest_json(ref),
+                "modelCallId": context.run_id,
+                "toolCallId": context.call_id,
+            },
         )
         await require_disclosed_ref(self.session, self.disclosure_session_id, ref)
         response = {"level": "L2", "fragment": await describe_fragment(self.session, ref)}
@@ -157,7 +168,7 @@ class WorkflowSliceAdapter(_WorkflowToolBase):
     }
 
     async def execute(
-        self, _context: ToolExecutionContext, arguments: dict[str, Any]
+        self, context: ToolExecutionContext, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         workflow_ref = arguments["workflowRef"]
         await require_disclosed_ref(
@@ -176,6 +187,8 @@ class WorkflowSliceAdapter(_WorkflowToolBase):
                 "workflowRefDigest": digest_json(workflow_ref),
                 "intentDigest": digest_json(arguments["intent"]),
                 "candidateNodeIds": sorted(candidate_ids),
+                "modelCallId": context.run_id,
+                "toolCallId": context.call_id,
             },
         )
         snapshot = await create_private_fragment_snapshot(
@@ -234,14 +247,18 @@ class WorkflowCompilePlanAdapter(_WorkflowToolBase):
     }
 
     async def execute(
-        self, _context: ToolExecutionContext, arguments: dict[str, Any]
+        self, context: ToolExecutionContext, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         plan = arguments["plan"]
         call = await consume_session_call(
             self.session,
             self.disclosure_session_id,
             "plan",
-            {"planDigest": digest_json(plan)},
+            {
+                "planDigest": digest_json(plan),
+                "modelCallId": context.run_id,
+                "toolCallId": context.call_id,
+            },
         )
         try:
             await require_plan_refs_disclosed(
@@ -325,11 +342,53 @@ class WorkflowCatalogAdapter(_WorkflowToolBase):
         ],
     }
 
+    async def record_input_failure(
+        self,
+        context: ToolExecutionContext,
+        arguments: dict[str, Any],
+        code: str,
+    ) -> None:
+        action = str(arguments.get("action", "unknown"))
+        operation = (
+            "plan"
+            if action == "compile_plan"
+            else "describe"
+            if action == "describe_fragment"
+            else action
+        )
+        await record_disclosure_failure(
+            self.session,
+            self.disclosure_session_id,
+            operation,
+            {
+                "action": action,
+                "argumentsDigest": digest_json(arguments),
+                "modelCallId": context.run_id,
+                "toolCallId": context.call_id,
+            },
+            code=code,
+        )
+        await self.session.commit()
+
     async def execute(
         self, context: ToolExecutionContext, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         action = str(arguments["action"])
-        await require_catalog_action(self.session, self.disclosure_session_id, action)
+        operation = (
+            "plan"
+            if action == "compile_plan"
+            else "describe"
+            if action == "describe_fragment"
+            else action
+        )
+        summary = {
+            "action": action,
+            "argumentsDigest": digest_json(
+                {key: value for key, value in arguments.items() if key != "action"}
+            ),
+            "modelCallId": context.run_id,
+            "toolCallId": context.call_id,
+        }
         adapters: dict[str, _WorkflowToolBase] = {
             "search": WorkflowSearchAdapter(self.session, self.disclosure_session_id),
             "describe": WorkflowDescribeAdapter(self.session, self.disclosure_session_id),
@@ -342,8 +401,32 @@ class WorkflowCatalogAdapter(_WorkflowToolBase):
             ),
         }
         payload = {key: value for key, value in arguments.items() if key != "action"}
-        output = await adapters[action].execute(context, payload)
-        return {"action": action, **output}
+        try:
+            await require_catalog_action(
+                self.session, self.disclosure_session_id, action
+            )
+            output = await adapters[action].execute(context, payload)
+            await self.session.commit()
+            return {"action": action, **output}
+        except CatalogError as exc:
+            message = str(exc)
+            if "第一个 action" in message:
+                code = "CATALOG_STATE_ORDER_INVALID"
+            elif "未由当前会话" in message:
+                code = "CATALOG_REF_NOT_DISCLOSED"
+            elif "超过上限" in message:
+                code = "CATALOG_CALL_BUDGET_EXCEEDED"
+            else:
+                code = "CATALOG_CONTRACT_INVALID"
+            await record_disclosure_failure(
+                self.session,
+                self.disclosure_session_id,
+                operation,
+                summary,
+                code=code,
+            )
+            await self.session.commit()
+            raise ToolBrokerError(code, message) from exc
 
 
 def workflow_tool_adapters(

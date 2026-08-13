@@ -21,10 +21,10 @@ def real_product_stack() -> Iterator[DemoStack]:
     if executable is None:
         pytest.skip("blocked: traex is not installed on PATH")
     stack = start_stack(
+        agent_fixture=False,
         model_env={
-            "SKILLX_AGENT_PROVIDER_TYPE": "real",
-            "SKILLX_TRAEX_COMMAND": f'["{executable}"]',
-            "SKILLX_TRAEX_ALLOWED_EXECUTABLES": '["traex"]',
+            "SKILLX_AGENT_BUILTIN_ENABLED": "true",
+            "SKILLX_AGENT_RUNTIME_TYPE": "unavailable",
             "SKILLX_PROVIDER_PROBE_TIMEOUT_SECONDS": "180",
             "SKILLX_AGENT_MAX_DURATION_SECONDS": "180",
         }
@@ -39,23 +39,44 @@ def _client(stack: DemoStack) -> httpx.Client:
     return httpx.Client(base_url=stack.base_url, timeout=240)
 
 
-def test_real_product_workflow_on_and_off(real_product_stack: DemoStack) -> None:
+@pytest.fixture(scope="module")
+def probed_real_product_stack(real_product_stack: DemoStack) -> DemoStack:
     with _client(real_product_stack) as client:
+        health = client.get("/health/ready")
+        assert health.status_code == 200, health.text
+        runtime = health.json()["agentRuntime"]
+        assert runtime["configured"] is True, runtime
+        assert runtime["runtimeType"] == "traex_builtin", runtime
+        assert runtime["source"] == "auto_discovered", runtime
         probe = client.post("/health/provider-probe")
         assert probe.status_code == 200, probe.text
         assert probe.json()["ok"] is True, probe.json()
+    return real_product_stack
 
+
+def test_real_product_workflow_on(probed_real_product_stack: DemoStack) -> None:
+    with _client(probed_real_product_stack) as client:
         enabled = client.post("/conversations", json={"title": "real-workflow-on"}).json()
         selected = client.post(
             f"/conversations/{enabled['id']}/messages",
-            json={"content": "请问候 Alice"},
+            json={"content": "请问候名叫 Alice 的人，姓名参数是 Alice"},
         )
         assert selected.status_code == 201, selected.text
         selected_assistant = selected.json()["assistant"]
         assert selected_assistant["state"] == "workflow_run", selected_assistant
+        assert selected_assistant["bindingSources"]
+        assert selected_assistant["bindingSources"][0]["serverVerified"] is True
         workflow_run = poll_run(client, selected_assistant["runId"], timeout=120)
         assert workflow_run["status"] == "succeeded", workflow_run
+        assert workflow_run["output"] == {"message": "你好，Alice"}
+        refreshed = client.get(f"/conversations/{enabled['id']}").json()
+        persisted = refreshed["messages"][-1]["content"]
+        assert persisted["runId"] == selected_assistant["runId"]
+        assert persisted["bindingSources"][0]["serverVerified"] is True
 
+
+def test_real_product_workflow_off(probed_real_product_stack: DemoStack) -> None:
+    with _client(probed_real_product_stack) as client:
         disabled = client.post("/conversations", json={"title": "real-workflow-off"}).json()
         mode = client.patch(
             f"/conversations/{disabled['id']}/workflow-mode",
@@ -80,8 +101,10 @@ def test_real_product_workflow_on_and_off(real_product_stack: DemoStack) -> None
         )
 
 
-def test_real_product_running_cancellation(real_product_stack: DemoStack) -> None:
-    with _client(real_product_stack) as client:
+def test_real_product_running_cancellation(
+    probed_real_product_stack: DemoStack,
+) -> None:
+    with _client(probed_real_product_stack) as client:
         conversation = client.post(
             "/conversations", json={"title": "real-cancellation"}
         ).json()
@@ -92,7 +115,7 @@ def test_real_product_running_cancellation(real_product_stack: DemoStack) -> Non
                     "请进行深入分析并列出一百个互不重复的工程风险，每项说明成因、"
                     "影响、检测办法和缓解措施"
                 ),
-                "allowedCapabilities": [],
+                "allowedCapabilities": ["lookup.table"],
             },
         )
         assert started.status_code == 202, started.text

@@ -467,6 +467,14 @@ export default function ChatPage() {
   async function distill(conversationRunId: string) {
     try {
       const result = await api.distillConversationRun(conversationRunId)
+      if (result.status === 'blocked') {
+        const diagnostics = result.analysis.diagnostics
+          .filter((item) => item.level === 'error')
+          .map((item) => `${item.code}：${item.message}`)
+          .join('；')
+        setError(diagnostics || '该轨迹缺少可验证事实，暂时不能发布')
+        return
+      }
       setDrafts((current) => ({
         ...current,
         [conversationRunId]: result.draftWorkflowId,
@@ -618,6 +626,13 @@ export default function ChatPage() {
       )
     }
     if (status === 'succeeded') {
+      const eligibility = run.distillationEligibility
+      const ineligibleReason =
+        eligibility?.reasonCode === 'NO_REUSABLE_ACTIONS'
+          ? '本次没有可复用动作'
+          : eligibility?.reasonCode === 'DRAFT_ALREADY_EXISTS'
+            ? '本次运行已有固化草稿'
+            : '本次运行不可固化'
       return (
         <>
           {run.output?.reply && (
@@ -626,9 +641,13 @@ export default function ChatPage() {
             </div>
           )}
           {checkpoint && renderContinuationLineage(checkpoint)}
-          <button className="button ghost" onClick={() => distill(conversationRunId)}>
-            固化为组件
-          </button>
+          {eligibility?.eligible ? (
+            <button className="button ghost" onClick={() => distill(conversationRunId)}>
+              固化为组件
+            </button>
+          ) : (
+            <span className="hint">{ineligibleReason}</span>
+          )}
         </>
       )
     }
@@ -935,6 +954,16 @@ export default function ChatPage() {
                 {message.content.code && (
                   <span className="error-code">{message.content.code}</span>
                 )}
+                {(message.content.diagnostics?.length ?? 0) > 0 && (
+                  <ul className="diagnostic-list" aria-label="失败诊断">
+                    {message.content.diagnostics?.map((diagnostic) => (
+                      <li key={`${diagnostic.field ?? ''}-${diagnostic.code}`}>
+                        <strong>{diagnostic.code}</strong>
+                        {diagnostic.field ? ` · ${diagnostic.field}` : ''}：{diagnostic.message}
+                      </li>
+                    ))}
+                  </ul>
+                )}
                 {message.content.disclosureSessionId && (
                   <div className="current-mapping">
                     <span className="metric-chip">
@@ -985,6 +1014,10 @@ export default function ChatPage() {
                           <span className="trace-tool">{item.capabilityRef}</span>
                         )}
                         {item.callId && <code className="digest-line">{item.callId}</code>}
+                        {item.action && <span className="metric-chip">{item.action}</span>}
+                        {item.attempt && (
+                          <span className="metric-chip">第 {item.attempt} 次</span>
+                        )}
                         {item.status && <span className="metric-chip">{item.status}</span>}
                         {(item.diagnostics ?? []).map((diagnostic) => (
                           <div

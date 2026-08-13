@@ -58,7 +58,10 @@ class BindingSource(BaseModel):
     message_id: str | None = Field(default=None, alias="messageId")
     call_id: str | None = Field(default=None, alias="callId")
     path: str | None = None
+    evidence_digest: str | None = Field(default=None, alias="evidenceDigest")
     quote: str
+    raw_span: dict[str, Any] | None = Field(default=None, alias="rawSpan")
+    canonical_value: Any | None = Field(default=None, alias="canonicalValue")
     confidence: float = Field(ge=0, le=1)
     uncertain: bool = False
     server_verified: bool = Field(default=False, alias="serverVerified")

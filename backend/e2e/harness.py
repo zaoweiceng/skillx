@@ -111,6 +111,7 @@ def start_stack(
     port: int | None = None,
     form_port: int | None = None,
     model_env: dict[str, str] | None = None,
+    agent_fixture: bool = True,
 ) -> DemoStack:
     port = port or _free_port()
     form_port = form_port or _free_port()
@@ -143,6 +144,14 @@ def start_stack(
         "SKILLX_DEMO_ARTICLE_URL": f"http://127.0.0.1:{form_port}/article",
         **(model_env or {}),
     }
+    if not agent_fixture:
+        for legacy_key in (
+            "SKILLX_AGENT_PROVIDER_TYPE",
+            "SKILLX_TRAEX_COMMAND",
+            "SKILLX_TRAEX_ALLOWED_EXECUTABLES",
+            "SKILLX_AGENT_COMMAND",
+        ):
+            env.pop(legacy_key, None)
 
     # 只通过 Alembic 建库，禁止 Base.metadata.create_all()。
     migrate = subprocess.run(

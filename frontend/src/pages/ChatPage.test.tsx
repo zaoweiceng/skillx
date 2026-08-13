@@ -365,6 +365,11 @@ describe('ChatPage 候选组件闭环', () => {
       input: {},
       output: { reply: '自动探索完成' },
       error: null,
+      distillationEligibility: {
+        eligible: true,
+        actionCount: 1,
+        reasonCode: 'ELIGIBLE',
+      },
     })
     listConversationRunEvents.mockResolvedValue([
       { seq: 1, type: 'agent.run.succeeded', payload: {} },
@@ -379,6 +384,77 @@ describe('ChatPage 候选组件闭环', () => {
 
     await waitFor(() => expect(screen.getByText('自动探索完成')).toBeInTheDocument())
     expect(screen.getByRole('button', { name: '固化为组件' })).toBeInTheDocument()
+  })
+
+  it('无工具成功回答显示不可固化原因而不是无效按钮', async () => {
+    getConversation.mockResolvedValue({
+      id: 'conv-1',
+      title: '普通回答',
+      boundComponentId: null,
+      messages: [
+        {
+          id: 'plain-answer',
+          role: 'assistant',
+          content: {
+            type: 'agent_run',
+            text: '普通回答',
+            conversationRunId: 'plain-run',
+          },
+        },
+      ],
+    })
+    getConversationRun.mockResolvedValue({
+      id: 'plain-run',
+      conversationId: 'conv-1',
+      status: 'succeeded',
+      runType: 'agent_run',
+      input: {},
+      output: { reply: '普通回答' },
+      error: null,
+      distillationEligibility: {
+        eligible: false,
+        actionCount: 0,
+        reasonCode: 'NO_REUSABLE_ACTIONS',
+      },
+    })
+    listConversationRunEvents.mockResolvedValue([])
+
+    renderAt('conv-1')
+    await waitFor(() => expect(screen.getByText('本次没有可复用动作')).toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: '固化为组件' })).not.toBeInTheDocument()
+  })
+
+  it('刷新后仍显示参数绑定失败及字段级诊断', async () => {
+    getConversation.mockResolvedValue({
+      id: 'conv-1',
+      title: '失败已持久化',
+      boundComponentId: null,
+      messages: [
+        {
+          id: 'binding-error',
+          role: 'assistant',
+          content: {
+            type: 'workflow_selection',
+            state: 'error',
+            code: 'SELECTION_BINDING_INCOMPLETE',
+            text: '参数来源未通过验证',
+            diagnostics: [
+              {
+                field: 'name',
+                code: 'VALUE_NOT_IN_SOURCE',
+                message: 'canonicalValue 不在 rawSpan 原文中',
+              },
+            ],
+          },
+        },
+      ],
+    })
+
+    renderAt('conv-1')
+
+    await waitFor(() => expect(screen.getByText('SELECTION_BINDING_INCOMPLETE')).toBeInTheDocument())
+    expect(screen.getByLabelText('失败诊断')).toHaveTextContent('VALUE_NOT_IN_SOURCE')
+    expect(screen.getByLabelText('失败诊断')).toHaveTextContent('name')
   })
 
   it('source failed 后自动发现 continuation 并展示最终正文', async () => {

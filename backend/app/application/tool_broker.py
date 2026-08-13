@@ -74,14 +74,18 @@ class ToolAdapterRegistry:
                 "CAPABILITY_NOT_REGISTERED",
                 f"能力 {capability_ref} 未注册 Host Adapter",
             )
-        return {
+        descriptor = {
             "capabilityRef": adapter.capability_ref,
             "inputSchema": adapter.input_schema,
             "outputSchema": adapter.output_schema,
             "effect": adapter.effect,
             "idempotent": adapter.idempotent,
             "fixturePolicy": adapter.fixture_policy,
+            "actionKind": getattr(adapter, "action_kind", "tool"),
+            "replayability": getattr(adapter, "replayability", "agent_only"),
         }
+        descriptor["capabilityIdentity"] = evidence_digest(descriptor)
+        return descriptor
 
     async def execute(
         self,
@@ -99,6 +103,9 @@ class ToolAdapterRegistry:
             Draft202012Validator(adapter.input_schema).iter_errors(arguments)
         )
         if input_errors:
+            recorder = getattr(adapter, "record_input_failure", None)
+            if recorder is not None:
+                await recorder(context, arguments, "INVALID_TOOL_ARGUMENTS")
             raise ToolBrokerError(
                 "INVALID_TOOL_ARGUMENTS",
                 f"{capability_ref} 参数不符合契约: {input_errors[0].message}",
@@ -165,6 +172,8 @@ class BrowserReadAdapter:
     effect = "none"
     idempotent = True
     fixture_policy = "capture_redacted"
+    action_kind = "browser"
+    replayability = "parameterizable"
 
     async def execute(
         self, context: ToolExecutionContext, arguments: dict[str, Any]
@@ -278,6 +287,8 @@ class LocalReadAdapter:
     effect = "none"
     idempotent = True
     fixture_policy = "capture_redacted"
+    action_kind = "file"
+    replayability = "parameterizable"
 
     async def execute(
         self, context: ToolExecutionContext, arguments: dict[str, Any]
@@ -318,6 +329,8 @@ class LookupTableAdapter:
     effect = "none"
     idempotent = True
     fixture_policy = "capture_redacted"
+    action_kind = "transform"
+    replayability = "deterministic"
     table = {
         "q1": "第一季度：营收增长 12%",
         "q2": "第二季度：营收增长 8%",

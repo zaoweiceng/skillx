@@ -249,6 +249,103 @@ def main() -> int:
     allowed = json.loads(args.allowed_tools) if args.allowed_tools else []
     output_schema = json.loads(args.output_schema) if args.output_schema else {}
 
+    if "WorkflowBindingExtraction" in args.prompt:
+        schema_match = re.search(r"^inputSchema=(.*)$", args.prompt, re.MULTILINE)
+        required_match = re.search(r"^required=(.*)$", args.prompt, re.MULTILINE)
+        packets_match = re.search(r"^messagePackets=(.*)$", args.prompt, re.MULTILINE)
+        input_schema = json.loads(schema_match.group(1)) if schema_match else {}
+        required = json.loads(required_match.group(1)) if required_match else []
+        packets = json.loads(packets_match.group(1)) if packets_match else []
+        current = packets[-1] if packets else {"messageId": "unknown", "text": ""}
+        current_text = str(current.get("text", ""))
+        requested_action = _directive(current_text, "SELECTION", "auto")
+        cleaned = _clean_message(current_text)
+        explicit = re.search(
+            r"(?:参数是|=)\s*([^，。！？；,;\s]+)", cleaned
+        )
+        force_missing = (
+            requested_action == "ask_user"
+            or (requested_action == "auto" and explicit is None)
+            or _directive(current_text, "BINDING", "found") == "missing"
+        )
+        force_ambiguous = _directive(current_text, "BINDING", "found") == "ambiguous"
+        candidate_value = explicit.group(1) if explicit else cleaned
+        evidence_text = explicit.group(0) if explicit else candidate_value
+        evidence_start = current_text.find(evidence_text)
+        evidence_end = evidence_start + len(evidence_text)
+        bindings: dict[str, Any] = {}
+        sources: list[dict[str, Any]] = []
+        assessments: list[dict[str, str]] = []
+        missing: list[str] = []
+        for field in required:
+            if force_missing:
+                assessments.append(
+                    {"field": field, "status": "missing", "reason": "消息中没有明确值"}
+                )
+                missing.append(field)
+                continue
+            if force_ambiguous:
+                assessments.append(
+                    {"field": field, "status": "ambiguous", "reason": "消息中有多个候选值"}
+                )
+                missing.append(field)
+                continue
+            field_schema = (input_schema.get("properties") or {}).get(field, {})
+            value: Any = candidate_value
+            if field_schema.get("type") == "integer" and re.fullmatch(r"[-+]?\d+", candidate_value):
+                value = int(candidate_value)
+            elif field_schema.get("type") == "number":
+                try:
+                    value = float(candidate_value)
+                except ValueError:
+                    value = candidate_value
+            bindings[field] = value
+            sources.append(
+                {
+                    "field": field,
+                    "source": "user_message",
+                    "messageId": current.get("messageId", "unknown"),
+                    "rawSpan": {
+                        "start": evidence_start,
+                        "end": evidence_end,
+                        "text": evidence_text,
+                    },
+                    "canonicalValue": value,
+                    "confidence": 1,
+                    "uncertain": False,
+                }
+            )
+            if _directive(current_text, "SOURCE", "valid") == "forged":
+                sources[-1]["rawSpan"] = {
+                    "start": 0,
+                    "end": 3,
+                    "text": "不存在",
+                }
+            assessments.append(
+                {"field": field, "status": "found", "reason": "当前消息包含明确原文"}
+            )
+        output = {
+            "bindings": bindings,
+            "bindingSources": sources,
+            "missingInputs": missing,
+            "fieldAssessments": assessments,
+            "question": f"请补充输入：{', '.join(missing)}" if missing else None,
+        }
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {
+                    "steps": 1,
+                    "totalTokens": 20,
+                    "output": output,
+                    "outputProvenance": generative_output_provenance(
+                        output, [], "workflow-binding-v1"
+                    ),
+                },
+            }
+        )
+        return 0
+
     if "Progressive WorkflowSelection" in args.prompt:
         use_catalog = "workflow.catalog" in allowed
 
@@ -261,10 +358,6 @@ def main() -> int:
 
         user_match = re.search(r"user=(.*)", args.prompt)
         user_text = user_match.group(1).strip() if user_match else _clean_message(args.prompt)
-        message_id_match = re.search(r"userMessageId=([^\s]+)", args.prompt)
-        user_message_id = (
-            message_id_match.group(1) if message_id_match else "unknown"
-        )
         requested_action = _directive(args.prompt, "SELECTION", "auto")
         emit({"type": "agent.plan", "payload": {"summary": "渐进发现 Workflow"}})
         search_capability, search_arguments = catalog_call(
@@ -287,8 +380,6 @@ def main() -> int:
                 "action": "continue_agent",
                 "reason": "目录没有适合当前任务的能力",
                 "refs": [],
-                "bindings": {},
-                "missingInputs": [],
             }
             emit(
                 {
@@ -495,20 +586,12 @@ def main() -> int:
                 },
                 "missingInputs": [],
             }
-        if output.get("bindings"):
-            output["bindingSources"] = [
-                {
-                    "field": field,
-                    "source": "user_message",
-                    "messageId": user_message_id,
-                    "quote": str(value),
-                    "confidence": 1,
-                    "uncertain": False,
-                }
-                for field, value in output["bindings"].items()
-            ]
-            if _directive(args.prompt, "SOURCE", "valid") == "forged":
-                output["bindingSources"][0]["quote"] = "不存在的引文"
+        if output.get("action") == "ask_user":
+            output["action"] = "run_full"
+            output["reason"] = "L1 契约满足任务；参数由第二阶段解析"
+            output.pop("question", None)
+        for key in ("bindings", "bindingSources", "missingInputs", "compiledPlan"):
+            output.pop(key, None)
         emit(
             {
                 "type": "agent.step.completed",
@@ -1440,6 +1523,7 @@ def main() -> int:
 
     if mode in {
         "deterministic",
+        "deterministic_generative",
         "deterministic_bad_output",
         "deterministic_fail_after_tool",
     }:
@@ -1502,12 +1586,22 @@ def main() -> int:
                         "reply": (
                             "fixture-constant"
                             if mode == "deterministic_bad_output"
+                            else f"查询结果：{output.get('value', '未知季度')}"
+                            if mode == "deterministic_generative"
                             else output.get("value", "未知季度")
                         )
                     },
                     "provenance": [{"callId": "call-1", "path": "output.value"}],
-                    "outputProvenance": deterministic_output_provenance(
-                        "reply", tool_result, "output.value"
+                    "outputProvenance": (
+                        generative_output_provenance(
+                            {"reply": f"查询结果：{output.get('value', '未知季度')}"},
+                            [tool_result],
+                            "fixture-generative-v1",
+                        )
+                        if mode == "deterministic_generative"
+                        else deterministic_output_provenance(
+                            "reply", tool_result, "output.value"
+                        )
                     ),
                 },
             }

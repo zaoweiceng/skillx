@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from fastapi import HTTPException
 from sqlalchemy import func, select
 
 from app.api.routes import (
     MessageCreate,
+    _canonical_message_evidence,
     _select_workflow_candidate,
     _verify_binding_sources,
     create_message,
@@ -20,9 +21,8 @@ from app.application.compiler import WorkflowCompiler
 from app.application.orchestrator import WorkerService
 from app.application.plans import WorkflowSelection
 from app.application.runtime_config import semantic_workflow_selection_available
-from app.application.tool_broker import ToolExecutionContext
+from app.application.tool_broker import ToolBrokerError, ToolExecutionContext
 from app.application.workflow_catalog import (
-    CatalogError,
     build_manifest,
     create_disclosure_session,
 )
@@ -46,8 +46,9 @@ STUB = Path(__file__).resolve().parents[2] / "examples" / "traex_stub.py"
 
 
 async def test_narrow_catalog_requires_search_as_first_server_action() -> None:
-    async with SessionLocal() as session, session.begin():
+    async with SessionLocal() as session:
         disclosure = await create_disclosure_session(session)
+        await session.commit()
         adapter = workflow_catalog_adapter(session, disclosure.id)
         assert adapter.capability_ref == "workflow.catalog"
         assert adapter.input_schema["properties"]["action"]["enum"] == [
@@ -57,7 +58,7 @@ async def test_narrow_catalog_requires_search_as_first_server_action() -> None:
             "slice",
             "compile_plan",
         ]
-        with pytest.raises(CatalogError, match="第一个 action 必须是 search"):
+        with pytest.raises(ToolBrokerError, match="第一个 action 必须是 search"):
             await adapter.execute(
                 ToolExecutionContext(
                     run_id="selection-test",
@@ -66,6 +67,20 @@ async def test_narrow_catalog_requires_search_as_first_server_action() -> None:
                 ),
                 {"action": "describe", "ref": "workflow:invented"},
             )
+        failure = await session.scalar(
+            select(WorkflowDisclosureCall).where(
+                WorkflowDisclosureCall.session_id == disclosure.id,
+                WorkflowDisclosureCall.status == "failed",
+            )
+        )
+        assert failure is not None
+        assert failure.error_json == {
+            "code": "CATALOG_STATE_ORDER_INVALID",
+            "retryable": False,
+        }
+        assert failure.request_summary_json["modelCallId"] == "selection-test"
+        assert failure.request_summary_json["toolCallId"] == "describe-first"
+        assert "invented" not in str(failure.request_summary_json)
 
 
 def greeting_definition() -> dict:
@@ -216,13 +231,13 @@ async def test_workflow_selection_failure_persists_dispatched_usage(
 
     monkeypatch.setattr("app.api.routes.AgentHost.execute", fail_after_dispatch)
     async with SessionLocal() as session:
-        with pytest.raises(HTTPException) as error:
-            await create_message(
-                conversation_id,
-                MessageCreate(content="上海天气如何"),
-                session,
-            )
-    assert error.value.status_code == 502
+        response = await create_message(
+            conversation_id,
+            MessageCreate(content="上海天气如何"),
+            session,
+        )
+    assert response["assistant"]["state"] == "error"
+    assert response["assistant"]["code"] == "WORKFLOW_SELECTION_FAILED"
 
     async with SessionLocal() as session:
         usage = await session.scalar(
@@ -233,6 +248,39 @@ async def test_workflow_selection_failure_persists_dispatched_usage(
     assert usage.request_dispatched_at is not None
     assert usage.completed_at is None
     assert usage.total_tokens == 15
+
+
+async def test_slow_selection_does_not_hold_initial_sqlite_write_lock(
+    traex_stub: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conversation_id = await _seed()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_failure(*_args: object, **_kwargs: object) -> None:
+        started.set()
+        await release.wait()
+        raise AgentHostError("MODEL_PROVIDER_ERROR", "slow failure")
+
+    monkeypatch.setattr("app.api.routes.AgentHost.execute", slow_failure)
+
+    async def send() -> dict:
+        async with SessionLocal() as session:
+            return await create_message(
+                conversation_id,
+                MessageCreate(content="慢选择并发检查"),
+                session,
+            )
+
+    request_task = asyncio.create_task(send())
+    await started.wait()
+    async with SessionLocal() as session, session.begin():
+        session.add(Conversation(id=str(uuid4()), title="并发写入成功"))
+        await asyncio.wait_for(session.flush(), timeout=0.5)
+    release.set()
+    response = await request_task
+    assert response["assistant"]["state"] == "error"
 
 
 async def _seed() -> str:
@@ -308,6 +356,127 @@ async def test_ask_user_resumes_original_selection_without_research(
     assert searches_after == searches_before
     assert run is not None and run.input_json == {"name": "Alice"}
     assert pending is not None and pending.status == "resumed"
+
+
+async def test_same_message_dynamic_binding_starts_workflow_once(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _seed()
+    async with SessionLocal() as session:
+        response = await create_message(
+            conversation_id,
+            MessageCreate(
+                content=(
+                    "请问候名叫 Alice 的人，姓名参数是 Alice "
+                    "[[SELECTION:run_full]]"
+                )
+            ),
+            session,
+        )
+    assistant = response["assistant"]
+    assert assistant["state"] == "workflow_run"
+    source = assistant["bindingSources"][0]
+    assert source["field"] == "name"
+    assert source["quote"] == "Alice"
+    assert source["rawSpan"]["text"] == "Alice"
+    assert source["canonicalValue"] == "Alice"
+    assert source["messageId"] == response["userMessageId"]
+    assert source["serverVerified"] is True
+    worker = WorkerService("same-message-binding")
+    for _ in range(4):
+        await worker.run_once()
+    async with SessionLocal() as session:
+        run = await session.get(Run, assistant["runId"])
+        usages = (
+            await session.scalars(
+                select(ModelUsage).where(ModelUsage.turn_id == response["turn"]["id"])
+            )
+        ).all()
+    assert run is not None and run.status == "succeeded"
+    assert run.output_json == {"message": "你好，Alice"}
+    assert {item.stage for item in usages} >= {
+        "workflow_selection",
+        "workflow_binding",
+    }
+
+
+def test_source_span_v1_rebuilds_unicode_scalar_array_and_object() -> None:
+    text = '姓名参数是 Alice；数量 42；列表 ["甲", "乙"]；对象 {"x": 1}'
+    message = Message(
+        id=str(uuid4()),
+        conversation_id=str(uuid4()),
+        role="user",
+        content_json={"type": "text", "text": text},
+    )
+    cases = [
+        ("name", "Alice", "姓名参数是 Alice", {"type": "string"}, "Alice"),
+        ("count", 42, "42", {"type": "integer"}, 42),
+        ("items", ["甲", "乙"], '["甲", "乙"]', {"type": "array"}, ["甲", "乙"]),
+        ("meta", {"x": 1}, '{"x": 1}', {"type": "object"}, {"x": 1}),
+    ]
+    for field, proposed, raw_text, schema, expected in cases:
+        start = text.index(raw_text)
+        value, source, diagnostic = _canonical_message_evidence(
+            field=field,
+            proposed_value=proposed,
+            raw_source={
+                "source": "user_message",
+                "messageId": message.id,
+                "rawSpan": {
+                    "start": start,
+                    "end": start + len(raw_text),
+                    "text": raw_text,
+                },
+                "canonicalValue": proposed,
+                "confidence": 1,
+                "uncertain": False,
+            },
+            field_schema=schema,
+            messages_by_id={message.id: message},
+            current_message_id=message.id,
+        )
+        assert diagnostic is None
+        assert value == expected
+        assert source is not None and source["serverVerified"] is True
+        if field == "name":
+            assert source["rawSpan"]["text"] == "Alice"
+
+    _, _, diagnostic = _canonical_message_evidence(
+        field="name",
+        proposed_value="Alice",
+        raw_source={
+            "source": "user_message",
+            "messageId": "forged",
+            "rawSpan": {"start": 0, "end": 5, "text": "Alice"},
+            "canonicalValue": "Alice",
+        },
+        field_schema={"type": "string"},
+        messages_by_id={message.id: message},
+        current_message_id=message.id,
+    )
+    assert diagnostic is not None
+    assert diagnostic["code"] == "SOURCE_MESSAGE_NOT_ALLOWED"
+
+
+async def test_ambiguous_dynamic_binding_asks_without_guessing(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _seed()
+    async with SessionLocal() as session:
+        response = await create_message(
+            conversation_id,
+            MessageCreate(
+                content=(
+                    "姓名可能是 Alice 或 Bob [[SELECTION:run_full]]"
+                    "[[BINDING:ambiguous]]"
+                )
+            ),
+            session,
+        )
+    assert response["assistant"]["state"] == "ask_user"
+    assert response["assistant"]["required"] == ["name"]
+    async with SessionLocal() as session:
+        assert await session.scalar(select(Run)) is None
 
 
 async def test_binding_sources_are_verified_against_server_evidence() -> None:
@@ -409,13 +578,18 @@ async def test_invalid_agent_binding_source_becomes_ask_user(
             session,
         )
 
-    assert response["assistant"]["state"] == "ask_user"
-    assert response["assistant"]["required"] == ["name"]
+    assert response["assistant"]["state"] == "error"
+    assert response["assistant"]["code"] == "SELECTION_BINDING_INCOMPLETE"
     async with SessionLocal() as session:
-        assert await session.scalar(select(Run)) is None
-        pending = await session.scalar(select(PendingSelection))
-    assert pending is not None
-    assert pending.bindings_json == {}
+        conversation = await session.get(Conversation, conversation_id)
+        assistant = await session.scalar(
+            select(Message).where(
+                Message.conversation_id == conversation_id,
+                Message.role == "assistant",
+            )
+        )
+    assert conversation is not None and conversation.title != "新对话"
+    assert assistant is not None and assistant.content_json["state"] == "error"
 
 
 @pytest.mark.parametrize(
@@ -424,7 +598,7 @@ async def test_invalid_agent_binding_source_becomes_ask_user(
         ("run_full", "run_full", {"L0", "L1"}),
         ("run_fragment", "run_fragment", {"L0", "L1", "L2"}),
         ("compose", "compose", {"L0", "L1", "L2"}),
-        ("ask_user", "ask_user", {"L0", "L1"}),
+        ("ask_user", "run_full", {"L0", "L1"}),
         ("continue_agent", "continue_agent", {"L0"}),
     ],
 )
@@ -435,10 +609,11 @@ async def test_selection_five_actions_come_from_progressive_agent_loop(
     levels: set[str],
 ) -> None:
     conversation_id = await _seed()
-    async with SessionLocal() as session, session.begin():
+    async with SessionLocal() as session:
         disclosure = await create_disclosure_session(
             session, conversation_id=conversation_id
         )
+        await session.commit()
         selection, timeline, _tool_evidence = await _select_workflow_candidate(
             session,
             f"渐进问候 [[SELECTION:{requested}]]",

@@ -449,7 +449,7 @@ def test_e2e_5_agent_distillation_reuse(stack: DemoStack) -> None:
         # 5) fixture 只证明协议；通过冻结版本 API 以新输入验证 Runtime 复用。
         selected = client.post(
             f"/workflow-versions/{version_id}/runs",
-            json={"input": {"message": "q2"}},
+            json={"input": {"key": "q2"}},
         )
         assert selected.status_code == 202, selected.text
         run = poll_run(client, selected.json()["id"])
@@ -1267,11 +1267,11 @@ def test_real_tool_failure_handoff_distill_and_second_reuse(
         stack.set_article("接力固化后的新正文")
         selected = client.post(
             f"/workflow-versions/{version_id}/runs",
-            json={
-                "input": {
-                    "message": f"{stack.form_url}/article?handoff=1"
-                }
-            },
+                json={
+                    "input": {
+                        "url": f"{stack.form_url}/article?handoff=1"
+                    }
+                },
         )
         assert selected.status_code == 202, selected.text
         reused_run = poll_run(client, selected.json()["id"], timeout=60)
@@ -2101,7 +2101,7 @@ def test_e2e_8b_real_browser_distillation_to_non_fake_agent(
         second_url = f"{article_url}?version=b"
         selected = client.post(
             f"/workflow-versions/{version_id}/runs",
-            json={"input": {"message": second_url}},
+            json={"input": {"url": second_url}},
         )
         assert selected.status_code == 202, selected.text
         workflow = client.get(f"/workflows/{draft_workflow_id}").json()

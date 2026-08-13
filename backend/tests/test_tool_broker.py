@@ -49,6 +49,10 @@ async def test_real_tool_result_is_sent_back_and_drives_final_output(
     assert result.output == {"reply": random_value}
     assert result.actions[0]["result"]["content"] == random_value
     assert result.actions[0]["evidenceDigest"].startswith("sha256:")
+    assert result.actions[0]["kind"] == "file"
+    assert result.actions[0]["outputSchema"]["required"] == ["path", "content", "bytes"]
+    assert result.actions[0]["argumentBindings"]["path"]["source"] == "user_input"
+    assert result.output_provenance["reply"]["callId"] == result.actions[0]["callId"]
     assert [event["type"] for event in result.runtime_events].count("tool.requested") == 1
     assert [event["type"] for event in result.runtime_events].count("tool.result") == 1
 
@@ -100,6 +104,15 @@ async def test_completed_action_ledger_reuses_result_without_external_call(
         if event["type"] == "tool.result"
     )
     assert tool_result["payload"]["reusedFromLedger"] is True
+    assert tool_result["payload"]["actionKind"] == "transform"
+    assert tool_result["payload"]["replayability"] == "deterministic"
+    assert tool_result["payload"]["argumentBindings"] == {
+        "key": {
+            "source": "user_input",
+            "inputKey": "key",
+            "rawSpan": {"start": 0, "end": 2, "text": "q1"},
+        }
+    }
 
 
 def test_agent_cannot_self_report_tool_result() -> None:

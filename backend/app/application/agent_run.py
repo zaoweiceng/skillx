@@ -595,6 +595,7 @@ class AgentRunWorker:
             claim_generation,
             claim_token,
             semantic_context=dict(run.input_json.get("semanticContext") or {}),
+            output_provenance=result.output_provenance,
             usage_complete=result.usage_complete,
             request_dispatched=result.request_dispatched,
             accepted_plan_digest=result.accepted_plan_digest,
@@ -700,7 +701,12 @@ class AgentRunWorker:
             "output": redact(payload.get("output")),
             "error": redact(payload.get("error")),
             "evidenceDigest": payload.get("evidenceDigest"),
+            "capabilityIdentity": payload.get("capabilityIdentity"),
+            "actionKind": payload.get("actionKind"),
+            "inputSchema": payload.get("inputSchema"),
             "outputSchema": payload.get("outputSchema"),
+            "argumentBindings": payload.get("argumentBindings"),
+            "replayability": payload.get("replayability"),
             "actionSignature": payload.get("actionSignature"),
             "planStepId": payload.get("planStepId"),
             "planDigest": payload.get("planDigest"),
@@ -776,6 +782,9 @@ class AgentRunWorker:
                         "callId": call_id,
                         "capabilityRef": payload.get("capabilityRef"),
                         "evidenceDigest": payload.get("evidenceDigest"),
+                        "capabilityIdentity": payload.get("capabilityIdentity"),
+                        "actionKind": payload.get("actionKind"),
+                        "replayability": payload.get("replayability"),
                         "status": payload.get("status"),
                         "argumentsDigest": payload.get("argumentsDigest"),
                         "effect": payload.get("effect"),
@@ -1075,6 +1084,7 @@ class AgentRunWorker:
         claim_token: str | None,
         *,
         semantic_context: dict[str, Any] | None = None,
+        output_provenance: dict[str, Any] | None = None,
         usage_complete: bool = True,
         request_dispatched: bool = True,
         accepted_plan_digest: str | None = None,
@@ -1103,6 +1113,7 @@ class AgentRunWorker:
             step_count,
             staged["uri"],
             semantic_context=semantic_context,
+            output_provenance=output_provenance,
         )
         trajectory["planLineage"] = {
             "acceptedPlanDigest": accepted_plan_digest,
@@ -1774,6 +1785,7 @@ def build_trajectory(
     artifact_uri: str | None = None,
     *,
     semantic_context: dict[str, Any] | None = None,
+    output_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """把一次成功的 Agent 运行归一化为可提炼的规范化轨迹（脱敏后入库）。
 
@@ -1784,44 +1796,46 @@ def build_trajectory(
     from app.application.security import redact
 
     cleaned_actions = [_desensitize_action(item) for item in actions]
-    last_action_id = cleaned_actions[-1].get("callId") if cleaned_actions else None
-    last_result = cleaned_actions[-1].get("result", {}) if cleaned_actions else {}
-    last_observations = (
-        cleaned_actions[-1].get("observations", {}) if cleaned_actions else {}
-    )
-    output_provenance: dict[str, Any] = {}
-    for field, value in output.items():
-        path = field
-        if last_observations.get("operation") == "lookup":
-            path = "value"
-        elif isinstance(last_result, dict):
-            if field in last_result:
-                path = field
-            else:
-                matching = [
-                    key for key, result_value in last_result.items() if result_value == value
-                ]
-                if len(matching) == 1:
-                    path = matching[0]
-        output_provenance[field] = {
-            "source": "action_output",
-            **({"actionId": last_action_id} if last_action_id else {}),
-            "path": path,
+    input_properties: dict[str, Any] = {}
+    input_required: list[str] = []
+    for action in cleaned_actions:
+        action_schema = action.get("inputSchema") or {}
+        action_properties = action_schema.get("properties") or {}
+        for field, binding in (action.get("argumentBindings") or {}).items():
+            if (
+                field not in (action.get("arguments") or {})
+                or not isinstance(binding, dict)
+                or binding.get("source") != "user_input"
+            ):
+                continue
+            input_key = str(binding.get("inputKey") or field)
+            input_properties[input_key] = dict(action_properties.get(field) or {})
+            if input_key not in input_required:
+                input_required.append(input_key)
+    input_schema = (
+        {
+            "type": "object",
+            "properties": input_properties,
+            "required": input_required,
+            "additionalProperties": False,
         }
-    return {
-        "runType": "agent_run",
-        "name": "conversation-agent-draft",
-        "prompt": prompt,
-        "inputSchema": {
+        if input_properties
+        else {
             "type": "object",
             "properties": {"message": {"type": "string"}},
             "required": ["message"],
             "additionalProperties": False,
-        },
+        }
+    )
+    return {
+        "runType": "agent_run",
+        "name": "conversation-agent-draft",
+        "prompt": prompt,
+        "inputSchema": input_schema,
         "outputSchema": config.output_schema,
         "actions": cleaned_actions,
         "output": redact(output),
-        "outputProvenance": output_provenance,
+        "outputProvenance": output_provenance or {},
         "semanticContext": {
             "resultConsumer": str(
                 (semantic_context or {}).get("resultConsumer", "unknown")
@@ -1866,7 +1880,11 @@ def build_agent_run_message(
     }
 
 
-def summarize_run(conversation_run: ConversationRun) -> dict[str, Any]:
+def summarize_run(
+    conversation_run: ConversationRun,
+    *,
+    distillation_eligibility: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """对话运行的 API 摘要视图（包含可恢复的长任务 handle 状态）。"""
 
     plan_lineage = (conversation_run.trajectory_json or {}).get(
@@ -1904,4 +1922,5 @@ def summarize_run(conversation_run: ConversationRun) -> dict[str, Any]:
         "browserEvidence": browser_evidence,
         "stepAttempts": plan_lineage.get("stepAttempts", {}),
         "replanBudget": plan_lineage.get("replanBudget"),
+        "distillationEligibility": distillation_eligibility,
     }

@@ -306,6 +306,8 @@ export type ChatMessageContent = {
   state?: string
   text: string
   code?: string
+  modelUsageCallIds?: string[]
+  diagnostics?: Array<{ field?: string; code: string; message: string }>
   componentId?: string
   componentName?: string
   workflowVersionId?: string
@@ -340,6 +342,8 @@ export type ChatMessageContent = {
     source: string
     messageId?: string
     quote: string
+    rawSpan?: { start: number; end: number; text: string }
+    canonicalValue?: unknown
     confidence: number
     uncertain: boolean
     serverVerified?: boolean
@@ -352,6 +356,12 @@ export type ChatMessageContent = {
     capabilityRef?: string
     level?: string
     status?: string
+    action?: string
+    attempt?: number
+    retryable?: boolean
+    sessionDigest?: string
+    modelCallId?: string
+    argumentsDigest?: string
     diagnostics?: Array<{ level: string; code: string; message: string }>
   }>
 }
@@ -396,6 +406,11 @@ export type ConversationRunSummary = {
   input: Record<string, unknown>
   output: Record<string, unknown>
   error: Record<string, unknown> | null
+  distillationEligibility?: {
+    eligible: boolean
+    actionCount: number
+    reasonCode: string
+  } | null
 }
 
 export type TaskCheckpointSummary = {

@@ -165,6 +165,46 @@ async def record_disclosure_response(
         raise CatalogError("disclosure call 不存在或已闭合")
 
 
+async def record_disclosure_failure(
+    session: AsyncSession,
+    session_id: str,
+    operation: str,
+    request_summary: dict[str, Any],
+    *,
+    code: str,
+) -> None:
+    """Persist bounded failure evidence without user or ToolResult payloads."""
+
+    pending = await session.scalar(
+        select(WorkflowDisclosureCall)
+        .where(
+            WorkflowDisclosureCall.session_id == session_id,
+            WorkflowDisclosureCall.operation == operation,
+            WorkflowDisclosureCall.status == "pending",
+        )
+        .order_by(WorkflowDisclosureCall.created_at.desc())
+        .limit(1)
+    )
+    error = {"code": code, "retryable": False}
+    if pending is None:
+        pending = WorkflowDisclosureCall(
+            id=str(uuid4()),
+            session_id=session_id,
+            operation=operation,
+            request_summary_json=request_summary,
+            response_digest=digest_json(error),
+            disclosure_level=None,
+            status="failed",
+            error_json=error,
+        )
+        session.add(pending)
+    else:
+        pending.response_digest = digest_json(error)
+        pending.status = "failed"
+        pending.error_json = error
+    await session.flush()
+
+
 async def disclose_refs(
     session: AsyncSession,
     session_id: str,

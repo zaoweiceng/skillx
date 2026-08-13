@@ -51,6 +51,7 @@ from app.application.conversation import (
 from app.application.distillation import (
     DistillationError,
     distill_conversation_run,
+    distillation_eligibility,
 )
 from app.application.error_policy import public_error, technical_error
 from app.application.mcp import (
@@ -74,7 +75,6 @@ from app.application.plans import (
 )
 from app.application.product_history import (
     bind_presentation_decision,
-    finalize_turn,
     normalize_presentation_policy,
     presentation_policy,
     presentation_view,
@@ -151,6 +151,7 @@ from app.infrastructure.database import (
     TaskCheckpoint,
     Workflow,
     WorkflowCapabilityManifest,
+    WorkflowDisclosureCall,
     WorkflowFragmentManifest,
     WorkflowVersion,
     get_session,
@@ -4142,6 +4143,14 @@ async def create_message(
     session.add(user_message)
     await session.flush()
     turn.user_message_id = user_message.id
+    conversation.last_message_at = accepted_at
+    conversation.updated_at = accepted_at
+    if conversation.title == "新对话":
+        title = " ".join(body.content.split())
+        conversation.title = title[:32] + ("…" if len(title) > 32 else "")
+    # Message acceptance is a short durable transaction. No model or Tool call
+    # below is allowed to inherit this SQLite write lock.
+    await session.commit()
     component_id = (
         body.component_id or conversation.bound_component_id
         if conversation.workflow_mode == "enabled"
@@ -4176,9 +4185,51 @@ async def create_message(
             "workflowModeSnapshot": "disabled",
         }
     else:
-        assistant_content, conversation_run = await _unbound_conversation_message(
-            session, conversation, body, turn.id, user_message.id
-        )
+        try:
+            assistant_content, conversation_run = await _unbound_conversation_message(
+                session, conversation, body, turn.id, user_message.id
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {}
+            usage_call_ids = list(
+                await session.scalars(
+                    select(ModelUsage.call_id).where(ModelUsage.turn_id == turn.id)
+                )
+            )
+            assistant_content = {
+                "type": "workflow_selection",
+                "state": "error",
+                "code": str(detail.get("code", "WORKFLOW_SELECTION_FAILED")),
+                "text": str(detail.get("message", "工作流选择未能完成")),
+                "retryable": bool(detail.get("retryable", False)),
+                "nextAction": detail.get("nextAction", "retry"),
+                "modelUsageCallIds": usage_call_ids,
+                **(
+                    {"disclosureSessionId": detail["disclosureSessionId"]}
+                    if detail.get("disclosureSessionId")
+                    else {}
+                ),
+                **(
+                    {"toolTimeline": detail["toolTimeline"]}
+                    if detail.get("toolTimeline")
+                    else {}
+                ),
+                **(
+                    {
+                        "diagnostics": [
+                            item
+                            if isinstance(item, dict)
+                            else {
+                                "code": "BINDING_CONTRACT_INVALID",
+                                "message": str(item),
+                            }
+                            for item in detail["diagnostics"][:4]
+                        ]
+                    }
+                    if isinstance(detail.get("diagnostics"), list)
+                    else {}
+                ),
+            }
     responded_at = utcnow()
     assistant_message = Message(
         id=str(uuid4()),
@@ -4212,9 +4263,6 @@ async def create_message(
     turn.assistant_message_id = assistant_message.id
     conversation.last_message_at = responded_at
     conversation.updated_at = responded_at
-    if conversation.title == "新对话":
-        title = " ".join(body.content.split())
-        conversation.title = title[:32] + ("…" if len(title) > 32 else "")
     await session.commit()
     return {
         "userMessageId": user_message.id,
@@ -4273,6 +4321,41 @@ async def _unbound_conversation_message(
         stored = dict(pending.selection_json)
         resume_action = stored.pop("resumeAction", "run_full")
         trusted_tool_evidence = stored.pop("_verifiedToolEvidence", {})
+        frozen_schema_digest = stored.pop("_inputSchemaDigest", None)
+        frozen_message_ids = list(stored.pop("_bindingMessageIds", []))
+        pending_contract_digest = stored.pop("_pendingContractDigest", None)
+        frozen_sources = list(stored.get("bindingSources", []))
+        if any(
+            item.get("source") in {"user_message", "history_message"}
+            and item.get("messageId") not in frozen_message_ids
+            for item in frozen_sources
+            if isinstance(item, dict)
+        ):
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "PENDING_SELECTION_STALE",
+                    "message": "待补充参数的历史来源不属于冻结消息集合",
+                },
+            )
+        expected_pending_digest = digest_json(
+            {
+                "refs": stored.get("refs", []),
+                "plan": stored.get("plan"),
+                "sessionId": stored.get("sessionId"),
+                "inputSchemaDigest": frozen_schema_digest,
+                "messageIds": frozen_message_ids,
+                "bindingSources": frozen_sources,
+            }
+        )
+        if pending_contract_digest != expected_pending_digest:
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "PENDING_SELECTION_STALE",
+                    "message": "待补充参数的冻结契约校验失败",
+                },
+            )
         selection = WorkflowSelection.model_validate(
             {
                 **stored,
@@ -4307,6 +4390,18 @@ async def _unbound_conversation_message(
                 "question": None,
             }
         )
+        resumed_schema, _, _ = await _selection_input_contract(session, selection)
+        if (
+            frozen_schema_digest is not None
+            and digest_json(resumed_schema) != frozen_schema_digest
+        ):
+            raise HTTPException(
+                409,
+                detail={
+                    "code": "PENDING_SELECTION_STALE",
+                    "message": "冻结的工作流输入契约已变化，请重新发起任务",
+                },
+            )
         selection, _ = await _prepare_selection(
             session,
             selection,
@@ -4341,13 +4436,67 @@ async def _unbound_conversation_message(
         conversation_id=conversation.id,
         agent_run_id=f"selection:{uuid4()}",
     )
-    selection, tool_timeline, tool_evidence = await _select_workflow_candidate(
-        session,
-        body.content,
-        disclosure.id,
-        turn_id=turn_id,
-        user_message_id=user_message_id,
-    )
+    await session.commit()
+    try:
+        selection, tool_timeline, tool_evidence = await _select_workflow_candidate(
+            session,
+            body.content,
+            disclosure.id,
+            turn_id=turn_id,
+            user_message_id=user_message_id,
+        )
+    except HTTPException as exc:
+        detail = dict(exc.detail) if isinstance(exc.detail, dict) else {}
+        detail["disclosureSessionId"] = disclosure.id
+        disclosure_calls = (
+            await session.scalars(
+                select(WorkflowDisclosureCall)
+                .where(WorkflowDisclosureCall.session_id == disclosure.id)
+                .order_by(WorkflowDisclosureCall.created_at)
+            )
+        ).all()
+        detail["toolTimeline"] = [
+            {
+                "type": "tool.result",
+                "callId": item.request_summary_json.get("toolCallId") or item.id,
+                "capabilityRef": "workflow.catalog",
+                "action": item.request_summary_json.get("action") or item.operation,
+                "status": item.status,
+                "retryable": bool((item.error_json or {}).get("retryable", False)),
+                "diagnostics": [
+                    {
+                        "level": "error",
+                        "code": str((item.error_json or {}).get("code", "CATALOG_CALL_FAILED")),
+                        "message": "目录调用未满足服务端契约",
+                    }
+                ]
+                if item.status == "failed"
+                else [],
+            }
+            for item in disclosure_calls
+        ]
+        exc.detail = detail
+        raise
+    if selection.action != "continue_agent":
+        try:
+            selection = await _extract_selection_bindings(
+                session,
+                selection,
+                conversation_id=conversation.id,
+                current_message_id=user_message_id,
+                turn_id=turn_id,
+                tool_evidence=tool_evidence,
+            )
+        except HTTPException as exc:
+            detail = dict(exc.detail) if isinstance(exc.detail, dict) else {}
+            detail.update(
+                {
+                    "disclosureSessionId": disclosure.id,
+                    "toolTimeline": tool_timeline,
+                }
+            )
+            exc.detail = detail
+            raise
     selection, resume_action = await _prepare_selection(
         session,
         selection,
@@ -4356,15 +4505,43 @@ async def _unbound_conversation_message(
         tool_evidence=tool_evidence,
     )
     if selection.action == "ask_user":
+        frozen_schema, _, _ = await _selection_input_contract(session, selection)
+        frozen_message_ids = (
+            await session.scalars(
+                select(Message.id)
+                .where(
+                    Message.conversation_id == conversation.id,
+                    Message.role == "user",
+                )
+                .order_by(Message.created_at.desc())
+                .limit(12)
+            )
+        ).all()
+        selection_payload = selection.model_dump(by_alias=True)
+        frozen_schema_digest = digest_json(frozen_schema)
+        frozen_message_ids = list(reversed(frozen_message_ids))
+        pending_contract_digest = digest_json(
+            {
+                "refs": selection_payload.get("refs", []),
+                "plan": selection_payload.get("plan"),
+                "sessionId": selection_payload.get("sessionId"),
+                "inputSchemaDigest": frozen_schema_digest,
+                "messageIds": frozen_message_ids,
+                "bindingSources": selection_payload.get("bindingSources", []),
+            }
+        )
         pending = PendingSelection(
             id=str(uuid4()),
             conversation_id=conversation.id,
             disclosure_session_id=disclosure.id,
             original_task=body.content,
             selection_json={
-                **selection.model_dump(by_alias=True),
+                **selection_payload,
                 "resumeAction": resume_action,
                 "_verifiedToolEvidence": tool_evidence,
+                "_inputSchemaDigest": frozen_schema_digest,
+                "_bindingMessageIds": frozen_message_ids,
+                "_pendingContractDigest": pending_contract_digest,
             },
             bindings_json=selection.bindings,
             missing_inputs_json=selection.missing_inputs,
@@ -4509,11 +4686,32 @@ async def _select_workflow_candidate(
                 "message": "语义选择服务不可用",
             },
         )
-    selection_schema = WorkflowSelection.model_json_schema(by_alias=True)
-    selection_schema["properties"].pop("sessionId", None)
-    selection_schema["required"] = [
-        item for item in selection_schema.get("required", []) if item != "sessionId"
-    ]
+    # Stage 1 only discovers an executable ref/plan. Dynamic input bindings are
+    # deliberately absent because their real Schema is unknown until this
+    # stage has returned a server-disclosed ref.
+    selection_schema = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "run_full",
+                    "run_fragment",
+                    "compose",
+                    "continue_agent",
+                ],
+            },
+            "reason": {"type": "string"},
+            "refs": {"type": "array", "items": {"type": "string"}},
+            "plan": {"type": ["object", "null"]},
+            "requiredCapabilities": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": ["action", "reason", "refs"],
+        "additionalProperties": False,
+    }
     settings = get_settings()
     request = AgentHostRequest(
         run_id=f"workflow-selection-{uuid4()}",
@@ -4522,10 +4720,10 @@ async def _select_workflow_candidate(
             "获取 L0，只在需要时通过同一窄工具请求 describe/describe_fragment/slice/"
             "compile_plan。"
             "不得选择未披露 ref，不得假设 Schema/DAG；编译失败时根据 diagnostics 修正。"
-            "比较 useWhen/doNotUseWhen、输入输出、副作用和成本后输出 WorkflowSelection。"
-            "从用户明确表达提取 bindings，并为每个字段返回 bindingSources（原文 quote、"
-            "messageId、confidence、uncertain）；禁止编造。只有 Schema 校验后仍缺失或"
-            "有真实歧义才 ask_user，无合适候选时 continue_agent。\n"
+            "比较 useWhen/doNotUseWhen、输入输出、副作用和成本后输出发现结果。"
+            "本阶段只选择 action/ref/plan/reason，不提取 bindings、不判断缺参，也不得"
+            "ask_user；服务端取得真实动态 inputSchema 后会单独执行参数提取。无合适候选时"
+            "continue_agent。\n"
             f"userMessageId={user_message_id or 'unknown'}\n"
             f"user={body_text(user_text)}\n"
         ),
@@ -4544,38 +4742,15 @@ async def _select_workflow_candidate(
         registry = ToolAdapterRegistry()
         registry.register(workflow_catalog_adapter(session, session_id))
         result = await AgentHost(tool_registry=registry).execute(request)
-        try:
-            selection = WorkflowSelection.model_validate(
-                {**result.output, "sessionId": session_id}
-            )
-        except ValidationError:
-            raw_bindings = result.output.get("bindings")
-            if not isinstance(raw_bindings, dict) or not raw_bindings:
-                raise
-            raw_plan = result.output.get("plan")
-            raw_refs = result.output.get("refs")
-            selection = WorkflowSelection.model_validate(
-                {
-                    "action": "ask_user",
-                    "reason": "Agent 返回的参数来源结构无效",
-                    "refs": (
-                        raw_refs
-                        if isinstance(raw_plan, dict) and isinstance(raw_refs, list)
-                        else raw_refs[:1]
-                        if isinstance(raw_refs, list)
-                        else []
-                    ),
-                    "bindings": {},
-                    "bindingSources": [],
-                    "missingInputs": list(raw_bindings),
-                    "question": (
-                        "参数来源无法由服务端验证，请重新提供："
-                        + ", ".join(raw_bindings)
-                    ),
-                    "plan": raw_plan if isinstance(raw_plan, dict) else None,
-                    "sessionId": session_id,
-                }
-            )
+        selection = WorkflowSelection.model_validate(
+            {
+                **result.output,
+                "bindings": {},
+                "bindingSources": [],
+                "missingInputs": [],
+                "sessionId": session_id,
+            }
+        )
         if turn_id:
             runtime = agent_runtime_config()
             await record_model_usage(
@@ -4598,6 +4773,7 @@ async def _select_workflow_candidate(
                 dispatched=result.request_dispatched,
                 completed=True,
             )
+        await session.commit()
     except (AgentHostError, ValueError) as exc:
         runtime = agent_runtime_config()
         dispatched = (
@@ -4651,7 +4827,6 @@ async def _select_workflow_candidate(
             dispatched=dispatched,
             completed=False,
         )
-        await finalize_turn(session, turn_id, "error")
         await session.commit()
         raise HTTPException(
             502,
@@ -4667,6 +4842,7 @@ async def _select_workflow_candidate(
         "workflow.slice": "L2",
         "workflow.compile_plan": "L2",
     }
+    request_by_call: dict[str, dict[str, Any]] = {}
     for event in result.runtime_events:
         if event["type"] not in {"tool.requested", "tool.result"}:
             continue
@@ -4676,6 +4852,9 @@ async def _select_workflow_candidate(
             continue
         output = payload.get("output")
         call_id = payload.get("callId")
+        if event["type"] == "tool.requested" and isinstance(call_id, str):
+            request_by_call[call_id] = dict(payload.get("arguments") or {})
+        arguments = request_by_call.get(str(call_id), {})
         if (
             event["type"] == "tool.result"
             and isinstance(call_id, str)
@@ -4688,7 +4867,7 @@ async def _select_workflow_candidate(
             action = (
                 output.get("action")
                 if isinstance(output, dict)
-                else (payload.get("arguments") or {}).get("action")
+                else arguments.get("action")
             )
             concrete_capability = {
                 "search": "workflow.search",
@@ -4703,6 +4882,20 @@ async def _select_workflow_candidate(
             if isinstance(output, dict) and output.get("level")
             else level_by_capability.get(concrete_capability)
         )
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        diagnostics = (
+            output.get("diagnostics", [])
+            if isinstance(output, dict) and output.get("diagnostics")
+            else [
+                {
+                    "level": "error",
+                    "code": str(error.get("code", "CATALOG_CALL_FAILED")),
+                    "message": str(error.get("message", "目录调用失败"))[:500],
+                }
+            ]
+            if error
+            else []
+        )
         timeline.append(
             {
                 "type": event["type"],
@@ -4710,6 +4903,13 @@ async def _select_workflow_candidate(
                 "capabilityRef": concrete_capability,
                 "level": level,
                 "status": payload.get("status", "pending"),
+                "action": arguments.get("action"),
+                "sessionDigest": digest_json({"sessionId": session_id}),
+                "modelCallId": request.run_id,
+                "argumentsDigest": payload.get("argumentsDigest")
+                or (digest_json(arguments) if arguments else None),
+                "attempt": int(payload.get("attempts", 1)),
+                "retryable": bool(error.get("retryable", False)),
                 **(
                     {
                         "result": bounded_result,
@@ -4718,11 +4918,7 @@ async def _select_workflow_candidate(
                     if bounded_result is not None
                     else {}
                 ),
-                **(
-                    {"diagnostics": output.get("diagnostics", [])}
-                    if isinstance(output, dict) and output.get("diagnostics")
-                    else {}
-                ),
+                **({"diagnostics": diagnostics} if diagnostics else {}),
             }
         )
     return selection, timeline, tool_evidence
@@ -4867,6 +5063,139 @@ def _binding_normalization(value: Any, quote: str) -> str | None:
     return "json" if canonical == quote.strip() else None
 
 
+def _canonical_message_evidence(
+    *,
+    field: str,
+    proposed_value: Any,
+    raw_source: dict[str, Any],
+    field_schema: dict[str, Any],
+    messages_by_id: dict[str, Message],
+    current_message_id: str,
+) -> tuple[Any | None, dict[str, Any] | None, dict[str, str] | None]:
+    """Rebuild one binding from an allowed Unicode source span.
+
+    The model points at evidence; the server owns the canonical minimal span and
+    executable value. Offsets are Python/Unicode code-point offsets, not bytes.
+    """
+
+    source_kind = raw_source.get("source")
+    message_id = raw_source.get("messageId")
+    message = messages_by_id.get(str(message_id))
+    if (
+        source_kind not in {"user_message", "history_message"}
+        or message is None
+        or (source_kind == "user_message" and message.id != current_message_id)
+    ):
+        return None, None, {
+            "field": field,
+            "code": "SOURCE_MESSAGE_NOT_ALLOWED",
+            "message": "messageId 不属于冻结消息集合或 source 类型不匹配",
+        }
+    raw_span = raw_source.get("rawSpan")
+    if not isinstance(raw_span, dict):
+        return None, None, {
+            "field": field,
+            "code": "SPAN_INVALID",
+            "message": "缺少 rawSpan",
+        }
+    text = str((message.content_json or {}).get("text", ""))
+    start = raw_span.get("start")
+    end = raw_span.get("end")
+    span_text = raw_span.get("text")
+    if (
+        not isinstance(start, int)
+        or not isinstance(end, int)
+        or not isinstance(span_text, str)
+        or start < 0
+        or end <= start
+        or end > len(text)
+        or text[start:end] != span_text
+    ):
+        return None, None, {
+            "field": field,
+            "code": "SPAN_INVALID",
+            "message": "rawSpan 下标或 text 与服务器消息不一致",
+        }
+
+    value_type = field_schema.get("type")
+    canonical_value: Any
+    canonical_text: str
+    relative_start = 0
+    if value_type == "string" or isinstance(proposed_value, str):
+        candidate = str(raw_source.get("canonicalValue", proposed_value))
+        positions = [
+            match.start() for match in re.finditer(re.escape(candidate), span_text)
+        ]
+        if not candidate or not positions:
+            return None, None, {
+                "field": field,
+                "code": "VALUE_NOT_IN_SOURCE",
+                "message": "canonicalValue 不在 rawSpan 原文中",
+            }
+        relative_start = positions[0]
+        canonical_text = candidate
+        canonical_value = text[
+            start + relative_start : start + relative_start + len(candidate)
+        ]
+    else:
+        stripped = span_text.strip()
+        relative_start = len(span_text) - len(span_text.lstrip())
+        try:
+            if value_type == "integer":
+                canonical_value = int(stripped)
+            elif value_type == "number":
+                canonical_value = float(stripped)
+            elif value_type == "boolean":
+                if stripped.lower() not in {"true", "false"}:
+                    raise ValueError
+                canonical_value = stripped.lower() == "true"
+            elif value_type in {"array", "object"}:
+                canonical_value = json.loads(stripped)
+            else:
+                canonical_value = json.loads(stripped)
+        except (ValueError, json.JSONDecodeError):
+            return None, None, {
+                "field": field,
+                "code": "NORMALIZATION_FAILED",
+                "message": "rawSpan 无法按字段 Schema 规范化",
+            }
+        canonical_text = stripped
+
+    schema_errors = list(
+        Draft202012Validator(field_schema, format_checker=FormatChecker()).iter_errors(
+            canonical_value
+        )
+    )
+    if schema_errors:
+        return None, None, {
+            "field": field,
+            "code": "NORMALIZATION_FAILED",
+            "message": schema_errors[0].message,
+        }
+    canonical_start = start + relative_start
+    canonical_end = canonical_start + len(canonical_text)
+    source = {
+        "field": field,
+        "source": source_kind,
+        "messageId": message.id,
+        "callId": None,
+        "path": None,
+        "evidenceDigest": None,
+        "quote": text[canonical_start:canonical_end],
+        "rawSpan": {
+            "start": canonical_start,
+            "end": canonical_end,
+            "text": text[canonical_start:canonical_end],
+        },
+        "canonicalValue": canonical_value,
+        "confidence": raw_source.get("confidence", 0),
+        "uncertain": raw_source.get("uncertain", False),
+        "serverVerified": True,
+        "normalizationType": "source_span_v1",
+    }
+    return canonical_value, source, None
+
+
 def _tool_evidence_value(output: dict[str, Any], path: str) -> Any:
     normalized = path.removeprefix("$.").removeprefix("output.")
     value: Any = output
@@ -4932,7 +5261,11 @@ async def _verify_binding_sources(
             if source.quote not in text_value:
                 invalid.append(field)
                 continue
-            normalization = _binding_normalization(value, source.quote)
+            normalization = (
+                source.normalization_type
+                if source.server_verified and source.canonical_value == value
+                else _binding_normalization(value, source.quote)
+            )
         else:
             output = tool_evidence.get(source.call_id or "")
             try:
@@ -4971,6 +5304,369 @@ async def _verify_binding_sources(
     return selection, list(dict.fromkeys(invalid))
 
 
+async def _selection_input_contract(
+    session: AsyncSession, selection: WorkflowSelection
+) -> tuple[dict[str, Any], list[str], dict[str, Any] | None]:
+    """Resolve the selected ref/plan to the exact server-owned input Schema."""
+
+    effective_action = _selection_resume_action(selection)
+    compiled_plan: dict[str, Any] | None = selection.compiled_plan
+    if effective_action == "run_full":
+        level = await require_disclosed_ref(
+            session, selection.session_id, selection.refs[0]
+        )
+        if level not in {"L1", "L2"}:
+            raise CatalogError("run_full 必须先披露 Workflow L1")
+        manifest = await resolve_workflow_manifest(session, selection.refs[0])
+        version = await session.get(WorkflowVersion, manifest.workflow_version_id)
+        if version is None:
+            raise CatalogError("WorkflowVersion 不存在")
+        schema = version.definition_json["spec"]["inputSchema"]
+    elif effective_action == "run_fragment":
+        level = await require_disclosed_ref(
+            session, selection.session_id, selection.refs[0]
+        )
+        if level != "L2":
+            raise CatalogError(
+                "run_fragment 必须先调用 workflow.describe_fragment 披露 L2"
+            )
+        fragment = await describe_fragment(session, selection.refs[0])
+        schema = fragment["boundaryInputSchema"]
+    else:
+        if selection.plan is None:
+            raise CatalogError("compose 缺少已披露 ExecutionPlan")
+        await require_plan_refs_disclosed(
+            session, selection.session_id, selection.plan
+        )
+        compiled_plan = await compile_plan(session, selection.plan)
+        schema = selection.plan.get("inputSchema", {})
+    return schema, list(schema.get("required", [])), compiled_plan
+
+
+def _binding_extraction_schema(
+    input_schema: dict[str, Any],
+    required: list[str],
+    message_ids: list[str],
+) -> dict[str, Any]:
+    bindings_schema = dict(input_schema)
+    bindings_schema.pop("required", None)
+    bindings_schema.setdefault("type", "object")
+    bindings_schema.setdefault("additionalProperties", False)
+    field_names = list((input_schema.get("properties") or {}).keys())
+    source_schema = {
+        "type": "object",
+        "properties": {
+            "field": {"type": "string", "enum": field_names},
+            "source": {
+                "type": "string",
+                "enum": ["user_message", "history_message", "tool_result"],
+            },
+            "messageId": {"type": ["string", "null"], "enum": [*message_ids, None]},
+            "callId": {"type": ["string", "null"]},
+            "path": {"type": ["string", "null"]},
+            "evidenceDigest": {"type": ["string", "null"]},
+            "rawSpan": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "integer", "minimum": 0},
+                    "end": {"type": "integer", "minimum": 0},
+                    "text": {"type": "string", "minLength": 1},
+                },
+                "required": ["start", "end", "text"],
+                "additionalProperties": False,
+            },
+            "canonicalValue": {},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "uncertain": {"type": "boolean"},
+        },
+        "required": [
+            "field",
+            "source",
+            "rawSpan",
+            "canonicalValue",
+            "confidence",
+            "uncertain",
+        ],
+        "additionalProperties": False,
+    }
+    assessment_schema: dict[str, Any] = {
+        "type": "array",
+        "minItems": len(required),
+        "maxItems": len(required),
+        "items": {
+            "type": "object",
+            "properties": {
+                "field": {"type": "string", "enum": required},
+                "status": {
+                    "type": "string",
+                    "enum": ["found", "missing", "ambiguous"],
+                },
+                "reason": {"type": "string"},
+            },
+            "required": ["field", "status", "reason"],
+            "additionalProperties": False,
+        },
+    }
+    if not required:
+        assessment_schema["items"] = {"type": "object"}
+    missing_items = {"type": "string", **({"enum": required} if required else {})}
+    return {
+        "type": "object",
+        "properties": {
+            "bindings": bindings_schema,
+            "bindingSources": {"type": "array", "items": source_schema},
+            "missingInputs": {
+                "type": "array",
+                "items": missing_items,
+                "uniqueItems": True,
+            },
+            "fieldAssessments": assessment_schema,
+            "question": {"type": ["string", "null"]},
+        },
+        "required": [
+            "bindings",
+            "bindingSources",
+            "missingInputs",
+            "fieldAssessments",
+            "question",
+        ],
+        "additionalProperties": False,
+    }
+
+
+async def _extract_selection_bindings(
+    session: AsyncSession,
+    selection: WorkflowSelection,
+    *,
+    conversation_id: str,
+    current_message_id: str,
+    turn_id: str | None,
+    tool_evidence: dict[str, dict[str, Any]],
+) -> WorkflowSelection:
+    """Stage 2: bind the selected dynamic Schema, then verify every source."""
+
+    input_schema, required, compiled_plan = await _selection_input_contract(
+        session, selection
+    )
+    messages = (
+        await session.scalars(
+            select(Message)
+            .where(Message.conversation_id == conversation_id, Message.role == "user")
+            .order_by(Message.created_at.desc())
+            .limit(12)
+        )
+    ).all()
+    packets = [
+        {
+            "messageId": item.id,
+            "source": (
+                "user_message" if item.id == current_message_id else "history_message"
+            ),
+            "text": body_text(str((item.content_json or {}).get("text", ""))),
+        }
+        for item in reversed(messages)
+    ]
+    message_ids = [str(item["messageId"]) for item in packets]
+    output_schema = _binding_extraction_schema(
+        input_schema, required, message_ids
+    )
+    settings = get_settings()
+    messages_by_id = {item.id: item for item in messages}
+    diagnostics: list[Any] = []
+    for attempt in (1, 2):
+        request = AgentHostRequest(
+            run_id=f"workflow-binding-{uuid4()}",
+            prompt=(
+                "WorkflowBindingExtraction。能力选择已由服务端冻结；只按给定 inputSchema "
+                "从 messagePackets 提取参数，不得重新搜索或更换 ref。每个 required 字段"
+                "必须恰好有一个 fieldAssessment。found 必须返回 binding 和唯一 bindingSource；"
+                "missing 表示证据确实不存在；ambiguous 表示存在多个无法消歧的候选。quote "
+                "已废弃，不得返回。rawSpan 使用 Unicode code point 下标 [start,end)，text "
+                "必须等于该范围原文，并且是值本身的最小连续片段，不得包含字段名或上下文；"
+                "canonicalValue 是按 inputSchema 解释该片段后的值。禁止猜测或改写。\n"
+                f"attempt={attempt}\n"
+                f"selectedRefDigest={digest_json(selection.refs or selection.plan)}\n"
+                f"inputSchemaDigest={digest_json(input_schema)}\n"
+                f"inputSchema={json.dumps(input_schema, ensure_ascii=False)}\n"
+                f"required={json.dumps(required, ensure_ascii=False)}\n"
+                f"messagePackets={json.dumps(packets, ensure_ascii=False)}\n"
+                + (
+                    f"previousDiagnostics={json.dumps(diagnostics, ensure_ascii=False)}\n"
+                    "这是唯一一次结构化纠正，请逐字段重新检查。"
+                    if diagnostics
+                    else ""
+                )
+            ),
+            output_schema=output_schema,
+            working_directory=settings.artifact_root / "workflow-bindings",
+            requested_capabilities=(),
+            max_steps=1,
+            max_total_tokens=settings.agent_max_total_tokens,
+            max_input_tokens=settings.agent_max_input_tokens,
+            max_output_tokens=settings.agent_max_output_tokens,
+            max_billable_tokens=settings.agent_max_billable_tokens,
+            max_duration_seconds=60,
+        )
+        result = None
+        try:
+            result = await AgentHost().execute(request)
+            runtime = agent_runtime_config()
+            await record_model_usage(
+                session,
+                call_id=request.run_id,
+                stage="workflow_binding",
+                turn_id=turn_id,
+                provider=result.provider or runtime.provider,
+                model=result.model,
+                protocol=runtime.protocol,
+                runtime_type=runtime.type,
+                adapter_version=runtime.adapter_version,
+                adapter_digest=runtime.adapter_digest,
+                runtime_used="agent_runtime",
+                runtime_digest=runtime.digest,
+                input_tokens=result.input_tokens,
+                output_tokens=result.output_tokens,
+                total_tokens=result.total_tokens or None,
+                usage_complete=result.usage_complete,
+                dispatched=result.request_dispatched,
+                completed=True,
+            )
+            await session.commit()
+        except AgentHostError as exc:
+            runtime = agent_runtime_config()
+            await record_model_usage(
+                session,
+                call_id=request.run_id,
+                stage="workflow_binding",
+                turn_id=turn_id,
+                provider=runtime.provider,
+                model=runtime.model,
+                protocol=runtime.protocol,
+                runtime_type=runtime.type,
+                adapter_version=runtime.adapter_version,
+                adapter_digest=runtime.adapter_digest,
+                runtime_used="agent_runtime",
+                runtime_digest=runtime.digest,
+                error_code=exc.code,
+                input_tokens=exc.input_tokens or None,
+                output_tokens=exc.output_tokens or None,
+                total_tokens=exc.total_tokens or None,
+                usage_complete=exc.usage_complete,
+                dispatched=exc.request_dispatched,
+                completed=False,
+            )
+            await session.commit()
+            raise HTTPException(
+                502,
+                detail={"code": "SELECTION_BINDING_FAILED", "message": str(exc)},
+            ) from exc
+
+        raw = result.output
+        assessments = raw.get("fieldAssessments", [])
+        assessment_fields = [
+            item.get("field") for item in assessments if isinstance(item, dict)
+        ]
+        found_fields = {
+            str(item.get("field"))
+            for item in assessments
+            if isinstance(item, dict) and item.get("status") == "found"
+        }
+        unresolved_fields = {
+            str(item.get("field"))
+            for item in assessments
+            if isinstance(item, dict) and item.get("status") in {"missing", "ambiguous"}
+        }
+        diagnostics = []
+        if set(assessment_fields) != set(required) or len(assessment_fields) != len(
+            set(assessment_fields)
+        ):
+            diagnostics.append("fieldAssessments 必须恰好覆盖全部 required 字段")
+        proposed_bindings = dict(raw.get("bindings") or {})
+        raw_sources = list(raw.get("bindingSources") or [])
+        source_fields = [
+            str(item.get("field")) for item in raw_sources if isinstance(item, dict)
+        ]
+        for field in found_fields:
+            if field not in proposed_bindings or source_fields.count(field) != 1:
+                diagnostics.append(f"found 字段 {field} 缺少 binding 或唯一 source")
+        if set(raw.get("missingInputs") or []) != unresolved_fields:
+            diagnostics.append("missingInputs 与 missing/ambiguous assessment 不一致")
+        bindings: dict[str, Any] = {}
+        canonical_sources: list[dict[str, Any]] = []
+        if not diagnostics:
+            properties = input_schema.get("properties") or {}
+            for field in sorted(found_fields):
+                raw_source = next(
+                    item
+                    for item in raw_sources
+                    if isinstance(item, dict) and item.get("field") == field
+                )
+                value, source, diagnostic = _canonical_message_evidence(
+                    field=field,
+                    proposed_value=proposed_bindings[field],
+                    raw_source=raw_source,
+                    field_schema=dict(properties.get(field) or {}),
+                    messages_by_id=messages_by_id,
+                    current_message_id=current_message_id,
+                )
+                if diagnostic:
+                    diagnostics.append(diagnostic)
+                else:
+                    bindings[field] = value
+                    assert source is not None
+                    canonical_sources.append(source)
+        try:
+            candidate = WorkflowSelection.model_validate(
+                {
+                    **selection.model_dump(by_alias=True),
+                    "bindings": bindings,
+                    "bindingSources": canonical_sources,
+                    "missingInputs": sorted(unresolved_fields),
+                    "question": raw.get("question"),
+                    "compiledPlan": compiled_plan,
+                }
+            )
+        except ValidationError as exc:
+            diagnostics.append(f"bindingSources 契约无效: {exc.errors()[0]['msg']}")
+            candidate = selection
+        if not diagnostics:
+            verified, invalid = await _verify_binding_sources(
+                session,
+                candidate,
+                conversation_id=conversation_id,
+                current_message_id=current_message_id,
+                tool_evidence=tool_evidence,
+            )
+            value_errors = [
+                error
+                for error in Draft202012Validator(
+                    input_schema, format_checker=FormatChecker()
+                ).iter_errors(verified.bindings)
+                if error.validator != "required"
+            ]
+            if invalid:
+                diagnostics.append(f"来源无法验证: {sorted(invalid)}")
+            if value_errors:
+                diagnostics.append(f"binding 不符合 inputSchema: {value_errors[0].message}")
+            if not diagnostics:
+                if unresolved_fields and attempt == 1:
+                    diagnostics.append(
+                        "required 字段被判定为缺失或歧义，请逐字段重新检查冻结消息"
+                    )
+                else:
+                    return verified
+        if attempt == 2:
+            raise HTTPException(
+                502,
+                detail={
+                    "code": "SELECTION_BINDING_INCOMPLETE",
+                    "message": "参数提取未满足冻结 Schema 与来源契约",
+                    "diagnostics": diagnostics[:4],
+                },
+            )
+    raise AssertionError("unreachable")
+
+
 async def _prepare_selection(
     session: AsyncSession,
     selection: WorkflowSelection,
@@ -4988,39 +5684,9 @@ async def _prepare_selection(
     if selection.action == "ask_user" and not selection.refs and selection.plan is None:
         return selection, resume_action
 
-    required: list[str]
-    schema: dict[str, Any]
-    compiled_plan: dict[str, Any] | None = selection.compiled_plan
-    effective_action = resume_action if selection.action == "ask_user" else selection.action
-    if effective_action == "run_full":
-        level = await require_disclosed_ref(
-            session, selection.session_id, selection.refs[0]
-        )
-        if level not in {"L1", "L2"}:
-            raise CatalogError("run_full 必须先披露 Workflow L1")
-        manifest = await resolve_workflow_manifest(session, selection.refs[0])
-        version = await session.get(WorkflowVersion, manifest.workflow_version_id)
-        if version is None:
-            raise CatalogError("WorkflowVersion 不存在")
-        schema = version.definition_json["spec"]["inputSchema"]
-        required = list(schema.get("required", []))
-    elif effective_action == "run_fragment":
-        level = await require_disclosed_ref(
-            session, selection.session_id, selection.refs[0]
-        )
-        if level != "L2":
-            raise CatalogError("run_fragment 必须先调用 workflow.describe_fragment 披露 L2")
-        fragment = await describe_fragment(session, selection.refs[0])
-        schema = fragment["boundaryInputSchema"]
-        required = list(schema.get("required", []))
-    else:
-        assert selection.plan is not None
-        await require_plan_refs_disclosed(
-            session, selection.session_id, selection.plan
-        )
-        compiled_plan = await compile_plan(session, selection.plan)
-        schema = selection.plan.get("inputSchema", {})
-        required = list(schema.get("required", []))
+    schema, required, compiled_plan = await _selection_input_contract(
+        session, selection
+    )
 
     selection, source_invalid = await _verify_binding_sources(
         session,
@@ -5350,7 +6016,20 @@ async def get_conversation_run(
     conversation_run = await session.get(ConversationRun, conversation_run_id)
     if conversation_run is None:
         raise HTTPException(404, "ConversationRun 不存在")
-    return summarize_run(conversation_run)
+    has_existing_draft = (
+        await session.scalar(
+            select(func.count())
+            .select_from(Distillation)
+            .where(Distillation.conversation_run_id == conversation_run.id)
+        )
+        or 0
+    ) > 0
+    return summarize_run(
+        conversation_run,
+        distillation_eligibility=distillation_eligibility(
+            conversation_run, has_existing_draft=has_existing_draft
+        ),
+    )
 
 
 @router.get("/conversation-runs/{conversation_run_id}/events")
@@ -5657,6 +6336,26 @@ async def distill_run(
     conversation_run = await session.get(ConversationRun, conversation_run_id)
     if conversation_run is None:
         raise HTTPException(404, "ConversationRun 不存在")
+    has_existing_draft = (
+        await session.scalar(
+            select(func.count())
+            .select_from(Distillation)
+            .where(Distillation.conversation_run_id == conversation_run.id)
+        )
+        or 0
+    ) > 0
+    eligibility = distillation_eligibility(
+        conversation_run, has_existing_draft=has_existing_draft
+    )
+    if not eligibility["eligible"]:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "DISTILLATION_NOT_ELIGIBLE",
+                "message": str(eligibility["reasonCode"]),
+                **eligibility,
+            },
+        )
     try:
         result = await distill_conversation_run(session, conversation_run)
         await session.commit()

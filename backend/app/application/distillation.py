@@ -32,6 +32,35 @@ class DistillationError(ValueError):
     pass
 
 
+def distillation_eligibility(
+    conversation_run: ConversationRun,
+    *,
+    has_existing_draft: bool = False,
+) -> dict[str, Any]:
+    """Single server-owned qualification rule for UI and API enforcement."""
+
+    actions = [
+        item
+        for item in (conversation_run.trajectory_json or {}).get("actions", [])
+        if isinstance(item, dict) and item.get("status", "succeeded") == "succeeded"
+    ]
+    if has_existing_draft:
+        reason = "DRAFT_ALREADY_EXISTS"
+    elif conversation_run.status != "succeeded":
+        reason = "RUN_NOT_SUCCEEDED"
+    elif conversation_run.run_type != "agent_run":
+        reason = "UNSUPPORTED_RUN_TYPE"
+    elif not actions:
+        reason = "NO_REUSABLE_ACTIONS"
+    else:
+        reason = "ELIGIBLE"
+    return {
+        "eligible": reason == "ELIGIBLE",
+        "actionCount": len(actions),
+        "reasonCode": reason,
+    }
+
+
 class CapabilityDescriptor(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     summary: str = Field(min_length=1, max_length=240)
@@ -378,6 +407,63 @@ def compile_agent_trajectory(
     if not actions:
         raise DistillationError("轨迹不含任何可分析动作")
 
+    output_provenance = trajectory.get("outputProvenance")
+    generative_sources = sorted(
+        {
+            str(call_id)
+            for source in (
+                output_provenance.values()
+                if isinstance(output_provenance, dict)
+                else []
+            )
+            if isinstance(source, dict) and source.get("mode") == "generative"
+            for call_id in source.get("sourceCallIds", [])
+        }
+    )
+    generative_node_id: str | None = None
+    if generative_sources:
+        unknown_sources = [
+            call_id for call_id in generative_sources if call_id not in action_node_ids
+        ]
+        if unknown_sources:
+            diagnostics.append(
+                {
+                    "level": "error",
+                    "code": "INVALID_OUTPUT_PROVENANCE",
+                    "path": "output",
+                    "message": f"生成式输出引用未知 action: {unknown_sources}",
+                }
+            )
+        else:
+            generative_node_id = _node_id("final-response", taken)
+            evidence_nodes = list(
+                dict.fromkeys(action_node_ids[item] for item in generative_sources)
+            )
+            nodes.append(
+                {
+                    "id": generative_node_id,
+                    "type": "llm",
+                    "displayName": "基于已验证证据生成最终结果",
+                    "input": {
+                        f"evidence{index + 1}": f"${{{node_id}.output}}"
+                        for index, node_id in enumerate(evidence_nodes)
+                    },
+                    "config": {
+                        "outputSchema": output_schema,
+                        "maxTotalTokens": 20000,
+                        "prompt": (
+                            "仅根据输入的已验证证据生成符合 outputSchema 的结果，"
+                            "不得增加证据中不存在的事实。"
+                        ),
+                    },
+                }
+            )
+            for source_node in evidence_nodes:
+                edges.append({"source": source_node, "target": generative_node_id})
+            agent_nodes += 1
+            last_node = generative_node_id
+            last_output_ref = f"${{{generative_node_id}.output}}"
+
     # 找出所有没有下游的“叶子”节点（终端），连到 output。
     sources_with_downstream = {edge["source"] for edge in edges}
     leaf_nodes = [
@@ -387,11 +473,12 @@ def compile_agent_trajectory(
     ]
     output_mapping, output_diagnostics = _build_output_mapping(
         output_schema,
-        trajectory.get("outputProvenance"),
+        output_provenance,
         action_node_ids,
         last_node,
         nodes,
         last_output_ref,
+        generative_node_id,
     )
     diagnostics.extend(output_diagnostics)
     nodes.append(
@@ -631,6 +718,7 @@ def _build_output_mapping(
     last_node: str,
     nodes: list[dict[str, Any]],
     last_output_ref: str,
+    generative_node_id: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     """把最后一个节点的输出映射到 workflow output 的每个属性。
 
@@ -654,7 +742,24 @@ def _build_output_mapping(
                 }
             )
             continue
-        action_id = source.get("actionId") or source.get("lastActionId")
+        if source.get("mode") == "generative":
+            if generative_node_id is None:
+                diagnostics.append(
+                    {
+                        "level": "error",
+                        "code": "INVALID_OUTPUT_PROVENANCE",
+                        "path": f"output.{key}",
+                        "message": f"输出字段 {key} 缺少生成节点",
+                    }
+                )
+            else:
+                mapping[key] = f"${{{generative_node_id}.output.{key}}}"
+            continue
+        action_id = (
+            source.get("callId")
+            or source.get("actionId")
+            or source.get("lastActionId")
+        )
         node_id = action_node_ids.get(str(action_id))
         if node_id is None:
             diagnostics.append(
@@ -666,7 +771,7 @@ def _build_output_mapping(
                 }
             )
             continue
-        path = source.get("path", key)
+        path = str(source.get("path", key)).removeprefix("output.")
         mapping[key] = f"${{{node_id}.output.{path}}}"
     if mapping or diagnostics:
         return mapping, diagnostics
@@ -841,7 +946,7 @@ async def distill_conversation_run(
     result = Distillation(
         id=distillation_id,
         conversation_run_id=conversation_run.id,
-        status="draft_created",
+        status="draft_created" if analysis["publishable"] else "blocked",
         draft_workflow_id=workflow.id,
         analysis_json=analysis,
     )

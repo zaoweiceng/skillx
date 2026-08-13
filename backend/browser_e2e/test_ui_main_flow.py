@@ -159,7 +159,7 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             stack.set_article("016 UI 第二次复用正文")
             page.goto(f"{frontend_url}/components")
             page.get_by_role("link", name="网页内容读取与总结").first.click()
-            page.locator("#root_message").fill(
+            page.locator("#root_url").fill(
                 f"{stack.form_url}/article?version=second"
             )
             page.get_by_role("button", name="启动工作流").click()
@@ -207,7 +207,7 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             stack.set_transient_healthy(False)
             page.goto(f"{frontend_url}/components")
             page.get_by_role("link", name="网页内容读取与总结").first.click()
-            page.locator("#root_message").fill(
+            page.locator("#root_url").fill(
                 f"{stack.form_url}/transient?mode=503"
             )
             page.get_by_role("button", name="启动工作流").click()

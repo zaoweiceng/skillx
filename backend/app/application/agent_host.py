@@ -135,6 +135,7 @@ class AgentHostResult:
     """AgentHost 成功执行后的结构化结果。"""
 
     output: dict[str, Any]
+    output_provenance: dict[str, Any] = field(default_factory=dict)
     actions: list[dict[str, Any]] = field(default_factory=list)
     runtime_events: list[dict[str, Any]] = field(default_factory=list)
     audit_events: list[dict[str, Any]] = field(default_factory=list)
@@ -510,8 +511,15 @@ class AgentHost:
                         if event_sink is not None:
                             await event_sink(runtime_event, audit_event)
                         open_calls[request_payload["callId"]] = request_payload
+                        argument_bindings = self._host_argument_bindings(
+                            request_payload.get("arguments", {}),
+                            request.prompt,
+                            broker_payloads,
+                        )
                         tool_result = await self._execute_tool_request(
-                            request, request_payload
+                            request,
+                            request_payload,
+                            argument_bindings=argument_bindings,
                         )
                         await adapter.send_tool_result(request.run_id, tool_result)
                         runtime_result, audit_result = validator.validate_pair(tool_result)
@@ -835,6 +843,9 @@ class AgentHost:
                                         protocol_violation=exc.message,
                                     ) from exc
                                 raise
+                        result.output_provenance = dict(
+                            payload.get("outputProvenance") or {}
+                        )
                         final_tokens = payload.get("totalTokens")
                         if final_tokens is not None:
                             # 终态 Token 一致性校验：必须非负、不得小于可信步骤累计值，
@@ -1209,10 +1220,69 @@ class AgentHost:
             current = current[segment]
         return current
 
+    @staticmethod
+    def _host_argument_bindings(
+        arguments: dict[str, Any],
+        prompt: str,
+        prior_results: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Classify argument provenance from Host-visible values only."""
+
+        def paths(value: Any, expected: Any, prefix: str = "") -> list[str]:
+            found: list[str] = []
+            if value == expected:
+                found.append(prefix)
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    child = f"{prefix}.{key}" if prefix else str(key)
+                    found.extend(paths(item, expected, child))
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    child = f"{prefix}.{index}" if prefix else str(index)
+                    found.extend(paths(item, expected, child))
+            return found
+
+        classified: dict[str, dict[str, Any]] = {}
+        for argument_name, value in arguments.items():
+            prior_matches: list[tuple[str, str]] = []
+            for call_id, payload in prior_results.items():
+                for path in paths(payload.get("output"), value):
+                    if path:
+                        prior_matches.append((call_id, path))
+            if len(prior_matches) == 1:
+                call_id, path = prior_matches[0]
+                classified[argument_name] = {
+                    "source": "prior_output",
+                    "fromAction": call_id,
+                    "fromPath": path,
+                }
+                continue
+            encoded = (
+                value
+                if isinstance(value, str)
+                else json.dumps(value, ensure_ascii=False, sort_keys=True)
+            )
+            start = prompt.find(str(encoded))
+            if start >= 0:
+                classified[argument_name] = {
+                    "source": "user_input",
+                    "inputKey": argument_name,
+                    "rawSpan": {
+                        "start": start,
+                        "end": start + len(str(encoded)),
+                        "text": str(encoded),
+                    },
+                }
+            else:
+                classified[argument_name] = {"source": "unknown"}
+        return classified
+
     async def _execute_tool_request(
         self,
         request: AgentHostRequest,
         payload: dict[str, Any],
+        *,
+        argument_bindings: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
         capability_ref = payload["capabilityRef"]
         try:
@@ -1256,7 +1326,9 @@ class AgentHost:
                         "fixturePolicy": descriptor["fixturePolicy"],
                         "actionSignature": signature,
                         "reusedFromLedger": True,
-                        **self._tool_result_metadata(payload),
+                        **self._tool_result_metadata(
+                            payload, descriptor, argument_bindings=argument_bindings
+                        ),
                     },
                 }
             attempts = 0
@@ -1298,9 +1370,11 @@ class AgentHost:
                     "attempts": attempts,
                     **self._tool_result_metadata(
                         payload,
+                        descriptor,
                         self._tool_registry.distillation_evidence(
                             capability_ref, output
                         ),
+                        argument_bindings=argument_bindings,
                     ),
                 },
             }
@@ -1331,31 +1405,42 @@ class AgentHost:
                     "fixturePolicy": descriptor["fixturePolicy"],
                     "actionSignature": signature,
                     "attempts": locals().get("attempts", 1),
-                    **self._tool_result_metadata(payload),
+                    **self._tool_result_metadata(
+                        payload, descriptor, argument_bindings=argument_bindings
+                    ),
                 },
             }
 
     @staticmethod
     def _tool_result_metadata(
         payload: dict[str, Any],
+        descriptor: dict[str, Any],
         adapter_evidence: dict[str, Any] | None = None,
+        *,
+        argument_bindings: dict[str, dict[str, Any]],
     ) -> dict[str, Any]:
         keys = (
             "action",
-            "actionKind",
-            "argumentBindings",
-            "effect",
-            "idempotent",
             "observations",
-            "outputSchema",
             "planDigest",
             "planRevision",
             "planStepId",
-            "replayability",
             "stepAttempt",
             "idempotencyKey",
         )
         metadata = {key: payload[key] for key in keys if key in payload}
+        metadata.update(
+            {
+                "actionKind": descriptor["actionKind"],
+                "argumentBindings": argument_bindings,
+                "inputSchema": descriptor["inputSchema"],
+                "outputSchema": descriptor["outputSchema"],
+                "effect": descriptor["effect"],
+                "idempotent": descriptor["idempotent"],
+                "replayability": descriptor["replayability"],
+                "capabilityIdentity": descriptor["capabilityIdentity"],
+            }
+        )
         observations = dict(metadata.get("observations") or {})
         observations.update(adapter_evidence or {})
         observations["resultSource"] = "host_tool_broker"
@@ -1406,7 +1491,15 @@ class AgentHost:
             action["status"] = completed.get("status")
             action["evidenceDigest"] = completed.get("evidenceDigest")
         # 透传固化证据（如果 Runtime 提供）。
-        for key in ("capabilityRef", "outputSchema", "replayability", "effect", "idempotent"):
+        for key in (
+            "capabilityRef",
+            "capabilityIdentity",
+            "inputSchema",
+            "outputSchema",
+            "replayability",
+            "effect",
+            "idempotent",
+        ):
             if key in completed:
                 action[key] = completed[key]
             elif key in started:
