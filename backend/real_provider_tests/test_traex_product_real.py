@@ -134,3 +134,116 @@ def test_real_product_running_cancellation(
         assert cancelled.status_code == 202, cancelled.text
         terminal = poll_conversation_run(client, run_id, timeout=30)
         assert terminal["status"] == "cancelled", terminal
+
+
+def test_real_product_distill_publish_discover_and_reuse(
+    probed_real_product_stack: DemoStack,
+) -> None:
+    """真实主闭环：探索、固化、发布、不同输入执行及新对话发现同一 v1。"""
+
+    with _client(probed_real_product_stack) as client:
+        source = client.post(
+            "/conversations", json={"title": "real-distill-source"}
+        ).json()
+        disabled = client.patch(
+            f"/conversations/{source['id']}/workflow-mode",
+            json={"workflowMode": "disabled"},
+        )
+        assert disabled.status_code == 200, disabled.text
+        explored = client.post(
+            f"/conversations/{source['id']}/messages",
+            json={
+                "content": "查询标识 q2 对应的本地示例数据并用一句中文告诉我结果"
+            },
+        )
+        assert explored.status_code == 201, explored.text
+        conversation_run_id = explored.json()["assistant"]["conversationRunId"]
+        exploration = poll_conversation_run(client, conversation_run_id, timeout=180)
+        assert exploration["status"] == "succeeded", exploration
+        events = client.get(
+            f"/conversation-runs/{conversation_run_id}/events"
+        ).json()
+        assert any(
+            item.get("type") == "tool.result"
+            and item.get("payload", {}).get("capabilityRef") == "lookup.table"
+            and item.get("payload", {}).get("status") == "succeeded"
+            for item in events
+        ), events
+
+        distilled = client.post(f"/conversation-runs/{conversation_run_id}/distill")
+        assert distilled.status_code == 201, distilled.text
+        distillation = distilled.json()
+        assert distillation["status"] == "draft_created", distillation
+        assert distillation["analysis"]["publishable"] is True, distillation
+        workflow_id = distillation["draftWorkflowId"]
+        workflow = client.get(f"/workflows/{workflow_id}").json()
+        definition = workflow["definition"]
+        node_types = {
+            node["type"] for node in definition["spec"]["nodes"]
+        }
+        assert {"transform", "llm"} <= node_types, definition
+        definition["metadata"]["presentationPolicy"] = {
+            "enabled": False,
+            "audience": "internal",
+            "producer": "template",
+            "template": "执行结果：{json}",
+        }
+        definition["metadata"]["presentationPolicyDecision"] = {
+            "status": "rejected",
+            "reviewer": "real-product-gate",
+            "reviewedAt": "2026-08-13T00:00:00Z",
+        }
+        updated = client.put(
+            f"/workflows/{workflow_id}/draft",
+            json={"revision": workflow["draftRevision"], "definition": definition},
+        )
+        assert updated.status_code == 200, updated.text
+        updated_workflow = updated.json()
+        validation = client.post(f"/workflows/{workflow_id}/validate")
+        assert validation.status_code == 200, validation.text
+        assert validation.json()["valid"] is True, validation.json()
+        published = client.post(
+            f"/workflows/{workflow_id}/publish",
+            json={
+                "draftRevision": updated_workflow["draftRevision"],
+                "draftDigest": updated_workflow["draftDigest"],
+            },
+        )
+        assert published.status_code == 201, published.text
+        published_version = published.json()
+        version_id = published_version["id"]
+
+        manual = client.post(
+            f"/workflow-versions/{version_id}/runs", json={"input": {"key": "q4"}}
+        )
+        assert manual.status_code == 202, manual.text
+        manual_run = poll_run(client, manual.json()["id"], timeout=180)
+        assert manual_run["status"] == "succeeded", manual_run
+        llm_node = next(
+            node for node in manual_run["nodes"] if node["type"] == "llm"
+        )
+        assert llm_node["status"] == "succeeded", llm_node
+        assert any(llm_node["input"].values()), llm_node
+
+        reuse = client.post(
+            "/conversations", json={"title": "real-distill-reuse"}
+        ).json()
+        selected = client.post(
+            f"/conversations/{reuse['id']}/messages",
+            json={
+                "content": "查询标识 q3 对应的本地示例数据并用一句中文告诉我结果"
+            },
+        )
+        assert selected.status_code == 201, selected.text
+        assistant = selected.json()["assistant"]
+        assert assistant["state"] == "workflow_run", assistant
+        # Agent 可选择直接 run_full，也可生成锁定同一版本的 plan/fragment；不可变 ref
+        # 才是两种执行形态共同的版本身份。
+        assert any(
+            ref == published_version["workflowRef"] or workflow_id in ref
+            for ref in assistant["refs"]
+        ), assistant
+        reused_run = poll_run(client, assistant["runId"], timeout=180)
+        assert reused_run["status"] == "succeeded", reused_run
+        refreshed = client.get(f"/conversations/{reuse['id']}").json()
+        assert refreshed["messages"][-1]["content"]["runId"] == assistant["runId"]

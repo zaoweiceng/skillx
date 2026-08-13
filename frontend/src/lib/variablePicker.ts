@@ -63,8 +63,8 @@ function expandSchemaPaths(schema: JsonSchema | undefined, prefix: string, depth
  *
  * - Input 节点：变量来自 workflow `inputSchema`，生成 `${input.<字段>}`，绝不生成
  *   `${input.output}`（运行时无该路径）。
- * - 其他节点：变量来自节点锁定的 `outputSchema`，生成 `${nodeId.output.<字段>}`；
- *   支持嵌套对象与数组路径。无 outputSchema 时回退到 `${nodeId.output}`。
+ * - 其他节点：`${nodeId.output}` 始终表示完整输出对象；若有锁定的
+ *   `outputSchema`，再追加 `${nodeId.output.<字段>}` 路径。
  */
 export function outputVariables(
   definition: WorkflowDefinition,
@@ -80,10 +80,11 @@ export function outputVariables(
   }
   const schema = (node.config?.outputSchema ?? node.config?.output_schema) as JsonSchema | undefined
   const paths = expandSchemaPaths(schema, '')
+  const wholeOutput = `\${${nodeId}.output}`
   if (paths.length === 0) {
-    return [`\${${nodeId}.output}`]
+    return [wholeOutput]
   }
-  return paths.map((path) => `\${${nodeId}.output${path}}`)
+  return [wholeOutput, ...paths.map((path) => `\${${nodeId}.output${path}}`)]
 }
 
 /**

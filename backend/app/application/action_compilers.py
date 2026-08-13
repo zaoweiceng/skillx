@@ -145,8 +145,20 @@ class BrowserActionCompiler:
     def compile(self, action: NormalizedAction, ctx: CompileContext) -> CompileResult:
         contract = action.observations.get("pageContract")
         if not isinstance(contract, dict):
-            # 没有抽象 Page/Action Contract 证据：保留 Agent 节点复现读取/抽取。
-            return _agent_node(action, ctx, "缺少抽象 Page/Action Contract，保留 Agent 读取")
+            # Browser 成功动作缺少 Host-owned contract 时不能声称已固化；保留位置由
+            # 上层统一回退 Agent，但 error 诊断必须阻断草稿发布。
+            return CompileResult(
+                decision="rejected",
+                diagnostics=[
+                    {
+                        "level": "error",
+                        "code": "MISSING_BROWSER_PAGE_CONTRACT",
+                        "path": ctx.node_id,
+                        "message": "Browser 成功动作缺少 Host 验证的 PageContract",
+                    }
+                ],
+                reason="缺少 Host-owned BrowserReadContract",
+            )
         cap_name = action.capability_ref.name if action.capability_ref else ""
         input_mapping = _input_mapping_from_bindings(action, ctx)
         action_kind = action.observations.get("action", "read")

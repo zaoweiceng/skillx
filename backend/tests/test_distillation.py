@@ -973,3 +973,31 @@ async def test_rejected_proposal_persists_blocked_distillation() -> None:
     assert result.analysis_json["publishable"] is False
     codes = {item["code"] for item in result.analysis_json["diagnostics"]}
     assert "DISTILLATION_REJECTED" in codes
+
+
+async def test_malformed_proposal_persists_blocked_distillation() -> None:
+    """可分析轨迹中的 Schema 非法 Proposal 也必须持久化，不能退回一次性 422。"""
+
+    trajectory = _base_trajectory([_lookup_action()])
+    trajectory["proposal"] = {"nodes": [{"nodeId": "n1"}]}
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="malformed blocked")
+        session.add(conversation)
+        await session.flush()
+        conversation_run = ConversationRun(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            status="succeeded",
+            run_type="agent_run",
+            input_json={"message": "q1"},
+            output_json={"reply": LOOKUP_TABLE["q1"]},
+            trajectory_json=trajectory,
+        )
+        session.add(conversation_run)
+        await session.flush()
+        result = await distill_conversation_run(session, conversation_run)
+
+    assert result.status == "blocked"
+    assert result.draft_workflow_id is None
+    assert result.analysis_json["proposalSource"] == "runtime_invalid"
+    assert result.analysis_json["diagnostics"][0]["code"] == "DISTILLATION_REJECTED"

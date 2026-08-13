@@ -152,10 +152,15 @@ def test_same_ir_and_registry_for_both_task_shapes() -> None:
     assert registry.compile(non_web_ir[0], ctx).decision == "compiled"
 
 
-def test_unknown_web_action_without_contract_preserved_as_agent() -> None:
-    # 网页动作缺少抽象契约证据：保留为 Agent 节点，不丢弃、不误确定化。
+def test_unknown_web_action_without_contract_is_blocked_and_preserved() -> None:
+    # 网页动作缺少 Host-owned 抽象契约：保留位置但阻断发布，不误报固化完成。
     action = _web_fetch_action("m")
     action["observations"] = {"action": "read"}  # 无 pageContract
     definition, analysis = compile_agent_trajectory(_trajectory([action], message="m"))
     assert definition["spec"]["nodes"][1]["type"] == "agent"
     assert analysis["agentNodes"] == 1
+    assert analysis["publishable"] is False
+    assert any(
+        item["code"] == "MISSING_BROWSER_PAGE_CONTRACT"
+        for item in analysis["diagnostics"]
+    )

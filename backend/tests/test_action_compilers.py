@@ -74,12 +74,14 @@ def test_unknown_kind_preserved_as_agent_not_dropped() -> None:
     assert result.node is not None and result.node["type"] == "agent"
 
 
-def test_browser_without_contract_stays_agent() -> None:
+def test_browser_without_contract_is_rejected() -> None:
     registry = ActionCompilerRegistry()
     action = NormalizedAction(
         actionId="c1", kind="browser", capabilityRef=CapabilityRef(name="browse")
     )
-    assert registry.compile(action, _ctx()).decision == "agent"
+    result = registry.compile(action, _ctx())
+    assert result.decision == "rejected"
+    assert result.diagnostics[0]["code"] == "MISSING_BROWSER_PAGE_CONTRACT"
 
 
 def test_build_ir_requires_call_id() -> None:

@@ -619,11 +619,30 @@ export default function ChatPage() {
         : undefined
     const checkpoint = taskCheckpoints[errorCheckpointId ?? messageCheckpointId ?? '']
     const terminalOwnerRunId = checkpoint?.lineage.at(-1)?.sourceRunId
-    if (drafts[conversationRunId]) {
+    const blockedDiagnostics =
+      run?.distillation?.status === 'blocked'
+        ? (run.distillation.analysis.diagnostics ?? []).filter(
+            (item) => item.level === 'error',
+          )
+        : []
+    const blockedDiagnosticList = blockedDiagnostics.length > 0 && (
+      <ul className="diagnostic-list" aria-label="固化阻断诊断">
+        {blockedDiagnostics.map((diagnostic) => (
+          <li key={`${diagnostic.code}-${diagnostic.message}`}>
+            <strong>{diagnostic.code}</strong>：{diagnostic.message}
+          </li>
+        ))}
+      </ul>
+    )
+    const persistedDraftId = drafts[conversationRunId] ?? run?.distillation?.draftWorkflowId
+    if (persistedDraftId) {
       return (
-        <Link className="button ghost" to={`/workflows/${drafts[conversationRunId]}/edit`}>
-          打开固化草稿
-        </Link>
+        <>
+          {blockedDiagnosticList}
+          <Link className="button ghost" to={`/workflows/${persistedDraftId}/edit`}>
+            打开固化草稿
+          </Link>
+        </>
       )
     }
     if (status === 'succeeded') {
@@ -642,6 +661,7 @@ export default function ChatPage() {
             </div>
           )}
           {checkpoint && renderContinuationLineage(checkpoint)}
+          {blockedDiagnosticList}
           {eligibility?.eligible ? (
             <button className="button ghost" onClick={() => distill(conversationRunId)}>
               固化为组件

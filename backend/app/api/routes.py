@@ -6029,10 +6029,26 @@ async def get_conversation_run(
         )
         or 0
     ) > 0
+    latest_distillation = await session.scalar(
+        select(Distillation)
+        .where(Distillation.conversation_run_id == conversation_run.id)
+        .order_by(Distillation.created_at.desc())
+        .limit(1)
+    )
     return summarize_run(
         conversation_run,
         distillation_eligibility=distillation_eligibility(
             conversation_run, has_existing_draft=has_existing_draft
+        ),
+        distillation=(
+            {
+                "id": latest_distillation.id,
+                "status": latest_distillation.status,
+                "draftWorkflowId": latest_distillation.draft_workflow_id,
+                "analysis": latest_distillation.analysis_json,
+            }
+            if latest_distillation is not None
+            else None
         ),
     )
 

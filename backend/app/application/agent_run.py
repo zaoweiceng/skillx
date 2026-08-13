@@ -1884,6 +1884,7 @@ def summarize_run(
     conversation_run: ConversationRun,
     *,
     distillation_eligibility: dict[str, Any] | None = None,
+    distillation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """对话运行的 API 摘要视图（包含可恢复的长任务 handle 状态）。"""
 
@@ -1923,4 +1924,5 @@ def summarize_run(
         "stepAttempts": plan_lineage.get("stepAttempts", {}),
         "replanBudget": plan_lineage.get("replanBudget"),
         "distillationEligibility": distillation_eligibility,
+        "distillation": distillation,
     }

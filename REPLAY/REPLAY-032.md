@@ -13,10 +13,10 @@
 无法解析；固化 manifest 与源任务语言脱节导致无法自发现）和一个 P1（非法固化提议回滚成一次性 422，无可审阅 blocked
 记录）已按现有架构、最小修改修复。本轮不新增产品需求、数据库迁移、鉴权/多租户/计费或领域模板。
 
-本地全部工程门禁通过：`make demo-check`（backend 354、frontend 55、独立进程 E2E 37）、`make browser-ui-check`
-（2 passed）、生产构建与文档链均通过。**真实 TraeX 的 `traex-real-check` / `traex-real-product-check` 本轮没有获得新的
-外部调用授权**，与 031 一致仍为 blocked，不能用 fixture 结果替代；因此完整真实闭环（新对话语义发现并复用）保持
-需授权执行状态，代码根因与本地流程已修复。
+全部门禁通过：`make demo-check`（backend 355、frontend 56、独立进程 E2E 37）、`make browser-ui-check`
+（2 passed）、真实 TraeX probe（1 passed）以及拆分后的四个真实产品用例（4 passed）。新增真实用例在全新栈实际完成
+lookup 探索、固化、Presentation 决策、静态检查、发布、不同 key 手动执行和新对话发现同一不可变版本并执行。
+因此 032 定义的主闭环已跑通，不以 fixture 结果代替真实 Provider 事实。
 
 ## 2. P0-1：区分审计 attempts 与可执行 actions
 
@@ -33,15 +33,17 @@
 Browser Contract 事实回到 Host：[`_normalize_action()`](../backend/app/application/agent_host.py) 在从可变 `arguments`
 删除 `pageContract` 前，对成功 Browser ToolResult 用 `BrowserReadContract` 规范化校验，并作为 Host-owned
 `observations.pageContract`（附 `action`/`runtime`/`resultSource=host_tool_broker`）保存；失败 ToolResult 的模型自报
-contract 不写入权威证据。这样 Browser compiler 能消费 Host-owned contract 生成确定性 browser 节点，缺失时才退回
-Agent 节点。规则只依据 status/effect 与 adapter descriptor，没有为网页/lookup/天气/特定 selector 加分支。
+contract 不写入权威证据。Browser compiler 只消费该 Host-owned contract；成功动作缺失时返回
+`MISSING_BROWSER_PAGE_CONTRACT` 并阻断发布，上层仅为保留审计位置生成不可发布 Agent fallback，不能再把它表现为
+“固化完成”。规则只依据 status/effect 与 adapter descriptor，没有为网页/lookup/天气/特定 selector 加分支。
 
 ## 3. P0-2：统一整体节点输出引用 `${node.output}`
 
 [`expressions.py`](../backend/app/application/expressions.py) 抽出 `_resolve_reference()` 并统一约定：非 input 根的
 `${node.output}` 返回该节点完整输出对象，`${node.output.<field>}` 返回字段；不再把 `output` 当成一个真实字段名去
 查找（原实现只特判 `output.` 前缀，恰好等于 `output` 时报“无法解析路径段 output”）。字符串插值中的对象/数组显式
-`json.dumps`（`ensure_ascii=False, sort_keys=True`），不再依赖 Python `str(dict)`。
+`json.dumps`（`ensure_ascii=False, sort_keys=True`），不再依赖 Python `str(dict)`。前端变量选择器无论是否有
+outputSchema 都提供 `${node.output}`，有 Schema 时再提供逐字段路径，编辑器与运行时语义一致。
 
 编译器侧无需新增分支：`_check_output_field` 只对 `output.<field>` 形态校验 Schema，整体 `output` 引用通过可达性
 校验即可，因此固化生成的 `input → transform → llm → output` 生成式图既能静态检查通过，也能实际运行。前端
@@ -59,7 +61,8 @@ Agent 节点。规则只依据 status/effect 与 adapter descriptor，没有为�
    [`build_manifest()`](../backend/app/application/workflow_catalog.py) 并入 `search_text` 作为稳定可检索语料，使
    源任务的同语言、同意图查询能召回自己，而不依赖 Descriptor 生成语言恰好一致。
 
-目录 `_score()` 仍是词法/字符重合，但 `matchReason` 增加 `matchKind="lexical"` 并把文案从“语义召回”改为“词法命中/
+平台 fallback descriptor 同样只按源语言和去实例化意图生成，不再按 browser/file/lookup 样本分支。目录 `_score()`
+仍是词法/字符重合，但 `matchReason` 增加 `matchKind="lexical"` 并把文案从“语义召回”改为“词法命中/
 词法重合，语义判断由 Agent 完成”，不再把词法命中冒充语义召回；最终选择判断仍由 Agent 在 L0/L1 描述上完成。规则
 对中英文与非 lookup 样本一致，无语言/领域特例。
 
@@ -71,8 +74,9 @@ action、无法构建 IR 等请求级问题，`_trajectory_is_analyzable` 判定
 Distillation + 结构化诊断（`DISTILLATION_REJECTED` + attempt 诊断），刷新后仍可审阅。
 
 distill 路由的 `DRAFT_ALREADY_EXISTS` 判定改为只统计 `draft_workflow_id` 非空的记录，因此无 draft 的 blocked 诊断
-不会永久占用重试入口；修复源 Run/编译规则后可重新发起固化。前端 `distillConversationRun` 类型放开 `draftWorkflowId`
-为可空，ChatPage 在 blocked 或无 draft 时展示 error 级诊断，publishable 图才写入 drafts。
+不会永久占用重试入口；修复源 Run/编译规则后可重新发起固化。Schema 本身非法的 runtime Proposal 也走同一持久化路径，
+不再提前抛一次性 422。ConversationRun 摘要返回最新 Distillation，ChatPage 刷新后继续显示 error 级诊断并保留重试
+按钮；publishable 图才写入 drafts。
 
 ## 6. 回归门禁（现有主流程）
 
@@ -90,6 +94,9 @@ distill 路由的 `DRAFT_ALREADY_EXISTS` 判定改为只统计 `draft_workflow_i
 - `test_source_language_query_recalls_own_manifest` / `test_english_source_uses_same_generic_self_recall`：中英文源任务
   发布后用源语言去实例化查询能召回自己，证明同一通用机制无语言特例；
 - `test_rejected_proposal_persists_blocked_distillation`：非法 Proposal 覆盖持久化 blocked + 诊断，不回滚成一次性 422。
+- `test_malformed_proposal_persists_blocked_distillation`：Proposal Schema 非法同样持久化 blocked；
+- ChatPage 回归：刷新后显示持久化固化诊断且无 draft 的记录仍允许重试；
+- 真实产品第四用例：真实 lookup 探索 → 固化 → 审阅 → 检查 → 发布 → q4 运行 → 新对话 q3 披露并执行同一 v1。
 
 ## 7. 最小修改边界
 
@@ -102,20 +109,23 @@ Distillation/Workflow 数据结构，没有新增 API 资源、数据库迁移�
 | 检查 | 结果 |
 |---|---|
 | P0-1/P0-2/P0-3/P1-1 定向测试 | 纳入后端全量，全部通过 |
-| `make demo-check` | 通过；backend 354、frontend 55、独立进程 E2E 37、迁移 0001→head、生产构建与文档链 |
+| `make demo-check` | 通过；backend 355、frontend 56、独立进程 E2E 37、迁移 0001→0023、生产构建与文档链 |
 | `make browser-ui-check` | 通过；2 passed |
-| `make traex-real-check` | **blocked / 未执行**；本轮无真实 TraeX 外部调用授权，不用 fixture 替代 |
-| `make traex-real-product-check` | **blocked / 未执行**；同上 |
+| `make traex-real-check` | 通过；宿主登录态真实执行 1 passed，未 skip |
+| `make traex-real-product-check` | 通过；workflow-on、workflow-off、cancellation、完整固化/发现/复用共 4 passed，未 skip |
 | `git diff --check`、文档链 | 通过 |
 
-## 9. 尚未形成的真实事实
+## 9. 真实栈事实与边界
 
-本地 fixture、单元测试、独立进程 E2E 与 Browser UI 只能证明协议实现与本地产品流程，不能证明真实 Provider 行为。
-以下 032 §6.2 真实栈验收仍需在明确授权真实 TraeX 外部调用后执行，失败重试仍导致 422、发布图仍 `INVALID_INPUT`
-或新对话仍找不到刚发布版本时不得声明 032 通过：
+本轮真实 TraeX 产品栈使用全新 SQLite、Artifact 目录、独立 API/Worker 和本地 Tool Adapter，按顺序形成以下事实：
 
-1. 真实 Agent 只读探索网页（首次 browser.read 失败、重试成功）→ 固化不再 422、成功读取被编译为 browser 节点；
-2. 真实 lookup 固化 `input→transform→llm→output`，发布后从组件页用不同 key 运行 succeeded、模型被调用；
-3. 新对话以源任务同意图不同参数触发 catalog 披露、Agent 选择并启动同一 v1，刷新对话/组件历史/RunDetail 后结果与
-   轨迹仍在；
-4. 长模型调用期间无 SQLite lock，结束后无 processing Turn、running Run 或遗留服务。
+1. workflow-on 的 Alice SourceSpan、workflow-off 和 running cancellation 独立通过；
+2. 真实 Agent 用 q2 调用 Host `lookup.table` 并成功完成探索；
+3. 固化生成可发布草稿，人工门禁明确拒绝 Presentation 后静态检查、发布 v1；
+4. 发布图用不同 key=q4 实际 Run succeeded，证明 `${node.output}` 给生成节点提供了非空证据；
+5. 新对话用同语言同意图 key=q3，目录披露并由 Agent 选择刚发布的不可变 ref，第二个 Run succeeded，刷新后 runId 仍在；
+6. 测试栈 finally 统一停止 API、Worker、表单服务和 TraeX 子进程，运行日志未出现 `database is locked`。
+
+本地 Browser UI 仍故意不允许协议 fixture 冒充产品语义选择；它验证实际点击固化、Presentation、检查/发布、组件页
+不同输入运行、刷新、历史、RunDetail、失败接力、主题与 console。新对话语义发现由上述真实产品用例承担，这是安全
+边界而不是验收缺口。

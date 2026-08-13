@@ -424,6 +424,60 @@ describe('ChatPage 候选组件闭环', () => {
     expect(screen.queryByRole('button', { name: '固化为组件' })).not.toBeInTheDocument()
   })
 
+  it('刷新后仍显示已持久化的固化阻断诊断并允许重试', async () => {
+    getConversation.mockResolvedValue({
+      id: 'conv-1',
+      title: '固化阻断',
+      boundComponentId: null,
+      messages: [
+        {
+          id: 'blocked-agent',
+          role: 'assistant',
+          content: {
+            type: 'agent_run',
+            text: '探索完成',
+            conversationRunId: 'blocked-run',
+          },
+        },
+      ],
+    })
+    getConversationRun.mockResolvedValue({
+      id: 'blocked-run',
+      conversationId: 'conv-1',
+      status: 'succeeded',
+      runType: 'agent_run',
+      input: {},
+      output: { reply: '探索完成' },
+      error: null,
+      distillationEligibility: {
+        eligible: true,
+        actionCount: 1,
+        reasonCode: 'ELIGIBLE',
+      },
+      distillation: {
+        id: 'distill-blocked',
+        status: 'blocked',
+        draftWorkflowId: null,
+        analysis: {
+          publishable: false,
+          diagnostics: [
+            {
+              level: 'error',
+              code: 'DISTILLATION_REJECTED',
+              message: '提议未覆盖成功动作',
+            },
+          ],
+        },
+      },
+    })
+    listConversationRunEvents.mockResolvedValue([])
+
+    renderAt('conv-1')
+    await waitFor(() => expect(screen.getByText('DISTILLATION_REJECTED')).toBeInTheDocument())
+    expect(screen.getByText(/提议未覆盖成功动作/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '固化为组件' })).toBeInTheDocument()
+  })
+
   it('刷新后仍显示参数绑定失败及字段级诊断', async () => {
     getConversation.mockResolvedValue({
       id: 'conv-1',

@@ -287,7 +287,9 @@ spec:
 
 ## 5.4 表达式
 
-- MVP 支持 ${input.x}、${node.output.y}、JSONPath/JMESPath、字符串模板和有限布尔表达式。
+- MVP 支持 `${input.x}`、`${node.output}`、`${node.output.y}`、JSONPath/JMESPath、字符串模板和有限布尔表达式。
+- `${node.output}` 表示节点完整输出对象，`${node.output.y}` 表示其中字段；完整对象嵌入字符串时必须使用规范 JSON
+  序列化，禁止依赖运行语言的对象转字符串结果。
 
 - 表达式运行在受控解释器中，不允许 eval 或任意 Python。
 

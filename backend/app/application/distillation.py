@@ -826,43 +826,30 @@ def _build_output_mapping(
 def _default_capability_descriptor(
     trajectory: dict[str, Any],
 ) -> CapabilityDescriptor:
-    actions = [item for item in trajectory.get("actions", []) if isinstance(item, dict)]
-    kinds = {str(item.get("kind", "")).lower() for item in actions}
-    capabilities = {str(item.get("capability", "")).lower() for item in actions}
-    if "browser" in kinds or "browser.read" in capabilities:
+    # Runtime 不可用时只使用源任务语言和去实例化意图生成通用 fallback；不按
+    # browser/file/lookup 等领域或样本分支，稳定 capability 名仅保留为 tag。
+    intent = _deinstantiate_intent(trajectory)
+    task = intent["text"][:160] or (
+        "reuse the verified task with a new input"
+        if intent["language"] == "en"
+        else "使用新输入复用已验证任务"
+    )
+    if intent["language"] == "en":
         return CapabilityDescriptor(
-            name="网页内容读取与总结",
-            summary="访问网页并基于实时正文生成结构化总结",
-            useWhen=["需要读取网页当前内容并提取或总结关键信息"],
-            doNotUseWhen=["目标不是网页读取任务或请求包含未授权副作用"],
-            tags=["网页", "读取", "总结", "distilled"],
-            examples=["读取另一个同类网页并总结正文"],
-        )
-    if "read.local" in capabilities or "file" in kinds:
-        return CapabilityDescriptor(
-            name="本地文件读取与处理",
-            summary="读取受控本地文件并按冻结契约处理内容",
-            useWhen=["需要读取同类本地文件并提取或总结内容"],
-            doNotUseWhen=["文件不在授权目录或任务需要写入文件"],
-            tags=["文件", "读取", "处理", "distilled"],
-            examples=["读取另一个同类文件并返回结构化结果"],
-        )
-    if "lookup.table" in capabilities or "transform" in kinds:
-        return CapabilityDescriptor(
-            name="结构化查询与结果返回",
-            summary="根据变化的业务键执行已验证查询并返回结构化结果",
-            useWhen=["需要使用同类业务键查询冻结数据映射"],
-            doNotUseWhen=["查询语义或输出契约与已发布版本不一致"],
-            tags=["查询", "结构化", "lookup", "distilled"],
-            examples=["使用另一个业务键执行同类查询"],
+            name="Verified task reuse",
+            summary=f"Reuse the verified input/output contract for: {task}"[:240],
+            useWhen=[f"The new task has the same intent and input category as: {task}"[:300]],
+            doNotUseWhen=["The task expands capabilities, secrets, or side effects"],
+            tags=["verified-task", "distilled"],
+            examples=[f"Run the same task with another compatible input: {task}"[:300]],
         )
     return CapabilityDescriptor(
         name="已验证任务复用",
-        summary="按冻结输入输出契约复用已验证的任务步骤",
-        useWhen=["新任务意图与已验证步骤及输入类别一致"],
-        doNotUseWhen=["任务需要扩大能力、网络范围、Secret 或副作用"],
-        tags=["任务复用", "distilled"],
-        examples=["使用新的同类输入执行已验证任务"],
+        summary=f"按冻结输入输出契约复用任务：{task}"[:240],
+        useWhen=[f"新任务与以下意图及输入类别一致：{task}"[:300]],
+        doNotUseWhen=["任务扩大能力、Secret 或副作用边界"],
+        tags=["verified-task", "distilled"],
+        examples=[f"使用另一个兼容输入执行同类任务：{task}"[:300]],
     )
 
 
@@ -942,17 +929,27 @@ async def distill_conversation_run(
     raw_proposal = conversation_run.trajectory_json.get("proposal")
     proposal_source = "runtime" if isinstance(raw_proposal, dict) else "none"
     distillation_runtime_available = agent_runtime_config().configured
+    distillation_id = str(uuid4())
     if isinstance(raw_proposal, dict):
         try:
             proposal = DistillationProposal.model_validate(raw_proposal)
-        except Exception as exc:  # noqa: BLE001 - 非法提议按固化失败返回 422。
-            raise DistillationError(f"非法 DistillationProposal: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001 - 可分析轨迹的非法提议必须持久化。
+            if not _trajectory_is_analyzable(conversation_run.trajectory_json):
+                raise DistillationError(f"非法 DistillationProposal: {exc}") from exc
+            return await _persist_blocked_distillation(
+                session,
+                conversation_run,
+                distillation_id,
+                run_type,
+                None,
+                "runtime_invalid",
+                reason=f"非法 DistillationProposal: {exc}",
+            )
     elif distillation_runtime_available:
         proposal = await _request_distillation_proposal(
             conversation_run.id, conversation_run.trajectory_json
         )
         proposal_source = "distillation_agent" if proposal is not None else "none"
-    distillation_id = str(uuid4())
     try:
         definition, analysis = compile_agent_trajectory(
             conversation_run.trajectory_json, proposal

@@ -411,6 +411,15 @@ export type ConversationRunSummary = {
     actionCount: number
     reasonCode: string
   } | null
+  distillation?: {
+    id: string
+    status: string
+    draftWorkflowId: string | null
+    analysis: {
+      publishable?: boolean
+      diagnostics?: Array<{ level: string; code: string; message: string }>
+    }
+  } | null
 }
 
 export type TaskCheckpointSummary = {
