@@ -904,7 +904,7 @@ export const api = {
     request<{
       id: string
       status: string
-      draftWorkflowId: string
+      draftWorkflowId: string | null
       analysis: {
         directNodes: number
         llmOrAgentNodes: number

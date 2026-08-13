@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from copy import deepcopy
 from typing import Any
@@ -42,6 +43,28 @@ def _get_path(value: Any, path: str) -> Any:
     return current
 
 
+def _resolve_reference(
+    root: str, path: str, run_input: dict[str, Any], outputs: dict[str, Any]
+) -> Any:
+    """解析单个 `${root.path}` 引用。
+
+    非 input 根统一约定：``${node.output}`` 返回该节点完整输出对象，
+    ``${node.output.<field>}`` 返回其中字段。这样固化生成的整体输出引用与逐字段引用
+    使用同一语义，而不再把 ``output`` 当成一个真实字段名去查找。
+    """
+
+    source = run_input if root == "input" else outputs.get(root)
+    if source is None:
+        raise ExpressionError(f"节点 {root} 尚无输出")
+    if root == "input":
+        return _get_path(source, path)
+    if path == "output":
+        return source
+    if path.startswith("output."):
+        return _get_path(source, path.removeprefix("output."))
+    return _get_path(source, path)
+
+
 def resolve_value(value: Any, run_input: dict[str, Any], outputs: dict[str, Any]) -> Any:
     if isinstance(value, dict):
         return {key: resolve_value(item, run_input, outputs) for key, item in value.items()}
@@ -53,21 +76,15 @@ def resolve_value(value: Any, run_input: dict[str, Any], outputs: dict[str, Any]
     exact = EXACT_REFERENCE.match(value)
     if exact:
         root, path = exact.group("root"), exact.group("path")
-        source = run_input if root == "input" else outputs.get(root)
-        if source is None:
-            raise ExpressionError(f"节点 {root} 尚无输出")
-        if root != "input" and path.startswith("output."):
-            path = path.removeprefix("output.")
-        return deepcopy(_get_path(source, path))
+        return deepcopy(_resolve_reference(root, path, run_input, outputs))
 
     def replace(match: re.Match[str]) -> str:
         root, path = match.group("root"), match.group("path")
-        source = run_input if root == "input" else outputs.get(root)
-        if source is None:
-            raise ExpressionError(f"节点 {root} 尚无输出")
-        if root != "input" and path.startswith("output."):
-            path = path.removeprefix("output.")
-        return str(_get_path(source, path))
+        resolved = _resolve_reference(root, path, run_input, outputs)
+        # 字符串插值中的对象/数组必须显式 JSON 序列化，不依赖 Python str(dict)。
+        if isinstance(resolved, (dict, list)):
+            return json.dumps(resolved, ensure_ascii=False, sort_keys=True)
+        return str(resolved)
 
     return REFERENCE.sub(replace, value)
 

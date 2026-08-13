@@ -40,3 +40,21 @@ def test_mapping_recurses() -> None:
     outputs = {"a": {"x": 1}}
     mapping = {"nested": {"value": "${a.output.x}"}, "list": ["${a.output.x}"]}
     assert resolve_mapping(mapping, {}, outputs) == {"nested": {"value": 1}, "list": [1]}
+
+
+def test_whole_node_output_reference_returns_full_object() -> None:
+    """032 P0-2：`${node.output}` 返回节点完整输出对象，而非查找名为 output 的字段。"""
+
+    outputs = {"lookup-1": {"value": "第二季度：营收增长 8%", "table": {"q2": "x"}}}
+    resolved = resolve_value("${lookup-1.output}", {}, outputs)
+    assert resolved == {"value": "第二季度：营收增长 8%", "table": {"q2": "x"}}
+
+
+def test_whole_output_in_string_is_json_serialized() -> None:
+    """032 P0-2：字符串插值中的对象引用显式 JSON 序列化，不依赖 Python str(dict)。"""
+
+    outputs = {"n1": {"a": 1, "b": [2, 3]}}
+    result = resolve_value("证据：${n1.output}", {}, outputs)
+    assert result == '证据：{"a": 1, "b": [2, 3]}'
+    # 不出现 Python dict 的单引号表示。
+    assert "'" not in result

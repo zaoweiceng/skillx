@@ -257,6 +257,19 @@ def _synopsis(schema: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _deinstantiated_intent_text(definition: WorkflowDefinition) -> str:
+    """固化时保存的去实例化源任务意图文本（可能为空）。
+
+    该文本由固化阶段从源任务去实例化得到，不含 URL/key/Secret/ToolResult 正文，
+    只用于让源任务的同语言查询能召回自己。
+    """
+
+    intent = definition.metadata.get("deInstantiatedIntent")
+    if isinstance(intent, dict):
+        return str(intent.get("text", ""))
+    return ""
+
+
 def _semantic_metadata(definition: WorkflowDefinition) -> dict[str, Any]:
     raw = definition.metadata.get("capability", {})
     if not isinstance(raw, dict):
@@ -504,6 +517,9 @@ async def build_manifest(
             *map(str, manifest["tags"]),
             *map(str, manifest["useWhen"]),
             *map(str, manifest["examples"]),
+            # 去实例化源任务意图：让源任务的同语言、同意图查询能召回自己，
+            # 不依赖 Descriptor 生成的语言恰好与查询一致。
+            str(_deinstantiated_intent_text(definition)),
         ]
     ).lower()
     item = WorkflowCapabilityManifest(
@@ -719,10 +735,11 @@ async def search_manifests(
         card["matchReason"] = {
             "score": score,
             "query": query[:200],
+            "matchKind": "lexical",
             "summary": (
-                f"命中：{'；'.join(map(str, matched))}"
+                f"词法命中：{'；'.join(map(str, matched))}"
                 if matched
-                else "名称、标签或适用场景存在语义召回"
+                else "名称、标签或适用场景存在词法重合，语义判断由 Agent 完成"
             ),
         }
         encoded = len(json.dumps(card, ensure_ascii=False).encode())

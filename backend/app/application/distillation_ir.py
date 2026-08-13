@@ -165,21 +165,26 @@ def _classify_bindings(
 def build_action_ir(trajectory: dict[str, Any]) -> list[NormalizedAction]:
     """把 AgentHost 归一化 action 序列转为 NormalizedAction IR，并校验 DAG 完整性。
 
+    只有 status=succeeded 的动作进入可执行 IR：失败尝试是审计事实而非可复用业务步骤，
+    交由 :func:`attempt_diagnostics` 处理（effect=none 记为 info、副作用/终态不确定记为
+    error 阻断），既不静默过滤也不参与 Proposal 覆盖、节点依赖与输出来源。
+
     每个 action 至少要能确定 kind 与输出关联；缺失关键信息时抛
     :class:`TrajectoryAnalysisError`，分析失败而不是猜测。
     """
 
     message = str(trajectory.get("prompt", ""))
     raw_actions = trajectory.get("actions") or []
-    # 先收集所有 callId：显式 prior_output 绑定必须引用序列中已出现的动作。
-    known_actions: set[str] = set()
     for index, raw in enumerate(raw_actions):
-        call_id = raw.get("callId")
-        if not call_id:
+        if not raw.get("callId"):
             raise TrajectoryAnalysisError(f"动作 {index} 缺少 callId，无法关联")
+    # 只把成功终态动作纳入可执行 IR，失败尝试不进入依赖/覆盖/输出来源。
+    executable = [raw for raw in raw_actions if _is_succeeded(raw)]
+    # 显式 prior_output 绑定只能引用序列中已出现的成功动作。
+    known_actions: set[str] = set()
     ir: list[NormalizedAction] = []
     previous_id: str | None = None
-    for raw in raw_actions:
+    for raw in executable:
         call_id = raw["callId"]
         kind = raw.get("kind") or "tool"
         capability_name = raw.get("capability") or raw.get("tool")
@@ -227,6 +232,53 @@ def build_action_ir(trajectory: dict[str, Any]) -> list[NormalizedAction]:
         known_actions.add(call_id)
         previous_id = call_id
     return ir
+
+
+def _is_succeeded(raw: dict[str, Any]) -> bool:
+    """动作是否为成功终态（缺失 status 时按 succeeded，兼容不带 status 的历史轨迹）。"""
+
+    return str(raw.get("status", "succeeded")) == "succeeded"
+
+
+def attempt_diagnostics(trajectory: dict[str, Any]) -> list[dict[str, str]]:
+    """把失败尝试转为诊断，保留审计事实而不静默过滤。
+
+    - failed 且 effect=none：只读失败尝试，info 级诊断，不阻断发布；
+    - failed 且 effect=unknown / 可能已产生副作用 / 终态不确定：error 级诊断，阻断发布，
+      要求人工确认后再固化。
+    """
+
+    diagnostics: list[dict[str, str]] = []
+    for raw in trajectory.get("actions") or []:
+        if not isinstance(raw, dict) or _is_succeeded(raw):
+            continue
+        call_id = str(raw.get("callId") or "unknown")
+        effect = str(raw.get("effect", "unknown"))
+        if effect == "none":
+            diagnostics.append(
+                {
+                    "level": "info",
+                    "code": "FAILED_ATTEMPT_DIAGNOSTIC",
+                    "path": call_id,
+                    "message": (
+                        f"失败的只读尝试 {call_id} 已保留为审计事实，"
+                        "不作为可执行业务步骤"
+                    ),
+                }
+            )
+        else:
+            diagnostics.append(
+                {
+                    "level": "error",
+                    "code": "UNCERTAIN_FAILED_ATTEMPT",
+                    "path": call_id,
+                    "message": (
+                        f"失败尝试 {call_id} 的副作用不确定（effect={effect}），"
+                        "禁止自动固化，需人工确认后再发布"
+                    ),
+                }
+            )
+    return diagnostics
 
 
 AnyNormalizedAction = Annotated[NormalizedAction, Field()]

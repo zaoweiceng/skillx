@@ -18,6 +18,7 @@ from app.application.distillation_ir import (
     DistillationProposal,
     NormalizedAction,
     TrajectoryAnalysisError,
+    attempt_diagnostics,
     build_action_ir,
 )
 from app.application.runtime_config import agent_runtime_config
@@ -26,6 +27,36 @@ from app.infrastructure.database import ConversationRun, Distillation, Workflow
 
 STEP_ID = re.compile(r"[^a-zA-Z0-9_-]+")
 DIRECTIVE = re.compile(r"\[\[.*?\]\]")
+_URL = re.compile(r"https?://[^\s]+")
+_CJK = re.compile(r"[\u4e00-\u9fff]")
+
+
+def _deinstantiate_intent(trajectory: dict[str, Any]) -> dict[str, str]:
+    """从源任务提取去实例化的任务意图与源语言。
+
+    去掉 fixture 指令、URL 以及每个 user_input 绑定的具体实例值（如业务键、路径），
+    保留源语言的通用意图句子。具体 URL、key、Secret、ToolResult 正文都不进入结果，
+    因此可以安全写入 manifest 的可检索语料并交给 Descriptor 阶段做同语言描述。
+    """
+
+    prompt = _clean_message(str(trajectory.get("prompt", "")))
+    text = _URL.sub(" ", prompt)
+    instance_values: set[str] = set()
+    for action in trajectory.get("actions", []):
+        if not isinstance(action, dict):
+            continue
+        arguments = action.get("arguments") or {}
+        bindings = action.get("argumentBindings") or {}
+        for field, binding in bindings.items():
+            if isinstance(binding, dict) and binding.get("source") == "user_input":
+                value = arguments.get(field)
+                if isinstance(value, str) and value.strip():
+                    instance_values.add(value.strip())
+    for value in sorted(instance_values, key=len, reverse=True):
+        text = text.replace(value, " ")
+    intent = re.sub(r"\s+", " ", text).strip()
+    language = "zh" if _CJK.search(intent) else "en"
+    return {"text": intent, "language": language}
 
 
 class DistillationError(ValueError):
@@ -289,6 +320,9 @@ def compile_agent_trajectory(
     except TrajectoryAnalysisError as exc:
         raise DistillationError(str(exc)) from exc
 
+    # 失败尝试保留为审计诊断：只读失败仅提示，副作用/终态不确定则阻断发布。
+    diagnostics: list[dict[str, str]] = attempt_diagnostics(trajectory)
+
     proposed_assignments: dict[str, tuple[str, str]] = {}
     if proposal is not None:
         proposed_assignments = _validate_proposal(proposal, actions)
@@ -297,7 +331,6 @@ def compile_agent_trajectory(
     nodes: list[dict[str, Any]] = [{"id": "input", "type": "input", "displayName": "输入"}]
     edges: list[dict[str, str]] = []
     taken = {"input", "output"}
-    diagnostics: list[dict[str, str]] = []
     deterministic_nodes = 0
     agent_nodes = 0
     capability_locks: list[dict[str, Any]] = []
@@ -596,11 +629,15 @@ def _enrich_distilled_definition(
         }
     )
     display_name = capability.name
+    intent = _deinstantiate_intent(trajectory)
     definition["metadata"] = {
         **definition.get("metadata", {}),
         "name": display_name,
         "logicalWorkflowId": logical_id,
         "capability": capability.model_dump(by_alias=True),
+        # 去实例化的源任务意图与语言：作为 manifest 的稳定可检索语料，让源任务的同意图、
+        # 同语言查询可以召回自己，而不依赖 Descriptor 生成的语言恰好一致。不含 URL/key/Secret。
+        "deInstantiatedIntent": intent,
         "lineage": {
             "sourceConversationRunId": conversation_run_id,
             "sourceTrajectoryDigest": source_trajectory_digest,
@@ -829,6 +866,64 @@ def _default_capability_descriptor(
     )
 
 
+def _trajectory_is_analyzable(trajectory: dict[str, Any]) -> bool:
+    """轨迹是否可分析为合法 IR（有成功 action、能构建 DAG）。
+
+    仅当轨迹本身可分析时，Proposal/Compiler 的拒绝才持久化为 blocked 供审阅；
+    无成功 action、无法构建 IR 等请求级问题仍应直接 4xx。
+    """
+
+    try:
+        actions = build_action_ir(trajectory)
+    except TrajectoryAnalysisError:
+        return False
+    return bool(actions)
+
+
+async def _persist_blocked_distillation(
+    session: AsyncSession,
+    conversation_run: ConversationRun,
+    distillation_id: str,
+    run_type: str,
+    proposal: DistillationProposal | None,
+    proposal_source: str,
+    *,
+    reason: str,
+) -> Distillation:
+    """持久化一个 blocked Distillation（无草稿 Workflow）+ 结构化诊断。
+
+    修复源 Run/编译规则后可重新发起固化；blocked 记录只用于让 UI 刷新后仍显示阻断原因，
+    不占用 ``DRAFT_ALREADY_EXISTS``（该判定只统计已有草稿的记录，见 distill 路由）。
+    """
+
+    analysis = {
+        "publishable": False,
+        "diagnostics": [
+            {
+                "level": "error",
+                "code": "DISTILLATION_REJECTED",
+                "path": "proposal",
+                "message": reason,
+            },
+            *attempt_diagnostics(conversation_run.trajectory_json),
+        ],
+        "sourceRunId": conversation_run.id,
+        "sourceRunType": run_type,
+        "usedProposal": proposal is not None,
+        "proposalSource": proposal_source,
+    }
+    result = Distillation(
+        id=distillation_id,
+        conversation_run_id=conversation_run.id,
+        status="blocked",
+        draft_workflow_id=None,
+        analysis_json=analysis,
+    )
+    session.add(result)
+    await session.flush()
+    return result
+
+
 async def distill_conversation_run(
     session: AsyncSession,
     conversation_run: ConversationRun,
@@ -857,14 +952,29 @@ async def distill_conversation_run(
             conversation_run.id, conversation_run.trajectory_json
         )
         proposal_source = "distillation_agent" if proposal is not None else "none"
-    definition, analysis = compile_agent_trajectory(
-        conversation_run.trajectory_json, proposal
-    )
+    distillation_id = str(uuid4())
+    try:
+        definition, analysis = compile_agent_trajectory(
+            conversation_run.trajectory_json, proposal
+        )
+    except DistillationError as exc:
+        # 可分析轨迹但 Proposal/Compiler 拒绝：持久化 blocked + 结构化诊断，供刷新后审阅，
+        # 而不是回滚后只返回一次性 422。无法分析（无成功 action 等请求级问题）仍向上抛。
+        if not _trajectory_is_analyzable(conversation_run.trajectory_json):
+            raise
+        return await _persist_blocked_distillation(
+            session,
+            conversation_run,
+            distillation_id,
+            run_type,
+            proposal,
+            proposal_source,
+            reason=str(exc),
+        )
     source_trajectory_digest = digest_json(conversation_run.trajectory_json)
     proposal_digest = (
         digest_json(proposal.model_dump(by_alias=True)) if proposal else None
     )
-    distillation_id = str(uuid4())
     capability = _default_capability_descriptor(conversation_run.trajectory_json)
     capability_source = "platform_fallback"
     if distillation_runtime_available:
@@ -971,12 +1081,16 @@ async def _request_capability_descriptor(
         for action in trajectory.get("actions", [])
         if isinstance(action, dict)
     ]
+    intent = _deinstantiate_intent(trajectory)
     settings = get_settings()
     request = AgentHostRequest(
         run_id=f"capability-{run_id}",
         prompt=(
-            "你是受限 CapabilityDescriptor Agent。仅根据动作类别、能力名和 I/O 字段"
-            "描述可复用任务意图与输入类别；禁止复制 URL、Secret、测试指令或具体输入值。\n"
+            "你是受限 CapabilityDescriptor Agent。根据去实例化任务意图、动作类别、能力名"
+            "和 I/O 字段描述可复用任务意图与输入类别；禁止复制 URL、Secret、测试指令或"
+            "具体输入值。**必须使用与去实例化任务意图相同的自然语言撰写 name/summary/"
+            "useWhen/doNotUseWhen/examples**，tags 可同时保留稳定的通用能力名。\n"
+            f"deInstantiatedIntent={intent['text']!r} language={intent['language']}\n"
             f"actions={action_summary}"
         ),
         output_schema=CapabilityDescriptor.model_json_schema(by_alias=True),
@@ -1002,21 +1116,25 @@ async def _request_distillation_proposal(
     """零工具受限阶段：只对动作摘要提出分组，不执行原任务。"""
 
     settings = get_settings()
+    # 只把成功终态动作作为可执行 action 发给受限 Agent，并显式携带 status；
+    # 失败尝试是审计事实，不参与节点分组与覆盖。
     action_summary = [
         {
             "actionId": action.get("callId"),
             "kind": action.get("kind"),
             "capability": action.get("capability") or action.get("tool"),
+            "status": action.get("status", "succeeded"),
             "bindings": action.get("argumentBindings", {}),
             "outputSchema": action.get("outputSchema"),
         }
         for action in trajectory.get("actions", [])
+        if str(action.get("status", "succeeded")) == "succeeded"
     ]
     request = AgentHostRequest(
         run_id=f"distillation-{run_id}",
         prompt=(
-            "你是受限 Distillation Agent。只根据动作摘要提出节点分组、策略和变量候选；"
-            "每个 action 必须恰好归属一个节点，不得调用工具。\n"
+            "你是受限 Distillation Agent。只根据成功动作摘要提出节点分组、策略和变量候选；"
+            "每个 action 必须恰好归属一个节点，不得覆盖未提供的动作，不得调用工具。\n"
             f"actions={action_summary}"
         ),
         output_schema=DistillationProposal.model_json_schema(by_alias=True),

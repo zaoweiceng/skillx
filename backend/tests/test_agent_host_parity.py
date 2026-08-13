@@ -271,3 +271,64 @@ async def test_audit_events_do_not_leak_secrets_or_raw_content(traex_stub: None)
     result_summary = tool_completed[0].payload_json["result"]
     assert result_summary["type"] == "object"
     assert "digest" in result_summary and "bytes" in result_summary
+
+
+def test_normalize_action_saves_host_owned_browser_contract() -> None:
+    """032 P0-1：成功 Browser ToolResult 归一化时把已验证 pageContract 保存到 observations，
+    删除可变 arguments 中的 contract 前不丢失权威证据。"""
+
+    from app.application.agent_host import AgentHost
+
+    started = {
+        "callId": "read-1",
+        "arguments": {
+            "url": "https://site.local/a",
+            "pageContract": {
+                "contractVersion": "1",
+                "urlPattern": "https://site.local/*",
+                "bodySelector": "#main",
+            },
+        },
+        "action": "read",
+    }
+    completed = {
+        "callId": "read-1",
+        "actionKind": "browser",
+        "capabilityRef": "browser.read",
+        "status": "succeeded",
+        "output": {"title": "T", "content": "正文", "fields": {}},
+        "effect": "none",
+        "idempotent": True,
+    }
+    action = AgentHost._normalize_action("tool.result", started, completed)
+    # 可变 arguments 中的 pageContract 已删除，但保留为 Host-owned observations 证据。
+    assert "pageContract" not in action["arguments"]
+    contract = action["observations"]["pageContract"]
+    assert contract["urlPattern"] == "https://site.local/*"
+    assert action["observations"]["resultSource"] == "host_tool_broker"
+    assert action["observations"]["action"] == "read"
+
+
+def test_normalize_action_ignores_failed_browser_contract() -> None:
+    """032 P0-1：失败 Browser ToolResult 不把模型自报 contract 当作权威证据。"""
+
+    from app.application.agent_host import AgentHost
+
+    started = {
+        "callId": "read-1",
+        "arguments": {
+            "url": "https://site.local/a",
+            "pageContract": {"contractVersion": "1", "urlPattern": "https://site.local/*"},
+        },
+        "action": "read",
+    }
+    completed = {
+        "callId": "read-1",
+        "actionKind": "browser",
+        "capabilityRef": "browser.read",
+        "status": "failed",
+        "error": {"code": "PAGE_DRIFT"},
+    }
+    action = AgentHost._normalize_action("tool.result", started, completed)
+    assert "pageContract" not in action["arguments"]
+    assert "pageContract" not in (action.get("observations") or {})

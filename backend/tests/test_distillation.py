@@ -9,6 +9,7 @@ from app.application.compiler import WorkflowCompiler, digest_json
 from app.application.distillation import (
     DistillationError,
     PresentationPolicyProposal,
+    _deinstantiate_intent,
     _propose_presentation_policy,
     compile_agent_trajectory,
     distill_conversation_run,
@@ -16,6 +17,7 @@ from app.application.distillation import (
 )
 from app.application.orchestrator import Orchestrator, WorkerService
 from app.application.product_history import bind_presentation_decision
+from app.application.workflow_catalog import search_manifests
 from app.infrastructure.database import (
     Conversation,
     ConversationRun,
@@ -230,6 +232,83 @@ def test_mixed_trajectory_preserves_all_actions_in_order() -> None:
     assert analysis["agentNodes"] == 1
 
 
+def test_failed_read_then_succeeded_read_only_keeps_success() -> None:
+    """032 P0-1：第一次 browser.read 失败、第二次成功，最终图只含成功读取节点。
+
+    失败 attempt 保留为审计诊断（不阻断发布），不进入 ProposedNode/DAG。
+    """
+
+    contract = {
+        "contractVersion": "1",
+        "urlPattern": "https://site.local/*",
+    }
+    failed = {
+        "callId": "read-1",
+        "kind": "browser",
+        "capability": "browser.read",
+        "status": "failed",
+        "effect": "none",
+        "arguments": {"url": "https://site.local/a"},
+        "argumentBindings": {"url": {"source": "user_input", "inputKey": "message"}},
+        "result": {},
+        "error": {"code": "PAGE_DRIFT"},
+    }
+    succeeded = {
+        "callId": "read-2",
+        "kind": "browser",
+        "capability": "browser.read",
+        "status": "succeeded",
+        "effect": "none",
+        "idempotent": True,
+        "arguments": {"url": "https://site.local/a"},
+        "argumentBindings": {"url": {"source": "user_input", "inputKey": "message"}},
+        "result": {"title": "T", "content": "正文"},
+        "observations": {
+            "action": "read",
+            "runtime": "playwright",
+            "pageContract": contract,
+        },
+    }
+    trajectory = {
+        **_base_trajectory([failed, succeeded], message="https://site.local/a"),
+        "outputProvenance": {
+            "reply": {"source": "action_output", "actionId": "read-2", "path": "content"}
+        },
+    }
+    definition, analysis = compile_agent_trajectory(trajectory)
+    business = [n for n in definition["spec"]["nodes"] if n["type"] not in {"input", "output"}]
+    # 只有成功读取被编译为节点；失败 attempt 不成为工作流节点。
+    assert len(business) == 1
+    assert business[0]["type"] == "browser"
+    # 失败尝试保留为 info 级审计诊断，不阻断发布，也不静默过滤。
+    assert any(
+        item["code"] == "FAILED_ATTEMPT_DIAGNOSTIC" for item in analysis["diagnostics"]
+    )
+    assert analysis["publishable"] is True, analysis["diagnostics"]
+
+
+def test_uncertain_failed_side_effect_blocks_publish() -> None:
+    """032 P0-1：失败且副作用/终态不确定的 attempt 使草稿 blocked，不静默过滤。"""
+
+    from app.application.distillation_ir import attempt_diagnostics
+
+    lookup = _lookup_action()
+    uncertain = {
+        "callId": "call-x",
+        "kind": "mcp",
+        "capability": "submit.order",
+        "status": "failed",
+        "effect": "external",
+        "arguments": {"orderId": "abc"},
+        "result": {},
+    }
+    trajectory = _base_trajectory([lookup, uncertain])
+    diagnostics = attempt_diagnostics(trajectory)
+    assert any(item["code"] == "UNCERTAIN_FAILED_ATTEMPT" for item in diagnostics)
+    _, analysis = compile_agent_trajectory(trajectory)
+    assert analysis["publishable"] is False
+
+
 def test_locked_mcp_capability_becomes_mcp_node() -> None:
     action = {
         "callId": "call-1",
@@ -440,6 +519,119 @@ async def test_distilled_draft_reuse_varies_with_new_input() -> None:
     assert not {"agent.completed", "llm.call.completed"} & event_types
 
 
+async def test_generative_lookup_graph_publishes_and_runs_with_new_key() -> None:
+    """032 P0-2/P2-1：生成式 input→transform→llm→output 发布版本用不同 key 实际运行成功，
+
+    LLM 节点通过 `${final-response.output}` 收到非空证据，模型调用真实发生，Run succeeded。
+    """
+
+    action = {
+        "callId": "lookup-1",
+        "kind": "transform",
+        "capability": "lookup.table",
+        "arguments": {"key": "q1"},
+        "result": {"table": dict(LOOKUP_TABLE), "value": LOOKUP_TABLE["q1"]},
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+            "additionalProperties": False,
+        },
+        "outputSchema": {
+            "type": "object",
+            "properties": {"table": {"type": "object"}, "value": {"type": "string"}},
+            "required": ["table", "value"],
+            "additionalProperties": False,
+        },
+        "argumentBindings": {"key": {"source": "user_input", "inputKey": "key"}},
+        "effect": "none",
+        "idempotent": True,
+        "replayability": "deterministic",
+        "observations": {"operation": "lookup", "table": dict(LOOKUP_TABLE)},
+    }
+    trajectory = build_trajectory(
+        AgentRunConfig.default(),
+        "查询 q1",
+        {"reply": f"查询结果是 {LOOKUP_TABLE['q1']}"},
+        [action],
+        1,
+        output_provenance={
+            "reply": {
+                "mode": "generative",
+                "sourceCallIds": ["lookup-1"],
+                "evidenceDigests": ["sha256:evidence"],
+                "promptVersion": "real-agent-v1",
+            }
+        },
+    )
+
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="生成式")
+        session.add(conversation)
+        await session.flush()
+        conversation_run = ConversationRun(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            status="succeeded",
+            run_type="agent_run",
+            input_json={"key": "q1"},
+            output_json={"reply": f"查询结果是 {LOOKUP_TABLE['q1']}"},
+            trajectory_json=trajectory,
+        )
+        session.add(conversation_run)
+        await session.flush()
+        result = await distill_conversation_run(session, conversation_run)
+        draft_workflow_id = result.draft_workflow_id
+        assert result.analysis_json["publishable"] is True
+
+    async with SessionLocal() as session:
+        workflow = await session.get(Workflow, draft_workflow_id)
+        metadata = workflow.draft_json["metadata"]
+        # 让生成式 final-response LLM 节点用 fake 模型，端到端断言运行时能解析 ${node.output}。
+        for node in workflow.draft_json["spec"]["nodes"]:
+            if node["type"] == "llm":
+                node["config"]["modelProfile"] = "fake"
+                node["config"]["fakeOutput"] = {"reply": "已根据证据生成"}
+        metadata["presentationPolicy"] = {
+            "enabled": False,
+            "audience": "internal",
+            "producer": "template",
+            "template": "执行结果：{json}",
+        }
+        metadata["presentationPolicyDecision"] = {
+            "status": "rejected",
+            "reviewer": "test-reviewer",
+            "reviewedAt": "2026-08-11T10:00:00Z",
+        }
+        bind_presentation_decision(metadata)
+        digest = WorkflowCompiler().compile(workflow.draft_json).digest
+        published = await publish_workflow(
+            draft_workflow_id,
+            PublishRequest(draftRevision=workflow.draft_revision, draftDigest=digest),
+            session,
+        )
+    version_id = published["id"]
+
+    async with SessionLocal() as session, session.begin():
+        version = await session.get(WorkflowVersion, version_id)
+        run = await Orchestrator().create_run(session, version, {"key": "q4"})
+        run_id = run.id
+    worker = WorkerService("distill-generative-worker")
+    for _ in range(6):
+        if not await worker.run_once():
+            break
+    async with SessionLocal() as session:
+        completed = await session.get(Run, run_id)
+        assert completed is not None
+        assert completed.status == "succeeded", completed.error_json
+        assert completed.output_json == {"reply": "已根据证据生成"}
+        event_types = set(
+            await session.scalars(select(RunEvent.type).where(RunEvent.run_id == run_id))
+        )
+    # 模型节点真实被调用（transform 先跑，final-response 收到非空证据）。
+    assert "llm.call.completed" in event_types
+
+
 async def test_distillation_creates_editable_draft_without_publishing() -> None:
     async with SessionLocal() as session, session.begin():
         conversation = Conversation(id=str(uuid4()), title="草稿")
@@ -611,3 +803,173 @@ async def test_distillation_freezes_generic_presentation_proposal() -> None:
         proposal = result.analysis_json["presentationPolicyProposal"]
         assert proposal["source"] == "platform_fallback"
         assert proposal["reason"] and proposal["confidence"] == 0
+
+
+def test_deinstantiate_intent_strips_url_and_instance_values() -> None:
+    """032 P0-3：去实例化保留源语言意图，去掉 URL 与用户输入实例值，判定语言。"""
+
+    zh = _deinstantiate_intent(
+        {
+            "prompt": "查询标识 q4 对应的本地示例数据并用一句中文告诉我结果",
+            "actions": [
+                {
+                    "callId": "c1",
+                    "arguments": {"key": "q4"},
+                    "argumentBindings": {"key": {"source": "user_input", "inputKey": "key"}},
+                }
+            ],
+        }
+    )
+    assert zh["language"] == "zh"
+    assert "q4" not in zh["text"]
+    assert "查询" in zh["text"]
+    en = _deinstantiate_intent(
+        {
+            "prompt": "read the article at https://x.local/a and summarize",
+            "actions": [],
+        }
+    )
+    assert en["language"] == "en"
+    assert "https://" not in en["text"]
+
+
+async def _publish_lookup_workflow(
+    *, message: str, capability_name: str, capability_summary: str
+) -> None:
+    """固化中文 lookup 源任务，用给定（可能是英文）descriptor 发布 v1。"""
+
+    # 显式声明 key 来自用户输入，使 lookup 确定化编译不依赖 prompt 与实例值是否字面相等。
+    action = {
+        **_lookup_action("q1"),
+        "argumentBindings": {"key": {"source": "user_input", "inputKey": "message"}},
+    }
+    trajectory = _base_trajectory([action], message=message)
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="自召回")
+        session.add(conversation)
+        await session.flush()
+        conversation_run = ConversationRun(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            status="succeeded",
+            run_type="agent_run",
+            input_json={"message": message},
+            output_json={"reply": LOOKUP_TABLE.get("q1", "")},
+            trajectory_json=trajectory,
+        )
+        session.add(conversation_run)
+        await session.flush()
+        result = await distill_conversation_run(session, conversation_run)
+        draft_workflow_id = result.draft_workflow_id
+
+    async with SessionLocal() as session:
+        workflow = await session.get(Workflow, draft_workflow_id)
+        metadata = workflow.draft_json["metadata"]
+        # 模拟真实 TraeX 为中文任务生成的（可能全英文）descriptor。
+        metadata["capability"] = {
+            "name": capability_name,
+            "summary": capability_summary,
+            "useWhen": ["look up frozen data by a business key"],
+            "doNotUseWhen": ["semantics differ from published version"],
+            "tags": ["lookup", "table", "distilled"],
+            "examples": ["look up another key"],
+        }
+        workflow.name = capability_name
+        metadata["name"] = capability_name
+        metadata["presentationPolicy"] = {
+            "enabled": False,
+            "audience": "internal",
+            "producer": "template",
+            "template": "执行结果：{json}",
+        }
+        metadata["presentationPolicyDecision"] = {
+            "status": "rejected",
+            "reviewer": "test-reviewer",
+            "reviewedAt": "2026-08-11T10:00:00Z",
+        }
+        bind_presentation_decision(metadata)
+        digest = WorkflowCompiler().compile(workflow.draft_json).digest
+        await publish_workflow(
+            draft_workflow_id,
+            PublishRequest(draftRevision=workflow.draft_revision, draftDigest=digest),
+            session,
+        )
+        await session.commit()
+
+
+async def test_source_language_query_recalls_own_manifest() -> None:
+    """032 P0-3：中文源任务发布后，源语言去实例化查询能召回自己，即使 descriptor 是英文。"""
+
+    message = "查询标识 q2 对应的本地示例数据并用一句中文告诉我结果"
+    await _publish_lookup_workflow(
+        message=message,
+        capability_name="Structured Table Lookup",
+        capability_summary="Run a verified lookup against a frozen data map",
+    )
+    intent = _deinstantiate_intent(
+        _base_trajectory([_lookup_action("q1")], message=message)
+    )["text"]
+    async with SessionLocal() as session:
+        items = await search_manifests(session, intent, limit=5)
+    names = {item["name"] for item in items}
+    assert "Structured Table Lookup" in names
+
+
+async def test_english_source_uses_same_generic_self_recall() -> None:
+    """032 P0-3：英文源任务用同一通用机制自召回，证明没有语言/领域特例。"""
+
+    message = "look up the local sample data for key foo and reply"
+    await _publish_lookup_workflow(
+        message=message,
+        capability_name="结构化查询与结果返回",
+        capability_summary="按业务键执行冻结数据查询并返回结构化结果",
+    )
+    intent = _deinstantiate_intent(
+        _base_trajectory([_lookup_action("q1")], message=message)
+    )["text"]
+    async with SessionLocal() as session:
+        items = await search_manifests(session, intent, limit=5)
+    names = {item["name"] for item in items}
+    assert "结构化查询与结果返回" in names
+
+
+async def test_rejected_proposal_persists_blocked_distillation() -> None:
+    """032 P1-1：可分析轨迹但 Proposal 覆盖不合法时持久化 blocked + 诊断，不回滚成 422。"""
+
+    from app.application.distillation_ir import DistillationProposal
+
+    lookup = _lookup_action()
+    second = {
+        "callId": "call-2",
+        "kind": "tool",
+        "capability": "summarize.text",
+        "arguments": {"text": "x"},
+        "result": {"summary": "y"},
+    }
+    trajectory = _base_trajectory([lookup, second])
+    # proposal 只覆盖 call-1，遗漏 call-2 → Compiler 拒绝。
+    trajectory["proposal"] = DistillationProposal.model_validate(
+        {"nodes": [{"nodeId": "n1", "actionIds": ["call-1"], "strategy": "deterministic"}]}
+    ).model_dump(by_alias=True)
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="blocked")
+        session.add(conversation)
+        await session.flush()
+        conversation_run = ConversationRun(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            status="succeeded",
+            run_type="agent_run",
+            input_json={"message": "q1"},
+            output_json={"reply": LOOKUP_TABLE["q1"]},
+            trajectory_json=trajectory,
+        )
+        session.add(conversation_run)
+        await session.flush()
+        result = await distill_conversation_run(session, conversation_run)
+    # 持久化 blocked 记录、无草稿 Workflow、带结构化诊断。
+    assert result.status == "blocked"
+    assert result.draft_workflow_id is None
+    assert result.analysis_json["publishable"] is False
+    codes = {item["code"] for item in result.analysis_json["diagnostics"]}
+    assert "DISTILLATION_REJECTED" in codes

@@ -6016,11 +6016,16 @@ async def get_conversation_run(
     conversation_run = await session.get(ConversationRun, conversation_run_id)
     if conversation_run is None:
         raise HTTPException(404, "ConversationRun 不存在")
+    # 只有已存在可编辑草稿（draft_workflow_id 非空）才算 DRAFT_ALREADY_EXISTS；
+    # 没有 draft 的 blocked 诊断记录不得永久占用该判定，修复后允许重新发起固化。
     has_existing_draft = (
         await session.scalar(
             select(func.count())
             .select_from(Distillation)
-            .where(Distillation.conversation_run_id == conversation_run.id)
+            .where(
+                Distillation.conversation_run_id == conversation_run.id,
+                Distillation.draft_workflow_id.is_not(None),
+            )
         )
         or 0
     ) > 0
@@ -6336,11 +6341,16 @@ async def distill_run(
     conversation_run = await session.get(ConversationRun, conversation_run_id)
     if conversation_run is None:
         raise HTTPException(404, "ConversationRun 不存在")
+    # 只有已存在可编辑草稿（draft_workflow_id 非空）才算 DRAFT_ALREADY_EXISTS；
+    # 没有 draft 的 blocked 诊断记录不得永久占用该判定，修复后允许重新发起固化。
     has_existing_draft = (
         await session.scalar(
             select(func.count())
             .select_from(Distillation)
-            .where(Distillation.conversation_run_id == conversation_run.id)
+            .where(
+                Distillation.conversation_run_id == conversation_run.id,
+                Distillation.draft_workflow_id.is_not(None),
+            )
         )
         or 0
     ) > 0

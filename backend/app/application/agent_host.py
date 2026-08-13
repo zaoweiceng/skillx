@@ -30,6 +30,7 @@ from app.application.tool_broker import (
 )
 from app.config import get_settings
 from app.runtime.adapters import AdapterError, AgentRunRequest, TraeXSubprocessAdapter
+from app.runtime.browser import BrowserReadContract
 from app.runtime.traex_builtin import TraeXBridgeError, TraeXBuiltinAdapter
 
 # 005-A：唯一的 Agent 信任边界。
@@ -1485,8 +1486,22 @@ class AgentHost:
             "arguments": dict(started.get("arguments", {})),
             "result": completed.get("output", completed.get("result", {})),
         }
+        # Browser ToolResult 的 pageContract 是 Host 在执行前验证、执行后确认的权威证据。
+        # 归一化会从可变 arguments 删除它，但删除前必须把规范化 contract 保存为
+        # Host-owned observations，否则 Browser compiler 只能看到 resultSource 而退回
+        # Agent 节点。模型自报的 observations 不能覆盖该权威事实。
+        host_page_contract: dict[str, Any] | None = None
         if event_type == "tool.result" and kind == "browser":
-            action["arguments"].pop("pageContract", None)
+            raw_contract = action["arguments"].pop("pageContract", None)
+            if completed.get("status") in (None, "succeeded") and isinstance(
+                raw_contract, dict
+            ):
+                try:
+                    host_page_contract = BrowserReadContract.model_validate(
+                        raw_contract
+                    ).model_dump(by_alias=True, exclude_none=True)
+                except Exception:  # noqa: BLE001 - 非法 contract 不写权威证据。
+                    host_page_contract = None
         if event_type == "tool.result":
             action["status"] = completed.get("status")
             action["evidenceDigest"] = completed.get("evidenceDigest")
@@ -1511,7 +1526,13 @@ class AgentHost:
         if isinstance(bindings, dict):
             action["argumentBindings"] = bindings
         observations = completed.get("observations") or started.get("observations")
-        if isinstance(observations, dict):
+        observations = dict(observations) if isinstance(observations, dict) else {}
+        if host_page_contract is not None:
+            observations["pageContract"] = host_page_contract
+            observations.setdefault("action", action.get("action") or "read")
+            observations.setdefault("runtime", "playwright")
+            observations["resultSource"] = "host_tool_broker"
+        if observations:
             action["observations"] = observations
         return action
 

@@ -467,7 +467,7 @@ export default function ChatPage() {
   async function distill(conversationRunId: string) {
     try {
       const result = await api.distillConversationRun(conversationRunId)
-      if (result.status === 'blocked') {
+      if (result.status === 'blocked' || !result.draftWorkflowId) {
         const diagnostics = result.analysis.diagnostics
           .filter((item) => item.level === 'error')
           .map((item) => `${item.code}：${item.message}`)
@@ -475,9 +475,10 @@ export default function ChatPage() {
         setError(diagnostics || '该轨迹缺少可验证事实，暂时不能发布')
         return
       }
+      const draftWorkflowId = result.draftWorkflowId
       setDrafts((current) => ({
         ...current,
-        [conversationRunId]: result.draftWorkflowId,
+        [conversationRunId]: draftWorkflowId,
       }))
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '固化失败')
