@@ -1497,7 +1497,7 @@ select:focus-visible {
 
 .trace-drawer {
   border-left: 1px solid var(--line);
-  background: #0e191f;
+  background: var(--panel);
 }
 
 .trace-empty {
