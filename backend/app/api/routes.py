@@ -4189,8 +4189,21 @@ async def create_message(
             assistant_content, conversation_run = await _unbound_conversation_message(
                 session, conversation, body, turn.id, user_message.id
             )
-        except HTTPException as exc:
-            detail = exc.detail if isinstance(exc.detail, dict) else {}
+        except (
+            HTTPException,
+            CatalogError,
+            PlanCompileError,
+            WorkflowValidationError,
+        ) as exc:
+            detail = (
+                exc.detail
+                if isinstance(exc, HTTPException) and isinstance(exc.detail, dict)
+                else {
+                    "code": "WORKFLOW_SELECTION_CONTRACT_INVALID",
+                    "message": str(exc),
+                    "retryable": False,
+                }
+            )
             usage_call_ids = list(
                 await session.scalars(
                     select(ModelUsage.call_id).where(ModelUsage.turn_id == turn.id)
@@ -4487,23 +4500,59 @@ async def _unbound_conversation_message(
                 turn_id=turn_id,
                 tool_evidence=tool_evidence,
             )
-        except HTTPException as exc:
-            detail = dict(exc.detail) if isinstance(exc.detail, dict) else {}
+        except (
+            HTTPException,
+            CatalogError,
+            PlanCompileError,
+            WorkflowValidationError,
+        ) as exc:
+            detail = (
+                dict(exc.detail)
+                if isinstance(exc, HTTPException) and isinstance(exc.detail, dict)
+                else {
+                    "code": "WORKFLOW_SELECTION_CONTRACT_INVALID",
+                    "message": str(exc),
+                    "retryable": False,
+                    "diagnostics": [
+                        {
+                            "code": type(exc).__name__,
+                            "message": str(exc),
+                        }
+                    ],
+                }
+            )
             detail.update(
                 {
                     "disclosureSessionId": disclosure.id,
                     "toolTimeline": tool_timeline,
                 }
             )
-            exc.detail = detail
-            raise
-    selection, resume_action = await _prepare_selection(
-        session,
-        selection,
-        conversation_id=conversation.id,
-        current_message_id=user_message_id,
-        tool_evidence=tool_evidence,
-    )
+            if isinstance(exc, HTTPException):
+                exc.detail = detail
+                raise
+            raise HTTPException(422, detail=detail) from exc
+    try:
+        selection, resume_action = await _prepare_selection(
+            session,
+            selection,
+            conversation_id=conversation.id,
+            current_message_id=user_message_id,
+            tool_evidence=tool_evidence,
+        )
+    except (CatalogError, PlanCompileError, WorkflowValidationError) as exc:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "WORKFLOW_SELECTION_CONTRACT_INVALID",
+                "message": str(exc),
+                "retryable": False,
+                "disclosureSessionId": disclosure.id,
+                "toolTimeline": tool_timeline,
+                "diagnostics": [
+                    {"code": type(exc).__name__, "message": str(exc)}
+                ],
+            },
+        ) from exc
     if selection.action == "ask_user":
         frozen_schema, _, _ = await _selection_input_contract(session, selection)
         frozen_message_ids = (
@@ -4628,9 +4677,24 @@ async def _unbound_conversation_message(
             },
             run,
         )
-    result = await _execute_selection_service(
-        session, selection, turn_id=turn_id, source_verified=True
-    )
+    try:
+        result = await _execute_selection_service(
+            session, selection, turn_id=turn_id, source_verified=True
+        )
+    except (CatalogError, PlanCompileError, WorkflowValidationError) as exc:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "WORKFLOW_SELECTION_CONTRACT_INVALID",
+                "message": str(exc),
+                "retryable": False,
+                "disclosureSessionId": disclosure.id,
+                "toolTimeline": tool_timeline,
+                "diagnostics": [
+                    {"code": type(exc).__name__, "message": str(exc)}
+                ],
+            },
+        ) from exc
     message = _selection_result_message(selection, result, resumed=False)
     message["toolTimeline"] = tool_timeline
     return message, None
@@ -4662,6 +4726,81 @@ def _selection_result_message(
         "resumedPendingSelection": resumed,
         "text": "选择已执行，后续由 Workflow Runtime 接管。",
     }
+
+
+async def _selection_disclosure_diagnostic(
+    session: AsyncSession, selection: WorkflowSelection
+) -> dict[str, Any] | None:
+    """Return the exact missing service-owned disclosure fact, if any."""
+
+    try:
+        if selection.action == "run_full":
+            level = await require_disclosed_ref(
+                session, selection.session_id, selection.refs[0]
+            )
+            if level not in {"L1", "L2"}:
+                return {
+                    "code": "WORKFLOW_L1_REQUIRED",
+                    "message": "run_full 终态需要所选 Workflow 的 L1 披露",
+                    "requiredAction": "describe",
+                    "ref": selection.refs[0],
+                }
+            await resolve_workflow_manifest(session, selection.refs[0])
+        elif selection.action == "run_fragment":
+            level = await require_disclosed_ref(
+                session, selection.session_id, selection.refs[0]
+            )
+            if level != "L2":
+                return {
+                    "code": "FRAGMENT_L2_REQUIRED",
+                    "message": "run_fragment 终态需要所选 Fragment 的 L2 披露",
+                    "requiredAction": "describe_fragment",
+                    "ref": selection.refs[0],
+                }
+            await describe_fragment(session, selection.refs[0])
+        elif selection.action == "compose":
+            if selection.plan is None:
+                raise PlanCompileError("compose 缺少 ExecutionPlan")
+            await require_plan_refs_disclosed(
+                session, selection.session_id, selection.plan
+            )
+            plan_digest = digest_json(selection.plan)
+            compiled_calls = (
+                await session.scalars(
+                select(WorkflowDisclosureCall)
+                .where(
+                    WorkflowDisclosureCall.session_id == selection.session_id,
+                    WorkflowDisclosureCall.operation == "plan",
+                    WorkflowDisclosureCall.status == "succeeded",
+                )
+                .order_by(WorkflowDisclosureCall.created_at.desc())
+                )
+            ).all()
+            if not any(
+                call.request_summary_json.get("planDigest") == plan_digest
+                for call in compiled_calls
+            ):
+                return {
+                    "code": "PLAN_DISCLOSURE_REQUIRED",
+                    "message": "compose 终态需要对当前 ExecutionPlan 完成 compile_plan",
+                    "requiredAction": "compile_plan",
+                    "planDigest": plan_digest,
+                }
+            await compile_plan(session, selection.plan)
+    except (CatalogError, PlanCompileError, WorkflowValidationError) as exc:
+        return {
+            "code": "WORKFLOW_SELECTION_DISCLOSURE_INVALID",
+            "message": str(exc),
+            "requiredAction": (
+                "describe_fragment"
+                if selection.action == "run_fragment"
+                else "compile_plan"
+                if selection.action == "compose"
+                else "describe"
+            ),
+            **({"ref": selection.refs[0]} if selection.refs else {}),
+        }
+    return None
 
 
 async def _select_workflow_candidate(
@@ -4832,6 +4971,169 @@ async def _select_workflow_candidate(
             502,
             detail={"code": "WORKFLOW_SELECTION_FAILED", "message": str(exc)},
         ) from exc
+    assert result is not None
+    selection_runs = [(request, result)]
+    disclosure_diagnostic = await _selection_disclosure_diagnostic(
+        session, selection
+    )
+    if disclosure_diagnostic is not None:
+        previous_selection = selection
+        used_steps = max(
+            result.step_count,
+            sum(
+                event.get("type") == "tool.requested"
+                for event in result.runtime_events
+            ),
+        )
+        remaining_steps = request.max_steps - used_steps
+        if remaining_steps <= 0:
+            raise HTTPException(
+                422,
+                detail={
+                    "code": "WORKFLOW_SELECTION_DISCLOSURE_INCOMPLETE",
+                    "message": "选择 Agent 已耗尽步骤预算，终态仍缺少服务端披露",
+                    "retryable": False,
+                    "diagnostics": [disclosure_diagnostic],
+                },
+            )
+        correction_request = AgentHostRequest(
+            run_id=f"workflow-selection-disclosure-{uuid4()}",
+            prompt=(
+                "WorkflowSelectionDisclosureContinuation。上一个选择终态未满足服务端披露"
+                "契约，不能进入参数提取或执行。仅调用 workflow.catalog 完成 diagnostic "
+                "指定的缺失动作，然后重新输出 WorkflowSelection；不得凭提示词假设披露已"
+                "完成，不得把用户输入当成新的搜索任务。除非 compile_plan diagnostics 要求"
+                "修正 plan，否则保持原 action/ref/plan。\n"
+                "previousSelection="
+                f"{json.dumps(selection.model_dump(by_alias=True), ensure_ascii=False)}\n"
+                f"diagnostic={json.dumps(disclosure_diagnostic, ensure_ascii=False)}\n"
+                f"user={body_text(user_text)}\n"
+            ),
+            output_schema=selection_schema,
+            working_directory=get_settings().artifact_root / "workflow-selections",
+            requested_capabilities=("workflow.catalog",),
+            max_steps=remaining_steps,
+            max_total_tokens=max(1, request.max_total_tokens - result.total_tokens),
+            max_input_tokens=(
+                max(1, request.max_input_tokens - result.input_tokens)
+                if request.max_input_tokens is not None
+                else None
+            ),
+            max_output_tokens=(
+                max(1, request.max_output_tokens - result.output_tokens)
+                if request.max_output_tokens is not None
+                else None
+            ),
+            max_billable_tokens=(
+                max(1, request.max_billable_tokens - result.total_tokens)
+                if request.max_billable_tokens is not None
+                else None
+            ),
+            max_duration_seconds=60,
+        )
+        correction_result = None
+        try:
+            registry = ToolAdapterRegistry()
+            registry.register(workflow_catalog_adapter(session, session_id))
+            correction_result = await AgentHost(tool_registry=registry).execute(
+                correction_request
+            )
+            selection = WorkflowSelection.model_validate(
+                {
+                    **correction_result.output,
+                    "bindings": {},
+                    "bindingSources": [],
+                    "missingInputs": [],
+                    "sessionId": session_id,
+                }
+            )
+            runtime = agent_runtime_config()
+            if turn_id:
+                await record_model_usage(
+                    session,
+                    call_id=correction_request.run_id,
+                    stage="workflow_selection",
+                    turn_id=turn_id,
+                    provider=correction_result.provider or runtime.provider,
+                    model=correction_result.model,
+                    protocol=runtime.protocol,
+                    runtime_type=runtime.type,
+                    adapter_version=runtime.adapter_version,
+                    adapter_digest=runtime.adapter_digest,
+                    runtime_used="agent_runtime",
+                    runtime_digest=runtime.digest,
+                    input_tokens=correction_result.input_tokens,
+                    output_tokens=correction_result.output_tokens,
+                    total_tokens=correction_result.total_tokens or None,
+                    usage_complete=correction_result.usage_complete,
+                    dispatched=correction_result.request_dispatched,
+                    completed=True,
+                )
+            await session.commit()
+        except (AgentHostError, ValueError) as exc:
+            runtime = agent_runtime_config()
+            if turn_id:
+                await record_model_usage(
+                    session,
+                    call_id=correction_request.run_id,
+                    stage="workflow_selection",
+                    turn_id=turn_id,
+                    provider=runtime.provider,
+                    model=runtime.model,
+                    protocol=runtime.protocol,
+                    runtime_type=runtime.type,
+                    adapter_version=runtime.adapter_version,
+                    adapter_digest=runtime.adapter_digest,
+                    runtime_used="agent_runtime",
+                    runtime_digest=runtime.digest,
+                    error_code=(
+                        exc.code
+                        if isinstance(exc, AgentHostError)
+                        else "WORKFLOW_SELECTION_INVALID"
+                    ),
+                    input_tokens=getattr(exc, "input_tokens", None),
+                    output_tokens=getattr(exc, "output_tokens", None),
+                    total_tokens=getattr(exc, "total_tokens", None),
+                    usage_complete=bool(getattr(exc, "usage_complete", False)),
+                    dispatched=bool(getattr(exc, "request_dispatched", False)),
+                    completed=False,
+                )
+            await session.commit()
+            raise HTTPException(
+                422,
+                detail={
+                    "code": "WORKFLOW_SELECTION_DISCLOSURE_INCOMPLETE",
+                    "message": "选择 Agent 未能补全服务端披露",
+                    "retryable": False,
+                    "diagnostics": [
+                        disclosure_diagnostic,
+                        {"code": "DISCLOSURE_CONTINUATION_FAILED", "message": str(exc)},
+                    ],
+                },
+            ) from exc
+        assert correction_result is not None
+        selection_runs.append((correction_request, correction_result))
+        disclosure_diagnostic = (
+            {
+                "code": "DISCLOSURE_SELECTION_CHANGED",
+                "message": "披露补全不得更换已选择的 action 或不可变 ref",
+            }
+            if (
+                selection.action != previous_selection.action
+                or selection.refs != previous_selection.refs
+            )
+            else await _selection_disclosure_diagnostic(session, selection)
+        )
+        if disclosure_diagnostic is not None:
+            raise HTTPException(
+                422,
+                detail={
+                    "code": "WORKFLOW_SELECTION_DISCLOSURE_INCOMPLETE",
+                    "message": "选择 Agent 补全后仍未满足服务端披露契约",
+                    "retryable": False,
+                    "diagnostics": [disclosure_diagnostic],
+                },
+            )
     timeline = []
     tool_evidence: dict[str, dict[str, Any]] = {}
     level_by_capability = {
@@ -4843,7 +5145,12 @@ async def _select_workflow_candidate(
         "workflow.compile_plan": "L2",
     }
     request_by_call: dict[str, dict[str, Any]] = {}
-    for event in result.runtime_events:
+    selection_events = [
+        (executed_request, event)
+        for executed_request, executed_result in selection_runs
+        for event in executed_result.runtime_events
+    ]
+    for executed_request, event in selection_events:
         if event["type"] not in {"tool.requested", "tool.result"}:
             continue
         payload = event["payload"]
@@ -4905,7 +5212,7 @@ async def _select_workflow_candidate(
                 "status": payload.get("status", "pending"),
                 "action": arguments.get("action"),
                 "sessionDigest": digest_json({"sessionId": session_id}),
-                "modelCallId": request.run_id,
+                "modelCallId": executed_request.run_id,
                 "argumentsDigest": payload.get("argumentsDigest")
                 or (digest_json(arguments) if arguments else None),
                 "attempt": int(payload.get("attempts", 1)),

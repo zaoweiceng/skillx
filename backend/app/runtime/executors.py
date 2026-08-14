@@ -408,6 +408,28 @@ class MCPExecutor:
 class LLMExecutor:
     node_type = NodeType.LLM
 
+    @staticmethod
+    def _prompt_with_resolved_inputs(
+        prompt_template: str, inputs: dict[str, Any]
+    ) -> str:
+        canonical_inputs = json.dumps(
+            inputs,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        input_section = (
+            "[RESOLVED_INPUT_JSON]\n"
+            f"{canonical_inputs}\n"
+            "[/RESOLVED_INPUT_JSON]"
+        )
+        if "{input}" in prompt_template:
+            prompt = prompt_template.replace("{input}", input_section, 1)
+            return prompt.replace(
+                "{input}", "[RESOLVED_INPUT_ALREADY_INCLUDED]"
+            )
+        return f"{prompt_template.rstrip()}\n\n{input_section}".lstrip()
+
     async def execute(
         self, context: RunContext, node: WorkflowNode, inputs: dict[str, Any]
     ) -> NodeResult:
@@ -420,8 +442,8 @@ class LLMExecutor:
                     message="LLM 节点缺少 outputSchema",
                 ),
             )
-        prompt = node.config.get("prompt", "{input}").replace(
-            "{input}", json.dumps(inputs, ensure_ascii=False)
+        prompt = self._prompt_with_resolved_inputs(
+            str(node.config.get("prompt", "{input}")), inputs
         )
         request_dispatched = False
         try:

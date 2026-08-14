@@ -346,7 +346,10 @@ def main() -> int:
         )
         return 0
 
-    if "Progressive WorkflowSelection" in args.prompt:
+    if (
+        "Progressive WorkflowSelection" in args.prompt
+        or "WorkflowSelectionDisclosureContinuation" in args.prompt
+    ):
         use_catalog = "workflow.catalog" in allowed
 
         def catalog_call(
@@ -358,6 +361,51 @@ def main() -> int:
 
         user_match = re.search(r"user=(.*)", args.prompt)
         user_text = user_match.group(1).strip() if user_match else _clean_message(args.prompt)
+        if "WorkflowSelectionDisclosureContinuation" in args.prompt:
+            previous_match = re.search(r"^previousSelection=(.*)$", args.prompt, re.MULTILINE)
+            diagnostic_match = re.search(r"^diagnostic=(.*)$", args.prompt, re.MULTILINE)
+            previous = json.loads(previous_match.group(1)) if previous_match else {}
+            diagnostic = json.loads(diagnostic_match.group(1)) if diagnostic_match else {}
+            provenance_results: list[dict[str, Any]] = []
+            if _directive(user_text, "DISCLOSURE", "complete") != "never":
+                action = diagnostic.get("requiredAction", "describe")
+                arguments = {"action": action}
+                if diagnostic.get("ref"):
+                    arguments["ref"] = diagnostic["ref"]
+                if action == "compile_plan":
+                    arguments["plan"] = previous.get("plan")
+                emit(
+                    {
+                        "type": "tool.requested",
+                        "payload": {
+                            "callId": "workflow-disclosure-correction",
+                            "capabilityRef": "workflow.catalog",
+                            "arguments": arguments,
+                        },
+                    }
+                )
+                provenance_results.append(
+                    read_tool_result("workflow-disclosure-correction")
+                )
+            output = {
+                key: previous[key]
+                for key in ("action", "reason", "refs", "plan", "requiredCapabilities")
+                if key in previous and previous[key] is not None
+            }
+            emit(
+                {
+                    "type": "agent.completed",
+                    "payload": {
+                        "steps": 1,
+                        "totalTokens": 20,
+                        "output": output,
+                        "outputProvenance": generative_output_provenance(
+                            output, provenance_results, "workflow-disclosure-v1"
+                        ),
+                    },
+                }
+            )
+            return 0
         requested_action = _directive(args.prompt, "SELECTION", "auto")
         emit({"type": "agent.plan", "payload": {"summary": "渐进发现 Workflow"}})
         search_capability, search_arguments = catalog_call(
@@ -450,6 +498,18 @@ def main() -> int:
                 "bindings": {},
                 "missingInputs": required or ["input"],
                 "question": f"请补充输入：{', '.join(required or ['input'])}",
+            }
+        elif (
+            action == "run_fragment"
+            and _directive(user_text, "DISCLOSURE", "complete")
+            in {"incomplete", "never"}
+        ):
+            fragments = workflow.get("fragments", [])
+            fragment_ref = fragments[0]["fragmentRef"]
+            output = {
+                "action": "run_fragment",
+                "reason": "先返回仅有 L1 的 Fragment 选择，用于服务端约束测试",
+                "refs": [fragment_ref],
             }
         elif action == "run_fragment":
             fragments = workflow.get("fragments", [])

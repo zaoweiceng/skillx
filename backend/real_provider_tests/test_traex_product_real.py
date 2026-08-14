@@ -224,6 +224,9 @@ def test_real_product_distill_publish_discover_and_reuse(
         )
         assert llm_node["status"] == "succeeded", llm_node
         assert any(llm_node["input"].values()), llm_node
+        manual_reply = str(manual_run["output"].get("reply", ""))
+        assert "第四季度" in manual_reply, manual_run["output"]
+        assert "15%" in manual_reply, manual_run["output"]
 
         reuse = client.post(
             "/conversations", json={"title": "real-distill-reuse"}
@@ -237,6 +240,21 @@ def test_real_product_distill_publish_discover_and_reuse(
         assert selected.status_code == 201, selected.text
         assistant = selected.json()["assistant"]
         assert assistant["state"] == "workflow_run", assistant
+        assert assistant["agentAction"] in {"run_full", "run_fragment", "compose"}
+        successful_results = [
+            item
+            for item in assistant["toolTimeline"]
+            if item["type"] == "tool.result" and item["status"] == "succeeded"
+        ]
+        levels = {item.get("level") for item in successful_results}
+        assert {"L0", "L1"} <= levels, assistant["toolTimeline"]
+        if assistant["agentAction"] != "run_full":
+            assert "L2" in levels, assistant["toolTimeline"]
+        assert assistant["bindingSources"], assistant
+        assert all(
+            source["serverVerified"] is True
+            for source in assistant["bindingSources"]
+        ), assistant["bindingSources"]
         # Agent 可选择直接 run_full，也可生成锁定同一版本的 plan/fragment；不可变 ref
         # 才是两种执行形态共同的版本身份。
         assert any(
@@ -245,5 +263,8 @@ def test_real_product_distill_publish_discover_and_reuse(
         ), assistant
         reused_run = poll_run(client, assistant["runId"], timeout=180)
         assert reused_run["status"] == "succeeded", reused_run
+        reused_reply = str(reused_run["output"].get("reply", ""))
+        assert "第三季度" in reused_reply, reused_run["output"]
+        assert "营收持平" in reused_reply, reused_run["output"]
         refreshed = client.get(f"/conversations/{reuse['id']}").json()
         assert refreshed["messages"][-1]["content"]["runId"] == assistant["runId"]

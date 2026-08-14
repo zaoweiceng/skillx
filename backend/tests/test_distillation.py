@@ -191,6 +191,10 @@ def test_host_lookup_facts_and_generative_output_compile_to_publishable_graph() 
     ]
     assert [node["type"] for node in business] == ["transform", "llm"]
     assert business[0]["input"] == {"key": "${input.key}"}
+    final_prompt = business[1]["config"]["prompt"]
+    assert "任务目标（已去实例化）" in final_prompt
+    assert "仅根据 resolved inputs 中的已验证证据" in final_prompt
+    assert "q1" not in final_prompt
     assert definition["spec"]["nodes"][-1]["input"] == {
         "reply": "${final-response.output.reply}"
     }

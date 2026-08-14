@@ -22,9 +22,27 @@ from app.infrastructure.database import (
     Workflow,
     WorkflowVersion,
 )
+from app.runtime.executors import LLMExecutor
 from app.runtime.models import ModelRuntimeError, OpenAICompatibleAdapter
 
 STUB = Path(__file__).resolve().parents[2] / "examples" / "traex_stub.py"
+
+
+def test_llm_prompt_always_includes_one_canonical_resolved_input_section() -> None:
+    inputs = {"evidence": {"value": "第四季度：营收增长 15%"}, "index": 2}
+
+    without_placeholder = LLMExecutor._prompt_with_resolved_inputs(
+        "只依据证据回答", inputs
+    )
+    with_repeated_placeholder = LLMExecutor._prompt_with_resolved_inputs(
+        "证据：{input}\n不要重复：{input}", inputs
+    )
+
+    canonical = '{"evidence":{"value":"第四季度：营收增长 15%"},"index":2}'
+    for prompt in (without_placeholder, with_repeated_placeholder):
+        assert prompt.count("[RESOLVED_INPUT_JSON]") == 1
+        assert prompt.count(canonical) == 1
+    assert "{input}" not in with_repeated_placeholder
 
 
 class _ModelHandler(BaseHTTPRequestHandler):

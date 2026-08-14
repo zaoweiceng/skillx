@@ -663,3 +663,61 @@ async def test_selection_five_actions_come_from_progressive_agent_loop(
     assert run.output_json == {"message": "你好，渐进问候"}
     expected_snapshots = 1 if requested in {"run_fragment", "compose"} else 0
     assert snapshots_after - snapshots_before == expected_snapshots
+
+
+async def test_fragment_selection_continues_until_l2_disclosure(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _seed()
+    async with SessionLocal() as session:
+        response = await create_message(
+            conversation_id,
+            MessageCreate(
+                content=(
+                    "渐进问候 参数是 Alice [[SELECTION:run_fragment]]"
+                    "[[DISCLOSURE:incomplete]]"
+                )
+            ),
+            session,
+        )
+
+    assistant = response["assistant"]
+    assert assistant["state"] == "workflow_run"
+    assert assistant["agentAction"] == "run_fragment"
+    assert {
+        item["level"]
+        for item in assistant["toolTimeline"]
+        if item["type"] == "tool.result"
+    } == {"L0", "L1", "L2"}
+    assert len(
+        {
+            item["modelCallId"]
+            for item in assistant["toolTimeline"]
+            if item["type"] == "tool.result"
+        }
+    ) == 2
+
+
+async def test_incomplete_fragment_disclosure_persists_error_turn(
+    traex_stub: None,
+) -> None:
+    conversation_id = await _seed()
+    async with SessionLocal() as session:
+        response = await create_message(
+            conversation_id,
+            MessageCreate(
+                content=(
+                    "渐进问候 参数是 Alice [[SELECTION:run_fragment]]"
+                    "[[DISCLOSURE:never]]"
+                )
+            ),
+            session,
+        )
+
+    assert response["assistant"]["state"] == "error"
+    assert (
+        response["assistant"]["code"]
+        == "WORKFLOW_SELECTION_DISCLOSURE_INCOMPLETE"
+    )
+    assert response["turn"]["status"] == "error"
+    assert response["turn"]["completedAt"] is not None

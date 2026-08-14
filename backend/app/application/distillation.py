@@ -314,6 +314,7 @@ def compile_agent_trajectory(
     if not isinstance(input_schema, dict) or not isinstance(output_schema, dict):
         raise DistillationError("轨迹缺少 inputSchema/outputSchema")
     trajectory = {**trajectory, "prompt": _clean_message(str(trajectory.get("prompt", "")))}
+    deinstantiated_intent = _deinstantiate_intent(trajectory)["text"]
 
     try:
         actions = build_action_ir(trajectory)
@@ -485,7 +486,9 @@ def compile_agent_trajectory(
                         "outputSchema": output_schema,
                         "maxTotalTokens": 20000,
                         "prompt": (
-                            "仅根据输入的已验证证据生成符合 outputSchema 的结果，"
+                            f"任务目标（已去实例化）：{deinstantiated_intent or '完成原任务'}。"
+                            "输出字段必须表达该任务的最终结果，并符合 outputSchema 的字段语义；"
+                            "仅根据 resolved inputs 中的已验证证据回答，不得复述 Schema，"
                             "不得增加证据中不存在的事实。"
                         ),
                     },
