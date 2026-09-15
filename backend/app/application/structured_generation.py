@@ -6,16 +6,11 @@ from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
 
-from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
 from app.application.compiler import digest_json
-from app.application.runtime_config import (
-    agent_runtime_config,
-    llm_runtime_config,
-)
-from app.config import get_settings
+from app.application.runtime_config import llm_runtime_config
 from app.runtime.models import ModelRuntimeError, OpenAICompatibleAdapter
 
-RuntimeUsed = Literal["direct_llm", "agent_fallback"]
+RuntimeUsed = Literal["direct_llm"]
 
 
 @dataclass(frozen=True)
@@ -30,7 +25,7 @@ class StructuredGenerationRequest:
 @dataclass(frozen=True)
 class StructuredGenerationRuntime:
     runtime_used: RuntimeUsed
-    runtime_kind: Literal["llm_runtime", "agent_runtime"]
+    runtime_kind: Literal["llm_runtime"]
     provider: str
     identity: str | None
     protocol: str
@@ -39,8 +34,6 @@ class StructuredGenerationRuntime:
     adapter_digest: str | None
     digest: str
     policy_digest: str
-    fallback_reason: str | None = None
-
     def snapshot(self) -> dict[str, Any]:
         return {
             "runtimeSelection": self.runtime_used,
@@ -53,7 +46,6 @@ class StructuredGenerationRuntime:
             "adapterDigest": self.adapter_digest,
             "runtimeDigest": self.digest,
             "policyDigest": self.policy_digest,
-            "fallbackReason": self.fallback_reason,
         }
 
 
@@ -73,10 +65,10 @@ def normalize_model_runtime_policy(
     policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw = policy or {}
-    order = raw.get("order", ["llm_runtime", "agent_runtime"])
-    if order != ["llm_runtime", "agent_runtime"]:
-        raise ValueError("modelRuntimePolicy.order 只支持 llm_runtime → agent_runtime")
-    return {"order": order, "fallback": "startup_unavailable_only"}
+    order = raw.get("order", ["llm_runtime"])
+    if order not in (["llm_runtime"], ["llm_runtime", "agent_runtime"]):
+        raise ValueError("modelRuntimePolicy.order 必须以 llm_runtime 开始")
+    return {"order": ["llm_runtime"]}
 
 
 def resolve_structured_generation_runtime(
@@ -98,24 +90,9 @@ def resolve_structured_generation_runtime(
             digest=llm.digest,
             policy_digest=policy_digest,
         )
-    agent = agent_runtime_config()
-    if agent.configured:
-        return StructuredGenerationRuntime(
-            runtime_used="agent_fallback",
-            runtime_kind="agent_runtime",
-            provider=agent.provider,
-            identity=agent.model,
-            protocol=agent.protocol,
-            runtime_type=agent.type,
-            adapter_version=agent.adapter_version,
-            adapter_digest=agent.adapter_digest,
-            digest=agent.digest,
-            policy_digest=policy_digest,
-            fallback_reason="LLM_RUNTIME_UNCONFIGURED",
-        )
     raise ModelRuntimeError(
         "MODEL_RUNTIME_UNAVAILABLE",
-        "LLM Runtime 与 Agent Runtime 均未配置",
+        "LLM Runtime 未配置",
     )
 
 
@@ -129,7 +106,6 @@ def frozen_runtime_from_snapshot(
     )
     if not snapshot or selection not in {
         "direct_llm",
-        "agent_fallback",
     }:
         raise ModelRuntimeError(
             "MODEL_RUNTIME_UNAVAILABLE",
@@ -146,68 +122,7 @@ def frozen_runtime_from_snapshot(
         adapter_digest=snapshot.get("adapterDigest"),
         digest=snapshot["runtimeDigest"],
         policy_digest=snapshot["policyDigest"],
-        fallback_reason=snapshot.get("fallbackReason"),
     )
-
-
-class AgentStructuredGenerationAdapter:
-    def __init__(self, host: AgentHost | None = None) -> None:
-        self._host = host or AgentHost()
-
-    async def generate(
-        self,
-        request: StructuredGenerationRequest,
-        runtime: StructuredGenerationRuntime,
-    ) -> StructuredGenerationResult:
-        settings = get_settings()
-        current = agent_runtime_config()
-        if current.digest != runtime.digest:
-            raise ModelRuntimeError(
-                "MODEL_RUNTIME_CONFIG_DRIFT",
-                "Agent Runtime 配置在 Run 启动后发生变化",
-            )
-        try:
-            result = await self._host.execute(
-                AgentHostRequest(
-                    run_id=request.call_id,
-                    prompt=(
-                        "完成一次严格结构化生成。禁止调用任何工具，只返回符合 JSON Schema "
-                        f"的对象。\n\n{request.prompt}"
-                    ),
-                    output_schema=request.output_schema,
-                    working_directory=request.working_directory,
-                    requested_capabilities=(),
-                    max_steps=1,
-                    max_total_tokens=settings.agent_max_total_tokens,
-                    max_input_tokens=settings.agent_max_input_tokens,
-                    max_output_tokens=settings.agent_max_output_tokens,
-                    max_billable_tokens=settings.agent_max_billable_tokens,
-                    max_duration_seconds=settings.agent_max_duration_seconds,
-                )
-            )
-        except AgentHostError as exc:
-            raise ModelRuntimeError(
-                exc.code,
-                exc.message,
-                request_dispatched=exc.request_dispatched,
-            ) from exc
-        tool_requests = sum(event["type"] == "tool.requested" for event in result.runtime_events)
-        if tool_requests:
-            raise ModelRuntimeError(
-                "PERMISSION_DENIED",
-                "Agent structured fallback 产生了禁止的 Tool 请求",
-            )
-        Draft202012Validator(request.output_schema).validate(result.output)
-        return StructuredGenerationResult(
-            output=result.output,
-            runtime=runtime,
-            input_tokens=result.input_tokens,
-            output_tokens=result.output_tokens,
-            total_tokens=result.total_tokens,
-            usage_complete=result.usage_complete,
-            tool_request_count=tool_requests,
-            request_dispatched=result.request_dispatched,
-        )
 
 
 class StructuredGenerationResolver:
@@ -217,27 +132,25 @@ class StructuredGenerationResolver:
         runtime_snapshot: dict[str, Any] | None,
     ) -> StructuredGenerationResult:
         runtime = frozen_runtime_from_snapshot(runtime_snapshot)
-        if runtime.runtime_used == "direct_llm":
-            if llm_runtime_config().digest != runtime.digest:
-                raise ModelRuntimeError(
-                    "MODEL_RUNTIME_CONFIG_DRIFT",
-                    "LLM Runtime 配置在 Run 启动后发生变化",
-                )
-            result = await OpenAICompatibleAdapter().generate(
-                request.prompt,
-                request.output_schema,
-                request.max_output_tokens,
+        if llm_runtime_config().digest != runtime.digest:
+            raise ModelRuntimeError(
+                "MODEL_RUNTIME_CONFIG_DRIFT",
+                "LLM Runtime 配置在 Run 启动后发生变化",
             )
-            Draft202012Validator(request.output_schema).validate(result.output)
-            return StructuredGenerationResult(
-                output=result.output,
-                runtime=runtime,
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-                total_tokens=result.input_tokens + result.output_tokens,
-                usage_complete=result.usage_complete,
-            )
-        return await AgentStructuredGenerationAdapter().generate(request, runtime)
+        result = await OpenAICompatibleAdapter().generate(
+            request.prompt,
+            request.output_schema,
+            request.max_output_tokens,
+        )
+        Draft202012Validator(request.output_schema).validate(result.output)
+        return StructuredGenerationResult(
+            output=result.output,
+            runtime=runtime,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            total_tokens=result.input_tokens + result.output_tokens,
+            usage_complete=result.usage_complete,
+        )
 
 
 def runtime_snapshot_for_definition(definition: Any) -> dict[str, Any]:
@@ -257,7 +170,6 @@ def runtime_snapshot_for_definition(definition: Any) -> dict[str, Any]:
             "runtimeDigest": digest_json(
                 {
                     "llm": llm_runtime_config().digest,
-                    "agent": agent_runtime_config().digest,
                 }
             ),
             "policyDigest": digest_json(normalized),

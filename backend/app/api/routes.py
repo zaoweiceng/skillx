@@ -40,6 +40,7 @@ from app.application.browser_readiness import browser_runtime_readiness
 from app.application.capabilities import (
     CapabilityResolutionError,
     register_skillx,
+    resolve_package_path,
     validate_workflow_capabilities,
 )
 from app.application.compiler import WorkflowCompiler, WorkflowValidationError, digest_json
@@ -121,10 +122,12 @@ from app.application.workflow_patch import (
 )
 from app.application.workflow_tool_broker import workflow_catalog_adapter
 from app.config import get_settings
+from app.domain.workflow import WorkflowDefinition
 from app.infrastructure.database import (
     Approval,
     Artifact,
     Capability,
+    CapabilityVersion,
     Component,
     Conversation,
     ConversationRun,
@@ -160,6 +163,7 @@ from app.infrastructure.database import (
 )
 from app.infrastructure.migrations import alembic_head_revision
 from app.runtime.contract_patch import ContractPatchViolation, apply_contract_patch
+from app.runtime.skillx_host import execute_in_subprocess
 
 router = APIRouter()
 compiler = WorkflowCompiler()
@@ -216,6 +220,11 @@ class CapabilityCreate(BaseModel):
     interface: str | None = None
 
 
+class CapabilityExecute(BaseModel):
+    interface: str = Field(min_length=1)
+    input: dict[str, Any]
+
+
 class MCPServerCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     transport: str
@@ -262,6 +271,23 @@ class ConversationRunCreate(BaseModel):
     input: dict[str, Any]
     output: dict[str, Any]
     trajectory: dict[str, Any]
+
+
+class DshTaskAction(BaseModel):
+    """一个成功的 DSH 工具名称，不携带任务实例数据。"""
+
+    name: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9_.:/-]+$",
+    )
+
+
+class DshTaskDistillationCreate(BaseModel):
+    """草稿固化桥接仅接收的最小 DSH 会话事实。"""
+
+    session_id: str = Field(alias="sessionId", min_length=1, max_length=160)
+    actions: list[DshTaskAction] = Field(min_length=1, max_length=32)
 
 
 class ContractPatchApply(BaseModel):
@@ -3665,6 +3691,150 @@ async def list_capabilities(
     ]
 
 
+@router.get("/capabilities/{capability_id}")
+async def get_capability(
+    capability_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    capability = await session.get(Capability, capability_id)
+    if capability is None or capability.current_version_id is None:
+        raise HTTPException(404, "SkillX 能力不存在")
+    version = await session.get(CapabilityVersion, capability.current_version_id)
+    if version is None or version.status != "published":
+        raise HTTPException(409, "SkillX 能力当前版本不可用")
+    manifest = version.manifest_json["manifest"]
+    metadata = manifest["metadata"]
+    manifest_interfaces = manifest["spec"]["interfaces"]
+    interfaces = [
+        {
+            "name": name,
+            "title": item.get("title", name),
+            "description": item.get("description", ""),
+            "inputSchema": version.manifest_json["interfaces"][name]["inputSchema"],
+            "outputSchema": version.manifest_json["interfaces"][name]["outputSchema"],
+        }
+        for name, item in manifest_interfaces.items()
+        if item.get("kind") == "direct"
+    ]
+    return {
+        "id": capability.id,
+        "name": capability.name,
+        "type": capability.type,
+        "displayName": metadata.get("displayName", capability.name),
+        "description": metadata.get("description", ""),
+        "version": version.version,
+        "interfaces": interfaces,
+    }
+
+
+@router.get("/prompt-catalog")
+async def prompt_catalog(
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """返回模型可按需展开的已发布工作流与 direct SkillX 摘要。"""
+
+    workflow_rows = (
+        await session.execute(
+            select(WorkflowVersion, Workflow)
+            .join(Workflow, Workflow.id == WorkflowVersion.workflow_id)
+            .order_by(WorkflowVersion.workflow_id, WorkflowVersion.version.desc())
+        )
+    ).all()
+    workflows: list[dict[str, Any]] = []
+    seen_workflows: set[str] = set()
+    for version, workflow in workflow_rows:
+        if workflow.id in seen_workflows:
+            continue
+        try:
+            definition = WorkflowDefinition.model_validate(version.definition_json)
+            await validate_workflow_capabilities(session, definition)
+        except (CapabilityResolutionError, ValidationError):
+            continue
+        seen_workflows.add(workflow.id)
+        metadata = version.definition_json.get("metadata", {})
+        capability = (
+            metadata.get("capability", {})
+            if isinstance(metadata, dict)
+            else {}
+        )
+        workflows.append(
+            {
+                "workflowId": workflow.id,
+                "workflowVersionId": version.id,
+                "name": workflow.name,
+                "summary": str(capability.get("summary", "")),
+            }
+        )
+    capabilities: list[dict[str, Any]] = []
+    rows = (await session.scalars(select(Capability).order_by(Capability.name))).all()
+    for capability in rows:
+        if capability.type != "skillx" or capability.current_version_id is None:
+            continue
+        version = await session.get(CapabilityVersion, capability.current_version_id)
+        if version is None or version.status != "published":
+            continue
+        manifest = version.manifest_json["manifest"]
+        metadata = manifest["metadata"]
+        interfaces = [
+            {
+                "name": name,
+                "title": interface.get("title", name),
+                "description": interface.get("description", ""),
+            }
+            for name, interface in manifest["spec"]["interfaces"].items()
+            if interface.get("kind") == "direct"
+        ]
+        if not interfaces:
+            continue
+        capabilities.append(
+            {
+                "capabilityId": capability.id,
+                "capabilityVersionId": version.id,
+                "name": capability.name,
+                "displayName": metadata.get("displayName", capability.name),
+                "description": metadata.get("description", ""),
+                "interfaces": interfaces,
+            }
+        )
+    return {"workflows": workflows, "capabilities": capabilities}
+
+
+@router.post("/capabilities/{capability_id}/execute")
+async def execute_capability(
+    capability_id: str,
+    body: CapabilityExecute,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    capability = await session.get(Capability, capability_id)
+    if capability is None or capability.current_version_id is None:
+        raise HTTPException(404, "SkillX 能力不存在")
+    version = await session.get(CapabilityVersion, capability.current_version_id)
+    if version is None or version.status != "published":
+        raise HTTPException(409, "SkillX 能力当前版本不可用")
+    interface = version.manifest_json.get("interfaces", {}).get(body.interface)
+    if not isinstance(interface, dict) or interface.get("kind") != "direct":
+        raise HTTPException(422, "SkillX direct 接口不存在")
+    try:
+        package = resolve_package_path(version.package_path or "")
+        result = await execute_in_subprocess(
+            package,
+            body.interface,
+            str(uuid4()),
+            body.input,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            502,
+            detail={"code": "SKILLX_EXECUTION_FAILED", "message": str(exc)},
+        ) from exc
+    return {
+        "status": result.status,
+        "output": result.output,
+        "error": result.error.model_dump() if result.error is not None else None,
+        "metrics": result.metrics,
+    }
+
+
 @router.get("/secrets")
 async def list_secret_references(
     session: AsyncSession = Depends(get_session),
@@ -6654,6 +6824,52 @@ async def import_conversation_trajectory(
     session.add(run)
     await session.commit()
     return {"id": run.id, "status": run.status, "runType": run.run_type}
+
+
+@router.post("/dsh-task-distillations", status_code=201)
+async def distill_dsh_task(
+    body: DshTaskDistillationCreate,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    """分析已完成的 DSH 工具序列并返回需人工确认的 SkillX 抽象候选。
+
+    桥接仅接收稳定的工具名称及顺序。用户提示词、工具参数、结果、路径、URL 和凭据
+    保留在 DSH 会话日志中，绝不进入工作流元数据。未知工具不得伪装为可执行
+    SkillX 或 Agent 节点；用户需先审阅并实现一个可验证的 direct SkillX。
+    """
+
+    action_names = [action.name for action in body.actions]
+    if len(action_names) < 2:
+        return {
+            "status": "not_eligible",
+            "draftWorkflowId": None,
+            "analysis": {
+                "sourceSessionId": body.session_id,
+                "reasonCode": "INSUFFICIENT_FIXED_STEPS",
+                "message": "至少需要两个成功步骤才能建议抽象为工作流",
+            },
+            "skillxCandidates": [],
+        }
+    return {
+        "status": "skillx_review_required",
+        "draftWorkflowId": None,
+        "analysis": {
+            "sourceSessionId": body.session_id,
+            "reasonCode": "SKILLX_IMPLEMENTATION_REQUIRED",
+            "message": "检测到可复用的多步骤流程；请先将固定输入输出部分实现并注册为 direct SkillX",
+        },
+        "skillxCandidates": [
+            {
+                "name": "待命名 SkillX",
+                "actionNames": action_names,
+                "requirements": [
+                    "定义固定输入和输出 JSON Schema",
+                    "实现可测试的 direct 执行器",
+                    "声明最小权限与副作用",
+                ],
+            }
+        ],
+    }
 
 
 @router.post("/conversation-runs/{conversation_run_id}/distill", status_code=201)

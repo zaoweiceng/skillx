@@ -79,7 +79,7 @@ def distillation_eligibility(
         reason = "DRAFT_ALREADY_EXISTS"
     elif conversation_run.status != "succeeded":
         reason = "RUN_NOT_SUCCEEDED"
-    elif conversation_run.run_type != "agent_run":
+    elif conversation_run.run_type not in {"agent_run", "dsh_session"}:
         reason = "UNSUPPORTED_RUN_TYPE"
     elif not actions:
         reason = "NO_REUSABLE_ACTIONS"
@@ -920,18 +920,22 @@ async def distill_conversation_run(
 ) -> Distillation:
     if conversation_run.status != "succeeded":
         raise DistillationError("只有成功的运行可以固化")
-    # 默认只固化 AgentRunService 生成的成功 agent_run：这是“探索一次，固化复用”的
-    # 唯一生产者。外部导入轨迹与单次 llm_response 都不作为固化来源。
+    # 只接受服务端 AgentRunService 与 DSH 会话桥接生成的已完成轨迹。外部导入轨迹与
+    # 单次 llm_response 都不作为固化来源。
     run_type = getattr(conversation_run, "run_type", "agent_run")
-    if run_type != "agent_run":
+    if run_type not in {"agent_run", "dsh_session"}:
         raise DistillationError(
-            "只有服务端生成的 agent_run 可固化；单次回答或导入轨迹请勿作为固化来源"
+            "只有服务端 Agent 运行或 DSH 会话桥接运行可固化"
         )
     # 若轨迹携带 TraeX 的 DistillationProposal，则校验其覆盖并让 proposed_strategy 参与裁决。
     proposal: DistillationProposal | None = None
     raw_proposal = conversation_run.trajectory_json.get("proposal")
     proposal_source = "runtime" if isinstance(raw_proposal, dict) else "none"
-    distillation_runtime_available = agent_runtime_config().configured
+    # DSH 会话桥接仅提交脱敏后的工具序列，固化过程保持本地确定性：模型拿不到任务
+    # 正文，生成草稿也不产生隐式模型请求。
+    distillation_runtime_available = (
+        run_type == "agent_run" and agent_runtime_config().configured
+    )
     distillation_id = str(uuid4())
     if isinstance(raw_proposal, dict):
         try:

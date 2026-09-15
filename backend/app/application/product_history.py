@@ -620,7 +620,7 @@ class PresentationDriver:
                             "runtimeSelection",
                             runtime_snapshot.get("runtimeUsed"),
                         )
-                        in {"direct_llm", "agent_fallback"}
+                        == "direct_llm"
                     ):
                         runtime_selection = runtime_snapshot.get(
                             "runtimeSelection",

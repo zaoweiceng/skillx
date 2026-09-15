@@ -84,14 +84,17 @@ class ModelRuntimePolicy(BaseModel):
     order: list[Literal["llm_runtime", "agent_runtime"]] = Field(
         default_factory=lambda: ["llm_runtime", "agent_runtime"]
     )
-    fallback: Literal["startup_unavailable_only"] = "startup_unavailable_only"
+    fallback: Literal["startup_unavailable_only"] | None = None
 
     model_config = ConfigDict(extra="forbid")
 
     @model_validator(mode="after")
     def fixed_order(self) -> ModelRuntimePolicy:
-        if self.order != ["llm_runtime", "agent_runtime"]:
-            raise ValueError("modelRuntimePolicy.order must be llm_runtime then agent_runtime")
+        if self.order not in (
+            ["llm_runtime"],
+            ["llm_runtime", "agent_runtime"],
+        ):
+            raise ValueError("modelRuntimePolicy.order 必须以 llm_runtime 开始")
         return self
 
 

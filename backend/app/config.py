@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     worker_poll_seconds: float = 0.5
     lease_seconds: int = 30
     auto_create_schema: bool = False
+    deterministic_workflows: bool = False
     mcp_allowed_executables: list[str] = [
         "python",
         "python3",

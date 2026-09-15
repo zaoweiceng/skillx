@@ -108,9 +108,17 @@ async def validate_workflow_capabilities(
     session: AsyncSession,
     definition: WorkflowDefinition,
 ) -> tuple[str, list[dict[str, Any]]]:
+    deterministic_workflows = get_settings().deterministic_workflows
     execution_class = "zero_llm"
     locks: list[dict[str, Any]] = []
     for node in definition.spec.nodes:
+        if deterministic_workflows and node.type in {
+            NodeType.LLM,
+            NodeType.AGENT,
+        }:
+            raise CapabilityResolutionError(
+                f"确定性工作流不支持 {node.type.value} 节点；请先抽象为已注册 SkillX"
+            )
         if node.type == NodeType.LLM:
             execution_class = "hybrid"
         elif node.type == NodeType.AGENT:
@@ -129,6 +137,10 @@ async def validate_workflow_capabilities(
         interface = version.manifest_json.get("interfaces", {}).get(interface_name)
         if not interface:
             raise CapabilityResolutionError(f"SkillX 节点 {node.id} 的接口 {interface_name} 不存在")
+        if deterministic_workflows and interface["kind"] != "direct":
+            raise CapabilityResolutionError(
+                f"确定性工作流仅支持 direct SkillX 接口，节点 {node.id} 引用了 {interface['kind']}"
+            )
         if interface["kind"] == "llm" and execution_class != "agent":
             execution_class = "hybrid"
         elif interface["kind"] == "agent":

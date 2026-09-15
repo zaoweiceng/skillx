@@ -458,7 +458,6 @@ class LLMExecutor:
                 model = fake.model
                 runtime_used = "fake_structured"
                 runtime_digest = digest_json({"profile": "fake"})
-                fallback_reason = ""
                 provider = "fixture"
                 usage_complete = fake.usage_complete
                 tool_request_count = 0
@@ -484,7 +483,6 @@ class LLMExecutor:
                 model = generated.runtime.identity or generated.runtime.provider
                 runtime_used = generated.runtime.runtime_used
                 runtime_digest = generated.runtime.digest
-                fallback_reason = generated.runtime.fallback_reason or ""
                 provider = generated.runtime.provider
                 protocol = generated.runtime.protocol
                 runtime_type = generated.runtime.runtime_type
@@ -525,7 +523,6 @@ class LLMExecutor:
                     ),
                     "runtimeUsed": runtime_used,
                     "runtimeDigest": runtime_digest,
-                    "fallbackReason": fallback_reason,
                     "usageComplete": usage_complete,
                     "toolRequestCount": tool_request_count,
                     "requestDispatched": request_dispatched,
@@ -537,7 +534,6 @@ class LLMExecutor:
                             "model": model,
                             "runtimeUsed": runtime_used,
                             "runtimeDigest": runtime_digest,
-                            "fallbackReason": fallback_reason or None,
                             "inputTokens": input_tokens,
                             "outputTokens": output_tokens,
                             "toolRequestCount": tool_request_count,
@@ -557,11 +553,10 @@ class LLMExecutor:
                     "model": str(snapshot.get("identity") or "unknown"),
                     "runtimeUsed": str(runtime_selection),
                     "runtimeDigest": str(snapshot.get("runtimeDigest") or ""),
-                    "fallbackReason": str(snapshot.get("fallbackReason") or ""),
                     "usageComplete": False,
                     "requestDispatched": exc.request_dispatched,
                 }
-                if runtime_selection in {"direct_llm", "agent_fallback"}
+                if runtime_selection == "direct_llm"
                 else {}
             )
             return NodeResult(
@@ -586,11 +581,10 @@ class LLMExecutor:
                         "model": str(snapshot.get("identity") or "unknown"),
                         "runtimeUsed": str(runtime_selection),
                         "runtimeDigest": str(snapshot.get("runtimeDigest") or ""),
-                        "fallbackReason": str(snapshot.get("fallbackReason") or ""),
                         "usageComplete": False,
                         "requestDispatched": request_dispatched,
                     }
-                    if runtime_selection in {"direct_llm", "agent_fallback"}
+                    if runtime_selection == "direct_llm"
                     else {}
                 ),
             )

@@ -20,7 +20,11 @@ from app.application.artifact_integrity import (
     artifact_record_matches,
     safe_artifact_path,
 )
-from app.application.capabilities import CapabilityResolutionError, resolve_skillx_node
+from app.application.capabilities import (
+    CapabilityResolutionError,
+    resolve_skillx_node,
+    validate_workflow_capabilities,
+)
 from app.application.compiler import digest_json
 from app.application.error_policy import error_policy, persisted_error, public_error
 from app.application.expressions import ExpressionError, resolve_mapping
@@ -263,6 +267,7 @@ class Orchestrator:
         turn_id: str | None = None,
     ) -> Run:
         definition = WorkflowDefinition.model_validate(workflow_version.definition_json)
+        await validate_workflow_capabilities(session, definition)
         errors = list(Draft202012Validator(definition.spec.input_schema).iter_errors(inputs))
         if errors:
             raise ValueError(errors[0].message)
