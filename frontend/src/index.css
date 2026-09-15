@@ -189,7 +189,7 @@ button {
   height: 42px;
   padding: 0 12px;
   border: 1px solid transparent;
-  color: #9baab0;
+  color: var(--muted);
   font-size: 13px;
   transition: 160ms ease;
 }

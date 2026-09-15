@@ -131,6 +131,16 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             if capture_dir:
                 Path(capture_dir).mkdir(parents=True, exist_ok=True)
                 page.screenshot(path=str(Path(capture_dir) / "chat-light.png"), full_page=True)
+            page.set_viewport_size({"width": 375, "height": 812})
+            assert page.evaluate("document.documentElement.scrollWidth") <= 375
+            heading = page.get_by_role("heading", name="通用对话").bounding_box()
+            assert heading is not None and heading["height"] < 50
+            composer = page.locator(".chat-composer").bounding_box()
+            assert composer is not None and composer["x"] >= 0
+            assert composer["x"] + composer["width"] <= 375
+            if capture_dir:
+                page.screenshot(path=str(Path(capture_dir) / "chat-mobile.png"), full_page=True)
+            page.set_viewport_size({"width": 1280, "height": 900})
             page.get_by_role("button", name="工作流：开启").click()
             expect(
                 page.get_by_role("button", name="工作流：关闭")
