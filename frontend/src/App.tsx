@@ -15,7 +15,7 @@ export default function App() {
     <BrowserRouter>
       <Routes>
         <Route element={<AppShell />}>
-          <Route path="/" element={<Navigate to="/components" replace />} />
+          <Route path="/" element={<Navigate to="/chat" replace />} />
           <Route path="/chat" element={<ChatPage />} />
           <Route path="/chat/:id" element={<ChatPage />} />
           <Route path="/components" element={<ComponentsPage />} />
@@ -25,7 +25,7 @@ export default function App() {
           <Route path="/workflows/:id/edit" element={<WorkflowEditorPage />} />
           <Route path="/capabilities" element={<CapabilitiesPage />} />
           <Route path="/settings" element={<SettingsPage />} />
-          <Route path="*" element={<Navigate to="/components" replace />} />
+          <Route path="*" element={<Navigate to="/chat" replace />} />
         </Route>
       </Routes>
     </BrowserRouter>

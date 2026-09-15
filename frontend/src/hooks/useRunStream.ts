@@ -1,7 +1,7 @@
 import { useEffect } from 'react'
 import { create } from 'zustand'
 
-import { eventStreamUrl, type RunEvent } from '@/api/client'
+import { api, eventStreamUrl, type RunEvent } from '@/api/client'
 
 type StoredRunEvent = RunEvent & {
   runId: string
@@ -64,8 +64,27 @@ export function useRunStream(
   historyLoaded: boolean,
   after: number,
   onEvent: () => void,
+  onError?: (message: string) => void,
 ): void {
   const add = useRunEvents((state) => state.add)
+  const addMany = useRunEvents((state) => state.addMany)
+
+  useEffect(() => {
+    if (!runId || !historyLoaded || !runStatus || !TERMINAL_STATUSES.has(runStatus)) return
+    let active = true
+    const reconcile = async () => {
+      let cursor = useRunEvents.getState().events[runId]?.at(-1)?.seq ?? after
+      while (active) {
+        const page = await api.listRunEvents(runId, cursor, 200)
+        if (!active) return
+        addMany(runId, page.map(event => ({ ...event, runId })))
+        if (page.length < 200) return
+        cursor = page.at(-1)!.seq
+      }
+    }
+    void reconcile().catch(error => { if (active) onError?.(error instanceof Error ? error.message : '事件同步失败') })
+    return () => { active = false }
+  }, [addMany, after, historyLoaded, onError, runId, runStatus])
 
   useEffect(() => {
     if (

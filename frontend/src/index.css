@@ -3,28 +3,28 @@
 @tailwind utilities;
 
 :root {
-  color: #e9eee9;
-  background: #091116;
+  color: #ececec;
+  background: #212121;
   font-family: "Avenir Next", "Noto Sans SC", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  --bg: #091116;
-  --sidebar: #0d171d;
-  --panel: #111d24;
-  --panel-raised: #15242c;
-  --line: #2b3a41;
-  --line-soft: #202e35;
-  --text: #e9eee9;
-  --muted: #8ea0a7;
-  --accent: #e59b45;
-  --accent-bright: #ffc06b;
+  --bg: #212121;
+  --sidebar: #171717;
+  --panel: #262626;
+  --panel-raised: #2f2f2f;
+  --line: #424242;
+  --line-soft: #343434;
+  --text: #ececec;
+  --muted: #b4b4b4;
+  --accent: #ececec;
+  --accent-bright: #ffffff;
   --success: #41c78c;
   --danger: #eb6f61;
   --blue: #639cf3;
-  --field: #0d171c;
-  --code-bg: #0a1318;
-  --overlay: rgba(12, 22, 28, 0.94);
-  --focus: rgba(229, 155, 69, 0.34);
+  --field: #2f2f2f;
+  --code-bg: #171717;
+  --overlay: #171717;
+  --focus: rgba(140, 140, 140, 0.34);
   --notice-border: #446453;
   --notice-bg: rgba(51, 122, 87, 0.14);
   --notice-text: #89d3ad;
@@ -40,25 +40,25 @@
 }
 
 :root[data-theme="light"] {
-  color: #172126;
-  background: #f4f1ea;
-  --bg: #f4f1ea;
-  --sidebar: #fbfaf6;
+  color: #171717;
+  background: #ffffff;
+  --bg: #ffffff;
+  --sidebar: #f9f9f9;
   --panel: #ffffff;
-  --panel-raised: #faf7f0;
-  --line: #c9d0d2;
-  --line-soft: #e1e5e5;
-  --text: #172126;
-  --muted: #5d6b70;
-  --accent: #a85c08;
-  --accent-bright: #8a4b06;
+  --panel-raised: #f3f3f3;
+  --line: #d4d4d4;
+  --line-soft: #e5e5e5;
+  --text: #171717;
+  --muted: #666666;
+  --accent: #171717;
+  --accent-bright: #000000;
   --success: #16734c;
   --danger: #b1362c;
   --blue: #245ea9;
   --field: #ffffff;
   --code-bg: #f3f5f4;
-  --overlay: rgba(251, 250, 246, 0.96);
-  --focus: rgba(168, 92, 8, 0.3);
+  --overlay: #f9f9f9;
+  --focus: rgba(100, 100, 100, 0.3);
   --notice-border: #397353;
   --notice-bg: #e8f4ec;
   --notice-text: #205d3d;
@@ -86,12 +86,7 @@ body,
 
 body {
   min-width: 320px;
-  background:
-    radial-gradient(circle at 78% 4%, rgba(48, 93, 102, 0.16), transparent 30rem),
-    linear-gradient(rgba(255, 255, 255, 0.012) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.012) 1px, transparent 1px),
-    var(--bg);
-  background-size: auto, 32px 32px, 32px 32px, auto;
+  background: var(--bg);
 }
 
 button,
@@ -148,23 +143,23 @@ button {
   display: grid;
   place-items: center;
   color: var(--accent-bright);
-  background: #1e2c32;
-  border: 1px solid #36464d;
+  background: var(--panel-raised);
+  border: 1px solid var(--line);
 }
 
 .brand-mark {
   width: 34px;
   height: 34px;
-  transform: rotate(45deg);
+  border-radius: 12px;
 }
 
 .brand-mark svg {
-  transform: rotate(-45deg);
+  transform: none;
 }
 
 .brand strong {
   display: block;
-  font-family: "Baskerville", "Songti SC", serif;
+  font-family: inherit;
   font-size: 19px;
   letter-spacing: 0.08em;
 }
@@ -207,7 +202,7 @@ button {
 
 .nav-item.active {
   color: var(--text);
-  background: linear-gradient(90deg, rgba(229, 155, 69, 0.17), transparent);
+  background: var(--panel-raised);
   border-color: var(--accent);
 }
 
@@ -301,7 +296,7 @@ select:focus-visible {
 .run-header h1,
 .chat-header h1 {
   margin: 5px 0 7px;
-  font-family: "Baskerville", "Songti SC", serif;
+  font-family: inherit;
   font-size: clamp(30px, 4vw, 46px);
   font-weight: 500;
   letter-spacing: -0.035em;
@@ -367,7 +362,7 @@ select:focus-visible {
 }
 
 .header-stat span {
-  font-family: "Baskerville", serif;
+  font-family: inherit;
   font-size: 23px;
 }
 
@@ -398,8 +393,8 @@ select:focus-visible {
 .filter-chip:hover,
 .filter-chip.active {
   color: var(--text);
-  border-color: #6b5234;
-  background: rgba(229, 155, 69, 0.1);
+  border-color: var(--line);
+  background: rgba(140, 140, 140, 0.1);
 }
 
 .component-grid {
@@ -412,16 +407,14 @@ select:focus-visible {
   min-height: 224px;
   padding: 20px;
   border: 1px solid var(--line);
-  background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.025), transparent 50%),
-    var(--panel);
+  background: var(--panel);
   animation: reveal 0.45s both;
   transition: 180ms ease;
 }
 
 .component-card:hover {
   transform: translateY(-3px);
-  border-color: #5e4a33;
+  border-color: var(--line);
   background-color: var(--panel-raised);
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.22);
 }
@@ -466,7 +459,7 @@ select:focus-visible {
 
 .component-card h2 {
   margin: 26px 0 9px;
-  font-family: "Baskerville", "Songti SC", serif;
+  font-family: inherit;
   font-size: 22px;
   font-weight: 500;
 }
@@ -512,7 +505,7 @@ select:focus-visible {
 
 .empty-state h2 {
   margin: 16px 0 7px;
-  font-family: "Baskerville", serif;
+  font-family: inherit;
   font-weight: 500;
 }
 
@@ -530,8 +523,8 @@ select:focus-visible {
   justify-content: center;
   gap: 7px;
   padding: 0 14px;
-  border: 1px solid #46565d;
-  background: #19272e;
+  border: 1px solid var(--line);
+  background: var(--panel-raised);
   color: var(--text);
   font-size: 11px;
   font-weight: 600;
@@ -550,7 +543,7 @@ select:focus-visible {
 }
 
 .button.primary {
-  border-color: #d98c35;
+  border-color: var(--accent);
   background: var(--accent);
   color: #1a1209;
 }
@@ -609,7 +602,7 @@ select:focus-visible {
 
 .panel-heading h2 {
   margin: 3px 0 0;
-  font-family: "Baskerville", "Songti SC", serif;
+  font-family: inherit;
   font-size: 17px;
   font-weight: 500;
 }
@@ -703,7 +696,7 @@ select:focus-visible {
 
 .form-control:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(229, 155, 69, 0.12);
+  box-shadow: 0 0 0 2px rgba(140, 140, 140, 0.12);
 }
 
 .field-description,
@@ -815,10 +808,8 @@ select:focus-visible {
   gap: 17px;
   margin-bottom: 16px;
   padding: 18px;
-  border: 1px solid #795c34;
-  background:
-    linear-gradient(90deg, rgba(229, 155, 69, 0.12), transparent 45%),
-    #161e21;
+  border: 1px solid var(--line);
+  background: var(--panel);
 }
 
 .approval-icon {
@@ -832,7 +823,7 @@ select:focus-visible {
 
 .approval-copy h2 {
   margin: 4px 0;
-  font-family: "Baskerville", serif;
+  font-family: inherit;
   font-size: 18px;
   font-weight: 500;
 }
@@ -1408,18 +1399,18 @@ select:focus-visible {
   width: 62px;
   height: 62px;
   place-items: center;
-  border: 1px solid #57462f;
+  border: 1px solid var(--line);
   color: var(--accent);
-  transform: rotate(45deg);
+  border-radius: 12px;
 }
 
 .chat-empty-icon svg {
-  transform: rotate(-45deg);
+  transform: none;
 }
 
 .chat-empty h2 {
   margin: 27px 0 8px;
-  font-family: "Baskerville", "Songti SC", serif;
+  font-family: inherit;
   font-size: 25px;
   font-weight: 500;
 }
@@ -1440,7 +1431,7 @@ select:focus-visible {
 .prompt-suggestions button {
   padding: 8px 11px;
   border: 1px solid var(--line);
-  background: #111d23;
+  background: var(--panel);
   color: #aebbbf;
   font-size: 9px;
   cursor: pointer;
@@ -1483,8 +1474,8 @@ select:focus-visible {
 }
 
 .message.user p {
-  border-color: #56452f;
-  background: rgba(229, 155, 69, 0.09);
+  border-color: var(--line);
+  background: rgba(140, 140, 140, 0.09);
 }
 
 .error-code {
@@ -1520,7 +1511,7 @@ select:focus-visible {
   height: 24px;
   border: 1px solid var(--accent);
   border-radius: 50%;
-  box-shadow: 0 0 0 8px rgba(229, 155, 69, 0.05);
+  box-shadow: 0 0 0 8px rgba(140, 140, 140, 0.05);
 }
 
 .trace-timeline {
@@ -1560,8 +1551,8 @@ select:focus-visible {
   flex: 0 0 auto;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  border: 1px solid #4c4539;
-  background: #111d24;
+  border: 1px solid var(--line);
+  background: #262626;
   box-shadow: 0 20px 50px rgba(0, 0, 0, 0.32);
 }
 
@@ -1793,7 +1784,7 @@ select:focus-visible {
 
 :root[data-theme="light"] .react-flow__controls button {
   background: #fff !important;
-  fill: #172126 !important;
+  fill: #171717 !important;
 }
 
 .inspector-fields dt {
@@ -1842,8 +1833,8 @@ select:focus-visible {
   padding: 8px 10px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: #142028;
-  color: #e8ede9;
+  background: var(--panel-raised);
+  color: var(--text);
   font-size: 12px;
   cursor: pointer;
   text-align: left;
@@ -1948,7 +1939,7 @@ select:focus-visible {
 }
 
 .registry-summary strong {
-  font-family: "Baskerville", serif;
+  font-family: inherit;
   font-size: 20px;
 }
 
@@ -2022,17 +2013,7 @@ select:focus-visible {
 
 .skeleton-grid {
   min-height: 420px;
-  background:
-    linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.025), transparent),
-    repeating-linear-gradient(
-      90deg,
-      var(--panel) 0,
-      var(--panel) calc(33.333% - 12px),
-      transparent calc(33.333% - 12px),
-      transparent 33.333%
-    );
-  background-size: 200% 100%, 100% 100%;
-  animation: shimmer 1.6s infinite;
+  background: var(--panel);
 }
 
 @keyframes reveal {

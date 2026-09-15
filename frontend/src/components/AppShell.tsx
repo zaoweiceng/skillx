@@ -48,7 +48,7 @@ export default function AppShell() {
           ))}
         </nav>
         <div className="runtime-status">
-          <span className="pulse-dot" />
+          <CircleDot size={14} aria-hidden="true" />
           <div>
             <strong>本地运行时</strong>
             <small>真实状态见系统页</small>

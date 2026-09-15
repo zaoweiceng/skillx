@@ -1,0 +1,17 @@
+.page :global(.chat-layout) { grid-template-columns: 200px minmax(0, 1fr); border: 0; background: var(--bg); }
+.page :global(.chat-header h1) { font-size: 26px; }
+.page :global(.chat-header .eyebrow) { display: none; }
+.page :global(.conversation-history) { background: var(--sidebar); border: 0; border-radius: 12px; }
+.page :global(.trace-drawer) { position: absolute; inset: 0 0 0 auto; z-index: 20; display: none; width: min(90%, 360px); background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+.page :global(.trace-drawer.open) { display: block; }
+.page :global(.mobile-history-toggle[aria-label="打开执行轨迹"]) { display: inline-flex; }
+.page :global(.chat-composer) { width: calc(100% - 32px); max-width: 760px; margin: 24px auto 16px; padding: 10px; border-radius: 20px; background: var(--panel-raised); box-shadow: none; }
+.page :global(.chat-composer textarea) { background: transparent; font-size: 15px; border-radius: 12px; min-height: 60px; }
+.page :global(.chat-composer button) { color: var(--bg); border-radius: 12px; min-width: 60px; max-height: 48px; align-self: center; }
+.page :global(.chat-composer button:disabled) { opacity: .5; cursor: default; }
+.page :global(.chat-empty p) { font-size: 14px; }
+.page :global(.prompt-suggestions button) { border-radius: 16px; padding: 8px 14px; font-size: 12px; }
+.composerControls { grid-column: 1 / -1; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 6px 8px 0; color: var(--muted); font-size: 12px; }
+.composerControls select { max-width: 180px; color: var(--text); background: transparent; border: 0; }
+@media (max-width: 1200px) { .page :global(.chat-layout) { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 600px) { .page :global(.chat-composer) { width: 100%; margin-inline: 0; } }

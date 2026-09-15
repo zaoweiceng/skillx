@@ -13,6 +13,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
 import { api, type Approval, type Run } from '@/api/client'
+import { HandoffPanel } from '@/features/runtime/HandoffPanel'
 import { StatusBadge } from '@/components/StatusBadge'
 import { useRunEvents, useRunStream } from '@/hooks/useRunStream'
 
@@ -101,6 +102,7 @@ export default function RunDetailPage() {
     historyLoaded,
     streamAfter,
     refresh,
+    setError,
   )
 
   async function decide(approval: Approval, approved: boolean) {
@@ -455,6 +457,7 @@ export default function RunDetailPage() {
         </section>
       )}
 
+      {run.status === 'failed' && <HandoffPanel run={run} onStarted={refresh} />}
       {run.status === 'failed' && (run.nodes ?? []).some((node) => node.status === 'failed') && (
         <section className="panel result-panel">
           <div className="panel-heading">

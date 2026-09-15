@@ -1,6 +1,7 @@
 import { Bot, Database, KeyRound, PanelsTopLeft, ServerCog } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '@/api/client'
+import { ProfileSettings } from '@/features/runtime/ProfileSettings'
 
 type Health = Awaited<ReturnType<typeof api.getHealth>>
 
@@ -123,6 +124,7 @@ export default function SettingsPage() {
           </p>
         </div>
       </header>
+      <ProfileSettings />
       {error && <div className="error-panel">运行状态探测失败：{error}</div>}
       {!health && !error && <div className="notice-panel">正在探测真实运行状态…</div>}
       {health && (
