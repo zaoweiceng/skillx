@@ -585,6 +585,7 @@ class PresentationDriver:
                 else:
                     raise ValueError(f"未知 Presentation producer: {policy['producer']}")
             except Exception as exc:  # noqa: BLE001 - presentation failure is isolated.
+                await session.rollback()
                 async with session.begin():
                     item = await session.get(RunPresentation, presentation_id)
                     run = await session.get(Run, run_id)

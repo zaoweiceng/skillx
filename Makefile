@@ -54,3 +54,12 @@ frontend-check:
 doc-chain-check:
 	cd tools && python3 -m unittest -q test_check_doc_chain.py
 	python3 tools/check_doc_chain.py
+
+.PHONY: api-types pi-check
+api-types:
+	@schema=$$(mktemp /tmp/skillx-openapi.XXXXXX) && \
+		uv run --directory backend python ../tools/export_openapi.py $$schema && \
+		cd frontend && npx --no-install openapi-typescript $$schema -o src/api/schema.d.ts
+
+pi-check:
+	cd bridges/pi && npm ci && npm run check && npm run probe

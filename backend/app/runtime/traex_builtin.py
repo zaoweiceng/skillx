@@ -17,9 +17,10 @@ from fastapi import FastAPI, Request, Response
 from jsonschema import Draft202012Validator
 
 from app.config import get_settings
+from app.runtime.agent_contracts import AdapterError
 
 
-class TraeXBridgeError(RuntimeError):
+class TraeXBridgeError(AdapterError):
     def __init__(self, code: str, message: str) -> None:
         self.code = code
         super().__init__(message)
@@ -106,7 +107,9 @@ def _error_code(stderr: str, events: list[dict[str, Any]]) -> str:
         + "\n"
         + "\n".join(json.dumps(item, ensure_ascii=False) for item in events)
     ).lower()
-    if any(marker in text for marker in ("401", "unauthorized", "access token expired")):
+    if any(marker in text for marker in (
+        "401", "unauthorized", "access token expired", "access token has expired"
+    )):
         return "TRAE_AUTH_REQUIRED"
     if any(
         marker in text
@@ -195,6 +198,8 @@ def _runtime_identity(events: list[dict[str, Any]]) -> tuple[str | None, str | N
 
 class TraeXBuiltinAdapter:
     """Bridge the native ``traex exec`` JSONL/MCP protocol to AgentHost events."""
+
+    supports_tool_descriptors = True
 
     def __init__(self, command: list[str]) -> None:
         if not command or Path(command[0]).name != "traex":

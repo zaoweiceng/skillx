@@ -488,7 +488,10 @@ def compile_agent_trajectory(
                         "prompt": (
                             f"任务目标（已去实例化）：{deinstantiated_intent or '完成原任务'}。"
                             "输出字段必须表达该任务的最终结果，并符合 outputSchema 的字段语义；"
-                            "仅根据 resolved inputs 中的已验证证据回答，不得复述 Schema，"
+                            "目标中的工具查询与自动化操作已由上游节点完成。当前节点只负责汇总结果，"
+                            "无需也不得重新执行这些操作；"
+                            "仅根据 resolved inputs 中的已验证证据回答，"
+                            "不得复述 Schema，"
                             "不得增加证据中不存在的事实。"
                         ),
                     },

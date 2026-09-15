@@ -7,7 +7,7 @@ from typing import Any, Literal
 from jsonschema import Draft202012Validator
 
 from app.application.compiler import digest_json
-from app.application.runtime_config import llm_runtime_config
+from app.application.runtime_config import LLMRuntimeConfig, llm_runtime_config
 from app.runtime.models import ModelRuntimeError, OpenAICompatibleAdapter
 
 RuntimeUsed = Literal["direct_llm"]
@@ -34,6 +34,7 @@ class StructuredGenerationRuntime:
     adapter_digest: str | None
     digest: str
     policy_digest: str
+
     def snapshot(self) -> dict[str, Any]:
         return {
             "runtimeSelection": self.runtime_used,
@@ -99,11 +100,7 @@ def resolve_structured_generation_runtime(
 def frozen_runtime_from_snapshot(
     snapshot: dict[str, Any] | None,
 ) -> StructuredGenerationRuntime:
-    selection = (
-        snapshot.get("runtimeSelection", snapshot.get("runtimeUsed"))
-        if snapshot
-        else None
-    )
+    selection = snapshot.get("runtimeSelection", snapshot.get("runtimeUsed")) if snapshot else None
     if not snapshot or selection not in {
         "direct_llm",
     }:
@@ -132,12 +129,18 @@ class StructuredGenerationResolver:
         runtime_snapshot: dict[str, Any] | None,
     ) -> StructuredGenerationResult:
         runtime = frozen_runtime_from_snapshot(runtime_snapshot)
-        if llm_runtime_config().digest != runtime.digest:
+        config = (runtime_snapshot or {}).get("modelConfig")
+        selected = LLMRuntimeConfig(**config) if config else llm_runtime_config()
+        if selected.digest != runtime.digest:
             raise ModelRuntimeError(
                 "MODEL_RUNTIME_CONFIG_DRIFT",
                 "LLM Runtime 配置在 Run 启动后发生变化",
             )
-        result = await OpenAICompatibleAdapter().generate(
+        result = await OpenAICompatibleAdapter(
+            selected,
+            structured_mode=(runtime_snapshot or {}).get("structuredMode") or "json_schema",
+            timeout_seconds=(runtime_snapshot or {}).get("timeoutSeconds", 60),
+        ).generate(
             request.prompt,
             request.output_schema,
             request.max_output_tokens,

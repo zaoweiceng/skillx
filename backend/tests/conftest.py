@@ -1,13 +1,16 @@
 import os
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 import pytest_asyncio
 from alembic import command
 from alembic.config import Config
 
-os.environ["SKILLX_DATABASE_URL"] = "sqlite+aiosqlite:////tmp/skillx-workflow-tests.db"
+_test_directory = TemporaryDirectory(prefix="skillx-workflow-tests-")
+_test_database = Path(_test_directory.name) / "database.sqlite"
+os.environ["SKILLX_DATABASE_URL"] = f"sqlite+aiosqlite:///{_test_database}"
 os.environ["SKILLX_AGENT_BUILTIN_ENABLED"] = "false"
 
 from app.infrastructure.database import Base, engine  # noqa: E402
@@ -15,8 +18,6 @@ from app.infrastructure.database import Base, engine  # noqa: E402
 
 @pytest.fixture(scope="session", autouse=True)
 def migrated_database() -> Iterator[None]:
-    database = Path("/tmp/skillx-workflow-tests.db")
-    database.unlink(missing_ok=True)
     config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
     command.upgrade(config, "head")
     yield

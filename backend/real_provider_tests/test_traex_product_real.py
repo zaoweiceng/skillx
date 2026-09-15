@@ -12,7 +12,7 @@ from e2e.harness import DemoStack, poll_conversation_run, poll_run, start_stack,
 
 
 @pytest.fixture(scope="module")
-def real_product_stack() -> Iterator[DemoStack]:
+def real_product_stack(request: pytest.FixtureRequest) -> Iterator[DemoStack]:
     if os.environ.get("SKILLX_RUN_TRAEX_REAL_PRODUCT_CHECK") != "1":
         pytest.skip(
             "blocked: set SKILLX_RUN_TRAEX_REAL_PRODUCT_CHECK=1 to authorize the real product gate"
@@ -27,12 +27,12 @@ def real_product_stack() -> Iterator[DemoStack]:
             "SKILLX_AGENT_RUNTIME_TYPE": "unavailable",
             "SKILLX_PROVIDER_PROBE_TIMEOUT_SECONDS": "180",
             "SKILLX_AGENT_MAX_DURATION_SECONDS": "180",
-        }
+        },
     )
     try:
         yield stack
     finally:
-        stop_stack(stack)
+        stop_stack(stack, failed=request.session.testsfailed > 0)
 
 
 def _client(stack: DemoStack) -> httpx.Client:
@@ -47,7 +47,7 @@ def probed_real_product_stack(real_product_stack: DemoStack) -> DemoStack:
         runtime = health.json()["agentRuntime"]
         assert runtime["configured"] is True, runtime
         assert runtime["runtimeType"] == "traex_builtin", runtime
-        assert runtime["source"] == "auto_discovered", runtime
+        assert runtime["source"] == "profile", runtime
         probe = client.post("/health/provider-probe")
         assert probe.status_code == 200, probe.text
         assert probe.json()["ok"] is True, probe.json()
@@ -94,9 +94,7 @@ def test_real_product_workflow_off(probed_real_product_stack: DemoStack) -> None
         assert isinstance(answer["output"].get("reply"), str)
         events = client.get(f"/conversation-runs/{answer_id}/events").json()
         assert not any(
-            str(item.get("payload", {}).get("capabilityRef", "")).startswith(
-                "workflow."
-            )
+            str(item.get("payload", {}).get("capabilityRef", "")).startswith("workflow.")
             for item in events
         )
 
@@ -105,9 +103,7 @@ def test_real_product_running_cancellation(
     probed_real_product_stack: DemoStack,
 ) -> None:
     with _client(probed_real_product_stack) as client:
-        conversation = client.post(
-            "/conversations", json={"title": "real-cancellation"}
-        ).json()
+        conversation = client.post("/conversations", json={"title": "real-cancellation"}).json()
         started = client.post(
             f"/conversations/{conversation['id']}/agent-runs",
             json={
@@ -142,9 +138,7 @@ def test_real_product_distill_publish_discover_and_reuse(
     """真实主闭环：探索、固化、发布、不同输入执行及新对话发现同一 v1。"""
 
     with _client(probed_real_product_stack) as client:
-        source = client.post(
-            "/conversations", json={"title": "real-distill-source"}
-        ).json()
+        source = client.post("/conversations", json={"title": "real-distill-source"}).json()
         disabled = client.patch(
             f"/conversations/{source['id']}/workflow-mode",
             json={"workflowMode": "disabled"},
@@ -153,16 +147,17 @@ def test_real_product_distill_publish_discover_and_reuse(
         explored = client.post(
             f"/conversations/{source['id']}/messages",
             json={
-                "content": "查询标识 q2 对应的本地示例数据并用一句中文告诉我结果"
+                "content": (
+                    "请调用 lookup.table 工具查询 key 为 q2 的本地示例数据，"
+                    "并用一句中文告诉我工具实际返回的结果。必须执行查询，不能凭记忆或猜测回答。"
+                )
             },
         )
         assert explored.status_code == 201, explored.text
         conversation_run_id = explored.json()["assistant"]["conversationRunId"]
         exploration = poll_conversation_run(client, conversation_run_id, timeout=180)
-        assert exploration["status"] == "succeeded", exploration
-        events = client.get(
-            f"/conversation-runs/{conversation_run_id}/events"
-        ).json()
+        assert exploration["status"] == "succeeded", exploration.get("error")
+        events = client.get(f"/conversation-runs/{conversation_run_id}/events").json()
         assert any(
             item.get("type") == "tool.result"
             and item.get("payload", {}).get("capabilityRef") == "lookup.table"
@@ -178,10 +173,15 @@ def test_real_product_distill_publish_discover_and_reuse(
         workflow_id = distillation["draftWorkflowId"]
         workflow = client.get(f"/workflows/{workflow_id}").json()
         definition = workflow["definition"]
-        node_types = {
-            node["type"] for node in definition["spec"]["nodes"]
-        }
+        node_types = {node["type"] for node in definition["spec"]["nodes"]}
         assert {"transform", "llm"} <= node_types, definition
+        # This gate intentionally verifies TraeX only, without a Direct LLM service.
+        # Explicitly choose an Agent node before publication; never use silent fallback.
+        for node in definition["spec"]["nodes"]:
+            if node["type"] == "llm":
+                node["type"] = "agent"
+                node["config"].update({"maxSteps": 1, "allowedCapabilities": []})
+                node["config"].pop("modelProfile", None)
         definition["metadata"]["presentationPolicy"] = {
             "enabled": False,
             "audience": "internal",
@@ -213,29 +213,21 @@ def test_real_product_distill_publish_discover_and_reuse(
         published_version = published.json()
         version_id = published_version["id"]
 
-        manual = client.post(
-            f"/workflow-versions/{version_id}/runs", json={"input": {"key": "q4"}}
-        )
+        manual = client.post(f"/workflow-versions/{version_id}/runs", json={"input": {"key": "q4"}})
         assert manual.status_code == 202, manual.text
         manual_run = poll_run(client, manual.json()["id"], timeout=180)
         assert manual_run["status"] == "succeeded", manual_run
-        llm_node = next(
-            node for node in manual_run["nodes"] if node["type"] == "llm"
-        )
+        llm_node = next(node for node in manual_run["nodes"] if node["type"] == "agent")
         assert llm_node["status"] == "succeeded", llm_node
         assert any(llm_node["input"].values()), llm_node
         manual_reply = str(manual_run["output"].get("reply", ""))
         assert "第四季度" in manual_reply, manual_run["output"]
         assert "15%" in manual_reply, manual_run["output"]
 
-        reuse = client.post(
-            "/conversations", json={"title": "real-distill-reuse"}
-        ).json()
+        reuse = client.post("/conversations", json={"title": "real-distill-reuse"}).json()
         selected = client.post(
             f"/conversations/{reuse['id']}/messages",
-            json={
-                "content": "查询标识 q3 对应的本地示例数据并用一句中文告诉我结果"
-            },
+            json={"content": "查询标识 q3 对应的本地示例数据并用一句中文告诉我结果"},
         )
         assert selected.status_code == 201, selected.text
         assistant = selected.json()["assistant"]
@@ -251,10 +243,9 @@ def test_real_product_distill_publish_discover_and_reuse(
         if assistant["agentAction"] != "run_full":
             assert "L2" in levels, assistant["toolTimeline"]
         assert assistant["bindingSources"], assistant
-        assert all(
-            source["serverVerified"] is True
-            for source in assistant["bindingSources"]
-        ), assistant["bindingSources"]
+        assert all(source["serverVerified"] is True for source in assistant["bindingSources"]), (
+            assistant["bindingSources"]
+        )
         # Agent 可选择直接 run_full，也可生成锁定同一版本的 plan/fragment；不可变 ref
         # 才是两种执行形态共同的版本身份。
         assert any(
@@ -268,3 +259,46 @@ def test_real_product_distill_publish_discover_and_reuse(
         assert "营收持平" in reused_reply, reused_run["output"]
         refreshed = client.get(f"/conversations/{reuse['id']}").json()
         assert refreshed["messages"][-1]["content"]["runId"] == assistant["runId"]
+
+
+def test_real_product_checkpoint_recovery(probed_real_product_stack: DemoStack) -> None:
+    """Actual TraeX repairs a failed node, preserving the committed predecessor."""
+    from app.seed import _recovery_workflow
+
+    definition = _recovery_workflow()
+    for node in definition["spec"]["nodes"]:
+        if node["id"] == "risky":
+            node["config"]["outputSchema"] = {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+                "additionalProperties": False,
+            }
+        if node["id"] == "recovery_agent":
+            node["config"]["maxTotalTokens"] = 20000
+    with _client(probed_real_product_stack) as client:
+        created = client.post(
+            "/workflows", json={"name": "real-recovery", "definition": definition}
+        )
+        assert created.status_code == 201, created.text
+        workflow = created.json()
+        published = client.post(
+            f"/workflows/{workflow['id']}/publish",
+            json={
+                "draftRevision": workflow["draftRevision"],
+                "draftDigest": workflow["draftDigest"],
+            },
+        )
+        assert published.status_code == 201, published.text
+        started = client.post(
+            f"/workflow-versions/{published.json()['id']}/runs",
+            json={"input": {"seed": "已核实的业务结果"}},
+        )
+        assert started.status_code == 202, started.text
+        result = poll_run(client, started.json()["id"], timeout=180)
+        assert result["status"] == "succeeded", result
+        detail = client.get(f"/runs/{result['id']}").json()
+        predecessors = [node for node in detail["nodes"] if node["nodeId"] == "sensitive"]
+        assert len(predecessors) == 1 and predecessors[0]["status"] == "succeeded"
+        assert detail["checkpoints"][0]["status"] == "applied"
+        assert detail["checkpoints"][0]["recoveryNodeRunId"]

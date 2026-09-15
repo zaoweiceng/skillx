@@ -12,11 +12,42 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from jsonschema import Draft202012Validator, FormatChecker
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import ValidationError
 from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.schemas import AgentRunCreate as AgentRunCreate
+from app.api.schemas import CapabilityCreate as CapabilityCreate
+from app.api.schemas import CapabilityExecute as CapabilityExecute
+from app.api.schemas import ComponentConfirm as ComponentConfirm
+from app.api.schemas import ComponentCreate as ComponentCreate
+from app.api.schemas import ContractPatchApply as ContractPatchApply
+from app.api.schemas import ConversationCreate as ConversationCreate
+from app.api.schemas import ConversationModeUpdate as ConversationModeUpdate
+from app.api.schemas import ConversationRunCreate as ConversationRunCreate
+from app.api.schemas import Decision as Decision
+from app.api.schemas import DisclosureSessionCreate as DisclosureSessionCreate
+from app.api.schemas import DraftUpdate as DraftUpdate
+from app.api.schemas import DshTaskAction as DshTaskAction
+from app.api.schemas import DshTaskDistillationCreate as DshTaskDistillationCreate
+from app.api.schemas import MCPServerCreate as MCPServerCreate
+from app.api.schemas import MCPToolClassify as MCPToolClassify
+from app.api.schemas import MCPToolTest as MCPToolTest
+from app.api.schemas import MessageCreate as MessageCreate
+from app.api.schemas import PlanCreate as PlanCreate
+from app.api.schemas import PlanRunCreate as PlanRunCreate
+from app.api.schemas import PlanSolidifyRequest as PlanSolidifyRequest
+from app.api.schemas import PublishRequest as PublishRequest
+from app.api.schemas import RecoveryAnswer as RecoveryAnswer
+from app.api.schemas import RunCreate as RunCreate
+from app.api.schemas import SecretReferenceCreate as SecretReferenceCreate
+from app.api.schemas import TaskCheckpointAnswer as TaskCheckpointAnswer
+from app.api.schemas import WorkflowCreate as WorkflowCreate
+from app.api.schemas import WorkflowDescribeRequest as WorkflowDescribeRequest
+from app.api.schemas import WorkflowSearchRequest as WorkflowSearchRequest
+from app.api.schemas import WorkflowSliceRequest as WorkflowSliceRequest
+from app.application import workflow_publishing as publishing
 from app.application.agent_host import (
     AgentHost,
     AgentHostError,
@@ -63,7 +94,6 @@ from app.application.mcp import (
     discover_tools,
     register_server,
     scan_dependent_workflows,
-    validate_mcp_nodes,
 )
 from app.application.orchestrator import Orchestrator, append_event
 from app.application.plans import (
@@ -76,13 +106,10 @@ from app.application.plans import (
 )
 from app.application.product_history import (
     bind_presentation_decision,
-    normalize_presentation_policy,
     presentation_policy,
     presentation_view,
     record_model_usage,
     turn_view,
-    validate_presentation_decision,
-    validate_presentation_template,
 )
 from app.application.replay import run_isolated_replay, run_replay_proof
 from app.application.retries import auto_retry_allowed
@@ -98,8 +125,6 @@ from app.application.security import redact
 from app.application.tool_broker import ToolAdapterRegistry
 from app.application.workflow_catalog import (
     CatalogError,
-    build_manifest,
-    capability_metadata_issues,
     consume_session_call,
     create_disclosure_session,
     create_private_fragment_snapshot,
@@ -170,135 +195,50 @@ compiler = WorkflowCompiler()
 orchestrator = Orchestrator()
 
 
-class WorkflowCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-    definition: dict[str, Any]
 
 
-class DraftUpdate(BaseModel):
-    revision: int = Field(ge=1)
-    definition: dict[str, Any]
 
 
-class PublishRequest(BaseModel):
-    draft_revision: int = Field(alias="draftRevision", ge=1)
-    draft_digest: str = Field(alias="draftDigest", min_length=8, max_length=80)
-    replay_evidence_id: str | None = Field(
-        default=None, alias="replayEvidenceId"
-    )
 
 
-class ComponentCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-    description: str = ""
-    workflow_version_id: str = Field(alias="workflowVersionId")
-    visibility: str = "private"
 
 
-class RunCreate(BaseModel):
-    input: dict[str, Any]
 
 
-class Decision(BaseModel):
-    snapshot_digest: str = Field(alias="snapshotDigest")
 
 
-class RecoveryAnswer(BaseModel):
-    snapshot_digest: str = Field(alias="snapshotDigest")
-    answer: Any
 
 
-class TaskCheckpointAnswer(BaseModel):
-    snapshot_digest: str = Field(alias="snapshotDigest")
-    answer: dict[str, Any]
 
 
-class CapabilityCreate(BaseModel):
-    name: str
-    type: str
-    package_path: str | None = Field(default=None, alias="packagePath")
-    interface: str | None = None
 
 
-class CapabilityExecute(BaseModel):
-    interface: str = Field(min_length=1)
-    input: dict[str, Any]
 
 
-class MCPServerCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
-    transport: str
-    config: dict[str, Any]
 
 
-class MCPToolTest(BaseModel):
-    arguments: dict[str, Any]
 
 
-class MCPToolClassify(BaseModel):
-    effect: str
-    idempotent: bool
 
 
-class SecretReferenceCreate(BaseModel):
-    name: str
-    environment_variable: str = Field(alias="environmentVariable")
-    description: str = ""
 
 
-class ConversationCreate(BaseModel):
-    title: str = "新对话"
-    bound_component_id: str | None = Field(default=None, alias="boundComponentId")
 
 
-class ConversationModeUpdate(BaseModel):
-    workflow_mode: str = Field(alias="workflowMode", pattern="^(enabled|disabled)$")
 
 
-class MessageCreate(BaseModel):
-    content: str
-    component_id: str | None = Field(default=None, alias="componentId")
-    inputs: dict[str, Any] | None = None
 
 
-class ComponentConfirm(BaseModel):
-    component_id: str = Field(alias="componentId")
-    candidate_snapshot_digest: str = Field(alias="candidateSnapshotDigest")
-    inputs: dict[str, Any] = Field(default_factory=dict)
 
 
-class ConversationRunCreate(BaseModel):
-    input: dict[str, Any]
-    output: dict[str, Any]
-    trajectory: dict[str, Any]
 
 
-class DshTaskAction(BaseModel):
-    """一个成功的 DSH 工具名称，不携带任务实例数据。"""
-
-    name: str = Field(
-        min_length=1,
-        max_length=160,
-        pattern=r"^[A-Za-z0-9_.:/-]+$",
-    )
 
 
-class DshTaskDistillationCreate(BaseModel):
-    """草稿固化桥接仅接收的最小 DSH 会话事实。"""
-
-    session_id: str = Field(alias="sessionId", min_length=1, max_length=160)
-    actions: list[DshTaskAction] = Field(min_length=1, max_length=32)
 
 
-class ContractPatchApply(BaseModel):
-    node_id: str = Field(alias="nodeId")
-    patch: dict[str, Any]
 
 
-class AgentRunCreate(BaseModel):
-    content: str = Field(min_length=1)
-    allowed_capabilities: list[str] | None = Field(default=None, alias="allowedCapabilities")
-    max_steps: int | None = Field(default=None, alias="maxSteps", ge=1, le=32)
 
 
 def _resolve_agent_capabilities(
@@ -327,45 +267,18 @@ def _resolve_agent_capabilities(
     return effective
 
 
-class WorkflowSearchRequest(BaseModel):
-    query: str = Field(min_length=1, max_length=1000)
-    constraints: dict[str, Any] = Field(default_factory=dict)
-    limit: int = Field(default=5, ge=1, le=8)
-    session_id: str = Field(alias="sessionId", min_length=1)
 
 
-class WorkflowDescribeRequest(BaseModel):
-    ref: str = Field(min_length=1, max_length=300)
-    session_id: str = Field(alias="sessionId", min_length=1)
 
 
-class WorkflowSliceRequest(BaseModel):
-    workflow_ref: str = Field(alias="workflowRef", min_length=1, max_length=300)
-    candidate_node_ids: list[str] = Field(alias="candidateNodeIds", min_length=1)
-    session_id: str = Field(alias="sessionId", min_length=1)
 
 
-class PlanCreate(BaseModel):
-    plan: dict[str, Any]
-    created_by_conversation_run_id: str | None = Field(
-        default=None, alias="createdByConversationRunId"
-    )
-    ttl_hours: int = Field(default=168, alias="ttlHours", ge=1, le=8760)
-    session_id: str = Field(alias="sessionId", min_length=1)
 
 
-class DisclosureSessionCreate(BaseModel):
-    conversation_id: str | None = Field(default=None, alias="conversationId")
-    agent_run_id: str | None = Field(default=None, alias="agentRunId")
-    ttl_minutes: int = Field(default=60, alias="ttlMinutes", ge=1, le=1440)
 
 
-class PlanRunCreate(BaseModel):
-    input: dict[str, Any]
 
 
-class PlanSolidifyRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=120)
 
 
 async def _record_human_definition_patch(
@@ -578,8 +491,8 @@ async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str
         "agentRuntime": provider,
         "llmRuntime": llm_runtime,
         "modelRuntimeFallbackPolicy": {
-            "order": ["llm_runtime", "agent_runtime"],
-            "trigger": "startup_unavailable_only",
+            "order": ["llm_runtime"],
+            "trigger": "explicit_recovery_policy",
             "executionErrorsFallback": False,
         },
         "runtimes": {
@@ -773,119 +686,10 @@ async def update_draft(
 async def validate_workflow(
     workflow_id: str, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
-    item = await session.get(Workflow, workflow_id)
-    if item is None:
-        raise HTTPException(404, "工作流不存在")
     try:
-        compiled = compiler.compile(item.draft_json)
-        metadata_issues = capability_metadata_issues(compiled.definition)
-        if metadata_issues:
-            return {
-                "valid": False,
-                "diagnostics": [
-                    {
-                        "level": "error",
-                        "code": "CAPABILITY_METADATA_REQUIRED",
-                        "path": path,
-                        "message": "可发布能力必须提供完整、非空的语义目录元数据",
-                    }
-                    for path in metadata_issues
-                ],
-            }
-        execution_class, capability_locks = await validate_workflow_capabilities(
-            session, compiled.definition
-        )
-        mcp_locks = await validate_mcp_nodes(session, compiled.definition.spec.nodes)
-        try:
-            validate_presentation_decision(compiled.definition.metadata)
-        except ValueError as exc:
-            return {
-                "valid": False,
-                "diagnostics": [
-                    {
-                        "level": "error",
-                        "code": "PRESENTATION_DECISION_REQUIRED",
-                        "path": "metadata.presentationPolicyDecision",
-                        "message": str(exc),
-                    }
-                ],
-            }
-        policy = compiled.definition.metadata.get("presentationPolicy", {})
-        if (
-            isinstance(policy, dict)
-            and policy.get("enabled") is True
-            and policy.get("producer", "template") == "template"
-        ):
-            validate_presentation_template(
-                str(policy.get("template", "执行结果：{json}")),
-                compiled.definition.spec.output_schema,
-            )
-        return {
-            "valid": True,
-            "digest": compiled.digest,
-            "topologicalOrder": compiled.topological_order,
-            "diagnostics": [
-                {
-                    "level": diagnostic.level,
-                    "code": diagnostic.code,
-                    "path": diagnostic.path,
-                    "message": diagnostic.message,
-                }
-                for diagnostic in compiled.diagnostics
-            ],
-            "executionClass": execution_class,
-            "capabilityLocks": capability_locks,
-            "mcpLocks": mcp_locks,
-        }
-    except WorkflowValidationError as exc:
-        return {
-            "valid": False,
-            "diagnostics": [
-                {
-                    "level": diagnostic.level,
-                    "code": diagnostic.code,
-                    "path": diagnostic.path,
-                    "message": diagnostic.message,
-                }
-                for diagnostic in exc.diagnostics
-            ],
-        }
-    except CapabilityResolutionError as exc:
-        return {
-            "valid": False,
-            "diagnostics": [
-                {
-                    "level": "error",
-                    "code": "CAPABILITY_INCOMPATIBLE",
-                    "path": "spec.nodes",
-                    "message": str(exc),
-                }
-            ],
-        }
-    except MCPConfigurationError as exc:
-        return {
-            "valid": False,
-            "diagnostics": [
-                {
-                    "level": "error",
-                    "code": "MCP_TOOL_INCOMPATIBLE",
-                    "path": "spec.nodes",
-                    "message": str(exc),
-                }
-            ],
-        }
-    except (TypeError, ValueError) as exc:
-        return {
-            "valid": False,
-            "diagnostics": [
-                {
-                    "level": "error",
-                    "code": "PRESENTATION_TEMPLATE_INVALID",
-                    "path": "metadata.presentationPolicy.template",
-                    "message": str(exc),
-                }
-            ],
-        }
+        return await publishing.validate_workflow(workflow_id, session)
+    except publishing.PublicationError as exc:
+        raise HTTPException(exc.status_code, detail=exc.detail) from exc
 
 
 @router.post("/workflows/{workflow_id}/publish", status_code=201)
@@ -894,296 +698,10 @@ async def publish_workflow(
     body: PublishRequest,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    item = await session.get(Workflow, workflow_id)
-    if item is None:
-        raise HTTPException(404, "工作流不存在")
     try:
-        compiled = compiler.compile(item.draft_json)
-        metadata_issues = capability_metadata_issues(compiled.definition)
-        if metadata_issues:
-            raise HTTPException(
-                422,
-                detail={
-                    "code": "CAPABILITY_METADATA_REQUIRED",
-                    "message": "目录公开前必须补充完整语义元数据",
-                    "fields": metadata_issues,
-                },
-            )
-        execution_class, capability_locks = await validate_workflow_capabilities(
-            session, compiled.definition
-        )
-        mcp_locks = await validate_mcp_nodes(session, compiled.definition.spec.nodes)
-        validate_presentation_decision(compiled.definition.metadata)
-    except WorkflowValidationError as exc:
-        raise HTTPException(
-            422,
-            detail={
-                "code": "WORKFLOW_VALIDATION_FAILED",
-                "diagnostics": [
-                    {
-                        "level": diagnostic.level,
-                        "code": diagnostic.code,
-                        "path": diagnostic.path,
-                        "message": diagnostic.message,
-                    }
-                    for diagnostic in exc.diagnostics
-                ],
-            },
-        ) from exc
-    except (CapabilityResolutionError, MCPConfigurationError) as exc:
-        raise HTTPException(
-            422,
-            detail={"code": "CAPABILITY_INCOMPATIBLE", "message": str(exc)},
-        ) from exc
-    except ValueError as exc:
-        raise HTTPException(
-            422,
-            detail={"code": "PRESENTATION_DECISION_REQUIRED", "message": str(exc)},
-        ) from exc
-
-    async def published_response(version: WorkflowVersion) -> dict[str, Any]:
-        manifest = await session.scalar(
-            select(WorkflowCapabilityManifest).where(
-                WorkflowCapabilityManifest.workflow_version_id == version.id
-            )
-        )
-        if manifest is None:
-            raise HTTPException(
-                409,
-                detail={
-                    "code": "PUBLISH_INCOMPLETE",
-                    "message": "已发布版本缺少 Capability Manifest",
-                },
-            )
-        return {
-            "id": version.id,
-            "workflowId": version.workflow_id,
-            "version": version.version,
-            "digest": version.digest,
-            "definition": version.definition_json,
-            "workflowRef": manifest.manifest_json["workflowRef"],
-            "manifestDigest": manifest.digest,
-            "publishedFromDraftRevision": version.published_from_draft_revision,
-            "publishedFromDraftDigest": version.published_from_draft_digest,
-        }
-
-    existing = await session.scalar(
-        select(WorkflowVersion).where(
-            WorkflowVersion.workflow_id == workflow_id,
-            WorkflowVersion.published_from_draft_revision
-            == body.draft_revision,
-            WorkflowVersion.published_from_draft_digest == body.draft_digest,
-        )
-    )
-    if existing is not None:
-        return await published_response(existing)
-    if (
-        item.draft_revision != body.draft_revision
-        or compiled.digest != body.draft_digest
-    ):
-        raise HTTPException(
-            409,
-            detail={
-                "code": "DRAFT_SNAPSHOT_CONFLICT",
-                "message": "草稿已变化，发布请求不是当前审核快照",
-                "currentRevision": item.draft_revision,
-                "currentDigest": compiled.digest,
-            },
-        )
-
-    revision_metadata = dict(item.draft_metadata_json or {})
-    revision_status = revision_metadata.get("status")
-    if revision_status == "dirty_after_replay":
-        raise HTTPException(
-            409,
-            detail={
-                "code": "REPLAY_PROOF_STALE",
-                "message": "Replay 后草稿已变化，必须重新 Replay",
-            },
-        )
-    expected_base_id = revision_metadata.get("baseVersionId")
-    if revision_status == "pending_revision":
-        evidence_id = revision_metadata.get("replayEvidenceId")
-        evidence = (
-            await session.get(ReplayEvidence, evidence_id)
-            if isinstance(evidence_id, str)
-            else None
-        )
-        if (
-            body.replay_evidence_id != evidence_id
-            or evidence is None
-            or not evidence.passed
-            or evidence.patched_definition_digest != compiled.digest
-            or revision_metadata.get("replayApprovedDraftDigest")
-            != compiled.digest
-            or evidence.base_version_id != expected_base_id
-            or evidence.patch_digest != revision_metadata.get("patchDigest")
-        ):
-            raise HTTPException(
-                409,
-                detail={
-                    "code": "REPLAY_PROOF_STALE",
-                    "message": "Replay proof 与当前草稿、Patch 或 base version 不一致",
-                },
-            )
-        latest_version_id = await session.scalar(
-            select(WorkflowVersion.id)
-            .where(WorkflowVersion.workflow_id == item.id)
-            .order_by(WorkflowVersion.version.desc())
-            .limit(1)
-        )
-        if latest_version_id != expected_base_id:
-            raise HTTPException(
-                409,
-                detail={
-                    "code": "DRAFT_BASE_CONFLICT",
-                    "message": "修订草稿的 base version 已不是当前最新版本",
-                },
-            )
-
-    publishing_metadata = {
-        **revision_metadata,
-        "status": "publishing",
-        "publishingDraftRevision": body.draft_revision,
-        "publishingDraftDigest": body.draft_digest,
-    }
-    status_expression = func.json_extract(
-        Workflow.draft_metadata_json, "$.status"
-    )
-    status_clause = (
-        status_expression == revision_status
-        if revision_status is not None
-        else status_expression.is_(None)
-    )
-    claimed = await session.execute(
-        update(Workflow)
-        .where(
-            Workflow.id == workflow_id,
-            Workflow.draft_revision == body.draft_revision,
-            or_(
-                Workflow.draft_digest == body.draft_digest,
-                Workflow.draft_digest.is_(None),
-            ),
-            status_clause,
-        )
-        .values(
-            draft_digest=body.draft_digest,
-            draft_metadata_json=publishing_metadata,
-        )
-        .execution_options(synchronize_session=False)
-    )
-    if claimed.rowcount != 1:
-        await session.rollback()
-        existing = await session.scalar(
-            select(WorkflowVersion).where(
-                WorkflowVersion.workflow_id == workflow_id,
-                WorkflowVersion.published_from_draft_revision
-                == body.draft_revision,
-                WorkflowVersion.published_from_draft_digest
-                == body.draft_digest,
-            )
-        )
-        if existing is not None:
-            return await published_response(existing)
-        raise HTTPException(
-            409,
-            detail={
-                "code": "PUBLISH_CONFLICT",
-                "message": "草稿已被并发修改或发布",
-            },
-        )
-
-    latest = await session.scalar(
-        select(func.max(WorkflowVersion.version)).where(WorkflowVersion.workflow_id == item.id)
-    )
-    lineage = dict(
-        compiled.definition.metadata.get("revisionLineage", {})
-    )
-    try:
-        frozen_presentation_policy = normalize_presentation_policy(
-            compiled.definition.metadata,
-            execution_class=execution_class,
-            output_schema=compiled.definition.spec.output_schema,
-        )
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(
-            422,
-            detail={
-                "code": "PRESENTATION_POLICY_INVALID",
-                "message": str(exc),
-                "field": "metadata.presentationPolicy",
-            },
-        ) from exc
-    version = WorkflowVersion(
-        id=str(uuid4()),
-        workflow_id=item.id,
-        version=(latest or 0) + 1,
-        definition_json=compiled.definition.model_dump(by_alias=True, mode="json"),
-        digest=compiled.digest,
-        validation_json={
-            "topologicalOrder": compiled.topological_order,
-            "diagnostics": [item.model_dump() for item in compiled.diagnostics],
-            "executionClass": execution_class,
-            "capabilityLocks": capability_locks,
-            "mcpLocks": mcp_locks,
-        },
-        published_from_draft_revision=body.draft_revision,
-        published_from_draft_digest=body.draft_digest,
-        revision_lineage_json=lineage,
-        presentation_policy_json=frozen_presentation_policy,
-    )
-    session.add(version)
-    await session.flush()
-    try:
-        await build_manifest(session, item, version)
-    except CatalogError as exc:
-        await session.rollback()
-        raise HTTPException(
-            422,
-            detail={"code": "CAPABILITY_MANIFEST_INVALID", "message": str(exc)},
-        ) from exc
-    published_metadata = {
-        **revision_metadata,
-        "status": "published",
-        "publishedVersionId": version.id,
-        "publishedVersion": version.version,
-        "publishedFromDraftRevision": body.draft_revision,
-        "publishedFromDraftDigest": body.draft_digest,
-    }
-    finalized = await session.execute(
-        update(Workflow)
-        .where(
-            Workflow.id == workflow_id,
-            Workflow.draft_revision == body.draft_revision,
-            func.json_extract(
-                Workflow.draft_metadata_json, "$.status"
-            )
-            == "publishing",
-            func.json_extract(
-                Workflow.draft_metadata_json, "$.publishingDraftDigest"
-            )
-            == body.draft_digest,
-        )
-        .values(
-            draft_base_version_id=version.id,
-            draft_json=version.definition_json,
-            draft_digest=version.digest,
-            draft_metadata_json=published_metadata,
-        )
-        .execution_options(synchronize_session=False)
-    )
-    if finalized.rowcount != 1:
-        await session.rollback()
-        raise HTTPException(
-            409,
-            detail={
-                "code": "PUBLISH_CONFLICT",
-                "message": "发布领取已失效",
-            },
-        )
-    await session.commit()
-    await session.refresh(version)
-    return await published_response(version)
+        return await publishing.publish_workflow(workflow_id, body, session)
+    except publishing.PublicationError as exc:
+        raise HTTPException(exc.status_code, detail=exc.detail) from exc
 
 
 @router.post("/workflows/{workflow_id}/contract-patch", status_code=200)
@@ -1482,7 +1000,9 @@ async def propose_failure_revision(
             f"replayDiagnostics={baseline.get('schemaDiagnostics', [])}"
         ),
         output_schema=WorkflowPatch.model_json_schema(by_alias=True),
-        working_directory=get_settings().artifact_root / "revisions" / observation.id,
+        working_directory=(
+            get_settings().artifact_root / "revisions" / observation.id / str(uuid4())
+        ),
         requested_capabilities=(),
         max_steps=1,
         max_total_tokens=settings.agent_max_total_tokens,
@@ -5037,7 +4557,7 @@ async def _select_workflow_candidate(
             f"user={body_text(user_text)}\n"
         ),
         output_schema=selection_schema,
-        working_directory=get_settings().artifact_root / "workflow-selections",
+        working_directory=get_settings().artifact_root / "workflow-selections" / str(uuid4()),
         requested_capabilities=("workflow.catalog",),
         max_steps=6,
         max_total_tokens=settings.agent_max_total_tokens,
@@ -5180,7 +4700,7 @@ async def _select_workflow_candidate(
                 f"user={body_text(user_text)}\n"
             ),
             output_schema=selection_schema,
-            working_directory=get_settings().artifact_root / "workflow-selections",
+            working_directory=get_settings().artifact_root / "workflow-selections" / str(uuid4()),
             requested_capabilities=("workflow.catalog",),
             max_steps=remaining_steps,
             max_total_tokens=max(1, request.max_total_tokens - result.total_tokens),
@@ -5975,7 +5495,7 @@ async def _extract_selection_bindings(
                 )
             ),
             output_schema=output_schema,
-            working_directory=settings.artifact_root / "workflow-bindings",
+            working_directory=settings.artifact_root / "workflow-bindings" / str(uuid4()),
             requested_capabilities=(),
             max_steps=1,
             max_total_tokens=settings.agent_max_total_tokens,

@@ -1,0 +1,17 @@
+{
+  "name": "skillx-pi-bridge",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "check": "node --check bridge.mjs",
+    "probe": "node bridge.mjs --probe",
+    "build": "node --check bridge.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1"
+  }
+}

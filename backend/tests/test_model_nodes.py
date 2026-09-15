@@ -238,7 +238,7 @@ def _configure_agent_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-async def test_llm_unconfigured_uses_toolless_agent_structured_fallback(
+async def test_llm_unconfigured_does_not_silently_switch_to_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = get_settings()
@@ -247,26 +247,15 @@ async def test_llm_unconfigured_uses_toolless_agent_structured_fallback(
 
     run_id, run = await execute_workflow(_real_model_workflow())
 
-    assert run.status == "succeeded"
-    assert run.output_json == {"category": "fixture"}
+    assert run.status == "failed"
+    assert run.error_json["code"] == "MODEL_RUNTIME_UNAVAILABLE"
     async with SessionLocal() as session:
-        usage = await session.scalar(
-            select(ModelUsage).where(ModelUsage.run_id == run_id)
-        )
+        usage = await session.scalar(select(ModelUsage).where(ModelUsage.run_id == run_id))
         event_types = set(
             await session.scalars(select(RunEvent.type).where(RunEvent.run_id == run_id))
         )
-        detail = await get_run(run_id, session)
-    assert usage is not None
-    assert usage.runtime_used == "agent_fallback"
-    assert usage.fallback_reason == "LLM_RUNTIME_UNCONFIGURED"
-    assert usage.input_tokens == 12
-    assert usage.output_tokens == 8
-    assert usage.total_tokens == 20
-    assert usage.request_dispatched_at is None
-    assert usage.completed_at is not None
+    assert usage is None
     assert "tool.requested" not in event_types
-    assert detail["runtimeSnapshot"]["modelCalled"] is False
 
 
 async def test_both_model_runtimes_unavailable_fails_stably(

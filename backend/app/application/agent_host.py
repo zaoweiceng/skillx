@@ -21,7 +21,7 @@ from app.application.agent_plans import (
 )
 from app.application.compiler import digest_json
 from app.application.error_policy import error_policy
-from app.application.runtime_config import agent_runtime_config
+from app.application.runtime_config import AgentRuntimeConfig, agent_runtime_config
 from app.application.tool_broker import (
     ToolAdapterRegistry,
     ToolBrokerError,
@@ -29,9 +29,9 @@ from app.application.tool_broker import (
     evidence_digest,
 )
 from app.config import get_settings
-from app.runtime.adapters import AdapterError, AgentRunRequest, TraeXSubprocessAdapter
+from app.runtime.agent_contracts import AdapterError, AgentRunRequest
+from app.runtime.agent_registry import AgentAdapter, default_agent_registry
 from app.runtime.browser import BrowserReadContract
-from app.runtime.traex_builtin import TraeXBridgeError, TraeXBuiltinAdapter
 
 # 005-A：唯一的 Agent 信任边界。
 #
@@ -250,16 +250,18 @@ class AgentHost:
 
     def __init__(
         self,
-        adapter: TraeXSubprocessAdapter | TraeXBuiltinAdapter | None = None,
+        adapter: AgentAdapter | None = None,
         tool_registry: ToolAdapterRegistry | None = None,
+        runtime: AgentRuntimeConfig | None = None,
     ) -> None:
         self._adapter = adapter
+        self._runtime = runtime
         self._tool_registry = tool_registry or ToolAdapterRegistry()
 
-    def _resolve_adapter(self) -> TraeXSubprocessAdapter | TraeXBuiltinAdapter:
+    def _resolve_adapter(self) -> AgentAdapter:
         if self._adapter is not None:
             return self._adapter
-        runtime = agent_runtime_config()
+        runtime = self._runtime or agent_runtime_config()
         if not runtime.configured or not runtime.command:
             if runtime.source == "auto_discovery_missing":
                 raise AgentHostError(
@@ -267,15 +269,10 @@ class AgentHost:
                     "PATH 中未发现受支持的 traex，请先安装 TraeX",
                 )
             raise AgentHostError("MODEL_NOT_CONFIGURED", "TraeX Runtime 尚未配置")
-        if runtime.type == "traex_builtin":
-            try:
-                return TraeXBuiltinAdapter(list(runtime.command))
-            except TraeXBridgeError as exc:
-                raise AgentHostError(exc.code, str(exc)) from exc
-        return TraeXSubprocessAdapter(
-            list(runtime.command),
-            set(runtime.allowed_executables),
-        )
+        try:
+            return default_agent_registry().create(runtime)
+        except AdapterError as exc:
+            raise AgentHostError(getattr(exc, "code", "MODEL_NOT_CONFIGURED"), str(exc)) from exc
 
     async def execute(
         self,
@@ -315,7 +312,7 @@ class AgentHost:
                     self._tool_registry.describe(capability)
                     for capability in effective
                 ]
-                if isinstance(adapter, TraeXBuiltinAdapter)
+                if getattr(adapter, "supports_tool_descriptors", False)
                 else []
             ),
             max_steps=request.max_steps,
@@ -341,7 +338,7 @@ class AgentHost:
         max_output_tokens = run_request.max_output_tokens
         max_billable_tokens = run_request.max_billable_tokens
 
-        runtime = agent_runtime_config()
+        runtime = self._runtime or agent_runtime_config()
         result = AgentHostResult(
             output={},
             provider=runtime.provider,
@@ -933,7 +930,7 @@ class AgentHost:
                 "Agent 运行超时，已取消",
                 request_dispatched=result.request_dispatched,
             ) from exc
-        except (AdapterError, TraeXBridgeError) as exc:
+        except AdapterError as exc:
             if failed_tool_result is not None:
                 raise self._failed_tool_error(
                     failed_tool_result,
@@ -1547,7 +1544,7 @@ class AgentHost:
 
     @staticmethod
     async def _cancel(
-        adapter: TraeXSubprocessAdapter | TraeXBuiltinAdapter,
+        adapter: AgentAdapter,
         run_id: str,
     ) -> None:
         try:

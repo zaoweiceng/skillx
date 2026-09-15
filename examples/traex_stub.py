@@ -854,8 +854,8 @@ def main() -> int:
                 context = json.loads(args.prompt.split("context: ", 1)[1])
             except json.JSONDecodeError:
                 context = {}
-        run_input = context.get("runInput", {})
-        seed = run_input.get("seed") if isinstance(run_input, dict) else None
+        failed_input = context.get("failedNode", {}).get("input", {})
+        seed = failed_input.get("value") if isinstance(failed_input, dict) else None
         action = _directive(args.prompt, "RECOVERY", "provide_substitution")
         if seed == "request-user":
             marker = Path(".recovery-user-answered")
@@ -866,11 +866,8 @@ def main() -> int:
                 action = "request_user"
         elif seed == "retry-replanned":
             action = "retry_replanned"
-        if "crash-recovery" in args.prompt:
-            marker = Path(".recovery-crash-observed")
-            if not marker.exists():
-                marker.write_text("claimed", encoding="utf-8")
-                time.sleep(30)
+        if "crash-recovery" in args.prompt and context.get("recoveryAttempt", 1) <= 1:
+            time.sleep(30)
         emit({"type": "agent.plan", "payload": {"summary": "评估 checkpoint 决定恢复策略"}})
         emit(
             {

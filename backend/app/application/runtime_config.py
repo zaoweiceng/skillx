@@ -2,92 +2,31 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import shutil
-from dataclasses import asdict, dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import asdict
 from pathlib import Path
 from typing import Literal
 
-from app.application.compiler import digest_json
 from app.config import get_settings
+from app.domain.runtime import AgentRuntimeConfig as AgentRuntimeConfig
+from app.domain.runtime import LLMRuntimeConfig as LLMRuntimeConfig
 
 logger = logging.getLogger(__name__)
 _legacy_logged = False
 
 
-@dataclass(frozen=True)
-class LLMRuntimeConfig:
-    type: Literal["openai_compatible", "unavailable"]
-    endpoint: str | None
-    model: str | None
-    api_key_env: str
-    source: str = "split"
-
-    @property
-    def configured(self) -> bool:
-        return bool(
-            self.type == "openai_compatible"
-            and self.endpoint
-            and self.model
-            and os.environ.get(self.api_key_env)
-        )
-
-    @property
-    def digest(self) -> str:
-        return digest_json(
-            {
-                "type": self.type,
-                "endpoint": self.endpoint,
-                "model": self.model,
-                "apiKeyEnv": self.api_key_env,
-            }
-        )
+_agent_override: ContextVar[AgentRuntimeConfig | None] = ContextVar("agent_runtime", default=None)
 
 
-@dataclass(frozen=True)
-class AgentRuntimeConfig:
-    type: Literal[
-        "traex_builtin",
-        "traex_managed",
-        "openai_sidecar",
-        "fixture",
-        "unavailable",
-    ]
-    command: tuple[str, ...]
-    allowed_executables: tuple[str, ...]
-    endpoint: str | None
-    model: str | None
-    api_key_env: str
-    protocol: str
-    provider: str
-    adapter_version: str
-    adapter_digest: str
-    source: str = "split"
-
-    @property
-    def configured(self) -> bool:
-        if self.type == "unavailable" or not self.command:
-            return False
-        if self.type == "openai_sidecar":
-            return bool(self.endpoint and self.model and os.environ.get(self.api_key_env))
-        return True
-
-    @property
-    def digest(self) -> str:
-        return digest_json(
-            {
-                "type": self.type,
-                "command": list(self.command),
-                "allowedExecutables": list(self.allowed_executables),
-                "endpoint": self.endpoint,
-                "model": self.model,
-                "apiKeyEnv": self.api_key_env,
-                "protocol": self.protocol,
-                "provider": self.provider,
-                "adapterVersion": self.adapter_version,
-                "adapterDigest": self.adapter_digest,
-            }
-        )
+@contextmanager
+def agent_runtime_scope(runtime: AgentRuntimeConfig | None):
+    token = _agent_override.set(runtime)
+    try:
+        yield
+    finally:
+        _agent_override.reset(token)
 
 
 def _log_legacy_mapping() -> None:
@@ -113,10 +52,15 @@ def llm_runtime_config() -> LLMRuntimeConfig:
 
 
 def agent_runtime_config() -> AgentRuntimeConfig:
+    if _agent_override.get() is not None:
+        return _agent_override.get()
     settings = get_settings()
     if settings.agent_runtime_type != "unavailable" or settings.agent_command is not None:
         runtime_type = settings.agent_runtime_type
         command = tuple(settings.agent_command or ())
+        if runtime_type == "pi" and not command:
+            bridge = Path(__file__).resolve().parents[3] / "bridges/pi/bridge.mjs"
+            command = (shutil.which("node") or "node", str(bridge))
         adapter_digest = ""
         if command:
             paths = [Path(item) for item in command[1:] if Path(item).is_file()]
@@ -128,7 +72,9 @@ def agent_runtime_config() -> AgentRuntimeConfig:
         return AgentRuntimeConfig(
             type=runtime_type,
             command=command,
-            allowed_executables=tuple(settings.agent_allowed_executables),
+            allowed_executables=(
+                ("node",) if runtime_type == "pi" else tuple(settings.agent_allowed_executables)
+            ),
             endpoint=settings.agent_endpoint,
             model=settings.agent_model,
             api_key_env=settings.agent_api_key_env,
@@ -142,7 +88,7 @@ def agent_runtime_config() -> AgentRuntimeConfig:
                 if runtime_type == "openai_sidecar"
                 else "fixture"
                 if runtime_type == "fixture"
-                else "traex"
+                else "pi" if runtime_type == "pi" else "traex"
             ),
             adapter_version=f"{runtime_type}/configured",
             adapter_digest=adapter_digest,
@@ -151,7 +97,8 @@ def agent_runtime_config() -> AgentRuntimeConfig:
     if settings.agent_provider_type != "unavailable" or settings.traex_command:
         _log_legacy_mapping()
         runtime_type: Literal[
-            "traex_builtin",
+            "pi",
+        "traex_builtin",
             "traex_managed",
             "openai_sidecar",
             "fixture",
@@ -254,7 +201,7 @@ def semantic_workflow_selection_available(*, probe_verified: bool = False) -> bo
     runtime = agent_runtime_config()
     if (
         not runtime.configured
-        or runtime.type not in {"traex_builtin", "traex_managed", "openai_sidecar"}
+        or runtime.type not in {"traex_builtin", "traex_managed", "openai_sidecar", "pi"}
         or not runtime.command
     ):
         return False

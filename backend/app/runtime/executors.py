@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import os
 import shutil
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator
@@ -40,6 +38,18 @@ from app.runtime.browser import (
     url_matches,
 )
 from app.runtime.contract_patch import ContractPatchViolation, build_contract_patch
+from app.runtime.execution_contracts import (
+    CancellationToken as CancellationToken,
+)
+from app.runtime.execution_contracts import (
+    ExecutionCancelledError as ExecutionCancelledError,
+)
+from app.runtime.execution_contracts import (
+    NodeExecutor as NodeExecutor,
+)
+from app.runtime.execution_contracts import (
+    RunContext as RunContext,
+)
 from app.runtime.models import FakeModelAdapter, ModelRuntimeError
 from app.runtime.playwright_browser import (
     BrowserExecutionError,
@@ -48,10 +58,6 @@ from app.runtime.playwright_browser import (
     PlaywrightPageSession,
 )
 from app.runtime.skillx_host import execute_in_subprocess
-
-
-class ExecutionCancelledError(Exception):
-    pass
 
 
 def _staging_dir(run_id: str, node_run_id: str) -> Path:
@@ -76,9 +82,7 @@ def list_final_files(run_id: str) -> set[str]:
     if not run_root.exists():
         return set()
     return {
-        entry.name
-        for entry in run_root.iterdir()
-        if entry.is_file() and entry.name != ".staging"
+        entry.name for entry in run_root.iterdir() if entry.is_file() and entry.name != ".staging"
     }
 
 
@@ -150,34 +154,6 @@ def write_json_artifact(
     }
 
 
-@dataclass
-class CancellationToken:
-    event: asyncio.Event
-
-    @property
-    def cancelled(self) -> bool:
-        return self.event.is_set()
-
-    def check(self) -> None:
-        if self.cancelled:
-            raise ExecutionCancelledError("执行已取消")
-
-
-@dataclass
-class RunContext:
-    run_id: str
-    run_input: dict[str, Any]
-    node_run_id: str
-    cancellation: CancellationToken
-    runtime_snapshot: dict[str, Any] = field(default_factory=dict)
-
-
-class NodeExecutor(Protocol):
-    node_type: NodeType
-
-    async def execute(
-        self, context: RunContext, node: WorkflowNode, inputs: dict[str, Any]
-    ) -> NodeResult: ...
 
 
 class InputExecutor:
@@ -409,25 +385,17 @@ class LLMExecutor:
     node_type = NodeType.LLM
 
     @staticmethod
-    def _prompt_with_resolved_inputs(
-        prompt_template: str, inputs: dict[str, Any]
-    ) -> str:
+    def _prompt_with_resolved_inputs(prompt_template: str, inputs: dict[str, Any]) -> str:
         canonical_inputs = json.dumps(
             inputs,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         )
-        input_section = (
-            "[RESOLVED_INPUT_JSON]\n"
-            f"{canonical_inputs}\n"
-            "[/RESOLVED_INPUT_JSON]"
-        )
+        input_section = f"[RESOLVED_INPUT_JSON]\n{canonical_inputs}\n[/RESOLVED_INPUT_JSON]"
         if "{input}" in prompt_template:
             prompt = prompt_template.replace("{input}", input_section, 1)
-            return prompt.replace(
-                "{input}", "[RESOLVED_INPUT_ALREADY_INCLUDED]"
-            )
+            return prompt.replace("{input}", "[RESOLVED_INPUT_ALREADY_INCLUDED]")
         return f"{prompt_template.rstrip()}\n\n{input_section}".lstrip()
 
     async def execute(
@@ -449,9 +417,9 @@ class LLMExecutor:
         try:
             max_output_tokens = int(node.config.get("maxOutputTokens", 1000))
             if node.config.get("modelProfile") == "fake":
-                fake = await FakeModelAdapter(
-                    node.config.get("fakeOutput", {})
-                ).generate(prompt, output_schema, max_output_tokens)
+                fake = await FakeModelAdapter(node.config.get("fakeOutput", {})).generate(
+                    prompt, output_schema, max_output_tokens
+                )
                 output = fake.output
                 input_tokens = fake.input_tokens
                 output_tokens = fake.output_tokens
@@ -470,12 +438,12 @@ class LLMExecutor:
                         output_schema=output_schema,
                         max_output_tokens=max_output_tokens,
                         working_directory=(
-                            get_settings().artifact_root
-                            / context.run_id
-                            / f"structured-{node.id}"
+                            get_settings().artifact_root / context.run_id / f"structured-{node.id}"
                         ),
                     ),
-                    context.runtime_snapshot,
+                    context.runtime_snapshot.get("nodeProfiles", {}).get(
+                        node.id, context.runtime_snapshot
+                    ),
                 )
                 output = generated.output
                 input_tokens = generated.input_tokens
@@ -502,24 +470,16 @@ class LLMExecutor:
                     "model": model,
                     "provider": provider,
                     "protocol": (
-                        protocol
-                        if node.config.get("modelProfile") != "fake"
-                        else "fixture"
+                        protocol if node.config.get("modelProfile") != "fake" else "fixture"
                     ),
                     "runtimeType": (
-                        runtime_type
-                        if node.config.get("modelProfile") != "fake"
-                        else "fixture"
+                        runtime_type if node.config.get("modelProfile") != "fake" else "fixture"
                     ),
                     "adapterVersion": (
-                        adapter_version or ""
-                        if node.config.get("modelProfile") != "fake"
-                        else ""
+                        adapter_version or "" if node.config.get("modelProfile") != "fake" else ""
                     ),
                     "adapterDigest": (
-                        adapter_digest or ""
-                        if node.config.get("modelProfile") != "fake"
-                        else ""
+                        adapter_digest or "" if node.config.get("modelProfile") != "fake" else ""
                     ),
                     "runtimeUsed": runtime_used,
                     "runtimeDigest": runtime_digest,
@@ -572,9 +532,7 @@ class LLMExecutor:
             )
             return NodeResult(
                 status="failed",
-                error=ExecutionError(
-                    code="MODEL_MALFORMED_OUTPUT", message=str(exc)
-                ),
+                error=ExecutionError(code="MODEL_MALFORMED_OUTPUT", message=str(exc)),
                 metrics=(
                     {
                         "provider": str(snapshot.get("provider") or "unknown"),
@@ -648,7 +606,15 @@ class AgentExecutor:
                 events=events,
                 artifacts=[artifact],
             )
-        if not agent_runtime_config().configured:
+        from app.application.runtime_profiles import restore_agent_snapshot
+
+        runtime = (
+            restore_agent_snapshot(
+                context.runtime_snapshot.get("nodeProfiles", {}).get(node.id, {}).get("agentConfig")
+            )
+            or agent_runtime_config()
+        )
+        if not runtime.configured:
             return NodeResult(
                 status="failed",
                 error=ExecutionError(
@@ -665,7 +631,6 @@ class AgentExecutor:
         # 得到一致的权限交集、事件契约、预算与取消语义；差异只在事件 sink。
         runtime_events: list[dict[str, Any]] = []
         audit_events: list[dict[str, Any]] = []
-        runtime = agent_runtime_config()
 
         async def event_sink(runtime_event: dict[str, Any], audit_event: dict[str, Any]) -> None:
             runtime_events.append(runtime_event)
@@ -681,7 +646,9 @@ class AgentExecutor:
             + "\n输入："
             + json.dumps(inputs, ensure_ascii=False),
             output_schema=output_schema,
-            working_directory=get_settings().artifact_root / context.run_id / f"agent-{node.id}",
+            working_directory=get_settings().artifact_root
+            / context.run_id
+            / f"agent-{context.node_run_id}",
             requested_capabilities=tuple(node.config.get("allowedCapabilities", [])),
             max_steps=int(node.config["maxSteps"]),
             max_total_tokens=max(
@@ -695,14 +662,12 @@ class AgentExecutor:
                 node.config.get("maxOutputTokens", settings.agent_max_output_tokens)
             ),
             max_billable_tokens=int(
-                node.config.get(
-                    "maxBillableTokens", settings.agent_max_billable_tokens
-                )
+                node.config.get("maxBillableTokens", settings.agent_max_billable_tokens)
             ),
             max_duration_seconds=int(node.config.get("maxDurationSeconds", node.timeout_seconds)),
         )
         try:
-            result = await AgentHost().execute(
+            result = await AgentHost(runtime=runtime).execute(
                 request, event_sink=event_sink, cancellation=cancellation
             )
         except AgentHostError as exc:
@@ -804,9 +769,7 @@ class BrowserContractExecutor:
                     context.node_run_id,
                 ) as browser:
                     context.cancellation.check()
-                    observed = await browser.inspect_and_fill(
-                        inputs.get("formValues", {})
-                    )
+                    observed = await browser.inspect_and_fill(inputs.get("formValues", {}))
                     return await self._evaluate(
                         context,
                         node,
@@ -921,9 +884,7 @@ class BrowserContractExecutor:
                     context.node_run_id,
                 ) as browser:
                     context.cancellation.check()
-                    result = await browser.read_and_extract(
-                        contract.body_selector, contract.fields
-                    )
+                    result = await browser.read_and_extract(contract.body_selector, contract.fields)
                     artifacts = browser.artifacts
             except PlaywrightTimeoutError as exc:
                 return NodeResult(

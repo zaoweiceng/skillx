@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from collections import defaultdict, deque
 from typing import Any
@@ -9,20 +7,14 @@ from typing import Any
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+from app.domain.serialization import canonical_json as canonical_json
+from app.domain.serialization import digest_json as digest_json
 from app.domain.workflow import CompiledWorkflow, Diagnostic, NodeType, WorkflowDefinition
 
 # 与 app.application.expressions 统一的引用语法：路径段支持 `字段` 与 `字段[整数索引]`。
 _SEGMENT = r"[a-zA-Z0-9_-]+(?:\[\d+\])*"
 _PATH = rf"{_SEGMENT}(?:\.{_SEGMENT})*"
 REFERENCE_PATTERN = re.compile(rf"\$\{{(?P<root>input|[a-zA-Z][\w-]*)\.(?P<path>{_PATH})}}")
-
-
-def canonical_json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def digest_json(value: Any) -> str:
-    return "sha256:" + hashlib.sha256(canonical_json(value).encode()).hexdigest()
 
 
 class WorkflowValidationError(ValueError):

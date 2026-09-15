@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import httpx
+from jsonschema import Draft202012Validator
 
-from app.application.runtime_config import llm_runtime_config
+from app.application.runtime_config import LLMRuntimeConfig, llm_runtime_config
 
 
 @dataclass(frozen=True)
@@ -17,6 +19,18 @@ class ModelResult:
     output_tokens: int
     model: str
     usage_complete: bool = True
+
+
+@dataclass(frozen=True)
+class ModelTextEvent:
+    delta: str = ""
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+def completion_endpoint(endpoint: str) -> str:
+    endpoint = endpoint.rstrip("/")
+    return endpoint if endpoint.endswith("/chat/completions") else endpoint + "/chat/completions"
 
 
 class ModelAdapter(Protocol):
@@ -61,17 +75,93 @@ class ModelRuntimeError(RuntimeError):
 
 
 class OpenAICompatibleAdapter:
+    def __init__(
+        self,
+        runtime: LLMRuntimeConfig | None = None,
+        *,
+        structured_mode: Literal["json_schema", "json_object", "prompt"] = "json_schema",
+        timeout_seconds: float = 60,
+    ) -> None:
+        self.runtime = runtime
+        self.structured_mode = structured_mode
+        self.timeout_seconds = timeout_seconds
+
+    async def stream_text(
+        self, messages: list[dict[str, str]], max_output_tokens: int = 1000
+    ) -> AsyncIterator[ModelTextEvent]:
+        """Stream text without an Agent process; cancellation closes the HTTP stream."""
+        runtime = self.runtime or llm_runtime_config()
+        if not runtime.configured or not runtime.endpoint:
+            raise ModelRuntimeError("MODEL_RUNTIME_UNAVAILABLE", "Direct LLM Runtime 未配置")
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                async with client.stream(
+                    "POST",
+                    completion_endpoint(runtime.endpoint),
+                    headers={"authorization": f"Bearer {os.environ[runtime.api_key_env]}"},
+                    json={
+                        "model": runtime.model,
+                        "messages": messages,
+                        "max_tokens": max_output_tokens,
+                        "stream": True,
+                        "stream_options": {"include_usage": True},
+                    },
+                ) as response:
+                    if response.is_error:
+                        code = (
+                            "MODEL_AUTH_FAILED"
+                            if response.status_code in {401, 403}
+                            else "RATE_LIMITED"
+                            if response.status_code == 429
+                            else "MODEL_PROVIDER_ERROR"
+                        )
+                        raise ModelRuntimeError(
+                            code, f"HTTP {response.status_code}", request_dispatched=True
+                        )
+                    async for line in response.aiter_lines():
+                        if not line.startswith("data:"):
+                            continue
+                        payload = line[5:].strip()
+                        if payload == "[DONE]":
+                            return
+                        event = json.loads(payload)
+                        if event.get("error"):
+                            raise ModelRuntimeError(
+                                "MODEL_PROVIDER_ERROR", "模型流返回错误", request_dispatched=True
+                            )
+                        for choice in event.get("choices", []):
+                            delta = choice.get("delta", {}).get("content")
+                            if isinstance(delta, str) and delta:
+                                yield ModelTextEvent(delta=delta)
+                        usage = event.get("usage")
+                        if isinstance(usage, dict):
+                            yield ModelTextEvent(
+                                input_tokens=usage.get("prompt_tokens"),
+                                output_tokens=usage.get("completion_tokens"),
+                            )
+                    raise ModelRuntimeError(
+                        "MODEL_MALFORMED_OUTPUT", "模型流未完整结束", request_dispatched=True
+                    )
+        except httpx.TimeoutException as exc:
+            raise ModelRuntimeError("TIMEOUT", "模型流超时", request_dispatched=True) from exc
+        except httpx.HTTPError as exc:
+            raise ModelRuntimeError(
+                "DEPENDENCY_UNAVAILABLE", "模型连接失败", request_dispatched=True
+            ) from exc
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ModelRuntimeError(
+                "MODEL_MALFORMED_OUTPUT", "模型流格式错误", request_dispatched=True
+            ) from exc
+
     async def generate(
         self,
         prompt: str,
         output_schema: dict[str, Any],
         max_output_tokens: int,
     ) -> ModelResult:
-        runtime = llm_runtime_config()
+        runtime = self.runtime or llm_runtime_config()
         if not runtime.configured or not runtime.endpoint or not runtime.model:
-            raise ModelRuntimeError(
-                "MODEL_RUNTIME_UNAVAILABLE", "Direct LLM Runtime 未配置"
-            )
+            raise ModelRuntimeError("MODEL_RUNTIME_UNAVAILABLE", "Direct LLM Runtime 未配置")
         api_key = os.environ.get(runtime.api_key_env)
         if not api_key:
             raise ModelRuntimeError(
@@ -91,12 +181,23 @@ class OpenAICompatibleAdapter:
                 },
             },
         }
+        if self.structured_mode != "json_schema":
+            request.pop("response_format")
+            request["messages"][0]["content"] += (
+                "\nReturn only a JSON object matching this schema: " + json.dumps(output_schema)
+            )
+            if self.structured_mode == "json_object":
+                request["response_format"] = {"type": "json_object"}
         request_dispatched = False
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                 request_dispatched = True
                 response = await client.post(
-                    runtime.endpoint,
+                    (
+                        runtime.endpoint.rstrip("/")
+                        if runtime.endpoint.rstrip("/").endswith("/chat/completions")
+                        else runtime.endpoint.rstrip("/") + "/chat/completions"
+                    ),
                     headers={"authorization": f"Bearer {api_key}"},
                     json=request,
                 )
@@ -141,13 +242,17 @@ class OpenAICompatibleAdapter:
                 "LLM Provider 返回无法解析的结构化结果",
                 request_dispatched=request_dispatched,
             ) from exc
-        usage = payload.get("usage", {})
+        if not isinstance(output, dict) or list(
+            Draft202012Validator(output_schema).iter_errors(output)
+        ):
+            raise ModelRuntimeError(
+                "MODEL_MALFORMED_OUTPUT", "模型结果不满足输出契约", request_dispatched=True
+            )
+        usage = payload.get("usage") or {}
         return ModelResult(
             output=output,
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
             model=payload.get("model", runtime.model),
-            usage_complete=(
-                "prompt_tokens" in usage and "completion_tokens" in usage
-            ),
+            usage_complete=("prompt_tokens" in usage and "completion_tokens" in usage),
         )

@@ -28,6 +28,7 @@ from app.application.compiler import digest_json
 from app.application.error_policy import error_policy, persisted_error, public_error
 from app.application.product_history import record_model_usage
 from app.application.runtime_config import agent_runtime_config
+from app.application.runtime_profiles import restore_agent_snapshot
 from app.config import get_settings
 from app.infrastructure.database import (
     Artifact,
@@ -39,8 +40,7 @@ from app.infrastructure.database import (
     rfc3339,
     utcnow,
 )
-from app.runtime.adapters import TraeXSubprocessAdapter
-from app.runtime.traex_builtin import TraeXBuiltinAdapter
+from app.runtime.agent_contracts import AgentAdapter
 
 FINAL_STATES = frozenset({"succeeded", "failed", "cancelled"})
 
@@ -142,13 +142,9 @@ class AgentRunConfig:
             max_total_tokens=int(data.get("maxTotalTokens", default.max_total_tokens)),
             max_input_tokens=int(data.get("maxInputTokens", default.max_input_tokens)),
             max_output_tokens=int(data.get("maxOutputTokens", default.max_output_tokens)),
-            max_billable_tokens=int(
-                data.get("maxBillableTokens", default.max_billable_tokens)
-            ),
+            max_billable_tokens=int(data.get("maxBillableTokens", default.max_billable_tokens)),
             allowed_capabilities=tuple(data.get("allowedCapabilities", [])),
-            max_duration_seconds=int(
-                data.get("maxDurationSeconds", default.max_duration_seconds)
-            ),
+            max_duration_seconds=int(data.get("maxDurationSeconds", default.max_duration_seconds)),
         )
 
 
@@ -192,6 +188,7 @@ async def enqueue_agent_run(
     prompt: str | None = None,
     turn_id: str | None = None,
     semantic_context: dict[str, Any] | None = None,
+    runtime_snapshot: dict[str, Any] | None = None,
 ) -> ConversationRun:
     """先持久化、后执行：在短事务内创建 ``queued`` run 与 created 事件并返回 handle。
 
@@ -200,6 +197,13 @@ async def enqueue_agent_run(
     """
 
     config = config or AgentRunConfig.default()
+    from app.application.runtime_profiles import agent_snapshot
+
+    snapshot = (
+        runtime_snapshot
+        if runtime_snapshot is not None
+        else await agent_snapshot(session, conversation.agent_profile_id)
+    )
     now = utcnow()
     conversation_run = ConversationRun(
         id=str(uuid4()),
@@ -220,7 +224,7 @@ async def enqueue_agent_run(
         },
         output_json={},
         trajectory_json={},
-        config_json=config.to_dict(),
+        config_json={**config.to_dict(), "agentRuntimeSnapshot": snapshot},
         queued_at=now,
         attempt=1,
         next_event_seq=0,
@@ -285,7 +289,7 @@ class AgentRunWorker:
         self,
         worker_id: str = "agent-worker",
         *,
-        adapter: TraeXSubprocessAdapter | TraeXBuiltinAdapter | None = None,
+        adapter: AgentAdapter | None = None,
         lease_seconds: int | None = None,
     ) -> None:
         self.worker_id = worker_id
@@ -409,6 +413,9 @@ class AgentRunWorker:
             if run is None or run.status != "running":
                 return
             config = AgentRunConfig.from_dict(run.config_json or {})
+            frozen_runtime = restore_agent_snapshot(
+                (run.config_json or {}).get("agentRuntimeSnapshot")
+            )
             content = run.input_json.get("message", "")
             prompt = run.input_json.get("prompt", content)
             claim_generation = run.claim_generation
@@ -438,7 +445,7 @@ class AgentRunWorker:
             )
         )
 
-        host = AgentHost(adapter=self._adapter)
+        host = AgentHost(adapter=self._adapter, runtime=frozen_runtime)
 
         async def event_sink(runtime: dict[str, Any], audit: dict[str, Any]) -> None:
             if runtime["type"] == "agent.plan" and isinstance(
@@ -478,42 +485,18 @@ class AgentRunWorker:
                 allowed_remaining_step_ids=tuple(
                     expected_plan_data.get("allowedRemainingStepIds", [])
                 ),
-                source_checkpoint_id=str(
-                    expected_plan_data.get("sourceCheckpointId", "")
-                ),
-                step_states=dict(
-                    expected_plan_data.get("stepStates", {})
-                ),
-                step_attempts=dict(
-                    expected_plan_data.get("stepAttempts", {})
-                ),
-                step_state_digest=str(
-                    expected_plan_data.get("stepStateDigest", "")
-                ),
-                original_input=dict(
-                    expected_plan_data.get("originalInput", {})
-                ),
-                step_outputs=dict(
-                    expected_plan_data.get("stepOutputs", {})
-                ),
-                artifact_outputs=dict(
-                    expected_plan_data.get("artifactOutputs", {})
-                ),
-                continuation_generation=int(
-                    expected_plan_data.get("continuationGeneration", 0)
-                ),
-                max_revisions=int(
-                    expected_plan_data.get("maxRevisions", 1)
-                ),
-                used_revisions=int(
-                    expected_plan_data.get("usedRevisions", 0)
-                ),
-                remaining_revisions=int(
-                    expected_plan_data.get("remainingRevisions", 1)
-                ),
-                legacy_replan=bool(
-                    expected_plan_data.get("legacyReplan", False)
-                ),
+                source_checkpoint_id=str(expected_plan_data.get("sourceCheckpointId", "")),
+                step_states=dict(expected_plan_data.get("stepStates", {})),
+                step_attempts=dict(expected_plan_data.get("stepAttempts", {})),
+                step_state_digest=str(expected_plan_data.get("stepStateDigest", "")),
+                original_input=dict(expected_plan_data.get("originalInput", {})),
+                step_outputs=dict(expected_plan_data.get("stepOutputs", {})),
+                artifact_outputs=dict(expected_plan_data.get("artifactOutputs", {})),
+                continuation_generation=int(expected_plan_data.get("continuationGeneration", 0)),
+                max_revisions=int(expected_plan_data.get("maxRevisions", 1)),
+                used_revisions=int(expected_plan_data.get("usedRevisions", 0)),
+                remaining_revisions=int(expected_plan_data.get("remainingRevisions", 1)),
+                legacy_replan=bool(expected_plan_data.get("legacyReplan", False)),
             )
             if isinstance(expected_plan_data, dict)
             else None
@@ -530,18 +513,14 @@ class AgentRunWorker:
             max_output_tokens=config.max_output_tokens,
             max_billable_tokens=config.max_billable_tokens,
             max_duration_seconds=config.max_duration_seconds,
-            completed_actions=tuple(
-                run.input_json.get("completedActionLedger", [])
-            ),
+            completed_actions=tuple(run.input_json.get("completedActionLedger", [])),
             expected_plan=expected_plan,
         )
 
         terminal: AgentRunError | None = None
         result = None
         try:
-            result = await host.execute(
-                request, event_sink=event_sink, cancellation=cancellation
-            )
+            result = await host.execute(request, event_sink=event_sink, cancellation=cancellation)
         except AgentHostError as exc:
             terminal = AgentRunError(
                 exc.code,
@@ -566,14 +545,10 @@ class AgentRunWorker:
         if signal.get("kind") == "lost":
             return  # 已被恢复或另一个 Worker 接管，不再写入终态。
         if signal.get("kind") == "cancelled":
-            await self._finalize_cancelled(
-                run_id, claim_generation, claim_token
-            )
+            await self._finalize_cancelled(run_id, claim_generation, claim_token)
             return
         if terminal is not None:
-            await self._finalize_failure(
-                run_id, terminal, claim_generation, claim_token
-            )
+            await self._finalize_failure(run_id, terminal, claim_generation, claim_token)
             return
         if result is None:
             await self._finalize_failure(
@@ -722,19 +697,13 @@ class AgentRunWorker:
         if len(content) > 64 * 1024:
             return
         call_id = str(payload.get("callId", "unknown"))
-        storage_key = (
-            "tool-results/"
-            + hashlib.sha256(call_id.encode()).hexdigest()[:24]
-            + ".json"
-        )
+        storage_key = "tool-results/" + hashlib.sha256(call_id.encode()).hexdigest()[:24] + ".json"
         token = claim_token or "unclaimed"
         staging_key = f".staging/{token}/{storage_key}"
         root = self._trajectory_dir(run_id)
         staging = (root / staging_key).resolve()
         if not staging.is_relative_to(root):
-            raise AgentHostError(
-                "EVIDENCE_CONFLICT", "ToolResult staging 路径越界"
-            )
+            raise AgentHostError("EVIDENCE_CONFLICT", "ToolResult staging 路径越界")
         staging.parent.mkdir(parents=True, exist_ok=True)
         staging.write_bytes(content)
         content_hash = hashlib.sha256(content).hexdigest()
@@ -809,9 +778,7 @@ class AgentRunWorker:
         if created:
             target = (root / storage_key).resolve()
             if not target.is_relative_to(root):
-                raise AgentHostError(
-                    "EVIDENCE_CONFLICT", "ToolResult 最终路径越界"
-                )
+                raise AgentHostError("EVIDENCE_CONFLICT", "ToolResult 最终路径越界")
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
                 if hashlib.sha256(target.read_bytes()).hexdigest() != content_hash:
@@ -837,9 +804,7 @@ class AgentRunWorker:
             separators=(",", ":"),
         ).encode()
         if len(content) > 64 * 1024:
-            raise AgentHostError(
-                "PAYLOAD_TOO_LARGE", "Agent PlanSnapshot 超过 64 KiB"
-            )
+            raise AgentHostError("PAYLOAD_TOO_LARGE", "Agent PlanSnapshot 超过 64 KiB")
         content_hash = hashlib.sha256(content).hexdigest()
         revision = int(payload.get("revision", 1))
         storage_key = f"plans/revision-{revision}.json"
@@ -906,9 +871,7 @@ class AgentRunWorker:
         target.parent.mkdir(parents=True, exist_ok=True)
         if target.exists():
             if hashlib.sha256(target.read_bytes()).hexdigest() != content_hash:
-                raise AgentHostError(
-                    "EVIDENCE_CONFLICT", "PlanSnapshot 最终文件 hash 冲突"
-                )
+                raise AgentHostError("EVIDENCE_CONFLICT", "PlanSnapshot 最终文件 hash 冲突")
             staging.unlink(missing_ok=True)
         else:
             staging.replace(target)
@@ -932,16 +895,8 @@ class AgentRunWorker:
                     "message": error.message,
                     "retryable": error.retryable,
                     "effectiveError": error.effective_error,
-                    **(
-                        {"reportedError": error.reported_error}
-                        if error.reported_error
-                        else {}
-                    ),
-                    **(
-                        {"failedCallId": error.failed_call_id}
-                        if error.failed_call_id
-                        else {}
-                    ),
+                    **({"reportedError": error.reported_error} if error.reported_error else {}),
+                    **({"failedCallId": error.failed_call_id} if error.failed_call_id else {}),
                     **(
                         {"protocolViolation": error.protocol_violation}
                         if error.protocol_violation
@@ -956,16 +911,8 @@ class AgentRunWorker:
                     "message": error.message,
                     "retryable": error.retryable,
                     "effectiveError": error.effective_error,
-                    **(
-                        {"reportedError": error.reported_error}
-                        if error.reported_error
-                        else {}
-                    ),
-                    **(
-                        {"failedCallId": error.failed_call_id}
-                        if error.failed_call_id
-                        else {}
-                    ),
+                    **({"reportedError": error.reported_error} if error.reported_error else {}),
+                    **({"failedCallId": error.failed_call_id} if error.failed_call_id else {}),
                     **(
                         {"protocolViolation": error.protocol_violation}
                         if error.protocol_violation
@@ -997,7 +944,10 @@ class AgentRunWorker:
             if claimed.rowcount != 1:
                 await session.delete(checkpoint)
                 return
-            runtime = agent_runtime_config()
+            runtime = (
+                restore_agent_snapshot((run.config_json or {}).get("agentRuntimeSnapshot"))
+                or agent_runtime_config()
+            )
             await record_model_usage(
                 session,
                 call_id=f"conversation-agent:{run_id}:{claim_generation}",
@@ -1102,9 +1052,7 @@ class AgentRunWorker:
         adapter_digest: str | None = None,
     ) -> None:
         # 先把原始轨迹写入 staging（不落最终目录），DB 只保存受控 artifact:// 引用与 hash。
-        staged = self._stage_trajectory(
-            run_id, raw_events, output, claim_token or "unclaimed"
-        )
+        staged = self._stage_trajectory(run_id, raw_events, output, claim_token or "unclaimed")
         trajectory = build_trajectory(
             config,
             prompt,
@@ -1162,27 +1110,33 @@ class AgentRunWorker:
                 committed = False
             else:
                 run_record = await session.get(ConversationRun, run_id)
+                runtime = (
+                    restore_agent_snapshot(
+                        (run_record.config_json or {}).get("agentRuntimeSnapshot")
+                    )
+                    if run_record
+                    else None
+                )
+                runtime = runtime or agent_runtime_config()
                 await record_model_usage(
                     session,
                     call_id=f"conversation-agent:{run_id}:{claim_generation}",
                     stage=(
                         "failure_continuation"
                         if run_record
-                        and run_record.input_json.get(
-                            "continuationOfConversationRunId"
-                        )
+                        and run_record.input_json.get("continuationOfConversationRunId")
                         else "general_agent"
                     ),
                     turn_id=run_record.turn_id if run_record else None,
                     conversation_run_id=run_id,
-                    provider=provider or agent_runtime_config().provider,
+                    provider=provider or runtime.provider,
                     model=model,
                     protocol=protocol,
                     runtime_type=runtime_type,
                     adapter_version=adapter_version,
                     adapter_digest=adapter_digest,
                     runtime_used="agent_runtime",
-                    runtime_digest=agent_runtime_config().digest,
+                    runtime_digest=runtime.digest,
                     total_tokens=total_tokens if usage_complete else None,
                     usage_complete=usage_complete,
                     dispatched=request_dispatched,
@@ -1256,84 +1210,51 @@ class AgentRunWorker:
             await session.scalars(
                 select(Artifact).where(
                     Artifact.conversation_run_id == run.id,
-                    Artifact.kind.in_(
-                        ["tool_result", "agent_plan_snapshot"]
-                    ),
+                    Artifact.kind.in_(["tool_result", "agent_plan_snapshot"]),
                 )
             )
         ).all()
-        tool_artifacts = [
-            item for item in artifacts if item.kind == "tool_result"
-        ]
+        tool_artifacts = [item for item in artifacts if item.kind == "tool_result"]
         expected_contract = run.input_json.get("expectedPlanContract")
         replan_budget = {
-            "maxRevisions": int(
-                (expected_contract or {}).get("maxRevisions", 1)
-            ),
-            "usedRevisions": int(
-                (expected_contract or {}).get("usedRevisions", 0)
-            ),
-            "remainingRevisions": int(
-                (expected_contract or {}).get("remainingRevisions", 1)
-            ),
+            "maxRevisions": int((expected_contract or {}).get("maxRevisions", 1)),
+            "usedRevisions": int((expected_contract or {}).get("usedRevisions", 0)),
+            "remainingRevisions": int((expected_contract or {}).get("remainingRevisions", 1)),
         }
         for item in events:
             persisted_budget = item.payload_json.get("replanBudget")
             if isinstance(persisted_budget, dict):
                 replan_budget = {
-                    "maxRevisions": int(
-                        persisted_budget.get("maxRevisions", -1)
-                    ),
-                    "usedRevisions": int(
-                        persisted_budget.get("usedRevisions", -1)
-                    ),
-                    "remainingRevisions": int(
-                        persisted_budget.get("remainingRevisions", -1)
-                    ),
+                    "maxRevisions": int(persisted_budget.get("maxRevisions", -1)),
+                    "usedRevisions": int(persisted_budget.get("usedRevisions", -1)),
+                    "remainingRevisions": int(persisted_budget.get("remainingRevisions", -1)),
                 }
         budget_integrity_error = None
         if (
             min(replan_budget.values()) < 0
-            or replan_budget["usedRevisions"]
-            + replan_budget["remainingRevisions"]
+            or replan_budget["usedRevisions"] + replan_budget["remainingRevisions"]
             != replan_budget["maxRevisions"]
         ):
             budget_integrity_error = "replan revision budget 不一致"
-        artifact_by_call = {
-            str(item.metadata_json.get("callId")): item
-            for item in tool_artifacts
-        }
+        artifact_by_call = {str(item.metadata_json.get("callId")): item for item in tool_artifacts}
         requested = {
-            item.payload_json.get("callId")
-            for item in events
-            if item.type == "tool.requested"
+            item.payload_json.get("callId") for item in events if item.type == "tool.requested"
         }
-        closed = {
-            item.payload_json.get("callId")
-            for item in events
-            if item.type == "tool.result"
-        }
+        closed = {item.payload_json.get("callId") for item in events if item.type == "tool.result"}
         failed_results = [
             item
             for item in events
-            if item.type == "tool.result"
-            and item.payload_json.get("status") == "failed"
+            if item.type == "tool.result" and item.payload_json.get("status") == "failed"
         ]
         failed_call_id = error.get("failedCallId") or (
-            failed_results[-1].payload_json.get("callId")
-            if failed_results
-            else None
+            failed_results[-1].payload_json.get("callId") if failed_results else None
         )
         failed_artifact = artifact_by_call.get(str(failed_call_id))
-        plan_artifacts = [
-            item for item in artifacts if item.kind == "agent_plan_snapshot"
-        ]
+        plan_artifacts = [item for item in artifacts if item.kind == "agent_plan_snapshot"]
         plan_artifact = (
             max(
                 plan_artifacts,
-                key=lambda item: int(
-                    item.metadata_json.get("revision", 0)
-                ),
+                key=lambda item: int(item.metadata_json.get("revision", 0)),
             )
             if plan_artifacts
             else None
@@ -1352,9 +1273,7 @@ class AgentRunWorker:
                 if not artifact_record_matches(path, plan_artifact):
                     raise ValueError("PlanSnapshot Artifact 不存在或已损坏")
                 plan_snapshot = json.loads(path.read_bytes())
-                if digest_json(plan_snapshot) != plan_artifact.metadata_json.get(
-                    "planDigest"
-                ):
+                if digest_json(plan_snapshot) != plan_artifact.metadata_json.get("planDigest"):
                     raise ValueError("PlanSnapshot digest 不一致")
                 plan_ref = {
                     "id": plan_artifact.id,
@@ -1362,9 +1281,7 @@ class AgentRunWorker:
                     "sha256": plan_artifact.sha256,
                     "bytes": plan_artifact.size,
                     "digest": plan_artifact.metadata_json.get("planDigest"),
-                    "schemaVersion": plan_artifact.metadata_json.get(
-                        "schemaVersion"
-                    ),
+                    "schemaVersion": plan_artifact.metadata_json.get("schemaVersion"),
                     "revision": plan_artifact.metadata_json.get("revision"),
                 }
             except (
@@ -1377,13 +1294,9 @@ class AgentRunWorker:
 
         results_by_step: dict[str, list[ConversationRunEvent]] = {}
         for item in events:
-            if item.type != "tool.result" or not item.payload_json.get(
-                "planStepId"
-            ):
+            if item.type != "tool.result" or not item.payload_json.get("planStepId"):
                 continue
-            results_by_step.setdefault(
-                str(item.payload_json["planStepId"]), []
-            ).append(item)
+            results_by_step.setdefault(str(item.payload_json["planStepId"]), []).append(item)
         completed_steps: list[dict[str, Any]] = []
         failed_step: dict[str, Any] | None = None
         remaining_steps: list[dict[str, Any]] = []
@@ -1396,9 +1309,7 @@ class AgentRunWorker:
                 result_events = results_by_step.get(step_id, [])
                 result_event = result_events[-1] if result_events else None
                 result_status = (
-                    result_event.payload_json.get("status")
-                    if result_event is not None
-                    else None
+                    result_event.payload_json.get("status") if result_event is not None else None
                 )
                 attempts = []
                 for item in result_events:
@@ -1410,28 +1321,16 @@ class AgentRunWorker:
                         "attempt": item.payload_json.get("stepAttempt"),
                         "callId": call_id,
                         "status": item.payload_json.get("status"),
-                        "argumentsDigest": item.payload_json.get(
-                            "argumentsDigest"
-                        ),
+                        "argumentsDigest": item.payload_json.get("argumentsDigest"),
                     }
                     artifact_attempt = (
                         {
-                            "planDigest": artifact.metadata_json.get(
-                                "planDigest"
-                            ),
-                            "stepId": artifact.metadata_json.get(
-                                "planStepId"
-                            ),
-                            "attempt": artifact.metadata_json.get(
-                                "stepAttempt"
-                            ),
-                            "callId": str(
-                                artifact.metadata_json.get("callId", "")
-                            ),
+                            "planDigest": artifact.metadata_json.get("planDigest"),
+                            "stepId": artifact.metadata_json.get("planStepId"),
+                            "attempt": artifact.metadata_json.get("stepAttempt"),
+                            "callId": str(artifact.metadata_json.get("callId", "")),
                             "status": artifact.metadata_json.get("status"),
-                            "argumentsDigest": artifact.metadata_json.get(
-                                "argumentsDigest"
-                            ),
+                            "argumentsDigest": artifact.metadata_json.get("argumentsDigest"),
                         }
                         if artifact is not None
                         else None
@@ -1441,11 +1340,9 @@ class AgentRunWorker:
                             f"step {step_id} call {call_id} 的 attempt "
                             "事件与 ToolResult Artifact metadata 冲突"
                         )
-                    elif not isinstance(
-                        event_attempt["argumentsDigest"], str
-                    ) or not str(event_attempt["argumentsDigest"]).startswith(
-                        "sha256:"
-                    ):
+                    elif not isinstance(event_attempt["argumentsDigest"], str) or not str(
+                        event_attempt["argumentsDigest"]
+                    ).startswith("sha256:"):
                         attempt_integrity_error = (
                             f"step {step_id} call {call_id} 缺少 argumentsDigest"
                         )
@@ -1457,38 +1354,26 @@ class AgentRunWorker:
                                 artifact.metadata_json.get("storageKey"),
                                 forbidden_root=root / ".staging",
                             )
-                            if not artifact_record_matches(
-                                artifact_path, artifact
-                            ):
-                                raise ValueError(
-                                    "ToolResult Artifact 不存在或已损坏"
-                                )
-                            envelope = json.loads(
-                                artifact_path.read_bytes()
-                            )
+                            if not artifact_record_matches(artifact_path, artifact):
+                                raise ValueError("ToolResult Artifact 不存在或已损坏")
+                            envelope = json.loads(artifact_path.read_bytes())
                             envelope_attempt = {
                                 "planDigest": envelope.get("planDigest"),
                                 "stepId": envelope.get("planStepId"),
                                 "attempt": envelope.get("stepAttempt"),
                                 "callId": str(envelope.get("callId", "")),
                                 "status": envelope.get("status"),
-                                "argumentsDigest": envelope.get(
-                                    "argumentsDigest"
-                                ),
+                                "argumentsDigest": envelope.get("argumentsDigest"),
                             }
                             if envelope_attempt != event_attempt:
-                                raise ValueError(
-                                    "ToolResult Artifact envelope 与事件冲突"
-                                )
+                                raise ValueError("ToolResult Artifact envelope 与事件冲突")
                         except (
                             ArtifactPathError,
                             ValueError,
                             json.JSONDecodeError,
                             UnicodeDecodeError,
                         ) as exc:
-                            attempt_integrity_error = (
-                                f"step {step_id} call {call_id}: {exc}"
-                            )
+                            attempt_integrity_error = f"step {step_id} call {call_id}: {exc}"
                     attempts.append(
                         {
                             **event_attempt,
@@ -1501,9 +1386,7 @@ class AgentRunWorker:
                     )
                 step_attempts[step_id] = attempts
                 artifact = (
-                    artifact_by_call.get(
-                        str(result_event.payload_json.get("callId"))
-                    )
+                    artifact_by_call.get(str(result_event.payload_json.get("callId")))
                     if result_event is not None
                     else None
                 )
@@ -1513,9 +1396,7 @@ class AgentRunWorker:
                         "sha256": artifact.sha256,
                         "bytes": artifact.size,
                         "uri": artifact.uri,
-                        "evidenceDigest": artifact.metadata_json.get(
-                            "evidenceDigest"
-                        ),
+                        "evidenceDigest": artifact.metadata_json.get("evidenceDigest"),
                     }
                     if artifact is not None
                     else None
@@ -1552,14 +1433,8 @@ class AgentRunWorker:
             # checkpoint continuation from a frozen plan.
             remaining_steps = []
 
-        pending_calls = sorted(
-            str(call_id) for call_id in requested - closed if call_id
-        )
-        integrity_error = (
-            plan_integrity_error
-            or budget_integrity_error
-            or attempt_integrity_error
-        )
+        pending_calls = sorted(str(call_id) for call_id in requested - closed if call_id)
+        integrity_error = plan_integrity_error or budget_integrity_error or attempt_integrity_error
         remaining_plan = (
             {
                 "mode": "integrity_failed",
@@ -1615,9 +1490,7 @@ class AgentRunWorker:
             "stepAttempts": step_attempts,
             "replanBudget": replan_budget,
             "artifactRefs": artifact_refs,
-            "continuationGeneration": int(
-                run.input_json.get("continuationGeneration", 0)
-            ),
+            "continuationGeneration": int(run.input_json.get("continuationGeneration", 0)),
         }
         source_digest = digest_json(source_evidence)
         snapshot = {
@@ -1626,12 +1499,8 @@ class AgentRunWorker:
                 "id": run.id,
                 "digest": source_digest,
             },
-            "rootSourceRunId": run.input_json.get(
-                "rootSourceConversationRunId", run.id
-            ),
-            "sourceCheckpointId": run.input_json.get(
-                "continuationOfCheckpointId"
-            ),
+            "rootSourceRunId": run.input_json.get("rootSourceConversationRunId", run.id),
+            "sourceCheckpointId": run.input_json.get("continuationOfCheckpointId"),
             "sourceEvidence": source_evidence,
             "planSnapshot": plan_ref,
             "completedSteps": completed_steps,
@@ -1644,17 +1513,14 @@ class AgentRunWorker:
                             "id": failed_artifact.id,
                             "sha256": failed_artifact.sha256,
                             "uri": failed_artifact.uri,
-                            "evidenceDigest": failed_artifact.metadata_json.get(
-                                "evidenceDigest"
-                            ),
+                            "evidenceDigest": failed_artifact.metadata_json.get("evidenceDigest"),
                         }
                     }
                     if failed_artifact is not None
                     else {}
                 ),
             },
-            "failedStep": failed_step
-            or {"error": error.get("effectiveError", error)},
+            "failedStep": failed_step or {"error": error.get("effectiveError", error)},
             "reportedError": error.get("reportedError"),
             "effectiveError": error.get("effectiveError", error),
             "pendingToolCalls": pending_calls,
@@ -1664,12 +1530,8 @@ class AgentRunWorker:
             "stepAttempts": step_attempts,
             "stepStateDigest": digest_json(step_states),
             "replanBudget": replan_budget,
-            "continuationGeneration": int(
-                run.input_json.get("continuationGeneration", 0)
-            ),
-            "locks": list(
-                (run.config_json or {}).get("allowedCapabilities", [])
-            ),
+            "continuationGeneration": int(run.input_json.get("continuationGeneration", 0)),
+            "locks": list((run.config_json or {}).get("allowedCapabilities", [])),
             "committedSideEffects": [],
             "outcomeCertainty": (
                 "unknown" if error.get("code") == "UNKNOWN_OUTCOME" else "known_failed"
@@ -1837,18 +1699,10 @@ def build_trajectory(
         "output": redact(output),
         "outputProvenance": output_provenance or {},
         "semanticContext": {
-            "resultConsumer": str(
-                (semantic_context or {}).get("resultConsumer", "unknown")
-            ),
-            "entrypointKind": str(
-                (semantic_context or {}).get("entrypointKind", "unknown")
-            ),
-            "topLevelReply": (semantic_context or {}).get(
-                "topLevelReply", "unknown"
-            ),
-            "intendedAsFragment": (semantic_context or {}).get(
-                "intendedAsFragment", "unknown"
-            ),
+            "resultConsumer": str((semantic_context or {}).get("resultConsumer", "unknown")),
+            "entrypointKind": str((semantic_context or {}).get("entrypointKind", "unknown")),
+            "topLevelReply": (semantic_context or {}).get("topLevelReply", "unknown"),
+            "intendedAsFragment": (semantic_context or {}).get("intendedAsFragment", "unknown"),
         },
         "config": {
             "maxSteps": config.max_steps,
@@ -1888,9 +1742,8 @@ def summarize_run(
 ) -> dict[str, Any]:
     """对话运行的 API 摘要视图（包含可恢复的长任务 handle 状态）。"""
 
-    plan_lineage = (conversation_run.trajectory_json or {}).get(
-        "planLineage", {}
-    )
+    snapshot = (conversation_run.config_json or {}).get("agentRuntimeSnapshot")
+    plan_lineage = (conversation_run.trajectory_json or {}).get("planLineage", {})
     browser_evidence = []
     for action in (conversation_run.trajectory_json or {}).get("actions", []):
         observations = action.get("observations") or {}
@@ -1900,14 +1753,15 @@ def summarize_run(
                 {
                     "callId": action.get("callId"),
                     "resultSource": observations.get("resultSource"),
-                    "contentSha256": hashlib.sha256(
-                        result["content"].encode()
-                    ).hexdigest(),
+                    "contentSha256": hashlib.sha256(result["content"].encode()).hexdigest(),
                 }
             )
     return {
         "id": conversation_run.id,
         "conversationId": conversation_run.conversation_id,
+        "executor": {"provider": snapshot.get("provider"), "model": snapshot.get("model")}
+        if snapshot
+        else None,
         "status": conversation_run.status,
         "runType": conversation_run.run_type,
         "input": conversation_run.input_json,

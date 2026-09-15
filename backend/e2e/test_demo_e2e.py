@@ -240,10 +240,10 @@ def test_e2e_3_hybrid_component(stack: DemoStack) -> None:
         assert "llm.call.completed" in _events(client, run["id"])
 
 
-def test_e2e_3b_agent_structured_fallback_for_node_and_presentation(
+def test_e2e_3b_unconfigured_llm_does_not_silently_execute_agent(
     isolated_stack: DemoStack,
 ) -> None:
-    """真实 API/Worker/Agent 子进程：LLM 未配置时两类结构化生成共用冻结 fallback。"""
+    """真实 API/Worker：未配置的 LLM 必须失败，不得隐式切换执行体。"""
 
     with isolated_stack.client() as client:
         component = _component(client, "反馈分类")
@@ -274,26 +274,8 @@ def test_e2e_3b_agent_structured_fallback_for_node_and_presentation(
         )
         assert created.status_code == 202, created.text
         run = poll_run(client, created.json()["id"], timeout=60)
-        assert run["status"] == "succeeded", run
-
-        deadline = time.time() + 30
-        detail = run
-        while time.time() < deadline:
-            detail = client.get(f"/runs/{run['id']}").json()
-            if (detail.get("presentation") or {}).get("status") == "completed":
-                break
-            time.sleep(0.2)
-        assert detail["runtimeSnapshot"]["runtimeUsed"] == "agent_fallback"
-        assert detail["runtimeSnapshot"]["fallbackReason"] == "LLM_RUNTIME_UNCONFIGURED"
-        assert detail["presentation"]["status"] == "completed"
-        assert len(detail["modelUsage"]) == 2
-        assert {
-            item["runtimeUsed"] for item in detail["modelUsage"]
-        } == {"agent_fallback"}
-        assert all(item["complete"] for item in detail["modelUsage"])
-        assert all(item["totalTokens"] == 20 for item in detail["modelUsage"])
-        llm_node = next(node for node in detail["nodes"] if node["type"] == "llm")
-        assert llm_node["metrics"]["toolRequestCount"] == 0
+        assert run["status"] == "failed", run
+        assert run["error"]["code"] == "MODEL_RUNTIME_UNAVAILABLE"
         assert "tool.requested" not in _events(client, run["id"])
 
 

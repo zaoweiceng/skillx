@@ -653,9 +653,7 @@ async def test_approval_gated_fallback_waits_then_recovers() -> None:
             select(ExecutionCheckpoint).where(ExecutionCheckpoint.run_id == run_id)
         )
         assert checkpoint.approval_status == "pending"
-        approval = await session.scalar(
-            select(Approval).where(Approval.run_id == run_id)
-        )
+        approval = await session.scalar(select(Approval).where(Approval.run_id == run_id))
         assert approval is not None
         approval_id = approval.id
         snapshot_digest = approval.snapshot_digest
@@ -737,3 +735,77 @@ async def test_rejected_recovery_keeps_failure_terminal() -> None:
             select(ExecutionCheckpoint).where(ExecutionCheckpoint.run_id == run_id)
         )
         assert checkpoint.approval_status == "rejected"
+
+
+async def test_manual_handoff_freezes_override_and_rejects_duplicate(monkeypatch):
+    from app.application.manual_handoff import request_handoff
+
+    run_id, checkpoint_id = await _seed_failed_run()
+    async with SessionLocal() as session, session.begin():
+        run = await session.get(Run, run_id)
+        run.status = "failed"
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        checkpoint.status = "failed"
+        failed_id = checkpoint.failed_node_run_id
+
+    async def snapshot(session, profile_id):
+        return {"type": "pi", "model": profile_id}
+
+    monkeypatch.setattr("app.application.manual_handoff.agent_snapshot", snapshot)
+    async with SessionLocal() as session, session.begin():
+        checkpoint = await request_handoff(
+            session, run_id, failed_id, "different-model", "改选执行体"
+        )
+        assert checkpoint.status == "pending"
+        assert (
+            checkpoint.snapshot_json["fallbackConfig"]["agentRuntimeSnapshot"]["model"]
+            == "different-model"
+        )
+        assert (await session.get(NodeRun, failed_id)).status == "failed"
+    async with SessionLocal() as session, session.begin():
+        with pytest.raises(ValueError, match="只允许"):
+            await request_handoff(session, run_id, failed_id, "another", "重复请求")
+
+
+async def test_manual_handoff_recovers_legacy_version_without_policy(monkeypatch, traex_stub):
+    from dataclasses import asdict
+
+    from app.application.manual_handoff import request_handoff
+    from app.application.runtime_config import agent_runtime_config
+
+    run_id, checkpoint_id = await _seed_failed_run()
+    async with SessionLocal() as session, session.begin():
+        run = await session.get(Run, run_id)
+        run.status = "failed"
+        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
+        failed_id = checkpoint.failed_node_run_id
+        await session.delete(checkpoint)
+        version = await session.get(WorkflowVersion, run.workflow_version_id)
+        definition = _recovery_workflow()
+        definition["spec"]["nodes"] = [
+            node for node in definition["spec"]["nodes"] if node["id"] != "recovery_agent"
+        ]
+        for node in definition["spec"]["nodes"]:
+            node.pop("fallback", None)
+        version.definition_json = definition
+        version.digest = WorkflowCompiler().compile(definition).digest
+        original_digest = version.digest
+
+    async def snapshot(session, profile_id):
+        return asdict(agent_runtime_config())
+
+    monkeypatch.setattr("app.application.manual_handoff.agent_snapshot", snapshot)
+    async with SessionLocal() as session, session.begin():
+        await request_handoff(session, run_id, failed_id, "fixture", "人工接力历史版本")
+    await RecoveryDriver().poll_once()
+    worker = WorkerService("manual-handoff-test")
+    for _ in range(4):
+        if not await worker.run_once():
+            break
+    async with SessionLocal() as session:
+        run = await session.get(Run, run_id)
+        assert run.status == "succeeded", run.error_json
+        assert (
+            await session.get(WorkflowVersion, run.workflow_version_id)
+        ).digest == original_digest
+        assert (await session.get(NodeRun, failed_id)).status == "failed"

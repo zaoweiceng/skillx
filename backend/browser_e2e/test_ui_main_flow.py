@@ -127,6 +127,10 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
                 assert composer["x"] >= 0
                 assert composer["x"] + composer["width"] <= width
             page.set_viewport_size({"width": 1280, "height": 900})
+            capture_dir = os.environ.get("SKILLX_UI_CAPTURE_DIR")
+            if capture_dir:
+                Path(capture_dir).mkdir(parents=True, exist_ok=True)
+                page.screenshot(path=str(Path(capture_dir) / "chat-light.png"), full_page=True)
             page.get_by_role("button", name="工作流：开启").click()
             expect(
                 page.get_by_role("button", name="工作流：关闭")
@@ -176,14 +180,15 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
                 page.get_by_role("link", name="browser-read-summary.json")
             ).to_be_visible()
             run_id = page.url.rstrip("/").rsplit("/", 1)[-1]
-            live_sequences = [
-                int(value)
-                for value in page.locator(".event-item > span").all_inner_texts()
-            ]
             with stack.client() as client:
                 persisted_events = client.get(
                     f"/runs/{run_id}/events", params={"limit": 500}
                 ).json()
+            expect(page.locator(".event-item > span")).to_have_count(len(persisted_events))
+            live_sequences = [
+                int(value)
+                for value in page.locator(".event-item > span").all_inner_texts()
+            ]
             assert live_sequences == [item["seq"] for item in persisted_events]
             assert live_sequences == list(range(1, len(live_sequences) + 1))
             page.reload()
@@ -230,6 +235,11 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
             expect(page.get_by_role("button", name="切换到亮色主题")).to_be_visible()
             page.reload()
             expect(page.get_by_role("button", name="切换到亮色主题")).to_be_visible()
+
+            if capture_dir:
+                page.goto(f"{frontend_url}/chat")
+                page.wait_for_url("**/chat/*")
+                page.screenshot(path=str(Path(capture_dir) / "chat-dark.png"), full_page=True)
 
             page.goto(f"{frontend_url}/settings")
             expect(

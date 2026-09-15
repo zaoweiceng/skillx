@@ -66,9 +66,7 @@ class TaskCheckpointDriver:
             await self._record_claim_error(handle, exc)
             return True
 
-    async def claim(
-        self, session: AsyncSession
-    ) -> ClaimedTaskCheckpoint | None:
+    async def claim(self, session: AsyncSession) -> ClaimedTaskCheckpoint | None:
         now = utcnow()
         candidate = await session.scalar(
             select(TaskCheckpoint)
@@ -87,9 +85,7 @@ class TaskCheckpointDriver:
         )
         if candidate is None:
             return None
-        chain_generation = int(
-            candidate.snapshot_json.get("continuationGeneration", 0)
-        )
+        chain_generation = int(candidate.snapshot_json.get("continuationGeneration", 0))
         max_generations = get_settings().agent_max_continuation_generations
         if chain_generation >= max_generations:
             next_snapshot = {
@@ -104,8 +100,7 @@ class TaskCheckpointDriver:
                 .where(
                     TaskCheckpoint.id == candidate.id,
                     TaskCheckpoint.status == candidate.status,
-                    TaskCheckpoint.claim_generation
-                    == candidate.claim_generation,
+                    TaskCheckpoint.claim_generation == candidate.claim_generation,
                 )
                 .values(
                     status="terminal",
@@ -156,9 +151,7 @@ class TaskCheckpointDriver:
             token=token,
         )
 
-    async def start_continuation(
-        self, handle: ClaimedTaskCheckpoint
-    ) -> bool:
+    async def start_continuation(self, handle: ClaimedTaskCheckpoint) -> bool:
         async with SessionLocal() as session, session.begin():
             checkpoint = await session.get(TaskCheckpoint, handle.id)
             if (
@@ -173,32 +166,23 @@ class TaskCheckpointDriver:
             if source is None:
                 raise TaskCheckpointError("checkpoint source ConversationRun 不存在")
             self._verify_checkpoint(checkpoint, source)
-            plan_snapshot = await self._load_plan_snapshot(
-                session, checkpoint, source.id
-            )
-            completed = await self._load_completed_outputs(
-                session, checkpoint, source.id
-            )
-            failed = await self._load_failed_output(
-                session, checkpoint, source.id
-            )
+            plan_snapshot = await self._load_plan_snapshot(session, checkpoint, source.id)
+            completed = await self._load_completed_outputs(session, checkpoint, source.id)
+            failed = await self._load_failed_output(session, checkpoint, source.id)
             completed_by_signature = {
                 str(item.get("actionSignature")): item
                 for item in completed
                 if item.get("actionSignature")
             }
             completed_action_ledger = []
-            for item in checkpoint.snapshot_json.get(
-                "completedActionLedger", []
-            ):
+            for item in checkpoint.snapshot_json.get("completedActionLedger", []):
                 saved = completed_by_signature.get(str(item.get("signature")))
                 completed_action_ledger.append(
                     {
                         **item,
                         **(
                             {"result": saved.get("output")}
-                            if isinstance(saved, dict)
-                            and isinstance(saved.get("output"), dict)
+                            if isinstance(saved, dict) and isinstance(saved.get("output"), dict)
                             else {}
                         ),
                     }
@@ -222,71 +206,44 @@ class TaskCheckpointDriver:
                 allowed_capabilities=allowed,
                 max_duration_seconds=source_config.max_duration_seconds,
             )
-            source_generation = int(
-                checkpoint.snapshot_json.get("continuationGeneration", 0)
-            )
+            source_generation = int(checkpoint.snapshot_json.get("continuationGeneration", 0))
             max_generations = get_settings().agent_max_continuation_generations
             if source_generation >= max_generations:
-                raise TaskCheckpointError(
-                    "continuation generation budget 已耗尽"
-                )
-            step_states = dict(
-                checkpoint.snapshot_json.get("stepStates", {})
-            )
-            step_attempts = dict(
-                checkpoint.snapshot_json.get("stepAttempts", {})
-            )
+                raise TaskCheckpointError("continuation generation budget 已耗尽")
+            step_states = dict(checkpoint.snapshot_json.get("stepStates", {}))
+            step_attempts = dict(checkpoint.snapshot_json.get("stepAttempts", {}))
             remaining_step_ids = [
                 str(item.get("id"))
-                for item in (
-                    checkpoint.snapshot_json.get("remainingPlan", {}).get(
-                        "steps", []
-                    )
-                )
+                for item in (checkpoint.snapshot_json.get("remainingPlan", {}).get("steps", []))
                 if item.get("id")
             ]
             step_outputs = {
                 str(item["planStepId"]): dict(item["output"])
                 for item in completed
-                if item.get("planStepId")
-                and isinstance(item.get("output"), dict)
+                if item.get("planStepId") and isinstance(item.get("output"), dict)
             }
             artifact_outputs = {
-                str(item["artifactId"]): item
-                for item in completed
-                if item.get("artifactId")
+                str(item["artifactId"]): item for item in completed if item.get("artifactId")
             }
-            replan_budget = dict(
-                checkpoint.snapshot_json.get("replanBudget") or {}
-            )
+            replan_budget = dict(checkpoint.snapshot_json.get("replanBudget") or {})
             max_revisions = int(replan_budget.get("maxRevisions", 1))
             used_revisions = int(replan_budget.get("usedRevisions", 0))
-            remaining_revisions = int(
-                replan_budget.get("remainingRevisions", 1)
-            )
+            remaining_revisions = int(replan_budget.get("remainingRevisions", 1))
             if (
                 min(max_revisions, used_revisions, remaining_revisions) < 0
                 or used_revisions + remaining_revisions != max_revisions
             ):
-                raise TaskCheckpointError(
-                    "checkpoint replan revision budget 不一致"
-                )
+                raise TaskCheckpointError("checkpoint replan revision budget 不一致")
             expected_plan_contract = {
                 "planSnapshot": plan_snapshot,
-                "planDigest": (
-                    checkpoint.snapshot_json.get("planSnapshot") or {}
-                ).get("digest"),
-                "revision": (
-                    checkpoint.snapshot_json.get("planSnapshot") or {}
-                ).get("revision"),
+                "planDigest": (checkpoint.snapshot_json.get("planSnapshot") or {}).get("digest"),
+                "revision": (checkpoint.snapshot_json.get("planSnapshot") or {}).get("revision"),
                 "allowedRemainingStepIds": remaining_step_ids,
                 "sourceCheckpointId": checkpoint.id,
                 "stepStates": step_states,
                 "stepAttempts": step_attempts,
                 "stepStateDigest": digest_json(step_states),
-                "originalInput": {
-                    "message": source.input_json.get("message", "")
-                },
+                "originalInput": {"message": source.input_json.get("message", "")},
                 "stepOutputs": step_outputs,
                 "artifactOutputs": artifact_outputs,
                 "continuationGeneration": source_generation + 1,
@@ -301,9 +258,7 @@ class TaskCheckpointDriver:
                 "reportedError": checkpoint.snapshot_json.get("reportedError"),
                 "effectiveError": checkpoint.snapshot_json.get("effectiveError"),
                 "completedOutputs": completed,
-                "completedPlanSteps": checkpoint.snapshot_json.get(
-                    "completedSteps", []
-                ),
+                "completedPlanSteps": checkpoint.snapshot_json.get("completedSteps", []),
                 "failedOutput": failed,
                 "completedActionLedger": completed_action_ledger,
                 "remainingPlan": checkpoint.snapshot_json.get("remainingPlan"),
@@ -341,6 +296,7 @@ class TaskCheckpointDriver:
                 config=config,
                 prompt=prompt,
                 turn_id=source.turn_id,
+                runtime_snapshot=source.config_json.get("agentRuntimeSnapshot"),
             )
             continuation.input_json = {
                 **continuation.input_json,
@@ -351,9 +307,7 @@ class TaskCheckpointDriver:
                 ),
                 "completedActionLedger": completed_action_ledger,
                 "continuationGeneration": source_generation + 1,
-                "sourcePlanSnapshot": checkpoint.snapshot_json.get(
-                    "planSnapshot"
-                ),
+                "sourcePlanSnapshot": checkpoint.snapshot_json.get("planSnapshot"),
                 "expectedPlanContract": expected_plan_contract,
             }
             continuation_message = Message(
@@ -367,8 +321,7 @@ class TaskCheckpointDriver:
                     "conversationRunId": continuation.id,
                     "runType": "agent_run",
                     "text": (
-                        f"已创建第 {source_generation + 1} 代失败接力，"
-                        "将从已冻结的剩余计划继续。"
+                        f"已创建第 {source_generation + 1} 代失败接力，将从已冻结的剩余计划继续。"
                     ),
                     "sourceRunId": source.id,
                     "rootSourceRunId": source.input_json.get(
@@ -497,9 +450,7 @@ class TaskCheckpointDriver:
                     TaskCheckpoint.source_id == continuation.id,
                 )
             )
-        next_status = (
-            "succeeded" if continuation.status == "succeeded" else "failed"
-        )
+        next_status = "succeeded" if continuation.status == "succeeded" else "failed"
         continuation_error = (
             continuation.error_json
             if continuation.status == "failed"
@@ -515,16 +466,8 @@ class TaskCheckpointDriver:
             **checkpoint.snapshot_json,
             "continuationStatus": continuation.status,
             "continuationOutputDigest": digest_json(continuation.output_json),
-            **(
-                {"continuationError": continuation_error}
-                if continuation_error is not None
-                else {}
-            ),
-            **(
-                {"childCheckpointId": child_checkpoint.id}
-                if child_checkpoint is not None
-                else {}
-            ),
+            **({"continuationError": continuation_error} if continuation_error is not None else {}),
+            **({"childCheckpointId": child_checkpoint.id} if child_checkpoint is not None else {}),
         }
         reconciled = await session.execute(
             update(TaskCheckpoint)
@@ -560,11 +503,7 @@ class TaskCheckpointDriver:
             },
         )
         if child_checkpoint is not None:
-            next_generation = int(
-                continuation.input_json.get(
-                    "continuationGeneration", 0
-                )
-            )
+            next_generation = int(continuation.input_json.get("continuationGeneration", 0))
             child_snapshot = {
                 **child_checkpoint.snapshot_json,
                 "continuationGeneration": next_generation,
@@ -584,9 +523,7 @@ class TaskCheckpointDriver:
     ) -> None:
         source_payload = checkpoint.snapshot_json.get("sourceEvidence")
         if not isinstance(source_payload, dict):
-            raise TaskCheckpointError(
-                "旧 checkpoint 缺少 sourceEvidence，必须 replan"
-            )
+            raise TaskCheckpointError("旧 checkpoint 缺少 sourceEvidence，必须 replan")
         if (
             source_payload.get("kind") != "conversation_run"
             or source_payload.get("id") != source.id
@@ -610,17 +547,13 @@ class TaskCheckpointDriver:
         source_run_id: str,
     ) -> dict[str, Any] | None:
         plan_ref = checkpoint.snapshot_json.get("planSnapshot")
-        mode = (
-            checkpoint.snapshot_json.get("remainingPlan") or {}
-        ).get("mode")
+        mode = (checkpoint.snapshot_json.get("remainingPlan") or {}).get("mode")
         if not isinstance(plan_ref, dict):
             if mode == "replan_required":
                 answer = checkpoint.snapshot_json.get("userAnswer")
                 if isinstance(answer, dict) and answer.get("continue") is True:
                     return None
-                raise TaskCheckpointError(
-                    "checkpoint 标记为 replan_required，未获人工确认"
-                )
+                raise TaskCheckpointError("checkpoint 标记为 replan_required，未获人工确认")
             raise TaskCheckpointError("checkpoint 缺少 PlanSnapshot")
         artifact = await session.get(Artifact, plan_ref.get("id"))
         if (
@@ -629,15 +562,10 @@ class TaskCheckpointDriver:
             or artifact.kind != "agent_plan_snapshot"
             or artifact.sha256 != plan_ref.get("sha256")
             or artifact.size != plan_ref.get("bytes")
-            or artifact.metadata_json.get("planDigest")
-            != plan_ref.get("digest")
+            or artifact.metadata_json.get("planDigest") != plan_ref.get("digest")
         ):
             raise TaskCheckpointError("checkpoint PlanSnapshot Artifact 关联错误")
-        root = (
-            get_settings().artifact_root
-            / "conversation-agents"
-            / source_run_id
-        ).resolve()
+        root = (get_settings().artifact_root / "conversation-agents" / source_run_id).resolve()
         try:
             path = safe_artifact_path(
                 root,
@@ -645,20 +573,14 @@ class TaskCheckpointDriver:
                 forbidden_root=root / ".staging",
             )
         except ArtifactPathError as exc:
-            raise TaskCheckpointError(
-                "checkpoint PlanSnapshot Artifact 路径越界"
-            ) from exc
+            raise TaskCheckpointError("checkpoint PlanSnapshot Artifact 路径越界") from exc
         if not artifact_record_matches(path, artifact):
-            raise TaskCheckpointError(
-                "checkpoint PlanSnapshot Artifact 不存在或已损坏"
-            )
+            raise TaskCheckpointError("checkpoint PlanSnapshot Artifact 不存在或已损坏")
         try:
             payload = json.loads(path.read_bytes())
             AgentPlanSnapshot.model_validate(payload)
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-            raise TaskCheckpointError(
-                "checkpoint PlanSnapshot 内容非法"
-            ) from exc
+            raise TaskCheckpointError("checkpoint PlanSnapshot 内容非法") from exc
         if digest_json(payload) != plan_ref.get("digest"):
             raise TaskCheckpointError("checkpoint PlanSnapshot digest 不一致")
         return payload
@@ -692,9 +614,7 @@ class TaskCheckpointDriver:
         checkpoint: TaskCheckpoint,
         source_run_id: str,
     ) -> dict[str, Any] | None:
-        artifact_ref = checkpoint.snapshot_json.get("failedAction", {}).get(
-            "artifact"
-        )
+        artifact_ref = checkpoint.snapshot_json.get("failedAction", {}).get("artifact")
         if not isinstance(artifact_ref, dict):
             return checkpoint.snapshot_json.get("failedAction")
         envelope = await TaskCheckpointDriver._load_artifact_envelope(
@@ -717,15 +637,10 @@ class TaskCheckpointDriver:
             or artifact.conversation_run_id != source_run_id
             or artifact.kind != "tool_result"
             or artifact.sha256 != artifact_ref.get("sha256")
-            or artifact.metadata_json.get("evidenceDigest")
-            != artifact_ref.get("evidenceDigest")
+            or artifact.metadata_json.get("evidenceDigest") != artifact_ref.get("evidenceDigest")
         ):
             raise TaskCheckpointError("checkpoint ToolResult Artifact 关联错误")
-        root = (
-            get_settings().artifact_root
-            / "conversation-agents"
-            / source_run_id
-        ).resolve()
+        root = (get_settings().artifact_root / "conversation-agents" / source_run_id).resolve()
         try:
             path = safe_artifact_path(
                 root,
@@ -733,16 +648,10 @@ class TaskCheckpointDriver:
                 forbidden_root=root / ".staging",
             )
         except ArtifactPathError as exc:
-            raise TaskCheckpointError(
-                "checkpoint ToolResult Artifact 路径越界"
-            ) from exc
+            raise TaskCheckpointError("checkpoint ToolResult Artifact 路径越界") from exc
         if not artifact_record_matches(path, artifact):
-            raise TaskCheckpointError(
-                "checkpoint ToolResult Artifact 不存在或已损坏"
-            )
+            raise TaskCheckpointError("checkpoint ToolResult Artifact 不存在或已损坏")
         try:
             return json.loads(path.read_bytes())
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise TaskCheckpointError(
-                "checkpoint ToolResult Artifact 内容非法"
-            ) from exc
+            raise TaskCheckpointError("checkpoint ToolResult Artifact 内容非法") from exc

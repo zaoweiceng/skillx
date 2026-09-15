@@ -11,11 +11,9 @@ from typing import Any, Protocol
 
 import httpx
 
-from app.application.runtime_config import agent_runtime_config
-
-
-class AdapterError(RuntimeError):
-    pass
+from app.application.runtime_config import AgentRuntimeConfig, agent_runtime_config
+from app.runtime.agent_contracts import AdapterError as AdapterError
+from app.runtime.agent_contracts import AgentRunRequest as AgentRunRequest
 
 
 @dataclass(frozen=True)
@@ -272,31 +270,26 @@ class StdioMCPGateway:
         return result
 
 
-@dataclass(frozen=True)
-class AgentRunRequest:
-    prompt: str
-    working_directory: Path
-    output_schema: dict[str, Any] = field(default_factory=dict)
-    allowed_tools: list[str] = field(default_factory=list)
-    tool_descriptors: list[dict[str, Any]] = field(default_factory=list)
-    max_steps: int = 8
-    max_tokens: int = 1250000
-    max_input_tokens: int = 1000000
-    max_output_tokens: int = 250000
-    max_billable_tokens: int = 1250000
 
 
-class TraeXSubprocessAdapter:
-    def __init__(self, command: list[str], allowed_executables: set[str]) -> None:
+class SubprocessAgentAdapter:
+    def __init__(
+        self, command: list[str], allowed_executables: set[str],
+        runtime: AgentRuntimeConfig | None = None,
+    ) -> None:
         if not command or Path(command[0]).name not in allowed_executables:
-            raise AdapterError("TraeX 命令不在白名单")
+            raise AdapterError("Agent 命令不在白名单")
         self.command = command
+        self._runtime = runtime
         self._processes: dict[str, asyncio.subprocess.Process] = {}
+
+    def extra_arguments(self, request: AgentRunRequest) -> list[str]:
+        return []
 
     async def events(self, run_id: str, request: AgentRunRequest) -> AsyncIterator[dict[str, Any]]:
         working_directory = request.working_directory.resolve()
         working_directory.mkdir(parents=True, exist_ok=True)
-        runtime = agent_runtime_config()
+        runtime = self._runtime or agent_runtime_config()
         provider_environment = {
             "SKILLX_AGENT_ENDPOINT": runtime.endpoint or "",
             "SKILLX_AGENT_MODEL": runtime.model or "",
@@ -310,6 +303,7 @@ class TraeXSubprocessAdapter:
             provider_environment[runtime.api_key_env] = api_key
         process = await asyncio.create_subprocess_exec(
             *self.command,
+            *self.extra_arguments(request),
             "--prompt",
             request.prompt,
             "--max-steps",
@@ -328,7 +322,13 @@ class TraeXSubprocessAdapter:
         )
         self._processes[run_id] = process
         if not process.stdout:
-            raise AdapterError("TraeX stdout 不可用")
+            raise AdapterError("Agent stdout 不可用")
+        async def drain_stderr() -> None:
+            if process.stderr is not None:
+                while await process.stderr.read(4096):
+                    pass
+
+        stderr_task = asyncio.create_task(drain_stderr())
         try:
             async for line in process.stdout:
                 try:
@@ -338,7 +338,7 @@ class TraeXSubprocessAdapter:
                 yield event
             code = await process.wait()
             if code != 0:
-                raise AdapterError(f"TraeX 进程退出码: {code}")
+                raise AdapterError(f"Agent 进程退出码: {code}")
         finally:
             if process.returncode is None:
                 process.terminate()
@@ -346,6 +346,9 @@ class TraeXSubprocessAdapter:
                     await asyncio.wait_for(process.wait(), timeout=5)
                 except TimeoutError:
                     process.kill()
+                    await process.wait()
+            stderr_task.cancel()
+            await asyncio.gather(stderr_task, return_exceptions=True)
             self._processes.pop(run_id, None)
 
     async def send_tool_result(
@@ -355,7 +358,7 @@ class TraeXSubprocessAdapter:
 
         process = self._processes.get(run_id)
         if process is None or process.returncode is not None or process.stdin is None:
-            raise AdapterError("TraeX stdin 不可用，无法回送 ToolResult")
+            raise AdapterError("Agent stdin 不可用，无法回送 ToolResult")
         process.stdin.write(
             json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()
             + b"\n"
@@ -371,3 +374,7 @@ class TraeXSubprocessAdapter:
             await asyncio.wait_for(process.wait(), timeout=5)
         except TimeoutError:
             process.kill()
+            await process.wait()
+
+
+TraeXSubprocessAdapter = SubprocessAgentAdapter

@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
 from app.application.compiler import digest_json
 from app.application.expressions import ExpressionError, resolve_mapping
+from app.application.recovery_context import relevant_checkpoint_values
 from app.application.security import redact
 from app.config import get_settings
 from app.domain.workflow import NON_RECOVERABLE_ERROR_CODES, NodeType, WorkflowDefinition
@@ -140,6 +141,9 @@ async def build_checkpoint(
         if target is not None:
             fallback_config = {
                 "target": fallback.target,
+                "agentRuntimeSnapshot": (run.runtime_snapshot_json or {}).get(
+                    "nodeProfiles", {}
+                ).get(fallback.target, {}).get("agentConfig"),
                 "allowedCapabilities": target.config.get("allowedCapabilities", []),
                 "maxSteps": target.config.get("maxSteps", 4),
                 "maxTotalTokens": target.config.get("maxTotalTokens", 20000),
@@ -265,7 +269,9 @@ def build_recovery_prompt(checkpoint: ExecutionCheckpoint) -> str:
 
     snapshot = checkpoint.snapshot_json
     failed = snapshot.get("failedNode", {})
+    completed_outputs, relevant_input = relevant_checkpoint_values(snapshot)
     context = {
+        "recoveryAttempt": checkpoint.claim_generation,
         "failedNode": {
             "nodeId": failed.get("nodeId"),
             "type": failed.get("type"),
@@ -275,14 +281,14 @@ def build_recovery_prompt(checkpoint: ExecutionCheckpoint) -> str:
             "outcomeCertainty": failed.get("outcomeCertainty"),
         },
         # 已完成节点的实际输出值（脱敏）：Agent 可据此计算替代输出。
-        "completedOutputs": redact(snapshot.get("completedOutputs", {})),
+        "completedOutputs": redact(completed_outputs),
         "remainingSubgraph": snapshot.get("remainingSubgraph", []),
         "remainingNodes": snapshot.get("remainingNodes", []),
         "remainingEdges": snapshot.get("remainingEdges", []),
         "capabilityLocks": snapshot.get("capabilityLocks", []),
         "outputContract": snapshot.get("outputContract"),
         "userAnswer": redact(snapshot.get("userAnswer")),
-        "runInput": redact(snapshot.get("runInput", {})),
+        "runInput": redact(relevant_input),
     }
     context = _bounded_recovery_context(context)
     return (
@@ -318,50 +324,10 @@ def _bounded_recovery_context(context: dict[str, Any]) -> dict[str, Any]:
     encoded = json.dumps(context, ensure_ascii=False, sort_keys=True).encode()
     if len(encoded) <= 24_000:
         return context
-    output_contract = context.get("outputContract", {})
-    properties = (
-        output_contract.get("properties", {})
-        if isinstance(output_contract, dict)
-        else {}
+    raise RecoveryError(
+        "CONTEXT_BUDGET_EXCEEDED",
+        "恢复所需上下文超过预算；未截断输出契约，请减少相关输入后重试",
     )
-    return {
-        **context,
-        "failedNode": {
-            **context.get("failedNode", {}),
-            "input": _prompt_summary(context.get("failedNode", {}).get("input")),
-        },
-        "completedOutputs": {
-            node_id: (
-                value
-                if isinstance(value, dict) and "summary" in value
-                else {"summary": {"digest": digest_json(value)}}
-            )
-            for node_id, value in context.get("completedOutputs", {}).items()
-        },
-        "outputContract": {
-            "required": output_contract.get("required", [])
-            if isinstance(output_contract, dict)
-            else [],
-            "properties": {
-                key: {"type": item.get("type", "unknown")}
-                for key, item in properties.items()
-                if isinstance(item, dict)
-            },
-        },
-        "runInput": _prompt_summary(context.get("runInput")),
-        "contextTruncated": True,
-    }
-
-
-def _prompt_summary(value: Any) -> Any:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True).encode()
-    if len(encoded) <= 4_096:
-        return value
-    return {
-        "type": type(value).__name__,
-        "bytes": len(encoded),
-        "digest": digest_json(value),
-    }
 
 
 def parse_recovery_decision(raw: dict[str, Any]) -> dict[str, Any]:
@@ -427,12 +393,17 @@ async def run_recovery_agent(
     """
 
     settings = get_settings()
-    host = host or AgentHost()
+    from app.application.runtime_profiles import restore_agent_snapshot
+
+    host = host or AgentHost(runtime=restore_agent_snapshot(
+        fallback_config.get("agentRuntimeSnapshot")
+    ))
+    attempt_id = str(uuid4())
     request = AgentHostRequest(
-        run_id=f"recovery-{checkpoint.id}",
+        run_id=f"recovery-{checkpoint.id}-{attempt_id}",
         prompt=build_recovery_prompt(checkpoint),
         output_schema=RECOVERY_DECISION_SCHEMA,
-        working_directory=settings.artifact_root / "recovery" / checkpoint.id,
+        working_directory=settings.artifact_root / "recovery" / checkpoint.id / attempt_id,
         requested_capabilities=tuple(fallback_config.get("allowedCapabilities", [])),
         max_steps=int(fallback_config.get("maxSteps", 4)),
         max_total_tokens=max(

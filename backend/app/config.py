@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     llm_model: str | None = None
     llm_api_key_env: str = "SKILLX_LLM_API_KEY"
     agent_runtime_type: Literal[
+        "pi",
         "traex_builtin",
         "traex_managed",
         "openai_sidecar",

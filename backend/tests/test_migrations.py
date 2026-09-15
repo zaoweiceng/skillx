@@ -94,7 +94,7 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
         component_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(components)")
         }
-    assert revision == ("0023",)
+    assert revision == ("0024",)
     assert {
         "runs",
         "capability_versions",

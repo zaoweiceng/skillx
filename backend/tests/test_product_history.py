@@ -210,7 +210,7 @@ async def test_template_presentation_is_persisted_without_changing_run_output() 
     assert not await PresentationDriver().poll_once()
 
 
-async def test_llm_presentation_uses_same_agent_fallback_snapshot(
+async def test_llm_presentation_unavailable_does_not_switch_agent(
     monkeypatch,
 ) -> None:
     settings = get_settings()
@@ -271,10 +271,9 @@ async def test_llm_presentation_uses_same_agent_fallback_snapshot(
             select(ModelUsage).where(ModelUsage.presentation_id == presentation.id)
         )
     assert presentation is not None
-    assert presentation.status == "completed"
-    assert usage is not None
-    assert usage.runtime_used == "agent_fallback"
-    assert usage.fallback_reason == "LLM_RUNTIME_UNCONFIGURED"
+    assert presentation.status == "failed"
+    assert presentation.error_json["code"] == "MODEL_RUNTIME_UNAVAILABLE"
+    assert usage is None
 
 
 async def test_run_history_filters_on_server() -> None:
