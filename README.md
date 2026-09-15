@@ -4,6 +4,8 @@ SkillX Workflow 是一个契约驱动的可视化工作流平台。首次任务�
 探索，稳定任务发布为不可变工作流版本，并由独立 Worker 持久化执行。模型只在
 显式的 LLM/Agent 节点介入。
 
+执行体配置、Pi 安装和失败接力见 [运行时适配器说明](docs/runtime-adapters.md)。
+
 ## 能力状态
 
 | 能力 | 状态 | 说明 |
@@ -148,7 +150,7 @@ npm run build
 - `make traex-real-check`：执行真实 PATH `traex` 探测；未安装或登录失效只报告
   skipped/blocked，绝不以 fixture 替代。
 - `make traex-real-product-check`：在全新 SQLite、独立 API/Worker 中验证真实 TraeX 的
-  workflow-on、workflow-off 与运行中取消；未显式执行时不计作通过。
+  workflow-on、workflow-off、运行中取消、固化发布复用及检查点恢复；未显式执行时不计作通过。
 
 测试覆盖双 Worker fencing/CAS、原子并发配额、取消、超时、并行汇聚、SkillX 版本锁定、
 MCP STDIO/HTTP 与契约漂移、Hybrid/真实 TraeX Agent、轨迹固化与发布复用、浏览器一次性
