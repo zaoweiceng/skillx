@@ -28,7 +28,10 @@ class AgentAdapterRegistry:
 
 def default_agent_registry() -> AgentAdapterRegistry:
     registry = AgentAdapterRegistry()
-    registry.register("traex_builtin", lambda runtime: TraeXBuiltinAdapter(list(runtime.command)))
+    registry.register(
+        "traex_builtin",
+        lambda runtime: TraeXBuiltinAdapter(list(runtime.command), model=runtime.model),
+    )
     for kind in ("traex_managed", "openai_sidecar", "fixture"):
         registry.register(
             kind,

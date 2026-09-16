@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.runtime_profiles import agent_snapshot, list_profiles, save_profile
 from app.infrastructure.database import Conversation, RuntimeProfile, get_session
+from app.runtime.traex_models import list_traex_models, validate_traex_model
 
 router = APIRouter(prefix="/runtime-profiles", tags=["Runtime profiles"])
 
@@ -17,7 +18,7 @@ class ProfileConfig(BaseModel):
     adapter: Literal["traex", "pi"] | None = None
     modelProfileId: str | None = None
     baseUrl: str | None = Field(default=None, pattern=r"^https?://[^\s]+$")
-    model: str | None = None
+    model: str | None = Field(default=None, min_length=1, max_length=200)
     timeoutSeconds: float = Field(default=60, ge=1, le=600)
     apiKeyEnv: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     structuredMode: Literal["json_schema", "json_object", "prompt"] = "json_schema"
@@ -62,6 +63,8 @@ async def listing(session: AsyncSession = Depends(get_session)) -> list[dict[str
 
 async def persist(body: ProfileInput, session: AsyncSession, profile_id: str | None = None):
     try:
+        if body.kind == "agent" and body.config.adapter == "traex":
+            await validate_traex_model(body.config.model)
         item = await save_profile(
             session,
             profile_id=profile_id,
@@ -89,7 +92,9 @@ async def edit(profile_id: str, body: ProfileInput, session: AsyncSession = Depe
 
 
 class Selection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     agentProfileId: str | None = None
+    traexModel: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 @router.get("/conversations/{conversation_id}")
@@ -97,7 +102,7 @@ async def get_selection(conversation_id: str, session: AsyncSession = Depends(ge
     conversation = await session.get(Conversation, conversation_id)
     if conversation is None:
         raise HTTPException(404, "对话不存在")
-    return {"agentProfileId": conversation.agent_profile_id}
+    return {"agentProfileId": conversation.agent_profile_id, "traexModel": conversation.traex_model}
 
 
 @router.put("/conversations/{conversation_id}")
@@ -110,12 +115,14 @@ async def select_agent(
     if conversation is None:
         raise HTTPException(404, "对话不存在")
     try:
-        await agent_snapshot(session, body.agentProfileId)
+        await validate_traex_model(body.traexModel)
+        await agent_snapshot(session, body.agentProfileId, body.traexModel)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     conversation.agent_profile_id = body.agentProfileId
+    conversation.traex_model = body.traexModel
     await session.commit()
-    return {"agentProfileId": conversation.agent_profile_id}
+    return {"agentProfileId": conversation.agent_profile_id, "traexModel": conversation.traex_model}
 
 
 @router.post("/{profile_id}/probe")
@@ -173,3 +180,12 @@ async def probe(profile_id: str, session: AsyncSession = Depends(get_session)):
         current.probe_json = result
         await session.commit()
     return result
+
+
+@router.get("/traex/models")
+async def traex_models():
+    try:
+        return await list_traex_models()
+    except (ValueError, OSError) as exc:
+        detail = str(exc) if isinstance(exc, ValueError) else "无法启动 TraeX 模型查询"
+        raise HTTPException(503, detail) from exc

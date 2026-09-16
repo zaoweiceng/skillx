@@ -105,3 +105,28 @@ async def test_pi_default_requires_verified_current_configuration():
                 is_default=True,
                 active=True,
             )
+
+
+async def test_traex_conversation_model_is_frozen_and_not_shared(monkeypatch):
+    monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/traex")
+    async with SessionLocal() as session, session.begin():
+        profile = await save_profile(
+            session, profile_id=None, name="TraeX", kind="agent",
+            config={"adapter": "traex", "model": "profile-model"},
+            is_default=True, active=True,
+        )
+        conversation = Conversation(
+            id=str(uuid4()), title="model selection", agent_profile_id=profile.id,
+            traex_model="first-model",
+        )
+        session.add(conversation)
+        await session.flush()
+        first = await enqueue_agent_run(session, conversation, "first")
+        conversation.traex_model = "second-model"
+        second = await enqueue_agent_run(session, conversation, "second")
+        assert first.config_json["agentRuntimeSnapshot"]["model"] == "first-model"
+        assert second.config_json["agentRuntimeSnapshot"]["model"] == "second-model"
+        assert (await agent_snapshot(session, profile.id))["model"] == "profile-model"
+        conversation.traex_model = None
+        third = await enqueue_agent_run(session, conversation, "third")
+        assert third.config_json["agentRuntimeSnapshot"]["model"] == "profile-model"

@@ -58,7 +58,9 @@ async def save_profile(
     return item
 
 
-async def agent_snapshot(session: AsyncSession, profile_id: str | None) -> dict[str, Any]:
+async def agent_snapshot(
+    session: AsyncSession, profile_id: str | None, traex_model: str | None = None
+) -> dict[str, Any]:
     profile = (
         await session.get(RuntimeProfile, profile_id)
         if profile_id
@@ -71,7 +73,12 @@ async def agent_snapshot(session: AsyncSession, profile_id: str | None) -> dict[
     if profile is None:
         if profile_id:
             raise ValueError("Agent 配置不存在")
-        return asdict(agent_runtime_config())
+        runtime = agent_runtime_config()
+        if traex_model:
+            if runtime.type != "traex_builtin":
+                raise ValueError("仅 TraeX 支持会话模型选择")
+            runtime = replace(runtime, model=traex_model)
+        return asdict(runtime)
     if not profile.active or profile.kind != "agent":
         raise ValueError("Agent 配置不可用")
     config = profile.config_json
@@ -94,12 +101,14 @@ async def agent_snapshot(session: AsyncSession, profile_id: str | None) -> dict[
             provider="traex",
             protocol="traex-cli-jsonl+mcp",
             endpoint=None,
-            model=None,
+            model=traex_model or config.get("model") or None,
             adapter_digest="sha256:" + hashlib.sha256(bridge.read_bytes()).hexdigest(),
             adapter_version="traex-builtin/v1",
             source="profile",
         )
     else:
+        if traex_model:
+            raise ValueError("Pi 模型请在模型服务配置中选择")
         import hashlib
         import shutil
         from pathlib import Path

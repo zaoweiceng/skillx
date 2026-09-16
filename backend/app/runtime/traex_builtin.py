@@ -201,10 +201,11 @@ class TraeXBuiltinAdapter:
 
     supports_tool_descriptors = True
 
-    def __init__(self, command: list[str]) -> None:
+    def __init__(self, command: list[str], model: str | None = None) -> None:
         if not command or Path(command[0]).name != "traex":
             raise TraeXBridgeError("TRAE_NOT_INSTALLED", "未发现受支持的 traex")
         self.command = command
+        self.model = model
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._tool_results: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] = {}
         self._tool_evidence: dict[str, list[dict[str, Any]]] = {}
@@ -285,6 +286,7 @@ class TraeXBuiltinAdapter:
             "plugins={}",
             "-c",
             "skills={}",
+            *(["--model", self.model] if self.model else []),
             *allowed_tools,
             request.prompt,
         ]

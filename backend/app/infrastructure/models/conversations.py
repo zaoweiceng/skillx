@@ -27,6 +27,7 @@ class Conversation(Base, TimestampMixin):
         ForeignKey("components.id"), nullable=True
     )
     agent_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    traex_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     workflow_mode: Mapped[str] = mapped_column(String(16), default="enabled")
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

@@ -65,14 +65,16 @@ async def selected_runtime(request: Request, call_next):
     ):
         return await call_next(request)
     profile_id = None
+    traex_model = None
     parts = request.url.path.split("/")
     async with SessionLocal() as session:
         if len(parts) > 3 and parts[2] == "conversations":
             conversation = await session.get(Conversation, parts[3])
             if conversation is not None:
                 profile_id = conversation.agent_profile_id
+                traex_model = conversation.traex_model
         try:
-            runtime = restore_agent_snapshot(await agent_snapshot(session, profile_id))
+            runtime = restore_agent_snapshot(await agent_snapshot(session, profile_id, traex_model))
         except OperationalError:
             if request.url.path == "/api/health/ready":
                 return await call_next(request)

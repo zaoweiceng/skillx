@@ -302,3 +302,40 @@ def test_real_product_checkpoint_recovery(probed_real_product_stack: DemoStack) 
         assert len(predecessors) == 1 and predecessors[0]["status"] == "succeeded"
         assert detail["checkpoints"][0]["status"] == "applied"
         assert detail["checkpoints"][0]["recoveryNodeRunId"]
+
+
+def test_real_product_selected_model(real_product_stack: DemoStack) -> None:
+    """Discover and select a real model, then exercise the persisted execution path."""
+    with _client(real_product_stack) as client:
+        models = client.get("/runtime-profiles/traex/models")
+        assert models.status_code == 200, models.text
+        choices = models.json()
+        assert choices
+        selected = next(
+            (item["id"] for item in choices if item["id"] == "Doubao-Seed-2.1-Turbo"),
+            choices[0]["id"],
+        )
+        conversation = client.post("/conversations", json={"title": "real-model-choice"}).json()
+        path = f"/runtime-profiles/conversations/{conversation['id']}"
+        response = client.put(
+            path, json={"agentProfileId": "builtin-traex", "traexModel": selected}
+        )
+        assert response.status_code == 200, response.text
+        assert client.get(path).json()["traexModel"] == selected
+        started = client.post(
+            f"/conversations/{conversation['id']}/agent-runs",
+            json={
+                "content": "只用一句中文回复：模型选择已生效。",
+                "allowedCapabilities": ["lookup.table"],
+            },
+        )
+        assert started.status_code == 202, started.text
+        run_id = started.json()["conversationRunId"]
+        # Changing the conversation selection must not alter this already queued run.
+        reset = client.put(path, json={"agentProfileId": "builtin-traex", "traexModel": None})
+        assert reset.status_code == 200, reset.text
+        result = poll_conversation_run(client, run_id, timeout=180)
+        assert result["status"] == "succeeded", result
+        assert result["executor"]["model"] == selected
+        assert result["output"].get("reply"), result
+        print(f"Real TraeX selected model verified: {selected}")

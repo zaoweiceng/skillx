@@ -33,6 +33,7 @@ import sys
 import urllib.request
 
 args = sys.argv[1:]
+assert args[args.index("--model") + 1] == "selected-test-model"
 print(json.dumps({{"type": "thread.started", "thread_id": "test"}}), flush=True)
 print(json.dumps({{"type": "turn.started"}}), flush=True)
 if {fail_auth!r}:
@@ -129,7 +130,7 @@ async def test_builtin_bridge_round_trips_host_tool_result(
     monkeypatch.setattr(get_settings(), "artifact_root", tmp_path)
     executable = _fake_traex(tmp_path)
     result = await AgentHost(
-        adapter=TraeXBuiltinAdapter([str(executable)])
+        adapter=TraeXBuiltinAdapter([str(executable)], model="selected-test-model")
     ).execute(
         AgentHostRequest(
             run_id="builtin-round-trip",
@@ -166,7 +167,7 @@ async def test_builtin_bridge_maps_auth_failure(
     executable = _fake_traex(tmp_path, fail_auth=True)
     with pytest.raises(AgentHostError) as error:
         await AgentHost(
-            adapter=TraeXBuiltinAdapter([str(executable)])
+            adapter=TraeXBuiltinAdapter([str(executable)], model="selected-test-model")
         ).execute(
             AgentHostRequest(
                 run_id="builtin-auth",
