@@ -83,6 +83,8 @@ describe('产品状态页面', () => {
       },
     })
     render(<SettingsPage />)
+    await waitFor(() => expect(screen.getByText('连接诊断与高级信息')).toBeInTheDocument())
+    fireEvent.click(screen.getByText('连接诊断与高级信息'))
     await waitFor(() => expect(screen.getByText('fixture')).toBeInTheDocument())
     expect(screen.getByText(/自动选择不可用/)).toBeInTheDocument()
     expect(screen.getByText(/不参与产品语义选择/)).toBeInTheDocument()

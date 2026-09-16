@@ -1324,6 +1324,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/runtime-profiles/traex/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Traex Models */
+        get: operations["traex_models_api_runtime_profiles_traex_models_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/runs/{run_id}/handoff": {
         parameters: {
             query?: never;
@@ -1687,6 +1704,8 @@ export interface components {
         Selection: {
             /** Agentprofileid */
             agentProfileId?: string | null;
+            /** Traexmodel */
+            traexModel?: string | null;
         };
         /** TaskCheckpointAnswer */
         TaskCheckpointAnswer: {
@@ -4430,6 +4449,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    traex_models_api_runtime_profiles_traex_models_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
         };

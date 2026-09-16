@@ -1566,7 +1566,7 @@ select:focus-visible {
   font-size: 11px;
 }
 
-.chat-composer button {
+.chat-composer > button {
   display: flex;
   min-width: 78px;
   align-items: center;
@@ -1702,8 +1702,7 @@ select:focus-visible {
 .inspector-fields select,
 .inspector-field input,
 .inspector-field textarea,
-.inspector-field select,
-.chat-composer textarea {
+.inspector-field select {
   width: 100%;
   min-height: 36px;
   padding: 8px 10px;

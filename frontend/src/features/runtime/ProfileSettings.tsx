@@ -1,5 +1,8 @@
+import { Alert, Button, Card, Checkbox, Empty, Input, InputNumber, Modal, Select, Space, Tag } from 'antd'
+import { Bot, Plus, ServerCog } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { type Profile, runtimeRequest } from './api'
+import { TraexModelSelect } from './TraexModelSelect'
 import styles from './runtime.module.css'
 
 const empty = { name: '', kind: 'agent' as Profile['kind'], active: true, isDefault: false,
@@ -8,64 +11,75 @@ export function ProfileSettings() {
   const [items, setItems] = useState<Profile[]>([])
   const [draft, setDraft] = useState(empty)
   const [editing, setEditing] = useState('')
+  const [open, setOpen] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [probing, setProbing] = useState<string[]>([])
   const [probes, setProbes] = useState<Record<string, string>>({})
   const refresh = () => runtimeRequest<Profile[]>().then(setItems)
   useEffect(() => { refresh().catch(() => setError('执行配置加载失败')) }, [])
   async function save() {
     setBusy(true); setError('')
     const config = draft.kind === 'agent'
-      ? { adapter: draft.config.adapter, ...(draft.config.adapter === 'pi' ? { modelProfileId: draft.config.modelProfileId } : {}) }
+      ? { adapter: draft.config.adapter, ...(draft.config.adapter === 'pi' ? { modelProfileId: draft.config.modelProfileId } : draft.config.model ? { model: draft.config.model } : {}) }
       : { baseUrl: draft.config.baseUrl, model: draft.config.model, apiKeyEnv: draft.config.apiKeyEnv, structuredMode: draft.config.structuredMode, timeoutSeconds: draft.config.timeoutSeconds }
     try {
       await runtimeRequest(editing ? `/${editing}` : '', editing ? 'PUT' : 'POST', { ...draft, config })
-      await refresh(); setDraft(empty); setEditing('')
+      await refresh(); setOpen(false); setDraft(empty); setEditing('')
     } catch (reason) { setError(reason instanceof Error ? reason.message : '保存失败') }
     finally { setBusy(false) }
   }
   async function probe(id: string) {
-    setProbes(current => ({ ...current, [id]: '探测中…' }))
+    setProbing(current => [...current, id])
     try {
       const result = await runtimeRequest<{ status: string; summary: string }>(`/${id}/probe`, 'POST')
-      setProbes(current => ({ ...current, [id]: result.summary }))
+      setProbes(current => ({ ...current, [id]: result.summary })); await refresh()
     } catch { setProbes(current => ({ ...current, [id]: '探测失败' })) }
+    finally { setProbing(current => current.filter(value => value !== id)) }
   }
-  const field = (name: keyof typeof draft.config, label: string) => <label>{label}<input
+  const field = (name: 'baseUrl' | 'model' | 'apiKeyEnv', label: string, placeholder: string) => <label>{label}<Input required placeholder={placeholder}
     value={draft.config[name]} onChange={event => setDraft({ ...draft, config: { ...draft.config, [name]: event.target.value } })} /></label>
   return <section className={styles.panel}>
-    <h2>模型服务与 Agent</h2>
-    <p>模型服务供直接调用和 Pi 使用；TraeX 使用本机登录及模型配置。</p>
-    {error && <p role="alert">{error}</p>}
-    <div className={styles.list}>{items.map(item => <div key={item.id}>
-      <span>{item.name} · {item.kind === 'model' ? item.config.model : item.config.adapter} {item.isDefault ? '· 默认' : ''} {!item.active ? '· 已停用' : ''}</span>
-      <span role="status">{probes[item.id] ?? item.probe?.summary ?? '未探测'}</span>
-      <button type="button" disabled={!item.active || probes[item.id] === '探测中…'} onClick={() => void probe(item.id)}>测试连接</button>
-      <button type="button" onClick={() => { setEditing(item.id); setDraft({ ...empty, ...item, config: { ...empty.config, ...item.config } }) }}>编辑</button>
-    </div>)}</div>
-    <form onSubmit={event => { event.preventDefault(); void save() }} className={styles.form}>
-      <h3>{editing ? '编辑配置' : '添加配置'}</h3>
-      <label>类型<select value={draft.kind} disabled={!!editing} onChange={event => setDraft({ ...draft, kind: event.target.value as Profile['kind'] })}>
-        <option value="agent">Agent 执行体</option><option value="model">模型服务</option>
-      </select></label>
-      <label>名称<input required value={draft.name} onChange={event => setDraft({ ...draft, name: event.target.value })} /></label>
-      {draft.kind === 'agent' ? <>
-        <label>执行体<select value={draft.config.adapter} onChange={event => setDraft({ ...draft, config: { ...draft.config, adapter: event.target.value as 'pi' | 'traex' } })}>
-          <option value="traex">TraeX</option><option value="pi">Pi</option>
-        </select></label>
-        {draft.config.adapter === 'pi' && <label>模型服务<select required value={draft.config.modelProfileId} onChange={event => setDraft({ ...draft, config: { ...draft.config, modelProfileId: event.target.value } })}>
-          <option value="">请选择模型服务</option>{items.filter(item => item.kind === 'model' && item.active).map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
-        </select></label>}
-      </> : <>{field('baseUrl', 'Base URL')}{field('model', '模型名称')}{field('apiKeyEnv', '密钥环境变量名称')}
-        <label>超时（秒）<input type="number" min={1} max={600} value={draft.config.timeoutSeconds}
-          onChange={event => setDraft({ ...draft, config: { ...draft.config, timeoutSeconds: Number(event.target.value) } })} /></label>
-        <label>结构化输出<select value={draft.config.structuredMode} onChange={event => setDraft({ ...draft, config: { ...draft.config, structuredMode: event.target.value } })}>
-          <option value="json_schema">JSON Schema</option><option value="json_object">JSON Object</option><option value="prompt">提示词约束</option>
-        </select></label></>}
-      <label><input type="checkbox" checked={draft.isDefault} onChange={event => setDraft({ ...draft, isDefault: event.target.checked })} />设为默认</label>
-      <label><input type="checkbox" checked={draft.active} onChange={event => setDraft({ ...draft, active: event.target.checked })} />启用</label>
-      <button className="button primary" disabled={busy}>保存</button>
-      {editing && <button type="button" className="button" onClick={() => { setEditing(''); setDraft(empty) }}>取消编辑</button>}
-    </form>
+    <div className={styles.heading}><div><h2>模型服务与 Agent</h2><p>为不同任务选择执行体与模型，连接一次，随时切换。</p></div>
+      <Button icon={<Plus size={15} />} type="primary" onClick={() => { setDraft(empty); setEditing(''); setError(''); setOpen(true) }}>添加配置</Button></div>
+    {error && !open && <Alert type="error" title={error} showIcon />}
+    {(['agent', 'model'] as const).map(kind => <div key={kind} className={styles.group}>
+      <div className={styles.groupTitle}>{kind === 'agent' ? 'AGENT 执行体' : '模型服务'}<span>{items.filter(item => item.kind === kind).length}</span></div>
+      <div className={styles.cards}>{items.filter(item => item.kind === kind).map(item => <Card key={item.id} size="small" className={styles.card}>
+        <div className={styles.cardHeading}><span className={styles.icon}>{kind === 'agent' ? <Bot size={20} /> : <ServerCog size={20} />}</span>
+          <div><strong>{item.name}</strong><small>{kind === 'model' ? item.config.model : item.config.adapter === 'traex' ? `TraeX · ${item.config.model || '默认模型'}` : 'Pi Agent'}</small></div>
+          {item.isDefault && <Tag>默认</Tag>}</div>
+        <div className={styles.status}><Tag color={!item.active ? 'default' : item.probe?.status === 'available' ? 'success' : item.probe?.status === 'failed' ? 'error' : 'default'}>
+          {!item.active ? '已停用' : item.probe?.status === 'available' ? '可用' : item.probe?.status === 'failed' ? '连接失败' : '未探测'}</Tag>
+          <span role="status">{probing.includes(item.id) ? '正在测试连接…' : probes[item.id] ?? item.probe?.summary ?? '测试连接以验证当前配置'}</span></div>
+        <Space><Button size="small" disabled={!item.active} loading={probing.includes(item.id)} onClick={() => void probe(item.id)}>测试连接</Button>
+          <Button size="small" type="text" onClick={() => { setEditing(item.id); setError(''); setDraft({ ...empty, ...item, config: { ...empty.config, ...item.config } }); setOpen(true) }}>编辑</Button></Space>
+      </Card>)}</div>
+      {!items.some(item => item.kind === kind) && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={kind === 'model' ? '尚未添加模型服务，Pi 和 LLM 直连可在此配置' : '尚未添加 Agent'} />}
+    </div>)}
+    <Modal title={editing ? '编辑配置' : '添加配置'} open={open} footer={null} onCancel={() => { if (!busy) setOpen(false) }} destroyOnHidden>
+      <form onSubmit={event => { event.preventDefault(); void save() }} className={styles.form}>
+        {error && <Alert type="error" title={error} showIcon className={styles.full} />}
+        <label>类型<Select aria-label="配置类型" value={draft.kind} disabled={!!editing} onChange={kind => setDraft({ ...draft, kind })}
+          options={[{ value: 'agent', label: 'Agent 执行体' }, { value: 'model', label: '模型服务' }]} /></label>
+        <label>名称<Input required value={draft.name} onChange={event => setDraft({ ...draft, name: event.target.value })} placeholder="例如：日常任务 Agent" /></label>
+        {draft.kind === 'agent' ? <>
+          <label>执行体<Select aria-label="配置执行体" value={draft.config.adapter} onChange={adapter => setDraft({ ...draft, config: { ...draft.config, adapter, model: '' } })}
+            options={[{ value: 'traex', label: 'TraeX' }, { value: 'pi', label: 'Pi Agent' }]} /></label>
+          {draft.config.adapter === 'pi' ? <label>模型服务<Select aria-label="模型服务" value={draft.config.modelProfileId || undefined} placeholder="请选择模型服务"
+            onChange={modelProfileId => setDraft({ ...draft, config: { ...draft.config, modelProfileId } })}
+            options={items.filter(item => item.kind === 'model' && item.active).map(item => ({ value: item.id, label: item.name }))} /></label>
+            : <label>默认模型<TraexModelSelect value={draft.config.model} onChange={model => setDraft({ ...draft, config: { ...draft.config, model: model ?? '' } })} /></label>}
+          <p className={styles.full}>{draft.config.adapter === 'traex' ? '使用本机 TraeX 登录。这里设置默认模型，对话中可以单独选择。' : '使用平台模型服务，工具调用由 SkillX 管理。'}</p>
+        </> : <>{field('baseUrl', 'Base URL', 'https://api.example.com/v1')}{field('model', '模型名称', '模型 ID')}{field('apiKeyEnv', '密钥环境变量名称', 'SKILLX_LLM_API_KEY')}
+          <label>超时（秒）<InputNumber min={1} max={600} value={draft.config.timeoutSeconds} style={{ width: '100%' }}
+            onChange={value => setDraft({ ...draft, config: { ...draft.config, timeoutSeconds: value ?? 60 } })} /></label>
+          <label>结构化输出<Select value={draft.config.structuredMode} onChange={structuredMode => setDraft({ ...draft, config: { ...draft.config, structuredMode } })}
+            options={[{ value: 'json_schema', label: 'JSON Schema' }, { value: 'json_object', label: 'JSON Object' }, { value: 'prompt', label: '提示词约束' }]} /></label></>}
+        <Space className={styles.full}><Checkbox checked={draft.isDefault} onChange={event => setDraft({ ...draft, isDefault: event.target.checked })}>设为默认</Checkbox>
+          <Checkbox checked={draft.active} onChange={event => setDraft({ ...draft, active: event.target.checked })}>启用</Checkbox></Space>
+        <div className={styles.actions}><Button disabled={busy} onClick={() => setOpen(false)}>取消</Button><Button htmlType="submit" type="primary" loading={busy}>保存</Button></div>
+      </form>
+    </Modal>
   </section>
 }

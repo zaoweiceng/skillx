@@ -1,18 +1,21 @@
+import { lazy, Suspense } from 'react'
+import { Spin } from 'antd'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 
 import AppShell from '@/components/AppShell'
-import CapabilitiesPage from '@/pages/CapabilitiesPage'
+const CapabilitiesPage = lazy(() => import('@/pages/CapabilitiesPage'))
 import ChatPage from '@/pages/ChatPage'
-import ComponentDetailPage from '@/pages/ComponentDetailPage'
-import ComponentsPage from '@/pages/ComponentsPage'
-import RunDetailPage from '@/pages/RunDetailPage'
-import SettingsPage from '@/pages/SettingsPage'
-import WorkflowEditorPage from '@/pages/WorkflowEditorPage'
-import WorkflowsPage from '@/pages/WorkflowsPage'
+const ComponentDetailPage = lazy(() => import('@/pages/ComponentDetailPage'))
+const ComponentsPage = lazy(() => import('@/pages/ComponentsPage'))
+const RunDetailPage = lazy(() => import('@/pages/RunDetailPage'))
+const SettingsPage = lazy(() => import('@/pages/SettingsPage'))
+const WorkflowEditorPage = lazy(() => import('@/pages/WorkflowEditorPage'))
+const WorkflowsPage = lazy(() => import('@/pages/WorkflowsPage'))
 
 export default function App() {
   return (
     <BrowserRouter>
+      <Suspense fallback={<div className="route-loading"><Spin size="large" /></div>}>
       <Routes>
         <Route element={<AppShell />}>
           <Route path="/" element={<Navigate to="/chat" replace />} />
@@ -28,6 +31,7 @@ export default function App() {
           <Route path="*" element={<Navigate to="/chat" replace />} />
         </Route>
       </Routes>
+      </Suspense>
     </BrowserRouter>
   )
 }

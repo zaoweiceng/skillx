@@ -1,3 +1,4 @@
+import { Button } from 'antd'
 import Form from '@rjsf/core'
 import validator from '@rjsf/validator-ajv8'
 import { ArrowLeft, CheckCircle2, Code2, Play, Plus, Save, Send } from 'lucide-react'
@@ -254,18 +255,18 @@ export default function WorkflowEditorPage() {
           <h1>{workflow.name}</h1>
         </div>
         <div className="run-header-actions">
-          <button className="button ghost" onClick={toggleJson} disabled={busy || publishing}>
+          <Button className="button ghost" onClick={toggleJson} disabled={busy || publishing}>
             <Code2 size={15} /> {showJson ? '应用 JSON' : 'JSON 视图'}
-          </button>
-          <button className="button ghost" onClick={save} disabled={busy || publishing}>
+          </Button>
+          <Button className="button ghost" onClick={save} disabled={busy || publishing}>
             <Save size={15} /> 保存
-          </button>
-          <button className="button ghost" onClick={validate} disabled={busy || publishing}>
+          </Button>
+          <Button className="button ghost" onClick={validate} disabled={busy || publishing}>
             <CheckCircle2 size={15} /> 静态检查
-          </button>
-          <button className="button primary" onClick={publish} disabled={busy || publishing}>
+          </Button>
+          <Button className="button primary" onClick={publish} disabled={busy || publishing}>
             <Send size={15} /> {publishing ? '发布中...' : '发布版本'}
-          </button>
+          </Button>
         </div>
       </header>
 
@@ -305,14 +306,14 @@ export default function WorkflowEditorPage() {
             </div>
             <div className="palette-list">
               {PALETTE_NODE_TYPES.map((type) => (
-                <button
+                <Button
                   key={type}
                   className="palette-item"
-                  type="button"
+                  htmlType="button"
                   onClick={() => handleAddNode(type)}
                 >
                   <Plus size={13} /> {type}
-                </button>
+                </Button>
               ))}
             </div>
           </div>
@@ -426,9 +427,9 @@ export default function WorkflowEditorPage() {
               }
               onSubmit={runPublishedVersion}
             >
-              <button className="button primary wide" type="submit" disabled={busy}>
+              <Button className="button primary wide" htmlType="submit" disabled={busy}>
                 <Play size={14} /> 启动已发布版本
-              </button>
+              </Button>
             </Form>
           </aside>
         )}

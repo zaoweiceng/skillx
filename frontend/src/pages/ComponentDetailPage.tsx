@@ -1,3 +1,4 @@
+import { Button } from 'antd'
 import Form from '@rjsf/core'
 import validator from '@rjsf/validator-ajv8'
 import { ArrowLeft, Clock3, Play, ShieldAlert } from 'lucide-react'
@@ -186,10 +187,10 @@ export default function ComponentDetailPage() {
             }
             onSubmit={runComponent}
           >
-            <button className="button primary wide" type="submit" disabled={submitting}>
+            <Button className="button primary wide" htmlType="submit" disabled={submitting}>
               <Play size={15} fill="currentColor" />
               {submitting ? '正在创建运行...' : '启动工作流'}
-            </button>
+            </Button>
           </Form>
           {error && <div className="form-error">{error}</div>}
           <div className="run-notes">
@@ -240,9 +241,9 @@ export default function ComponentDetailPage() {
           </div>
         )}
         {runsCursor && (
-          <button className="button ghost" type="button" onClick={loadMoreRuns}>
+          <Button className="button ghost" htmlType="button" onClick={loadMoreRuns}>
             加载更多
-          </button>
+          </Button>
         )}
       </section>
     </div>

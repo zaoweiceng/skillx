@@ -1,3 +1,4 @@
+import { Button } from 'antd'
 import {
   AlertTriangle,
   ArrowLeft,
@@ -182,12 +183,12 @@ export default function RunDetailPage() {
         <div className="run-header-actions">
           <StatusBadge status={run.status} />
           {!['succeeded', 'failed', 'cancelled'].includes(run.status) && (
-            <button
+            <Button
               className="button danger ghost"
               onClick={() => id && api.cancelRun(id).then(setRun)}
             >
               <Ban size={14} /> 取消运行
-            </button>
+            </Button>
           )}
         </div>
       </header>
@@ -210,12 +211,12 @@ export default function RunDetailPage() {
               )}
             </div>
             <div className="approval-actions">
-              <button className="button primary" onClick={() => decide(approval, true)}>
+              <Button className="button primary" onClick={() => decide(approval, true)}>
                 <Check size={15} /> 确认继续
-              </button>
-              <button className="button danger ghost" onClick={() => decide(approval, false)}>
+              </Button>
+              <Button className="button danger ghost" onClick={() => decide(approval, false)}>
                 <X size={15} /> 拒绝
-              </button>
+              </Button>
             </div>
           </section>
         ))}
@@ -227,9 +228,9 @@ export default function RunDetailPage() {
               <span className="eyebrow">NODE EXECUTION</span>
               <h2>节点状态</h2>
             </div>
-            <button className="icon-button" onClick={refresh} aria-label="刷新">
+            <Button className="icon-button" onClick={refresh} aria-label="刷新">
               <RotateCw size={15} />
-            </button>
+            </Button>
           </div>
           <div className="node-table">
             {(run.nodes ?? []).map((node) => (
@@ -320,19 +321,19 @@ export default function RunDetailPage() {
             <h2>{run.error ? '运行错误' : '结构化结果'}</h2>
             <StatusBadge status={run.status} />
             {run.error && !technicalEvidence && (
-              <button
+              <Button
                 className="button ghost"
-                type="button"
+                htmlType="button"
                 disabled={loadingTechnicalEvidence}
                 onClick={loadTechnicalEvidence}
               >
                 {loadingTechnicalEvidence ? '读取中…' : '查看技术证据'}
-              </button>
+              </Button>
             )}
             {!run.error && (
-              <button
+              <Button
                 className="button ghost"
-                type="button"
+                htmlType="button"
                 onClick={() => void copyResult(JSON.stringify(run.output, null, 2), 'json')}
               >
                 <Copy size={13} />{' '}
@@ -341,7 +342,7 @@ export default function RunDetailPage() {
                   : copyFeedback === 'json:failed'
                     ? '复制失败'
                     : '复制 JSON'}
-              </button>
+              </Button>
             )}
           </div>
           <JsonBlock value={run.error ?? run.output} />
@@ -388,9 +389,9 @@ export default function RunDetailPage() {
               {run.presentation.status}
             </span>
             {run.presentation.text && (
-              <button
+              <Button
                 className="button ghost"
-                type="button"
+                htmlType="button"
                 onClick={() => void copyResult(run.presentation?.text ?? '', 'text')}
               >
                 <Copy size={13} />{' '}
@@ -399,7 +400,7 @@ export default function RunDetailPage() {
                   : copyFeedback === 'text:failed'
                     ? '复制失败'
                     : '复制文本'}
-              </button>
+              </Button>
             )}
           </div>
           {run.presentation.text && (
@@ -475,14 +476,14 @@ export default function RunDetailPage() {
             .map((node) => (
               <div className="mapping-row" key={node.id}>
                 <span className="metric-chip">失败节点 {node.nodeId}</span>
-                <button
+                <Button
                   className="button ghost"
-                  type="button"
+                  htmlType="button"
                   disabled={patching}
                   onClick={() => proposePatch(node.nodeId)}
                 >
                   {patching ? '正在生成补丁草稿...' : '提出补丁草稿'}
-                </button>
+                </Button>
               </div>
             ))}
           {patchDraft && (

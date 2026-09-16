@@ -1,3 +1,4 @@
+import { Button, Input, Skeleton } from 'antd'
 import { ArrowUpRight, Boxes, Gauge, ShieldCheck, Sparkles } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
@@ -6,6 +7,7 @@ import { api, type ComponentSummary } from '@/api/client'
 
 export default function ComponentsPage() {
   const [components, setComponents] = useState<ComponentSummary[]>([])
+  const [query, setQuery] = useState('')
   const [filter, setFilter] = useState<'all' | 'zero_llm' | 'hybrid' | 'agent'>('all')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
@@ -17,10 +19,9 @@ export default function ComponentsPage() {
       .catch((reason: Error) => setError(reason.message))
       .finally(() => setLoading(false))
   }, [])
-  const filtered =
-    filter === 'all'
-      ? components
-      : components.filter((component) => component.executionClass === filter)
+  const filtered = components.filter(component =>
+    (filter === 'all' || component.executionClass === filter) &&
+    `${component.name} ${component.description}`.toLowerCase().includes(query.toLowerCase()))
   const filters = [
     ['all', '全部'],
     ['zero_llm', '零 LLM'],
@@ -43,21 +44,23 @@ export default function ComponentsPage() {
         </div>
       </header>
 
+      <div className="collection-toolbar"><Input.Search aria-label="搜索组件" placeholder="搜索组件名称或描述" allowClear value={query} onChange={event => setQuery(event.target.value)} style={{ maxWidth: 300 }} />
       <div className="filter-strip">
         {filters.map(([value, label]) => (
-          <button
+          <Button
             className={`filter-chip ${filter === value ? 'active' : ''}`}
-            type="button"
+            htmlType="button"
             aria-pressed={filter === value}
             onClick={() => setFilter(value)}
             key={value}
           >
             {label}
-          </button>
+          </Button>
         ))}
       </div>
 
-      {loading && <div className="skeleton-grid" aria-label="加载组件" />}
+      </div>
+      {loading && <Skeleton active paragraph={{ rows: 4 }} aria-label="加载组件" />}
       {error && <div className="error-panel">{error}</div>}
       {!loading && !error && components.length === 0 && (
         <section className="empty-state">
@@ -72,8 +75,8 @@ export default function ComponentsPage() {
       {!loading && !error && components.length > 0 && filtered.length === 0 && (
         <section className="empty-state">
           <Boxes size={30} />
-          <h2>当前分类暂无组件</h2>
-          <p>切换其他执行分类查看已发布组件。</p>
+          <h2>没有匹配的组件</h2>
+          <p>试试其他关键词或执行分类。</p>
         </section>
       )}
       <section className="component-grid">

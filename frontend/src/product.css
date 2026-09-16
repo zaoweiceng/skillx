@@ -1,0 +1,33 @@
+/* Shared product surfaces; feature-specific layout lives beside each feature. */
+body { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif; }
+.page { max-width: 1440px; padding: 36px 40px; }
+.page-header { padding-bottom: 26px; margin-bottom: 28px; border-bottom: 1px solid var(--line-soft); }
+.page-header h1 { font-size: 28px; font-weight: 600; letter-spacing: -.8px; margin-top: 8px; }
+.page-header p { font-size: 13px; line-height: 1.8; max-width: 660px; }
+.eyebrow { font-size: 10px; letter-spacing: 1.4px; color: var(--muted); }
+.header-stat { border: 1px solid var(--line-soft); background: var(--sidebar); border-radius: 12px; padding: 16px; }
+.button { border-radius: 9px; font-size: 13px; min-height: 36px; }
+.component-grid { gap: 20px; }.component-card { border-radius: 16px; border-color: var(--line-soft); padding: 24px; background: var(--panel); box-shadow: 0 2px 4px #00000003; }
+.component-card:hover { border-color: var(--line); box-shadow: 0 10px 32px #00000008; transform: translateY(-2px); }
+.component-card h2 { font-size: 18px; font-weight: 600; margin-top: 24px; }.component-card p { font-size: 13px; line-height: 1.8; }
+.component-icon, .setting-icon { width: 44px; height: 44px; border-radius: 12px; border: 0; background: var(--sidebar); }
+.card-metrics { font-size: 11px; padding-top: 20px; border-color: var(--line-soft); }.mode-tag, .contract-label, .revision-label { border-radius: 6px; font-size: 10px; }
+.filter-strip { gap: 8px; margin-bottom: 24px; }.filter-chip { border-radius: 8px; padding: 8px 16px; font-size: 12px; }
+.filter-chip.active { background: var(--text); color: var(--bg); }
+.workflow-list { border: 1px solid var(--line-soft); border-radius: 16px; overflow: hidden; }.workflow-list-item { padding: 22px; gap: 16px; border-color: var(--line-soft); }.workflow-list-item strong { font-size: 15px; }.workflow-list-item small { font-size: 12px; margin-top: 5px; }
+.setting-card { border-radius: 14px; border-color: var(--line-soft); padding: 22px; }.setting-card h2 { font-size: 15px; }.setting-card p { font-size: 12px; line-height: 1.8; }
+.empty-state { border-radius: 16px; border: 1px dashed var(--line); background: var(--sidebar); padding: 60px 24px; }.empty-state h2 { font-size: 20px; }.empty-state p { font-size: 13px; }
+.error-panel, .notice, .result-panel { border-radius: 10px; }
+.editor-toolbar, .editor-panel, .schema-panel, .run-summary, .run-section { border-radius: 12px; }
+.agent-picker { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }.selection-note { color: var(--muted); font-size: 10px; }
+.model-picker { min-width: 0; }.model-picker-row { display: flex; align-items: center; gap: 2px; }.model-picker-error { color: var(--danger); font-size: 11px; display: block; max-width: 320px; }
+.model-picker-row .ant-btn { min-width: 26px; padding: 2px; background: transparent; color: var(--muted); }
+.ant-select, .ant-input, .ant-input-number { max-width: 100%; }
+.ant-btn > svg { flex-shrink: 0; }
+@media (max-width: 800px) { .page { padding: 24px; }.page-header h1 { font-size: 24px; } }
+@media (max-width: 600px) { .page { padding: 22px 16px; }.page-header { gap: 16px; }.header-stat { display: none; }.workflow-list-item { padding: 16px; }.workflow-list-item .contract-label { display: none; } }
+.collection-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }.collection-toolbar .filter-strip { margin-bottom: 0; }
+.route-loading { min-height: 60vh; display: grid; place-items: center; }
+.capability-overview { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin-bottom: 32px; }.capability-overview .ant-card-body { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 24px; }.capability-overview strong { font-size: 20px; font-weight: 600; }.capability-overview span { display: block; width: 100%; color: var(--muted); font-size: 12px; }.table-secondary { font-size: 11px; color: var(--muted); margin-top: 5px; }.collection-toolbar h2 { font-size: 18px; font-weight: 600; }
+@media (max-width: 600px) { .capability-overview { grid-template-columns: 1fr; gap: 10px; }.capability-overview .ant-card-body { padding: 16px; } }
+.runtime-diagnostics { margin-bottom: 20px; }.runtime-diagnostics-content { color: var(--muted); font-size: 12px; line-height: 1.8; }.runtime-diagnostics-content > span { display: block; margin: 10px 0; }

@@ -1,10 +1,11 @@
+import { useState } from 'react'
+import { Button, Input, Tag } from 'antd'
 import Form from '@rjsf/core'
 import validator from '@rjsf/validator-ajv8'
 import {
   Bot,
   CornerDownLeft,
   History,
-  Link2Off,
   MessageSquareText,
   Plus,
   Workflow,
@@ -17,6 +18,7 @@ import styles from '@/features/chat/chat.module.css'
 import { AgentSelector } from '@/features/runtime/AgentSelector'
 
 export default function ChatPage() {
+  const [runtimePending, setRuntimePending] = useState(false)
   const { turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, workflowMode, workflowSelectionAvailable, switchingMode, clock, optimisticStartedAt, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill } = useConversation()
 
   // 候选卡片绑定产生它的用户消息：取该助手消息之前最近的一条用户消息文本，
@@ -58,21 +60,21 @@ export default function ChatPage() {
             onSubmit={() => startComponent(message)}
           >
             <div className="candidate-actions">
-              <button
+              <Button
                 className="button primary"
-                type="submit"
+                htmlType="submit"
                 disabled={confirming === message.id || !content.candidateSnapshotDigest}
               >
                 {confirming === message.id ? '正在启动...' : '使用该组件'}
-              </button>
-              <button
+              </Button>
+              <Button
                 className="button ghost"
-                type="button"
+                htmlType="button"
                 disabled={startingAgent || !sourcePrompt}
                 onClick={() => startAgent(sourcePrompt)}
               >
                 {startingAgent ? '正在启动 Agent...' : '继续通用 Agent'}
-              </button>
+              </Button>
             </div>
           </Form>
         )}
@@ -197,9 +199,9 @@ export default function ChatPage() {
           {checkpoint && renderContinuationLineage(checkpoint)}
           {blockedDiagnosticList}
           {eligibility?.eligible ? (
-            <button className="button ghost" onClick={() => distill(conversationRunId)}>
+            <Button className="button ghost" onClick={() => distill(conversationRunId)}>
               固化为组件
-            </button>
+            </Button>
           ) : (
             <span className="hint">{ineligibleReason}</span>
           )}
@@ -298,9 +300,9 @@ export default function ChatPage() {
           <div className="result-layer" aria-label="结构化结果">
             <div className="result-layer-heading">
               <strong>结构化结果</strong>
-              <button
+              <Button
                 className="button ghost"
-                type="button"
+                htmlType="button"
                 onClick={() => void copyResult(JSON.stringify(run.output, null, 2), 'json')}
               >
                 {copyFeedback === 'json:ok'
@@ -308,7 +310,7 @@ export default function ChatPage() {
                   : copyFeedback === 'json:failed'
                     ? '复制失败'
                     : '复制 JSON'}
-              </button>
+              </Button>
             </div>
             {typeof run.output?.reply === 'string' && (
               <p className="structured-summary">{run.output.reply}</p>
@@ -319,9 +321,9 @@ export default function ChatPage() {
             <div className="result-layer" aria-label="阅读结果">
               <div className="result-layer-heading">
                 <strong>阅读结果</strong>
-                <button
+                <Button
                   className="button ghost"
-                  type="button"
+                  htmlType="button"
                   onClick={() => void copyResult(run.presentation?.text ?? '', 'text')}
                 >
                   {copyFeedback === 'text:ok'
@@ -329,7 +331,7 @@ export default function ChatPage() {
                     : copyFeedback === 'text:failed'
                       ? '复制失败'
                       : '复制文本'}
-                </button>
+                </Button>
               </div>
               <p className="presentation-text">{run.presentation.text}</p>
             </div>
@@ -391,42 +393,39 @@ export default function ChatPage() {
     <div className={`chat-page ${styles.page}`}>
       <header className="chat-header">
         <div>
-          <span className="eyebrow">GENERAL AGENT WORKSPACE</span>
+          <span className="eyebrow">工作空间 / 对话</span>
           <h1>通用对话</h1>
         </div>
         <div className="chat-header-actions">
-          <button
+          <Button
             className="mobile-history-toggle"
-            type="button"
+            htmlType="button"
             aria-label="打开历史对话"
             aria-expanded={historyOpen}
             onClick={() => setHistoryOpen((current) => !current)}
           >
             <History size={14} />
-          </button>
-          <button
+          </Button>
+          <Button
             className="mobile-history-toggle"
-            type="button"
+            htmlType="button"
             aria-label="打开执行轨迹"
             aria-expanded={traceOpen}
             onClick={() => setTraceOpen((current) => !current)}
           >
             <Bot size={14} />
-          </button>
-          <button
+          </Button>
+          <Button
             className={`workflow-mode-toggle ${workflowMode}`}
-            type="button"
+            htmlType="button"
             aria-pressed={workflowMode === 'enabled'}
             disabled={switchingMode}
             onClick={toggleWorkflowMode}
           >
             <Workflow size={14} />
             工作流：{workflowMode === 'enabled' ? '开启' : '关闭'}
-          </button>
-          <div className="context-pill">
-            <Link2Off size={14} />
-            未绑定组件
-          </div>
+          </Button>
+          <Tag variant="filled">Agent 工作空间</Tag>
         </div>
       </header>
       <div className="chat-layout">
@@ -436,9 +435,9 @@ export default function ChatPage() {
         >
           <div className="history-heading">
             <span><History size={14} /> 历史对话</span>
-            <button type="button" aria-label="新建对话" onClick={createNewConversation}>
+            <Button htmlType="button" aria-label="新建对话" onClick={createNewConversation}>
               <Plus size={15} />
-            </button>
+            </Button>
           </div>
           <nav>
             {history.map((item) => (
@@ -461,9 +460,9 @@ export default function ChatPage() {
             {history.length === 0 && <span className="hint">暂无历史对话</span>}
           </nav>
           {historyCursor && (
-            <button className="button ghost" type="button" onClick={loadMoreHistory}>
+            <Button className="button ghost" htmlType="button" onClick={loadMoreHistory}>
               加载更多
-            </button>
+            </Button>
           )}
         </aside>
         <section className="message-column">
@@ -473,17 +472,18 @@ export default function ChatPage() {
               <span className="chat-empty-icon">
                 <MessageSquareText size={28} />
               </span>
-              <h2>探索一次，固化复用</h2>
+              <span className={styles.welcomeLabel}>想法，从这里开始</span>
+              <h2>今天，一起完成什么？</h2>
               <p>
                 描述你的目标，一起完成任务，并将重复步骤保存为工作流。
               </p>
               <div className="prompt-suggestions">
-                <button onClick={() => setInput('帮我梳理一个重复任务的执行步骤')}>
-                  梳理重复任务
-                </button>
-                <button onClick={() => setInput('分析现有组件是否适合我的任务')}>
-                  匹配已有组件
-                </button>
+                <Button onClick={() => setInput('帮我梳理一个重复任务的执行步骤')}>
+                  <Workflow size={20} /><strong>梳理重复任务</strong><span>把日常步骤变成自动化流程</span>
+                </Button>
+                <Button onClick={() => setInput('分析现有组件是否适合我的任务')}>
+                  <Bot size={20} /><strong>匹配已有组件</strong><span>发现工作空间中的可用能力</span>
+                </Button>
               </div>
             </div>
           )}
@@ -592,23 +592,23 @@ export default function ChatPage() {
                   renderWorkflowCandidates(message)}
                 {message.content.offerAgentRun &&
                   message.content.code !== 'WORKFLOW_SELECTION_UNAVAILABLE' && (
-                  <button
+                  <Button
                     className="button ghost"
-                    type="button"
+                    htmlType="button"
                     disabled={startingAgent}
                     onClick={() => startAgent(sourcePromptFor(message))}
                   >
                     {startingAgent ? '正在启动 Agent...' : '启动通用 Agent 探索'}
-                  </button>
+                  </Button>
                 )}
                 {message.content.code === 'WORKFLOW_SELECTION_UNAVAILABLE' && (
                   <>
                     <Link className="button ghost" to="/settings">
                       前往运行时设置并探测
                     </Link>
-                    <button className="button ghost" type="button" onClick={toggleWorkflowMode}>
+                    <Button className="button ghost" htmlType="button" onClick={toggleWorkflowMode}>
                       关闭工作流，下一条交给通用 Agent
-                    </button>
+                    </Button>
                   </>
                 )}
                 {message.content.runId && (
@@ -640,20 +640,20 @@ export default function ChatPage() {
               {optimisticStartedAt !== null &&
                 ` · ${((clock - optimisticStartedAt) / 1000).toFixed(1)}s`}
             </span>
-            <textarea
+            <Input.TextArea variant="borderless"
               aria-label="对话输入"
               placeholder="描述一个需要探索或固化的任务..."
               value={input}
               onChange={(event) => setInput(event.target.value)}
               rows={2}
             />
-            <button type="submit" disabled={sending || !conversationId}>
+            <Button type="primary" htmlType="submit" disabled={sending || runtimePending || !conversationId} aria-label={sending ? "处理中" : "发送"}>
               <CornerDownLeft size={17} />
               <span>{sending ? '处理中' : '发送'}</span>
-            </button>
+            </Button>
             <div className={styles.composerControls}>
-              <AgentSelector conversationId={conversationId} />
-              {agentRuns[activeRunId]?.executor && <span>本次执行：{agentRuns[activeRunId].executor?.provider}</span>}
+              <AgentSelector key={conversationId} conversationId={conversationId} onBusyChange={setRuntimePending} />
+              {agentRuns[activeRunId]?.executor && <span>本次执行：{agentRuns[activeRunId].executor?.provider}{agentRuns[activeRunId].executor?.model ? ` · ${agentRuns[activeRunId].executor?.model}` : ""}</span>}
             </div>
           </form>
         </section>
@@ -665,9 +665,9 @@ export default function ChatPage() {
             </div>
             {runStatus && <span className={`status-badge ${runStatus}`}>{runStatus}</span>}
             {(runStatus === 'queued' || runStatus === 'running') && (
-              <button className="button ghost" type="button" onClick={cancelActiveRun}>
+              <Button className="button ghost" htmlType="button" onClick={cancelActiveRun}>
                 取消运行
-              </button>
+              </Button>
             )}
           </div>
           {renderTrace()}

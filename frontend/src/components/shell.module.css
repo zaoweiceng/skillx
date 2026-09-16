@@ -1,0 +1,33 @@
+.shell { min-height: 100vh; display: grid; grid-template-columns: 232px minmax(0, 1fr); color: var(--text); background: var(--bg); }
+.sidebar { position: fixed; inset: 0 auto 0 0; width: 232px; display: flex; flex-direction: column; background: var(--sidebar); border-right: 1px solid var(--line-soft); padding: 28px 16px 18px; z-index: 30; }
+.brand { display: flex; align-items: center; gap: 12px; color: var(--text); padding: 0 10px 28px; }
+.logo { background: var(--text); color: var(--bg); display: grid; place-items: center; width: 40px; height: 40px; border-radius: 13px; }
+.brand strong { font-size: 22px; letter-spacing: -.7px; font-weight: 650; }
+.brand strong span { display: block; font-size: 11px; color: var(--muted); font-weight: 400; letter-spacing: 1px; margin-top: 1px; }
+.newChat { width: 100%; height: 42px; margin-bottom: 30px; background: var(--panel); }
+.navCaption { font-size: 11px; color: var(--muted); padding: 0 14px 12px; letter-spacing: 1px; }
+.navigation { display: flex; flex-direction: column; gap: 6px; }
+.navItem { display: flex; align-items: center; gap: 13px; padding: 12px 14px; border-radius: 11px; color: var(--muted); transition: background .15s; }
+.navItem:hover, .active { color: var(--text); background: var(--panel-raised); }
+.active { font-weight: 600; }
+.navItem span { font-size: 14px; }
+.navItem small { display: block; color: var(--muted); font-size: 10px; font-weight: 400; margin-top: 4px; }
+.footer { margin-top: auto; }
+.local { display: flex; gap: 10px; align-items: center; padding: 0 10px 20px; font-size: 12px; }
+.local small { display: block; color: var(--muted); font-size: 10px; margin-top: 4px; }
+.workspace { grid-column: 2; min-width: 0; }
+@media (max-width: 1000px) {
+  .shell { grid-template-columns: 80px minmax(0, 1fr); }
+  .sidebar { width: 80px; padding: 24px 10px; align-items: center; }
+  .brand { padding: 0 0 24px; }.brand strong, .navCaption, .navItem span, .local, .newChat span, .footer button span { display: none; }
+  .newChat { width: 42px; margin-bottom: 20px; }.navItem { padding: 14px; }.footer { width: 100%; }
+}
+@media (max-width: 600px) {
+  .shell { display: block; padding-bottom: 66px; }
+  .sidebar { inset: auto 0 0; width: 100%; height: 64px; padding: 5px 8px; border: 0; border-top: 1px solid var(--line-soft); }
+  .brand, .newChat, .footer { display: none; }.navigation { width: 100%; flex-direction: row; justify-content: space-around; }
+  .navItem { padding: 7px 14px; flex-direction: column; gap: 3px; }.navItem span { display: block; font-size: 10px; }.navItem small { display: none; }
+}
+
+.mobileTheme { display: none; }
+@media (max-width: 600px) { .mobileTheme { display: inline-flex; height: 48px; width: 34px; }.navItem { padding: 7px 10px; } }

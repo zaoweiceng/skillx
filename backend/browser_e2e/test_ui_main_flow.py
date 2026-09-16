@@ -252,6 +252,7 @@ def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
                 page.screenshot(path=str(Path(capture_dir) / "chat-dark.png"), full_page=True)
 
             page.goto(f"{frontend_url}/settings")
+            page.get_by_text("连接诊断与高级信息", exact=True).click()
             expect(
                 page.get_by_text("自动选择不可用", exact=False)
             ).to_be_visible()

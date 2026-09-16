@@ -1,3 +1,4 @@
+import { Button, Collapse } from 'antd'
 import { Bot, Database, KeyRound, PanelsTopLeft, ServerCog } from 'lucide-react'
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '@/api/client'
@@ -119,8 +120,7 @@ export default function SettingsPage() {
           <span className="eyebrow">RUNTIME GOVERNANCE</span>
           <h1>系统与执行环境</h1>
           <p>
-            结构化生成优先使用 LLM Runtime；仅启动前未配置时使用受约束的 Agent fallback。
-            401、429、超时或畸形输出不会切换 Runtime。
+            配置模型连接与 Agent，查看本地服务的运行状态。
           </p>
         </div>
       </header>
@@ -128,7 +128,7 @@ export default function SettingsPage() {
       {error && <div className="error-panel">运行状态探测失败：{error}</div>}
       {!health && !error && <div className="notice-panel">正在探测真实运行状态…</div>}
       {health && (
-        <div className="notice-panel">
+        <Collapse className="runtime-diagnostics" items={[{ key: "diagnostics", label: "连接诊断与高级信息", children: <div className="runtime-diagnostics-content">
           当前工作流选择 Provider：<strong>{health.workflowSelectionMode}</strong>
           {health.workflowSelectionMode === 'unavailable' && '。自动选择不可用。'}
           {provider?.protocolTestOnly &&
@@ -177,9 +177,9 @@ export default function SettingsPage() {
                 {!activeProbeAuthenticated && credentialPresent &&
                   ' 本地凭据已存在但未验证：登录状态不等于可用，请执行主动探测确认协议与 Host ToolResult 可用。'}
               </span>
-              <button
+              <Button
                 className="button ghost"
-                type="button"
+                htmlType="button"
                 disabled={
                   probing ||
                   activeProbeAuthenticated ||
@@ -188,10 +188,10 @@ export default function SettingsPage() {
                 onClick={runProbe}
               >
                 {probing ? '探测中…' : '重新探测'}
-              </button>
+              </Button>
             </>
           )}
-        </div>
+        </div> }]} />
       )}
       <section className="settings-grid">
         {runtimeCards.map(({ icon: Icon, name, detail, status }) => (
