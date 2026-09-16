@@ -74,7 +74,7 @@
 
 ### P2-3 — Alembic 历史迁移依赖当前 ORM 元数据
 
-`0001` 直接执行当前 `Base.metadata.create_all()`，[`0001_initial.py`](../backend/migrations/versions/0001_initial.py#L8)；`0003`、`0004` 等也从当前模型取表定义。这使旧迁移随 ORM 变化而变化，后续迁移的 `checkfirst` 又会掩盖问题。当前空库升级通过，不能证明迁移历史可重放。应把每个 revision 改成固定 `op.create_table/op.add_column` 定义。
+`0001` 直接执行当前 `Base.metadata.create_all()`，`0001_initial.py`；`0003`、`0004` 等也从当前模型取表定义。这使旧迁移随 ORM 变化而变化，后续迁移的 `checkfirst` 又会掩盖问题。当前空库升级通过，不能证明迁移历史可重放。应把每个 revision 改成固定 `op.create_table/op.add_column` 定义。
 
 ### P2-4 — Readiness 把 Alembic head 写死为 `0005`
 
@@ -114,3 +114,5 @@ Makefile 只串联 pytest、迁移和前端检查，[`Makefile`](../Makefile#L1)
 
 质量门禁通过说明当前实现内部一致，但不抵消上述未覆盖分支和验收口径差异。
 
+
+> 2026-09-16：以上为历史审计记录。旧数据库迁移链已移除，当前使用[固定初始结构](../backend/migrations/versions/0001_refactored_schema.py)，旧数据按要求清空重建。

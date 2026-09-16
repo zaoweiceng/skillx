@@ -57,8 +57,9 @@ Pi 每次执行使用内存会话、独立进程与目录；不加载项目/用�
 
 ## 数据与验收
 
-增量 Alembic 迁移 `0024` 添加运行配置和对话选择。原工作流定义、发布 digest 与历史审计数据不重写。
-升级时在 `backend` 目录执行 `uv run alembic upgrade head`，然后重启 API 和 Worker。
+数据库迁移已合并为 `0001_refactored`，不保留旧版本和历史数据。
+旧数据库需先停止 API/Worker，在 `backend` 目录执行 `uv run python -m app.reset_database --confirm-reset`，
+再按 README 执行 seed 并启动服务。新数据库使用 `uv run alembic upgrade head`。
 
 验证命令：
 

@@ -29,7 +29,7 @@ Replay 后定义发生变化会进入 `dirty_after_replay`。旧审核快照和�
 
 ## 2. 持久化与状态机
 
-迁移 [`0017_replay_publish_binding.py`](../backend/migrations/versions/0017_replay_publish_binding.py)
+迁移 `0017_replay_publish_binding.py`
 新增：
 
 - `revision_proposals`：observation/base version、Agent run、prompt version、fixture/baseline、
@@ -99,3 +99,5 @@ final 文件。
 
 主复用、失败接力、真实瞬态拒绝和故障修订发布证据链均已通过独立黑盒与统一门禁。
 Local Demo 范围内可将发布证据链标记为 `closed-loop`。
+
+> 2026-09-16：以上为历史审计记录。旧数据库迁移链已移除，当前使用[固定初始结构](../backend/migrations/versions/0001_refactored_schema.py)，旧数据按要求清空重建。

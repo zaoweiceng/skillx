@@ -21,3 +21,5 @@ review/NEXT_STEPS-*.md
 review/REPLAY-*.md
 
 bridges/*/node_modules/
+
+.dev/

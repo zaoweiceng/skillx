@@ -72,7 +72,7 @@ Browser 路径还有第二个断点：`BrowserActionCompiler` 生成 `runtime=co
 
 ### P1-7 — 0009 对已有 MCP 数据的 digest 回填会制造契约漂移
 
-证据：[`0009_mcp_contract_digest.py`](../backend/migrations/versions/0009_mcp_contract_digest.py) 新增 `contract_digest` 后直接执行 `contract_digest = digest`。但旧 `digest` 包含本地 effect/idempotent，新的 remote contract digest 只覆盖 name/description/input/output/timeout，两者不是同一算法。
+证据：`0009_mcp_contract_digest.py` 新增 `contract_digest` 后直接执行 `contract_digest = digest`。但旧 `digest` 包含本地 effect/idempotent，新的 remote contract digest 只覆盖 name/description/input/output/timeout，两者不是同一算法。
 
 影响：非空 0008 数据库升级后，首次对未变化的远端 Tool 执行 discovery 会比较两个不同 hash 并报 `MCPContractDriftError`。空库 0001→0010 门禁发现不了该问题。
 
@@ -120,3 +120,5 @@ E2E-7 只证明 `fail_dependency` 配合固定 RecoveryDecision 可把 run 变�
 4. 最后统一轨迹 Artifact/脱敏、取消与预算边界、带数据迁移和产品证据。
 
 具体任务与出口条件见 [`NEXT_STEPS-006.md`](../STEP/NEXT_STEPS-006.md)。
+
+> 2026-09-16：以上为历史审计记录。旧数据库迁移链已移除，当前使用[固定初始结构](../backend/migrations/versions/0001_refactored_schema.py)，旧数据按要求清空重建。

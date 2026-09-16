@@ -4,6 +4,16 @@ SkillX Workflow 是一个契约驱动的可视化工作流平台。首次任务�
 探索，稳定任务发布为不可变工作流版本，并由独立 Worker 持久化执行。模型只在
 显式的 LLM/Agent 节点介入。
 
+数据库已合并为新的初始迁移 `0001_refactored`，不再支持旧迁移链。
+已有本地数据库（包括停在 `0017` 或残留 `_alembic_tmp_*` 的数据库）请先停止 API/Worker，
+在 `backend` 目录执行以下命令；**会删除全部历史数据和已发布版本**：
+
+```bash
+uv run python -m app.reset_database --confirm-reset
+```
+
+也可直接使用 `./dev.sh --reset-db` 完成重置、seed 和启动。全新数据库仍使用 `uv run alembic upgrade head`。
+
 执行体配置、Pi 安装和失败接力见 [运行时适配器说明](docs/runtime-adapters.md)。
 
 ## 能力状态
@@ -21,7 +31,7 @@ SkillX Workflow 是一个契约驱动的可视化工作流平台。首次任务�
 | 通用失败接力 | `available` | Host accepted PlanSnapshot 是 continuation execution source of truth；continuation 与 checkpoint CAS、Conversation assistant message 原子持久化；Chat 自动跟踪多代 lineage 并从可信 ConversationRun 回显最终 output/error；Browser、lookup、file 共用有界 ContinuationRequest |
 | 失败可复现性与受控修订 | `available` | WorkflowVersion/PlanSnapshot 失败使用判别联合归因；Runtime/Replay 共用边选择与 Output Schema 终态，外部和副作用 replay 只接受捕获 fixture |
 | Workflow 能力目录与临时组合 | `available` | 持久 disclosure session 审计 L0/L1/L2 与预算；Selection-5 严格互斥；FragmentPort、Plan source map、TTL 恢复和 active-version catalog 已接通 |
-| MCP 副作用与幂等分类 | `available` | annotations 仅作提示且始终 `unreviewed`，分类创建**新的不可变快照**（旧快照/历史版本不变）；多 Tool Server 分类某 Tool 时克隆完整版本、分离远端 contract digest 与本地审核 digest，重复 discovery 稳定；0009 迁移用运行时 canonical 算法从行字段重算 remote-only contract_digest，非空 0008 升级后首次 discovery 不伪漂移；发布保存完整 lock，运行前逐项核对 digest/effect/idempotent/timeout，漂移即 `MCP_CONTRACT_DRIFT` fail closed |
+| MCP 副作用与幂等分类 | `available` | annotations 仅作提示且始终 `unreviewed`，分类创建**新的不可变快照**（旧快照/历史版本不变）；多 Tool Server 分类某 Tool 时克隆完整版本、分离远端 contract digest 与本地审核 digest，重复 discovery 稳定；发布保存完整 lock，运行前逐项核对 digest/effect/idempotent/timeout，漂移即 `MCP_CONTRACT_DRIFT` fail closed |
 | 浏览器契约与一次性授权 | `available` | Playwright 隔离 Context、L2 漂移一次性授权重放、提交确认、L3 ContractPatch 草稿；Browser Read/Extract 作为只读 Adapter 用 `BrowserReadContract` 导航并抽取正文/结构化字段作为节点输出（URL 来自输入，第二次以新输入重新取数，不缓存首次结果）；人工审核补丁可应用到草稿（仅字段契约，L4 安全域不可改） |
 | 通配黑盒 E2E | `available` | Runtime/Recovery/Catalog/Plan/Replay 纳入 `make demo-check`；`make browser-ui-check` 以真实 Vite/Chromium 验收正常主流程和 503→Worker 重启→原 Chat 自动回显/刷新恢复 |
 | 可视化拖放编辑器 | `available` | 结构化 state 为唯一真相（JSON 降级为导入/导出视图），调色板新增节点、画布连线/删除、环检测、可编辑 Inspector 与 VariablePicker 写入映射、fallback 配置、发布治理；运行详情提供检查点接力视图（fallback target/审批状态/唯一 Recovery NodeRun）与受控 WorkflowPatch eligibility/replay 入口 |
@@ -32,35 +42,30 @@ SkillX Workflow 是一个契约驱动的可视化工作流平台。首次任务�
 
 ## 本地启动
 
-要求 Python 3.12+、`uv`、Node.js 20+。
+要求 Python 3.12–3.13、`uv`、Node.js 22.19+、`npm`。在项目根目录执行：
 
 ```bash
-cd backend
-uv sync --extra dev
-uv run playwright install chromium
-uv run alembic upgrade head
-uv run python -m app.seed
-uv run uvicorn app.main:app --reload
+# 日常启动：安装缺失依赖、迁移、seed，并启动 API / Worker / 前端
+./dev.sh
+
+# 从旧数据库切换到重构版本（永久清空旧数据，仅首次需要）
+./dev.sh --reset-db
 ```
 
-另开终端启动 Worker：
+浏览器打开 `http://127.0.0.1:5173`，OpenAPI 位于 `http://127.0.0.1:8000/docs`。
+按 `Ctrl+C` 同时停止全部服务；任意服务异常退出时，脚本也会停止其余进程。
+日志保存在 `.dev/logs/{api,worker,frontend}.log`。后端代码修改后重新运行脚本；前端保留 Vite 热更新。
 
 ```bash
-cd backend
-uv run python -m app.worker --worker-id worker-local
+./dev.sh --skip-install       # 依赖已安装时跳过安装检查
+./dev.sh --setup-only         # 仅初始化数据库和示例数据
+API_PORT=8001 FRONTEND_PORT=5174 ./dev.sh  # 自定义端口
 ```
 
-启动前端：
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-API 默认只允许按上述命令监听 `127.0.0.1`。本版本是单用户 Local Demo，禁止
-直接绑定 `0.0.0.0` 或暴露到共享网络。访问 `http://localhost:5173`。OpenAPI 位于
-`http://127.0.0.1:8000/docs`。
+脚本仅监听本机。API 和 Worker 共用 `backend/.env` 及同一数据库配置。
+需要单独管理服务时，可在 `backend` 目录使用 `uv run alembic upgrade head`、
+`uv run python -m app.seed`、`uv run uvicorn app.main:app` 和
+`uv run python -m app.worker --worker-id worker-local`；前端在 `frontend` 目录运行 `npm run dev`。
 
 ## 工程结构
 

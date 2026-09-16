@@ -72,8 +72,14 @@ def configure_sqlite(dbapi_connection: Any, _: Any) -> None:
 
 
 async def init_database() -> None:
-    async with engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
+    # API and Worker share the same versioned schema path as the CLI.
+    import asyncio
+
+    from alembic import command
+
+    from app.reset_database import migration_config
+
+    await asyncio.to_thread(command.upgrade, migration_config(), "head")
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:

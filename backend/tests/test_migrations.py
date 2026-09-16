@@ -1,5 +1,3 @@
-import hashlib
-import json
 import os
 import sqlite3
 import subprocess
@@ -48,53 +46,36 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         run_type_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(conversation_runs)")
+            row[1] for row in connection.execute("PRAGMA table_info(conversation_runs)")
         }
         snapshot_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(mcp_tool_snapshots)")
+            row[1] for row in connection.execute("PRAGMA table_info(mcp_tool_snapshots)")
         }
         observation_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(failure_observations)")
+            row[1] for row in connection.execute("PRAGMA table_info(failure_observations)")
         }
         disclosure_call_columns = {
-            row[1]
-            for row in connection.execute(
-                "PRAGMA table_info(workflow_disclosure_calls)"
-            )
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_disclosure_calls)")
         }
-        workflow_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(workflows)")
-        }
+        workflow_columns = {row[1] for row in connection.execute("PRAGMA table_info(workflows)")}
         fixture_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(replay_fixtures)")
+            row[1] for row in connection.execute("PRAGMA table_info(replay_fixtures)")
         }
         evidence_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(replay_evidence)")
+            row[1] for row in connection.execute("PRAGMA table_info(replay_evidence)")
         }
         version_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(workflow_versions)")
+            row[1] for row in connection.execute("PRAGMA table_info(workflow_versions)")
         }
         conversation_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(conversations)")
+            row[1] for row in connection.execute("PRAGMA table_info(conversations)")
         }
-        run_columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(runs)")
-        }
+        run_columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)")}
         model_usage_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(model_usage)")
         }
-        component_columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(components)")
-        }
-    assert revision == ("0024",)
+        component_columns = {row[1] for row in connection.execute("PRAGMA table_info(components)")}
+    assert revision == ("0001_refactored",)
     assert {
         "runs",
         "capability_versions",
@@ -169,86 +150,100 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
     assert {"workflow_mode", "last_message_at"} <= conversation_columns
     assert {"turn_id", "runtime_snapshot_json"} <= run_columns
     with sqlite3.connect(database) as connection:
-        usage_columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(model_usage)")
-        }
+        usage_columns = {row[1] for row in connection.execute("PRAGMA table_info(model_usage)")}
     assert {"runtime_used", "runtime_digest", "fallback_reason"} <= usage_columns
     with sqlite3.connect(database) as connection:
         checkpoint_columns = {
-            row[1]
-            for row in connection.execute("PRAGMA table_info(execution_checkpoints)")
+            row[1] for row in connection.execute("PRAGMA table_info(execution_checkpoints)")
         }
     assert {"lease_owner", "recovery_node_run_id", "approval_status"} <= checkpoint_columns
 
 
-def _canonical(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+def test_schema_matches_current_models_and_upgrade_is_repeatable(tmp_path: Path) -> None:
+    import sqlalchemy as sa
+    from alembic.autogenerate import compare_metadata
+    from alembic.migration import MigrationContext
 
+    from app.infrastructure.database import Base
 
-def test_non_empty_0008_to_head_recomputes_remote_contract_digest(tmp_path: Path) -> None:
-    """带 MCP 数据的 0008→head 升级：contract_digest 按运行时 canonical 算法从行字段
-    重算（remote-only），首次 rediscovery 不会伪漂移。"""
-
-    database = tmp_path / "data-migration.db"
-    _alembic(database, "0008")
-    # 在 0008 插入两个 Tool（旧 digest 含本地 effect/idempotent，与 remote 契约不同）。
-    input_schema = {"type": "object", "properties": {"city": {"type": "string"}}}
-    output_schema = {"type": "object", "properties": {"temp": {"type": "number"}}}
-    tools = [
-        ("tool-a", "weather.get", "查询天气"),
-        ("tool-b", "forecast.get", "查询预报"),
-    ]
-    with sqlite3.connect(database) as connection:
-        connection.execute(
-            "INSERT INTO mcp_servers (id, name, transport, created_at, updated_at) "
-            "VALUES ('srv', 'weather', 'stdio', '2026-01-01', '2026-01-01')"
-        )
-        connection.execute(
-            "INSERT INTO mcp_server_versions (id, server_id, version, config_json, digest, "
-            "status, created_at, updated_at) VALUES "
-            "('sv', 'srv', 1, '{}', 'sha256:sv', 'published', '2026-01-01', '2026-01-01')"
-        )
-        for tool_id, name, description in tools:
-            old_digest = "sha256:" + hashlib.sha256((name + "old").encode()).hexdigest()
-            connection.execute(
-                "INSERT INTO mcp_tool_snapshots (id, server_version_id, name, description, "
-                "input_schema_json, output_schema_json, digest, side_effect, idempotent, "
-                "timeout_seconds, effect_source, effect_review_status, created_at, updated_at) "
-                "VALUES (?, 'sv', ?, ?, ?, ?, ?, 'none', 1, 30, 'registry', 'reviewed', "
-                "'2026-01-01', '2026-01-01')",
-                (
-                    tool_id,
-                    name,
-                    description,
-                    json.dumps(input_schema),
-                    json.dumps(output_schema),
-                    old_digest,
-                ),
-            )
-        connection.commit()
-
-    # 升级到 head：0009 应重算 remote-only contract_digest。
+    database = tmp_path / "schema.db"
     _alembic(database, "head")
+    _alembic(database, "head")
+    with sa.create_engine(f"sqlite:///{database}").connect() as connection:
+        assert compare_metadata(MigrationContext.configure(connection), Base.metadata) == []
+        assert connection.exec_driver_sql("PRAGMA foreign_key_check").all() == []
 
+
+def test_reset_replaces_legacy_and_interrupted_migration_database(tmp_path: Path) -> None:
+    database = tmp_path / "legacy.db"
     with sqlite3.connect(database) as connection:
-        rows = connection.execute(
-            "SELECT name, description, timeout_seconds, contract_digest, digest "
-            "FROM mcp_tool_snapshots ORDER BY name"
-        ).fetchall()
-    assert len(rows) == 2
-    for name, description, timeout_seconds, contract_digest, digest in rows:
-        # contract_digest 与运行时 discover_tools 的 remote_contract 结构一致。
-        expected = "sha256:" + hashlib.sha256(
-            _canonical(
-                {
-                    "name": name,
-                    "description": description,
-                    "inputSchema": input_schema,
-                    "outputSchema": output_schema,
-                    "timeoutSeconds": timeout_seconds,
-                }
-            ).encode()
-        ).hexdigest()
-        assert contract_digest == expected
-        # 且不等于旧的完整 digest（含 effect/idempotent），证明没有直接回填。
-        assert contract_digest != digest
+        connection.executescript("""
+            CREATE TABLE alembic_version (version_num TEXT PRIMARY KEY);
+            INSERT INTO alembic_version VALUES ('0017');
+            CREATE TABLE conversations (id TEXT PRIMARY KEY);
+            INSERT INTO conversations VALUES ('old');
+            CREATE TABLE _alembic_tmp_conversations (id TEXT);
+        """)
+    result = subprocess.run(
+        [sys.executable, "-m", "app.reset_database", "--confirm-reset"],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "SKILLX_DATABASE_URL": f"sqlite+aiosqlite:///{database}"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            "0001_refactored",
+        )
+        assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (0,)
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE '_alembic_tmp_%'"
+            ).fetchall()
+            == []
+        )
+
+
+def test_failed_sqlite_ddl_rolls_back_schema_and_revision(tmp_path: Path) -> None:
+    import shutil
+
+    root = Path(__file__).resolve().parents[1]
+    database = tmp_path / "atomic.db"
+    _alembic(database, "head")
+    scripts = tmp_path / "migrations"
+    shutil.copytree(root / "migrations", scripts, ignore=shutil.ignore_patterns("__pycache__"))
+    (scripts / "versions" / "failure.py").write_text("""from alembic import op
+import sqlalchemy as sa
+revision = "injected_failure"
+down_revision = "0001_refactored"
+def upgrade():
+    op.create_table("_alembic_tmp_probe", sa.Column("id", sa.Integer()))
+    raise RuntimeError("injected migration interruption")
+""")
+    config = tmp_path / "alembic.ini"
+    config.write_text(
+        (root / "alembic.ini")
+        .read_text()
+        .replace("script_location = migrations", f"script_location = {scripts}")
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "-c", str(config), "upgrade", "head"],
+        cwd=root,
+        env={**os.environ, "SKILLX_DATABASE_URL": f"sqlite+aiosqlite:///{database}"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode != 0 and "injected migration interruption" in result.stderr
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
+            "0001_refactored",
+        )
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE name='_alembic_tmp_probe'"
+            ).fetchall()
+            == []
+        )
