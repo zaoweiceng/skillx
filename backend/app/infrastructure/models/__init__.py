@@ -34,6 +34,11 @@ from .runs import NodeRun as NodeRun
 from .runs import Run as Run
 from .runs import RunEvent as RunEvent
 from .runs import RunPresentation as RunPresentation
+from .tasks import HumanInteraction as HumanInteraction
+from .tasks import Invocation as Invocation
+from .tasks import LearningJob as LearningJob
+from .tasks import Task as Task
+from .tasks import TaskEvent as TaskEvent
 from .workflows import Component as Component
 from .workflows import PendingSelection as PendingSelection
 from .workflows import PlanSnapshot as PlanSnapshot

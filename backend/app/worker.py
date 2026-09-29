@@ -81,36 +81,39 @@ async def run_worker(
     # 明确的轮询就绪信号：黑盒 harness 据此确认 Worker 已进入领取循环，
     # 而不是仅检查进程尚未退出。
     print(f"worker polling worker_id={service.worker_id}", flush=True)
+    from app.application.invocations import InvocationDriver
+    from app.application.task_learning import LearningDriver
+    from app.application.tasks import TaskDriver
+
+    async def driver_loop(driver, method="poll_once"):
+        while not stopping.is_set():
+            try:
+                processed = await getattr(driver, method)()
+            except Exception:
+                logger.exception("durable driver failed: %s", type(driver).__name__)
+                processed = False
+            if not processed:
+                await asyncio.sleep(settings.worker_poll_seconds)
+
+    durable_drivers = [asyncio.create_task(driver_loop(TaskDriver())),
+                       asyncio.create_task(driver_loop(LearningDriver()))]
+    durable_drivers.extend(asyncio.create_task(driver_loop(InvocationDriver())) for _ in range(4))
+    durable_drivers.extend(asyncio.create_task(driver_loop(
+        WorkerService(f"{service.worker_id}-node-{index}", settings.lease_seconds), "run_once"
+    )) for index in range(3))
+    durable_drivers.extend(asyncio.create_task(driver_loop(driver))
+                           for driver in [agent_worker, recovery_driver, presentation_driver])
+    if task_recovery_enabled:
+        durable_drivers.append(asyncio.create_task(driver_loop(task_recovery_driver)))
     ticks = 0
     try:
         while not stopping.is_set():
             processed = await service.run_once()
             try:
-                processed_agent = await agent_worker.poll_once()
-            except Exception:  # noqa: BLE001 - 记录根因后继续工作流循环，不静默吞掉。
-                logger.exception("agent worker poll_once failed on worker %s", service.worker_id)
-                processed_agent = False
-            try:
-                processed_recovery = await recovery_driver.poll_once()
-            except Exception:  # noqa: BLE001 - 恢复失败记录根因后继续。
-                logger.exception("recovery driver poll_once failed on worker %s", service.worker_id)
-                processed_recovery = False
-            processed_task_recovery = False
-            if task_recovery_enabled:
-                try:
-                    processed_task_recovery = await task_recovery_driver.poll_once()
-                except Exception:  # noqa: BLE001 - 保留 checkpoint 供租约过期后重新领取。
-                    logger.exception(
-                        "task recovery driver poll_once failed on worker %s",
-                        service.worker_id,
-                    )
-            try:
-                processed_presentation = await presentation_driver.poll_once()
                 async with SessionLocal() as session, session.begin():
                     await finalize_ready_turns(session)
-            except Exception:  # noqa: BLE001 - 展示失败不能中断执行 Worker。
-                logger.exception("presentation driver poll_once failed")
-                processed_presentation = False
+            except Exception:
+                logger.exception("turn finalization failed")
             # 周期性 reconcile（约每 60 次空闲轮询一次），限制批量，形成可观察 GC。
             ticks += 1
             if ticks % 60 == 0:
@@ -119,13 +122,7 @@ async def run_worker(
                         await reconcile_recent_runs(session, limit=20)
                 except Exception:  # noqa: BLE001
                     logger.exception("periodic reconcile failed")
-            if (
-                not processed
-                and not processed_agent
-                and not processed_recovery
-                and not processed_task_recovery
-                and not processed_presentation
-            ):
+            if not processed:
                 try:
                     await asyncio.wait_for(
                         stopping.wait(), timeout=settings.worker_poll_seconds
@@ -134,6 +131,9 @@ async def run_worker(
                     pass
     finally:
         stopping.set()
+        for driver_task in durable_drivers:
+            driver_task.cancel()
+        await asyncio.gather(*durable_drivers, return_exceptions=True)
         browser_health_task.cancel()
         try:
             await browser_health_task

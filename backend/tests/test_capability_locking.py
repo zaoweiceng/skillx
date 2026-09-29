@@ -162,7 +162,7 @@ async def test_package_digest_change_blocks_historical_execution(
         _, version = await register_skillx(session, "text-stats")
         definition = WorkflowDefinition.model_validate(skillx_workflow(version.id))
 
-    executor = capability_root / "text-stats" / "executors" / "count.py"
+    executor = capability_root / version.package_path / "executors" / "count.py"
     executor.write_text(executor.read_text() + "\n# changed\n", encoding="utf-8")
 
     async with SessionLocal() as session:

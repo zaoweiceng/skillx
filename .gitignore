@@ -23,3 +23,7 @@ review/REPLAY-*.md
 bridges/*/node_modules/
 
 .dev/
+
+# Immutable runtime copies and automatically validated candidates
+capabilities/skillx/.versions/
+capabilities/skillx/generated/

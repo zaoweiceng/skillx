@@ -169,6 +169,12 @@ async def _seed_failed_run(*, seed: str = "s1") -> tuple[str, str]:
         )
         session.add(run)
         await session.flush()
+        # A real run cannot have completed descendants before its input node.
+        session.add(NodeRun(
+            id=str(uuid4()), run_id=run.id, node_id="input", node_type="input",
+            attempt=1, status="succeeded", input_json={}, output_json={"seed": seed},
+            finished_at=utcnow(),
+        ))
         session.add(
             NodeRun(
                 id=str(uuid4()),

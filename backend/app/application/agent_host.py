@@ -253,7 +253,9 @@ class AgentHost:
         adapter: AgentAdapter | None = None,
         tool_registry: ToolAdapterRegistry | None = None,
         runtime: AgentRuntimeConfig | None = None,
+        capability_grants: frozenset[str] | None = None,
     ) -> None:
+        self._capability_grants = capability_grants
         self._adapter = adapter
         self._runtime = runtime
         self._tool_registry = tool_registry or ToolAdapterRegistry()
@@ -287,7 +289,12 @@ class AgentHost:
         """
 
         # 请求能力必须是 Host 授予的子集：存在越权能力则执行前 fail closed。
-        effective, denied = resolve_effective_capabilities(request.requested_capabilities)
+        if self._capability_grants is None:
+            effective, denied = resolve_effective_capabilities(request.requested_capabilities)
+        else:
+            requested = set(request.requested_capabilities)
+            effective = sorted(requested & self._capability_grants)
+            denied = sorted(requested - self._capability_grants)
         if denied:
             raise AgentHostError(
                 "PERMISSION_DENIED",

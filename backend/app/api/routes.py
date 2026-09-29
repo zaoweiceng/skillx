@@ -71,7 +71,6 @@ from app.application.browser_readiness import browser_runtime_readiness
 from app.application.capabilities import (
     CapabilityResolutionError,
     register_skillx,
-    resolve_package_path,
     validate_workflow_capabilities,
 )
 from app.application.compiler import WorkflowCompiler, WorkflowValidationError, digest_json
@@ -95,7 +94,7 @@ from app.application.mcp import (
     register_server,
     scan_dependent_workflows,
 )
-from app.application.orchestrator import Orchestrator, append_event
+from app.application.orchestrator import Orchestrator
 from app.application.plans import (
     PlanCompileError,
     WorkflowSelection,
@@ -188,7 +187,6 @@ from app.infrastructure.database import (
 )
 from app.infrastructure.migrations import alembic_head_revision
 from app.runtime.contract_patch import ContractPatchViolation, apply_contract_patch
-from app.runtime.skillx_host import execute_in_subprocess
 
 router = APIRouter()
 compiler = WorkflowCompiler()
@@ -2121,7 +2119,9 @@ async def create_plan_run(
     if snapshot is None:
         raise HTTPException(404, "PlanSnapshot 不存在")
     try:
-        run = await orchestrator.create_plan_run(session, snapshot, body.input)
+        run = await orchestrator.create_plan_run(
+            session, snapshot, body.input, automatic_recovery=True
+        )
     except (ValueError, CatalogError) as exc:
         raise HTTPException(422, detail={"code": "INVALID_PLAN_RUN", "message": str(exc)}) from exc
     await session.commit()
@@ -2397,7 +2397,9 @@ async def create_component_run(
     if version is None:
         raise HTTPException(409, "组件默认版本无效")
     try:
-        run = await orchestrator.create_run(session, version, body.input, component.id)
+        run = await orchestrator.create_run(
+            session, version, body.input, component.id, automatic_recovery=True
+        )
     except ValueError as exc:
         raise HTTPException(422, detail={"code": "INVALID_INPUT", "message": str(exc)}) from exc
     await session.commit()
@@ -2414,7 +2416,7 @@ async def create_workflow_version_run(
     if version is None:
         raise HTTPException(404, "已发布 WorkflowVersion 不存在")
     try:
-        run = await orchestrator.create_run(session, version, body.input)
+        run = await orchestrator.create_run(session, version, body.input, automatic_recovery=True)
     except ValueError as exc:
         raise HTTPException(
             422,
@@ -2860,111 +2862,17 @@ async def cancel_run(run_id: str, session: AsyncSession = Depends(get_session)) 
     return run_view(run)
 
 
-async def _approve_recovery(session: AsyncSession, approval: Approval) -> dict[str, Any]:
-    """批准恢复：checkpoint→approved 且 Run→recovering，交给同一 Recovery claim。"""
-
-    checkpoint_id = approval.snapshot_json.get("checkpointId")
-    checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
-    if checkpoint is None or checkpoint.status != "pending":
-        raise HTTPException(409, "恢复检查点不可用或已处理")
-    run = await session.get(Run, approval.run_id)
-    if run is None or run.status != "waiting_approval":
-        raise HTTPException(409, "运行不在等待恢复审批状态")
-    approval.status = "approved"
-    approval.decided_by = "local-user"
-    approval.decided_at = utcnow()
-    checkpoint.approval_status = "approved"
-    run.status = "recovering"
-    await append_event(
-        session,
-        approval.run_id,
-        "run.recovery_requested",
-        {"runId": run.id, "checkpointId": checkpoint.id, "failedNode": approval.node_id},
-        approval.node_run_id,
-    )
-    await session.commit()
-    return {"id": approval.id, "status": approval.status}
-
-
 @router.post("/approvals/{approval_id}/approve")
 async def approve(
     approval_id: str,
     body: Decision,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    approval = await session.get(Approval, approval_id)
-    if approval is None:
-        raise HTTPException(404, "审批不存在")
-    if approval.status != "pending":
-        raise HTTPException(409, "审批已处理")
-    if approval.snapshot_digest != body.snapshot_digest:
-        raise HTTPException(
-            409,
-            detail={"code": "APPROVAL_SNAPSHOT_CHANGED", "message": "审批快照已变化"},
-        )
-    if digest_json(approval.snapshot_json) != approval.snapshot_digest:
-        raise HTTPException(
-            409,
-            detail={"code": "APPROVAL_SNAPSHOT_CHANGED", "message": "服务端审批快照已变化"},
-        )
-    effect = approval.snapshot_json.get("effect")
-    # 恢复审批：批准后 checkpoint→approved 且 Run→recovering，由同一 Recovery claim 处理；
-    # 关联的失败 NodeRun 保持 failed（不可变）。
-    if effect == "recovery.approval":
-        return await _approve_recovery(session, approval)
-    node_run = await session.get(NodeRun, approval.node_run_id)
-    if node_run is None or node_run.status != "waiting_user":
-        raise HTTPException(409, "关联节点不在等待状态")
-    approval.status = "approved"
-    approval.decided_by = "local-user"
-    approval.decided_at = utcnow()
-    if node_run.node_type == "browser" and effect == "form.submit":
-        authorization_digest_value = approval.snapshot_json.get("authorizationDigest")
-        if not authorization_digest_value:
-            raise HTTPException(409, "浏览器审批缺少服务端授权摘要")
-        node_run.status = "ready"
-        node_run.input_json = {
-            **node_run.input_json,
-            "_authorizationDigest": authorization_digest_value,
-        }
-        node_run.output_json = None
-        node_run.error_json = None
-        node_run.available_at = utcnow()
-    elif node_run.node_type == "browser" and effect == "browser.drift":
-        drift_authorization_value = approval.snapshot_json.get("driftAuthorization")
-        if not drift_authorization_value:
-            raise HTTPException(409, "浏览器审批缺少服务端漂移授权摘要")
-        node_run.status = "ready"
-        node_run.input_json = {
-            **node_run.input_json,
-            "_driftAuthorization": drift_authorization_value,
-        }
-        node_run.output_json = None
-        node_run.error_json = None
-        node_run.available_at = utcnow()
-    elif (
-        node_run.node_type == "browser"
-        and (node_run.error_json or {}).get("code") == "UNKNOWN_OUTCOME"
-    ):
-        node_run.status = "failed"
-        node_run.finished_at = utcnow()
-    else:
-        node_run.status = "succeeded"
-        node_run.output_json = {
-            "approved": True,
-            "snapshot": approval.snapshot_json.get("payload", {}),
-        }
-        node_run.finished_at = utcnow()
-    await append_event(
-        session,
-        approval.run_id,
-        "approval.resolved",
-        {"approvalId": approval.id, "nodeId": approval.node_id, "status": "approved"},
-        node_run.id,
-    )
-    await orchestrator.advance_run(session, approval.run_id)
+    from app.application.approval_transitions import approve as transition
+
+    result = await transition(approval_id, body, session)
     await session.commit()
-    return {"id": approval.id, "status": approval.status}
+    return result
 
 
 @router.post("/approvals/{approval_id}/answer")
@@ -2973,105 +2881,23 @@ async def answer_recovery_question(
     body: RecoveryAnswer,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    approval = await session.get(Approval, approval_id)
-    if approval is None:
-        raise HTTPException(404, "审批不存在")
-    if (
-        approval.status != "pending"
-        or approval.snapshot_json.get("effect") != "recovery.question"
-    ):
-        raise HTTPException(409, "恢复问题不可回答或已处理")
-    if approval.snapshot_digest != body.snapshot_digest:
-        raise HTTPException(409, "恢复问题快照已变化")
-    checkpoint = await session.get(
-        ExecutionCheckpoint, approval.snapshot_json.get("checkpointId")
-    )
-    run = await session.get(Run, approval.run_id)
-    if checkpoint is None or run is None or checkpoint.status != "awaiting_user":
-        raise HTTPException(409, "恢复检查点不可继续")
-    checkpoint.snapshot_json = {
-        **checkpoint.snapshot_json,
-        "userAnswer": redact(body.answer),
-    }
-    checkpoint.digest = digest_json(checkpoint.snapshot_json)
-    checkpoint.status = "pending"
-    checkpoint.decision_json = {
-        **(checkpoint.decision_json or {}),
-        "userAnswer": redact(body.answer),
-    }
-    checkpoint.lease_owner = None
-    checkpoint.lease_expires_at = None
-    run.status = "recovering"
-    approval.status = "approved"
-    approval.decided_by = "local-user"
-    approval.decided_at = utcnow()
-    await append_event(
-        session,
-        run.id,
-        "recovery.user_answered",
-        {"checkpointId": checkpoint.id, "approvalId": approval.id},
-    )
+    from app.application.approval_transitions import answer_recovery_question as transition
+
+    result = await transition(approval_id, body, session)
     await session.commit()
-    return {"id": approval.id, "status": approval.status, "checkpointId": checkpoint.id}
+    return result
 
 
 @router.post("/approvals/{approval_id}/reject")
-async def reject(approval_id: str, session: AsyncSession = Depends(get_session)) -> dict[str, Any]:
-    approval = await session.get(Approval, approval_id)
-    if approval is None:
-        raise HTTPException(404, "审批不存在")
-    if approval.status != "pending":
-        raise HTTPException(409, "审批已处理")
-    # 恢复审批被拒绝：checkpoint→rejected，Run 保持原失败终态，失败历史不变。
-    if approval.snapshot_json.get("effect") == "recovery.approval":
-        checkpoint_id = approval.snapshot_json.get("checkpointId")
-        checkpoint = await session.get(ExecutionCheckpoint, checkpoint_id)
-        approval.status = "rejected"
-        approval.decided_by = "local-user"
-        approval.decided_at = utcnow()
-        run = await session.get(Run, approval.run_id)
-        failed_node = await session.get(NodeRun, approval.node_run_id)
-        if checkpoint is not None:
-            checkpoint.approval_status = "rejected"
-            checkpoint.status = "rejected"
-        if run is not None:
-            run.status = "failed"
-            run.finished_at = utcnow()
-            run.error_json = failed_node.error_json if failed_node else {
-                "code": "RECOVERY_REJECTED",
-                "message": "恢复审批被拒绝",
-            }
-        await append_event(
-            session,
-            approval.run_id,
-            "run.recovery_rejected",
-            {"approvalId": approval.id, "checkpointId": checkpoint_id},
-            approval.node_run_id,
-        )
-        await session.commit()
-        return {"id": approval.id, "status": approval.status}
-    node_run = await session.get(NodeRun, approval.node_run_id)
-    approval.status = "rejected"
-    approval.decided_by = "local-user"
-    approval.decided_at = utcnow()
-    if node_run:
-        node_run.status = "failed"
-        node_run.error_json = {
-            "code": "CONFIRMATION_DENIED",
-            "message": "用户拒绝审批",
-            "retryable": False,
-        }
-        node_run.finished_at = utcnow()
-    await append_event(
-        session,
-        approval.run_id,
-        "approval.resolved",
-        {"approvalId": approval.id, "nodeId": approval.node_id, "status": "rejected"},
-        approval.node_run_id,
-    )
-    await orchestrator.advance_run(session, approval.run_id)
+async def reject(
+    approval_id: str,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    from app.application.approval_transitions import reject as transition
+
+    result = await transition(approval_id, session)
     await session.commit()
-    return {"id": approval.id, "status": approval.status}
+    return result
 
 
 @router.get("/runs/{run_id}/events")
@@ -3319,40 +3145,29 @@ async def prompt_catalog(
     return {"workflows": workflows, "capabilities": capabilities}
 
 
-@router.post("/capabilities/{capability_id}/execute")
+@router.post("/capabilities/{capability_id}/execute", status_code=202)
 async def execute_capability(
     capability_id: str,
     body: CapabilityExecute,
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
+    from app.api.tasks import invocation_view
+    from app.application.invocations import enqueue_invocation
+
     capability = await session.get(Capability, capability_id)
     if capability is None or capability.current_version_id is None:
         raise HTTPException(404, "SkillX 能力不存在")
-    version = await session.get(CapabilityVersion, capability.current_version_id)
-    if version is None or version.status != "published":
-        raise HTTPException(409, "SkillX 能力当前版本不可用")
-    interface = version.manifest_json.get("interfaces", {}).get(body.interface)
-    if not isinstance(interface, dict) or interface.get("kind") != "direct":
-        raise HTTPException(422, "SkillX direct 接口不存在")
     try:
-        package = resolve_package_path(version.package_path or "")
-        result = await execute_in_subprocess(
-            package,
-            body.interface,
-            str(uuid4()),
-            body.input,
+        invocation = await enqueue_invocation(
+            session, kind="skillx",
+            arguments={"versionId": capability.current_version_id,
+                       "interface": body.interface, "input": body.input},
+            key=str(uuid4()),
         )
-    except Exception as exc:
-        raise HTTPException(
-            502,
-            detail={"code": "SKILLX_EXECUTION_FAILED", "message": str(exc)},
-        ) from exc
-    return {
-        "status": result.status,
-        "output": result.output,
-        "error": result.error.model_dump() if result.error is not None else None,
-        "metrics": result.metrics,
-    }
+        await session.commit()
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return invocation_view(invocation)
 
 
 @router.get("/secrets")
@@ -3803,7 +3618,7 @@ async def get_conversation(
     }
 
 
-@router.post("/conversations/{conversation_id}/messages", status_code=201)
+@router.post("/conversations/{conversation_id}/messages", status_code=202)
 async def create_message(
     conversation_id: str,
     body: MessageCreate,
@@ -3841,137 +3656,20 @@ async def create_message(
     # Message acceptance is a short durable transaction. No model or Tool call
     # below is allowed to inherit this SQLite write lock.
     await session.commit()
-    component_id = (
-        body.component_id or conversation.bound_component_id
-        if conversation.workflow_mode == "enabled"
-        else None
-    )
-    assistant_content: dict[str, Any]
-    conversation_run: ConversationRun | None = None
-    if component_id:
-        # 绑定组件或显式指定组件：补参齐全则启动 Workflow，否则请求补参。
-        assistant_content = await _bound_component_message(
-            session, component_id, body.content, body.inputs, turn.id
-        )
-    elif conversation.workflow_mode == "disabled":
-        config = AgentRunConfig.default()
-        config.allowed_capabilities = tuple(
-            capability
-            for capability in config.allowed_capabilities
-            if not capability.startswith("workflow.")
-        )
-        conversation_run = await enqueue_agent_run(
-            session,
-            conversation,
-            body.content,
-            config=config,
-            turn_id=turn.id,
-        )
-        assistant_content = {
-            **build_agent_run_message(
-                conversation_run,
-                "本轮已冻结为工作流关闭模式，由通用 Agent 处理。",
-            ),
-            "workflowModeSnapshot": "disabled",
-        }
-    else:
-        try:
-            assistant_content, conversation_run = await _unbound_conversation_message(
-                session, conversation, body, turn.id, user_message.id
-            )
-        except (
-            HTTPException,
-            CatalogError,
-            PlanCompileError,
-            WorkflowValidationError,
-        ) as exc:
-            detail = (
-                exc.detail
-                if isinstance(exc, HTTPException) and isinstance(exc.detail, dict)
-                else {
-                    "code": "WORKFLOW_SELECTION_CONTRACT_INVALID",
-                    "message": str(exc),
-                    "retryable": False,
-                }
-            )
-            usage_call_ids = list(
-                await session.scalars(
-                    select(ModelUsage.call_id).where(ModelUsage.turn_id == turn.id)
-                )
-            )
-            assistant_content = {
-                "type": "workflow_selection",
-                "state": "error",
-                "code": str(detail.get("code", "WORKFLOW_SELECTION_FAILED")),
-                "text": str(detail.get("message", "工作流选择未能完成")),
-                "retryable": bool(detail.get("retryable", False)),
-                "nextAction": detail.get("nextAction", "retry"),
-                "modelUsageCallIds": usage_call_ids,
-                **(
-                    {"disclosureSessionId": detail["disclosureSessionId"]}
-                    if detail.get("disclosureSessionId")
-                    else {}
-                ),
-                **(
-                    {"toolTimeline": detail["toolTimeline"]}
-                    if detail.get("toolTimeline")
-                    else {}
-                ),
-                **(
-                    {
-                        "diagnostics": [
-                            item
-                            if isinstance(item, dict)
-                            else {
-                                "code": "BINDING_CONTRACT_INVALID",
-                                "message": str(item),
-                            }
-                            for item in detail["diagnostics"][:4]
-                        ]
-                    }
-                    if isinstance(detail.get("diagnostics"), list)
-                    else {}
-                ),
-            }
-    responded_at = utcnow()
+    from app.application.tasks import enqueue_task
+    task = await enqueue_task(session, conversation, turn.id, body.content)
+    task.state_json = {"userInputs": body.inputs or {}, "componentHint": body.component_id}
     assistant_message = Message(
-        id=str(uuid4()),
-        conversation_id=conversation.id,
-        turn_id=turn.id,
-        role="assistant",
-        content_json=assistant_content,
-        created_at=responded_at,
+        id=str(uuid4()), conversation_id=conversation.id, turn_id=turn.id,
+        role="assistant", content_json={"type": "task", "taskId": task.id, "text": "任务已接受"},
     )
-    turn.first_response_at = responded_at
-    assistant_content["workflowModeSnapshot"] = turn.workflow_mode_snapshot
-    if assistant_content.get("state") == "ask_user":
-        turn.status = "ask_user"
-        turn.completed_at = responded_at
-        turn.elapsed_ms = max(
-            0, int((responded_at - accepted_at).total_seconds() * 1000)
-        )
-    elif assistant_content.get("state") in {"error", "unavailable"}:
-        turn.status = "error"
-        turn.completed_at = responded_at
-        turn.elapsed_ms = max(
-            0, int((responded_at - accepted_at).total_seconds() * 1000)
-        )
-    session.add_all(
-        [
-            assistant_message,
-            *([conversation_run] if conversation_run is not None else []),
-        ]
-    )
+    session.add(assistant_message)
     await session.flush()
     turn.assistant_message_id = assistant_message.id
-    conversation.last_message_at = responded_at
-    conversation.updated_at = responded_at
+    turn.first_response_at = utcnow()
     await session.commit()
-    return {
-        "userMessageId": user_message.id,
-        "assistant": assistant_message.content_json,
-        "turn": await turn_view(session, turn),
-    }
+    return {"taskId": task.id, "userMessageId": user_message.id,
+            "assistant": assistant_message.content_json, "turn": await turn_view(session, turn)}
 
 
 async def _unbound_conversation_message(

@@ -213,6 +213,17 @@ async def build_checkpoint(
     from app.application.orchestrator import load_execution_source
 
     source = await load_execution_source(session, run)
+    output_schema = failed_node.config.get("outputSchema") if failed_node else None
+    if failed_node and failed_node.type == NodeType.SKILLX:
+        from app.infrastructure.database import CapabilityVersion
+
+        version = await session.get(
+            CapabilityVersion, failed_node.config.get("capabilityVersionId")
+        )
+        if version:
+            output_schema = version.manifest_json.get("interfaces", {}).get(
+                failed_node.config.get("interface"), {}
+            ).get("outputSchema")
     snapshot = {
         "workflowVersionId": run.workflow_version_id,
         "planSnapshotId": run.plan_snapshot_id,
@@ -229,7 +240,8 @@ async def build_checkpoint(
             "outcomeCertainty": (
                 "unknown" if error.get("code") == "UNKNOWN_OUTCOME" else "known"
             ),
-            "outputSchema": (failed_node.config.get("outputSchema") if failed_node else None),
+            "outputSchema": output_schema,
+            "sideEffect": bool(failed_node and failed_node.side_effect),
         },
         "remainingNodes": remaining_nodes,
         "remainingEdges": remaining_edges,
@@ -492,7 +504,11 @@ def verify_checkpoint(checkpoint: ExecutionCheckpoint) -> None:
 def _validate_substitution(checkpoint: ExecutionCheckpoint, output: dict[str, Any]) -> None:
     """用失败节点 outputSchema（若声明）校验替代输出，类型不匹配 fail closed。"""
 
-    schema = (checkpoint.snapshot_json.get("failedNode") or {}).get("outputSchema")
+    failed = checkpoint.snapshot_json.get("failedNode") or {}
+    automatic = checkpoint.snapshot_json.get("fallbackConfig", {}).get("automatic")
+    if automatic and (failed.get("sideEffect") or not isinstance(failed.get("outputSchema"), dict)):
+        raise RecoveryError("CONTRACT_VIOLATION", "自动恢复不能虚构副作用结果或绕过缺失的输出契约")
+    schema = failed.get("outputSchema")
     if isinstance(schema, dict):
         errors = list(Draft202012Validator(schema).iter_errors(output))
         if errors:
@@ -574,10 +590,14 @@ async def apply_recovery_decision(
                 status="pending",
             )
         )
+        from app.application.orchestrator import Orchestrator
+
+        Orchestrator._set_wait_clock(run, True)
         run.status = "waiting_approval"
         checkpoint.status = "awaiting_user"
         await session.flush()
-        return "waiting_approval"
+        await Orchestrator().advance_run(session, run.id)
+        return run.status
     if action == "provide_substitution":
         output = decision["substitution"]
         _validate_substitution(checkpoint, output)
@@ -1052,9 +1072,10 @@ class RecoveryDriver:
             if run is None or run.status != "recovering":
                 return True
             try:
-                next_status = await apply_recovery_decision(
-                    session, checkpoint, decision, claim=claim
-                )
+                async with session.begin_nested():
+                    next_status = await apply_recovery_decision(
+                        session, checkpoint, decision, claim=claim
+                    )
             except RecoveryError as exc:
                 if exc.code == "RECOVERY_CLAIM_LOST":
                     logger.info(
@@ -1063,7 +1084,24 @@ class RecoveryDriver:
                         claim.generation,
                     )
                     return True
-                raise
+                # Validation rejection is a terminal recovery outcome, not a Worker crash.
+                # Roll back the proposed graph/output before recording the rejection.
+                await session.refresh(checkpoint)
+                await session.refresh(run)
+                if await self._set_owned_checkpoint_status(
+                    session, checkpoint_id, claim, "failed"
+                ):
+                    checkpoint.decision_json = {"rejected": _redacted_decision(decision),
+                                                "error": {"code": exc.code, "message": exc.message}}
+                    await self._finish_recovery_node(session, checkpoint, "failed", claim)
+                    original = checkpoint.snapshot_json.get("failedNode", {}).get("error", {})
+                    await Orchestrator()._finish_failed(session, run, {
+                        **original, "recoveryError": {"code": exc.code, "message": exc.message}
+                    })
+                    await append_event(session, run.id, "recovery.decision_rejected", {
+                        "checkpointId": checkpoint_id, "code": exc.code, "message": exc.message
+                    })
+                return True
             await self._finish_recovery_node(session, checkpoint, "succeeded", claim)
             run_id = checkpoint.run_id
         if next_status == "running":

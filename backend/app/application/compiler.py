@@ -164,6 +164,14 @@ class WorkflowCompiler:
                         message="非幂等副作用节点不得自动重试",
                     )
                 )
+            if node.type == NodeType.CAPABILITY_CALL and not all(
+                node.config.get(key) for key in ("capabilityVersionId", "interface", "digest")
+            ):
+                diagnostics.append(Diagnostic(
+                    level="error", code="CAPABILITY_VERSION_REQUIRED",
+                    path=f"spec.nodes.{index}.config",
+                    message="能力节点必须锁定 capabilityVersionId、interface 和 digest",
+                ))
             if node.type == NodeType.SKILLX:
                 if node.config.get("package"):
                     diagnostics.append(

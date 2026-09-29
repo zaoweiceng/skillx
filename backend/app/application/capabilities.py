@@ -42,6 +42,10 @@ def snapshot_manifest(package: Path, manifest: dict[str, Any]) -> dict[str, Any]
     for name, interface in manifest["spec"]["interfaces"].items():
         interfaces[name] = {
             "kind": interface["kind"],
+            "description": interface["description"],
+            "title": interface.get("title", name),
+            "uiSchema": json.loads((package / interface["uiSchema"]).read_text(encoding="utf-8"))
+            if interface.get("uiSchema") else {},
             "inputSchema": json.loads(
                 (package / interface["inputSchema"]).read_text(encoding="utf-8")
             ),
@@ -68,6 +72,9 @@ async def register_skillx(
     package = resolve_package_path(relative_path)
     manifest = load_manifest(package)
     snapshot = snapshot_manifest(package, manifest)
+    from app.application.skillx_dependencies import lock_dependencies
+
+    snapshot["dependencyLocks"] = await lock_dependencies(session, manifest)
     metadata = manifest["metadata"]
     capability = await session.scalar(select(Capability).where(Capability.name == metadata["name"]))
     if capability is None:
@@ -89,6 +96,28 @@ async def register_skillx(
         if existing.digest != snapshot["packageDigest"]:
             raise SkillXValidationError("同一 SemVer 的包内容已变化；请提升版本后重新注册")
         return capability, existing
+    import shutil
+
+    frozen = (
+        get_settings().capability_root.resolve()
+        / ".versions"
+        / snapshot["packageDigest"].split(":", 1)[1]
+    )
+    if not frozen.exists():
+        frozen.parent.mkdir(parents=True, exist_ok=True)
+        staging = frozen.with_name(frozen.name + "-" + str(uuid4()))
+        shutil.copytree(
+            package,
+            staging,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".venv", "node_modules"),
+        )
+        if package_digest(staging) != snapshot["packageDigest"]:
+            raise SkillXValidationError("能力快照复制后 digest 不一致")
+        try:
+            staging.rename(frozen)
+        except FileExistsError:
+            shutil.rmtree(staging)
+    relative_path = str(frozen.relative_to(get_settings().capability_root.resolve()))
     version = CapabilityVersion(
         id=str(uuid4()),
         capability_id=capability.id,

@@ -304,6 +304,7 @@ export type WorkflowVersionSummary = {
 }
 
 export type ChatMessageContent = {
+  taskId?: string
   type: string
   state?: string
   text: string

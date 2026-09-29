@@ -195,7 +195,7 @@ describe('ChatPage 候选组件闭环', () => {
     expect(createConversation).toHaveBeenCalledTimes(1)
   })
 
-  it('真实语义 Runtime 缺失时预先提示自动选择不可用', async () => {
+  it('入口不要求用户切换工作流模式', async () => {
     getHealth.mockResolvedValue({ workflowSelectionMode: 'unavailable' })
     getConversation.mockResolvedValue({
       id: 'conv-1',
@@ -210,7 +210,7 @@ describe('ChatPage 候选组件闭环', () => {
 
     await waitFor(() =>
       expect(
-        screen.getByText('自动选择不可用；请关闭工作流后继续通用 Agent'),
+        screen.getByText('Agent 自动调用能力；需要你决策时会显示交互卡片'),
       ).toBeInTheDocument(),
     )
   })
@@ -737,7 +737,7 @@ describe('ChatPage 候选组件闭环', () => {
     expect(screen.getByText('上游暂不可用')).toBeInTheDocument()
   })
 
-  it('展示持久历史并切换当前对话的工作流模式', async () => {
+  it('展示持久历史但不提供工作流模式开关', async () => {
     getConversation.mockResolvedValue({
       id: 'conv-1',
       title: '当前对话',
@@ -763,14 +763,7 @@ describe('ChatPage 候选组件闭环', () => {
     renderAt('conv-1')
 
     await waitFor(() => expect(screen.getByText('当前对话')).toBeInTheDocument())
-    const toggle = screen.getByRole('button', { name: '工作流：开启' })
-    fireEvent.click(toggle)
-    await waitFor(() =>
-      expect(updateConversationWorkflowMode).toHaveBeenCalledWith('conv-1', 'disabled'),
-    )
-    expect(screen.getByRole('button', { name: '工作流：关闭' })).toHaveAttribute(
-      'aria-pressed',
-      'false',
-    )
+    expect(screen.queryByRole('button', { name: '工作流：开启' })).not.toBeInTheDocument()
+    expect(updateConversationWorkflowMode).not.toHaveBeenCalled()
   })
 })

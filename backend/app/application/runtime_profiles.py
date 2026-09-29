@@ -157,6 +157,19 @@ async def workflow_profiles(session: AsyncSession, definition: Any) -> dict[str,
         )
     )
     for node in definition.spec.nodes:
+        if node.type == "skillx":
+            from app.infrastructure.database import CapabilityVersion
+
+            capability = await session.get(
+                CapabilityVersion, node.config.get("capabilityVersionId")
+            )
+            interface = (
+                capability.manifest_json.get("interfaces", {}).get(node.config.get("interface"), {})
+                if capability
+                else {}
+            )
+            if interface.get("kind") in {"llm", "agent"}:
+                node = node.model_copy(update={"type": interface["kind"]})
         if node.type == "agent" and node.config.get("agentProfile") != "fixture":
             result[node.id] = {
                 "agentConfig": await agent_snapshot(session, node.config.get("agentProfileId"))

@@ -348,35 +348,25 @@ def test_e2e_3c_direct_llm_does_not_fallback_after_request_started(
             stop_stack(direct_stack, failed=failed)
 
 
-def test_e2e_4_conversation_component(stack: DemoStack) -> None:
+def test_e2e_4_automatic_task_dispatch(stack: DemoStack) -> None:
     with stack.client() as client:
-        unbound = client.post("/conversations", json={"title": "未绑定对话"}).json()
-        unavailable = client.post(
-            f"/conversations/{unbound['id']}/messages",
-            json={"content": "上海天气如何"},
-        )
-        assert unavailable.status_code == 201, unavailable.text
-        assert unavailable.json()["assistant"]["state"] == "unavailable"
-        assert unavailable.json()["assistant"]["selectionMode"] == "unavailable"
-
-        component = _component(client, "确定性问候")
-        conversation = client.post(
-            "/conversations",
-            json={
-                "title": "显式绑定组件",
-                "boundComponentId": component["id"],
-            },
-        ).json()
+        conversation = client.post("/conversations", json={"title": "自动派发"}).json()
         message = client.post(
             f"/conversations/{conversation['id']}/messages",
             json={"content": "问候 Bob", "inputs": {"name": "Bob"}},
         )
-        assert message.status_code == 201, message.text
-        selected = message.json()["assistant"]
-        assert selected["state"] == "component_run"
-        run = poll_run(client, selected["runId"])
-        assert run["status"] == "succeeded"
-        assert run["output"] == {"message": "你好，Bob"}
+        assert message.status_code == 202, message.text
+        task_id = message.json()["taskId"]
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            task = client.get(f"/tasks/{task_id}").json()
+            if task["status"] in {"succeeded", "failed", "blocked"}:
+                break
+            time.sleep(0.1)
+        assert task["status"] == "succeeded", task
+        assert len(task["invocations"]) == 1
+        assert task["invocations"][0]["output"] == {"message": "你好，Bob"}
+        assert not task["learning"]
 
 
 def test_e2e_5_agent_distillation_reuse(stack: DemoStack) -> None:
@@ -443,7 +433,7 @@ def test_e2e_5_agent_distillation_reuse(stack: DemoStack) -> None:
         assert "llm.call.completed" not in reuse_events
 
 
-def test_workflow_disabled_message_runs_fixture_agent_protocol(
+def test_explicit_agent_endpoint_runs_fixture_protocol(
     stack: DemoStack,
 ) -> None:
     stack.set_article("自然入口网页正文")
@@ -476,22 +466,12 @@ def test_workflow_disabled_message_runs_fixture_agent_protocol(
             conversation = client.post(
                 "/conversations", json={"title": f"自然入口-{capability}"}
             ).json()
-            mode = client.patch(
-                f"/conversations/{conversation['id']}/workflow-mode",
-                json={"workflowMode": "disabled"},
-            )
-            assert mode.status_code == 200, mode.text
             sent = client.post(
-                f"/conversations/{conversation['id']}/messages",
-                json={"content": prompt},
+                f"/conversations/{conversation['id']}/agent-runs",
+                json={"content": prompt, "allowedCapabilities": [capability, "summarize.text"]},
             )
-            assert sent.status_code == 201, sent.text
-            assistant = sent.json()["assistant"]
-            assert assistant["type"] == "agent_run"
-            assert assistant["runType"] == "agent_run"
-            assert assistant["state"] == "queued"
-            assert assistant["workflowModeSnapshot"] == "disabled"
-
+            assert sent.status_code == 202, sent.text
+            assistant = sent.json()
             summary = poll_conversation_run(
                 client, assistant["conversationRunId"], timeout=60
             )

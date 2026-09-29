@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     lease_seconds: int = 30
     auto_create_schema: bool = False
     deterministic_workflows: bool = False
+    task_max_decisions: int = 20
+    task_max_active_seconds: int = 1800
+    task_local_execution_enabled: bool = True
     mcp_allowed_executables: list[str] = [
         "python",
         "python3",

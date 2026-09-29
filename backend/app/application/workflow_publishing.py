@@ -54,7 +54,9 @@ async def validate_workflow(
     if item is None:
         raise PublicationError(404, "工作流不存在")
     try:
-        compiled = compiler.compile(item.draft_json)
+        compiler.compile(item.draft_json)
+        from app.application.workflow_nesting import expand_workflow
+        compiled = compiler.compile(await expand_workflow(session, item.draft_json))
         metadata_issues = capability_metadata_issues(compiled.definition)
         if metadata_issues:
             return {
@@ -174,7 +176,9 @@ async def publish_workflow(
     if item is None:
         raise PublicationError(404, "工作流不存在")
     try:
-        compiled = compiler.compile(item.draft_json)
+        source_compiled = compiler.compile(item.draft_json)
+        from app.application.workflow_nesting import expand_workflow
+        compiled = compiler.compile(await expand_workflow(session, item.draft_json))
         metadata_issues = capability_metadata_issues(compiled.definition)
         if metadata_issues:
             raise PublicationError(
@@ -255,7 +259,7 @@ async def publish_workflow(
         return await published_response(existing)
     if (
         item.draft_revision != body.draft_revision
-        or compiled.digest != body.draft_digest
+        or source_compiled.digest != body.draft_digest
     ):
         raise PublicationError(
             409,
@@ -263,7 +267,7 @@ async def publish_workflow(
                 "code": "DRAFT_SNAPSHOT_CONFLICT",
                 "message": "草稿已变化，发布请求不是当前审核快照",
                 "currentRevision": item.draft_revision,
-                "currentDigest": compiled.digest,
+                "currentDigest": source_compiled.digest,
             },
         )
 

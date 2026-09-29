@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, ValidationError
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -154,8 +154,6 @@ def write_json_artifact(
     }
 
 
-
-
 class InputExecutor:
     node_type = NodeType.INPUT
 
@@ -221,8 +219,10 @@ class TransformExecutor:
                 output = {"value": table.get(str(key), default)}
             else:
                 raise ValueError(f"不支持的转换操作: {operation}")
+            if isinstance(node.config.get("outputSchema"), dict):
+                Draft202012Validator(node.config["outputSchema"]).validate(output)
             return NodeResult(status="succeeded", output=output)
-        except (KeyError, ValueError, TypeError) as exc:
+        except (KeyError, ValueError, TypeError, ValidationError) as exc:
             return NodeResult(
                 status="failed",
                 error=ExecutionError(code="INVALID_INPUT", message=str(exc)),
@@ -290,6 +290,74 @@ class SkillXExecutor:
     async def execute(
         self, context: RunContext, node: WorkflowNode, inputs: dict[str, Any]
     ) -> NodeResult:
+        from app.application.skillx_execution import execute_skillx
+
+        if node.config.get("capabilityVersionId"):
+            from sqlalchemy import select
+
+            from app.infrastructure.database import Approval, CapabilityVersion, SessionLocal
+
+            operation = {
+                "versionId": node.config["capabilityVersionId"],
+                "interface": node.config["interface"],
+                "input": inputs,
+            }
+            approved = False
+            async with SessionLocal() as session:
+                version = await session.get(CapabilityVersion, operation["versionId"])
+                interface = version.manifest_json["interfaces"][operation["interface"]]
+                required = any(
+                    e.get("confirmation") == "required" for e in interface.get("effects", [])
+                )
+                if required:
+                    approvals = await session.scalars(
+                        select(Approval).where(
+                            Approval.node_run_id == context.node_run_id,
+                            Approval.status == "approved",
+                        )
+                    )
+                    approved = any(
+                        a.snapshot_json.get("operation") == operation
+                        and a.snapshot_json.get("versionDigest") == version.digest
+                        and a.snapshot_digest == digest_json(a.snapshot_json)
+                        for a in approvals
+                    )
+                    if not approved:
+                        snapshot = {
+                            "runId": context.run_id,
+                            "nodeId": node.id,
+                            "effect": "skillx.invoke",
+                            "title": "批准本次 SkillX 操作",
+                            "description": "能力要求本次执行授权，请核对输入和版本。",
+                            "operation": operation,
+                            "payload": inputs,
+                            "versionDigest": version.digest,
+                        }
+                        return NodeResult(
+                            status="waiting_user",
+                            output={
+                                "approvalSnapshot": snapshot,
+                                "snapshotDigest": digest_json(snapshot),
+                            },
+                        )
+
+            async def cancelled():
+                return context.cancellation.cancelled
+
+            return await execute_skillx(
+                node.config["capabilityVersionId"],
+                node.config["interface"],
+                inputs,
+                context.node_run_id,
+                {
+                    "agentConfig": context.runtime_snapshot.get("nodeProfiles", {})
+                    .get(node.id, {})
+                    .get("agentConfig"),
+                    "modelSnapshot": context.runtime_snapshot.get("nodeProfiles", {}).get(node.id),
+                },
+                cancelled,
+                effect_approved=approved,
+            )
         package = node.config.get("_resolvedPackage")
         interface_name = node.config.get("interface")
         if not package or not interface_name:

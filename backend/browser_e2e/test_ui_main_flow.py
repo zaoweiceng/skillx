@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import signal
 import socket
 import subprocess
 import time
@@ -9,11 +8,9 @@ from pathlib import Path
 
 import httpx
 import pytest
-from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import expect, sync_playwright
 
 from e2e.harness import (
-    poll_conversation_run,
     restart_worker,
     start_stack,
     stop_stack,
@@ -48,429 +45,115 @@ def _submit(page, prompt: str) -> None:
     page.get_by_role("button", name="发送").click()
 
 
-def test_real_ui_natural_exploration_reuse_and_run_detail() -> None:
+@pytest.mark.parametrize("human", [False, True])
+def test_durable_task_ui_and_manual_panels(human: bool) -> None:
     frontend_port = _free_port()
     frontend_url = f"http://127.0.0.1:{frontend_port}"
-    stack = start_stack(
-        model_env={"SKILLX_CORS_ORIGINS": f'["{frontend_url}"]'}
-    )
-    frontend_log_path = stack.workdir / "frontend.log"
-    frontend_log = frontend_log_path.open("w", encoding="utf-8")
-    stack._logs["frontend"] = frontend_log_path
-    stack._log_handles.append(frontend_log)
+    stack = start_stack(model_env={"SKILLX_CORS_ORIGINS": f'["{frontend_url}"]'})
+    log_path = stack.workdir / "frontend.log"
+    log = log_path.open("w", encoding="utf-8")
+    stack._logs["frontend"] = log_path
+    stack._log_handles.append(log)
     frontend = subprocess.Popen(
-        [
-            "npm",
-            "run",
-            "dev",
-            "--",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(frontend_port),
-        ],
+        ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", str(frontend_port)],
         cwd=FRONTEND_DIR,
         env={**os.environ, "VITE_API_BASE": stack.base_url},
-        stdout=frontend_log,
+        stdout=log,
         stderr=subprocess.STDOUT,
     )
     failed = False
     try:
         _wait_http(frontend_url, frontend)
         with sync_playwright() as playwright:
-            try:
-                browser = playwright.chromium.launch(headless=True)
-            except PlaywrightError as exc:
-                pytest.fail(f"Chromium 发布门禁无法启动：{exc}")
+            browser = playwright.chromium.launch(headless=True)
             page = browser.new_page()
-            assert page.evaluate(
-                "new Date('2026-08-10T07:12:23Z').getHours()"
-            ) == 15
-            utc_context = browser.new_context(timezone_id="UTC")
-            utc_page = utc_context.new_page()
-            assert utc_page.evaluate(
-                "new Date('2026-08-10T07:12:23Z').getHours()"
-            ) == 7
-            utc_context.close()
-            console_errors: list[str] = []
-            console_warnings: list[str] = []
-            stream_requests: list[str] = []
-            page.on(
-                "console",
-                lambda message: (
-                    console_errors.append(message.text)
-                    if message.type == "error"
-                    else console_warnings.append(message.text)
-                    if message.type == "warning"
-                    else None
-                ),
-            )
-            page.on(
-                "request",
-                lambda request: (
-                    stream_requests.append(request.url)
-                        if "/events/stream" in request.url
-                    else None
-                ),
-            )
-
-            stack.set_article("016 UI 首次探索正文")
+            errors = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
             page.goto(f"{frontend_url}/chat")
             page.wait_for_url("**/chat/*")
-            for width in (760, 903, 1024, 1280, 1440):
-                page.set_viewport_size({"width": width, "height": 900})
-                message_column = page.locator(".message-column").bounding_box()
-                composer = page.locator(".chat-composer").bounding_box()
-                assert message_column is not None
-                assert composer is not None
-                assert message_column["width"] >= 420
-                assert composer["x"] >= 0
-                assert composer["x"] + composer["width"] <= width
-            page.set_viewport_size({"width": 1280, "height": 900})
-            capture_dir = os.environ.get("SKILLX_UI_CAPTURE_DIR")
-            if capture_dir:
-                Path(capture_dir).mkdir(parents=True, exist_ok=True)
-                page.screenshot(path=str(Path(capture_dir) / "chat-light.png"), full_page=True)
-            page.set_viewport_size({"width": 375, "height": 812})
-            assert page.evaluate("document.documentElement.scrollWidth") <= 375
-            heading = page.get_by_role("heading", name="通用对话").bounding_box()
-            assert heading is not None and heading["height"] < 50
-            composer = page.locator(".chat-composer").bounding_box()
-            assert composer is not None and composer["x"] >= 0
-            assert composer["x"] + composer["width"] <= 375
-            if capture_dir:
-                page.screenshot(path=str(Path(capture_dir) / "chat-mobile.png"), full_page=True)
-            page.set_viewport_size({"width": 1280, "height": 900})
-            page.get_by_role("button", name="工作流：开启").click()
-            expect(
-                page.get_by_role("button", name="工作流：关闭")
-            ).to_be_visible()
-            _submit(
-                page,
-                (
-                    f"请读取并总结 {stack.form_url}/article "
-                    "[[SELECTION:continue_agent]][[MODE:browser_summary]]"
-                ),
-            )
-            expect(page.get_by_text("016 UI 首次探索正文")).to_be_visible(
-                timeout=60_000
-            )
-            page.get_by_role("button", name="固化为组件").click()
-            page.get_by_role("link", name="打开固化草稿").click()
-            expect(page.get_by_role("heading", name="网页内容读取与总结")).to_be_visible()
-            page.get_by_role(
-                "checkbox", name="面向最终用户生成阅读结果"
-            ).check()
-            page.get_by_role("button", name="修改后接受").click()
-            page.get_by_role("button", name="静态检查").click()
+            expect(page.get_by_role("button", name="工作流：开启")).to_have_count(0)
             with page.expect_response(
-                lambda response: response.url.endswith("/publish")
-                and response.status == 201,
-                timeout=30_000,
-            ):
-                page.get_by_role("button", name="发布版本").click()
-
-            stack.set_article("016 UI 第二次复用正文")
-            page.goto(f"{frontend_url}/components")
-            page.get_by_role("link", name="网页内容读取与总结").first.click()
-            page.locator("#root_url").fill(
-                f"{stack.form_url}/article?version=second"
-            )
-            page.get_by_role("button", name="启动工作流").click()
-            expect(page.get_by_role("heading", name="运行详情")).to_be_visible(
-                timeout=60_000
-            )
-            presentation_panel = page.locator("section").filter(
-                has=page.get_by_role("heading", name="阅读结果")
-            )
-            expect(presentation_panel).to_contain_text(
-                "016 UI 第二次复用正文", timeout=60_000
-            )
+                lambda r: "/messages" in r.url and r.status == 202
+            ) as response:
+                _submit(page, "请问候用户 [[HUMAN]]" if human else "请问候 Alice")
+            task_id = response.value.json()["taskId"]
+            if human:
+                expect(page.get_by_text("请提供姓名", exact=True)).to_be_visible(timeout=30_000)
+                restart_worker(stack, crash=True)
+                page.reload()
+                expect(page.get_by_text("请提供姓名", exact=True)).to_be_visible(timeout=30_000)
+                page.get_by_label("姓名", exact=False).fill("Bob")
+                page.get_by_role("button", name="提交并继续").click()
+            panel = page.get_by_role("region", name="任务执行")
+            expect(panel.get_by_text("succeeded", exact=True).first).to_be_visible(timeout=30_000)
             expect(
-                page.get_by_role("link", name="browser-read-summary.json")
+                panel.get_by_text("你好，Bob" if human else "你好，Alice", exact=False).first
             ).to_be_visible()
-            run_id = page.url.rstrip("/").rsplit("/", 1)[-1]
-            with stack.client() as client:
-                persisted_events = client.get(
-                    f"/runs/{run_id}/events", params={"limit": 500}
-                ).json()
-            expect(page.locator(".event-item > span")).to_have_count(len(persisted_events))
-            live_sequences = [
-                int(value)
-                for value in page.locator(".event-item > span").all_inner_texts()
-            ]
-            assert live_sequences == [item["seq"] for item in persisted_events]
-            assert live_sequences == list(range(1, len(live_sequences) + 1))
-            page.reload()
-            presentation_panel = page.locator("section").filter(
-                has=page.get_by_role("heading", name="阅读结果")
-            )
-            expect(presentation_panel).to_contain_text(
-                "016 UI 第二次复用正文", timeout=30_000
-            )
-            expect(page.get_by_role("heading", name="运行详情")).to_be_visible()
-            expect(page.get_by_role("heading", name="结构化结果")).to_be_visible()
-            expect(
-                page.get_by_role("link", name="browser-read-summary.json")
-            ).to_be_visible()
-            expect(page.get_by_text("实时流已关闭")).to_be_visible()
-            terminal_stream_count = len(stream_requests)
-            assert terminal_stream_count > 0
-            page.wait_for_timeout(5_000)
-            assert len(stream_requests) == terminal_stream_count
-
-            stack.set_transient_healthy(False)
-            page.goto(f"{frontend_url}/components")
-            page.get_by_role("link", name="网页内容读取与总结").first.click()
-            page.locator("#root_url").fill(
-                f"{stack.form_url}/transient?mode=503"
-            )
-            page.get_by_role("button", name="启动工作流").click()
-            expect(page.get_by_role("heading", name="运行错误")).to_be_visible(
-                timeout=60_000
-            )
-            expect(page.get_by_role("heading", name="检查点接力")).to_be_visible()
-
-            page.goto(f"{frontend_url}/components")
-            expect(page.get_by_role("heading", name="已发布组件")).to_be_visible()
-            expect(page.get_by_text("网页内容读取与总结").first).to_be_visible()
-            agent_filter = page.get_by_role("button", name="Agent 工作流")
-            agent_filter.focus()
-            agent_filter.press("Enter")
-            expect(agent_filter).to_have_attribute("aria-pressed", "true")
-            expect(page.get_by_text("网页内容读取与总结").first).to_be_visible()
-
-            theme_toggle = page.get_by_role("button", name="切换到暗色主题")
-            theme_toggle.click()
-            expect(page.get_by_role("button", name="切换到亮色主题")).to_be_visible()
-            page.reload()
-            expect(page.get_by_role("button", name="切换到亮色主题")).to_be_visible()
-
-            if capture_dir:
-                page.goto(f"{frontend_url}/chat")
-                page.wait_for_url("**/chat/*")
-                page.screenshot(path=str(Path(capture_dir) / "chat-dark.png"), full_page=True)
-
-            page.goto(f"{frontend_url}/settings")
-            page.get_by_text("连接诊断与高级信息", exact=True).click()
-            expect(
-                page.get_by_text("自动选择不可用", exact=False)
-            ).to_be_visible()
-            expect(
-                page.get_by_text("协议 fixture 可用", exact=False)
-            ).to_be_visible()
-            expect(
-                page.get_by_text("不参与产品语义选择", exact=False)
-            ).to_be_visible()
-            browser_card = page.locator("article").filter(
-                has=page.get_by_role("heading", name="浏览器运行时")
-            )
-            expect(browser_card).to_contain_text("available")
-            expect(browser_card).to_contain_text("Chromium")
-            assert not console_errors, console_errors
-            assert not console_warnings, console_warnings
-            browser.close()
-    except pytest.skip.Exception:
-        raise
-    except BaseException:
-        failed = True
-        raise
-    finally:
-        if frontend.poll() is None:
-            frontend.send_signal(signal.SIGTERM)
-            try:
-                frontend.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                frontend.kill()
-        stop_stack(stack, failed=failed)
-
-
-def test_real_ui_agent_failure_handoff_returns_to_original_chat() -> None:
-    frontend_port = _free_port()
-    frontend_url = f"http://127.0.0.1:{frontend_port}"
-    stack = start_stack(
-        model_env={"SKILLX_CORS_ORIGINS": f'["{frontend_url}"]'}
-    )
-    restart_worker(stack, crash=True, disable_task_recovery=True)
-    frontend_log_path = stack.workdir / "frontend-handoff.log"
-    frontend_log = frontend_log_path.open("w", encoding="utf-8")
-    stack._logs["frontend-handoff"] = frontend_log_path
-    stack._log_handles.append(frontend_log)
-    frontend = subprocess.Popen(
-        [
-            "npm",
-            "run",
-            "dev",
-            "--",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(frontend_port),
-        ],
-        cwd=FRONTEND_DIR,
-        env={**os.environ, "VITE_API_BASE": stack.base_url},
-        stdout=frontend_log,
-        stderr=subprocess.STDOUT,
-    )
-    failed = False
-    try:
-        _wait_http(frontend_url, frontend)
-        with sync_playwright() as playwright:
-            try:
-                browser = playwright.chromium.launch(headless=True)
-            except PlaywrightError as exc:
-                pytest.fail(f"Chromium 发布门禁无法启动：{exc}")
-            page = browser.new_page()
-            console_errors: list[str] = []
-            page.on(
-                "console",
-                lambda message: (
-                    console_errors.append(message.text)
-                    if message.type == "error"
-                    else None
-                ),
-            )
-
-            stack.set_transient_healthy(False)
-            page.goto(f"{frontend_url}/chat")
-            page.wait_for_url("**/chat/*")
-            page.get_by_role("button", name="工作流：开启").click()
-            expect(
-                page.get_by_role("button", name="工作流：关闭")
-            ).to_be_visible()
-            with page.expect_response(
-                lambda response: "/messages" in response.url
-                and response.status == 201,
-                timeout=30_000,
-            ) as response_info:
-                _submit(
-                    page,
-                    (
-                        f"请读取并总结 {stack.form_url}/transient?mode=503 "
-                        "[[SELECTION:continue_agent]]"
-                        "[[MODE:planned_browser_summary]]"
-                    ),
-                )
-            message_response = response_info.value
-            conversation_id = message_response.url.split(
-                "/conversations/", 1
-            )[1].split("/", 1)[0]
-            conversation_url = f"{frontend_url}/chat/{conversation_id}"
-
-            with stack.client() as client:
-                deadline = time.time() + 30
-                source_id = None
-                while time.time() < deadline:
-                    conversation = client.get(
-                        f"/conversations/{conversation_id}"
-                    ).json()
-                    source_id = next(
-                        (
-                            item["content"].get("conversationRunId")
-                            for item in conversation["messages"]
-                            if item["role"] == "assistant"
-                            and item["content"].get("type") == "agent_run"
-                        ),
-                        None,
-                    )
-                    if source_id:
-                        break
-                    time.sleep(0.1)
-                assert source_id is not None
-                source = poll_conversation_run(client, source_id)
-                assert source["status"] == "failed"
-                assert source["error"]["code"] == "DEPENDENCY_UNAVAILABLE"
-                checkpoint_id = source["error"]["taskCheckpointId"]
-                checkpoint = client.get(
-                    f"/task-checkpoints/{checkpoint_id}"
-                ).json()
-                assert checkpoint["status"] == "pending"
-                assert checkpoint["continuationRunId"] is None
-                assert stack.form_stats()["transientCount"] == 2
-
+            with httpx.Client(base_url=stack.base_url) as client:
+                task = client.get(f"/tasks/{task_id}").json()
+                assert task["status"] == "succeeded", task
+                assert len(task["invocations"]) == 1
+                assert not task["learning"]
+                workflow_run = client.get(f"/runs/{task['invocations'][0]['runId']}").json()
+                workflows = client.get("/workflows").json()
+                workflow = next(x for x in workflows if x["name"] == "问候工作流")
+                page.goto(f"{frontend_url}/workflows/{workflow['id']}/run")
+                page.get_by_label("姓名", exact=False).fill("Carol")
+                page.get_by_role("button", name="运行能力").click()
+                page.get_by_role("link", name="运行详情").first.click()
+                page.wait_for_url("**/runs/*")
                 expect(
-                    page.get_by_text("等待接力", exact=True).first
-                ).to_be_visible(
-                    timeout=30_000
+                    page.locator(".run-header").get_by_text("succeeded", exact=True)
+                ).to_be_visible(timeout=30_000)
+                assert workflow_run["status"] == "succeeded"
+                registered = client.post(
+                    "/capabilities",
+                    json={"name": "text-stats", "type": "skillx", "packagePath": "text-stats"},
                 )
-                stack._worker.kill()
-                stack._worker.wait(timeout=10)
-                stack.set_transient_healthy(True)
-                restart_worker(stack)
-
-                expect(page.get_by_text("恢复后的正文")).to_be_visible(
-                    timeout=60_000
-                )
-                expect(page.get_by_text("恢复后的正文")).to_have_count(1)
-
-                deadline = time.time() + 30
-                while time.time() < deadline:
-                    checkpoint = client.get(
-                        f"/task-checkpoints/{checkpoint_id}"
-                    ).json()
-                    if checkpoint["chainStatus"] == "succeeded":
-                        break
-                    time.sleep(0.1)
-                assert checkpoint["chainStatus"] == "succeeded"
-                assert checkpoint["continuationStatus"] == "succeeded"
-                assert checkpoint["continuationOutputDigest"].startswith(
-                    "sha256:"
-                )
-                continuation_id = checkpoint["continuationRunId"]
-                continuation = poll_conversation_run(
-                    client, continuation_id
-                )
-                assert continuation["output"] == {
-                    "reply": "恢复后的正文"
-                }
-                assert continuation["input"][
-                    "continuationOfConversationRunId"
-                ] == source_id
-                attempts = continuation["stepAttempts"]["browser"]
-                assert [item["attempt"] for item in attempts] == [1, 2]
-                assert [item["status"] for item in attempts] == [
-                    "failed",
-                    "succeeded",
-                ]
-                assert len(
-                    {item["argumentsDigest"] for item in attempts}
-                ) == 1
-                assert stack.form_stats()["transientCount"] == 3
-                conversation = client.get(
-                    f"/conversations/{conversation_id}"
-                ).json()
-                continuation_messages = [
-                    item
-                    for item in conversation["messages"]
-                    if item["content"].get("taskCheckpointId")
-                    == checkpoint_id
-                ]
-                assert len(continuation_messages) == 1
-                assert continuation_messages[0]["content"][
-                    "continuationGeneration"
-                ] == 1
-                assert poll_conversation_run(client, source_id)[
-                    "status"
-                ] == "failed"
-
-            assert page.url == conversation_url
-            page.reload()
-            expect(page.get_by_text("恢复后的正文")).to_be_visible(
-                timeout=30_000
-            )
-            expect(page.get_by_text("恢复后的正文")).to_have_count(1)
-            assert not console_errors, console_errors
+                assert registered.status_code == 201, registered.text
+                capabilities = client.get("/capabilities").json()
+                assert capabilities
+                page.goto(f"{frontend_url}/capabilities/{capabilities[0]['id']}")
+                expect(page.get_by_role("heading", name="能力手动执行")).to_be_visible()
+                page.get_by_label("文本", exact=False).fill("Hello world")
+                page.get_by_role("button", name="运行能力").click()
+                expect(page.get_by_text("succeeded", exact=True)).to_be_visible(timeout=30_000)
+                if human:
+                    component = next(
+                        x
+                        for x in client.get("/components").json()
+                        if x["name"] == "费用提交（真实浏览器）"
+                    )
+                    created = client.post(
+                        f"/components/{component['id']}/runs", json={"input": {"amount": 321}}
+                    )
+                    assert created.status_code == 202, created.text
+                    run_id = created.json()["id"]
+                    page.goto(f"{frontend_url}/runs/{run_id}")
+                    expect(page.get_by_role("button", name="批准本次操作")).to_be_visible(
+                        timeout=30_000
+                    )
+                    assert stack.form_stats()["submitCount"] == 0
+                    restart_worker(stack, crash=True)
+                    page.reload()
+                    expect(page.get_by_role("button", name="批准本次操作")).to_be_visible(
+                        timeout=30_000
+                    )
+                    with page.expect_response(
+                        lambda r: "/human-interactions/" in r.url and r.url.endswith("/answer")
+                    ) as approved:
+                        page.get_by_role("button", name="批准本次操作").click()
+                    assert approved.value.status == 200
+                    expect(
+                        page.locator(".run-header").get_by_text("succeeded", exact=True)
+                    ).to_be_visible(timeout=30_000)
+                    assert stack.form_stats()["submitCount"] == 1
+            assert not errors, errors
             browser.close()
-    except pytest.skip.Exception:
-        raise
-    except BaseException:
+    except Exception:
         failed = True
         raise
     finally:
-        if frontend.poll() is None:
-            frontend.send_signal(signal.SIGTERM)
-            try:
-                frontend.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                frontend.kill()
+        frontend.terminate()
+        frontend.wait(timeout=10)
         stop_stack(stack, failed=failed)

@@ -59,7 +59,7 @@ export default function WorkflowsPage() {
           {workflows.filter(workflow => workflow.name.toLowerCase().includes(query.toLowerCase())).map((workflow) => (
             <Link
               className="workflow-list-item"
-              to={`/workflows/${workflow.id}/edit`}
+              to={`/workflows/${workflow.id}/run`}
               key={workflow.id}
             >
               <span className="component-icon">

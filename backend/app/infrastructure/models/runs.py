@@ -16,6 +16,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.infrastructure.payloads import ArtifactJSON
+
 from .base import Base, TimestampMixin, utcnow
 
 
@@ -48,9 +50,9 @@ class Run(Base, TimestampMixin):
     )
     owner_id: Mapped[str] = mapped_column(String(120), default="local-user")
     status: Mapped[str] = mapped_column(String(32), index=True, default="queued")
-    input_json: Mapped[dict[str, Any]] = mapped_column(JSON)
-    output_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    input_json: Mapped[dict[str, Any]] = mapped_column(ArtifactJSON)
+    output_json: Mapped[dict[str, Any] | None] = mapped_column(ArtifactJSON, nullable=True)
+    error_json: Mapped[dict[str, Any] | None] = mapped_column(ArtifactJSON, nullable=True)
     runtime_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     next_event_seq: Mapped[int] = mapped_column(Integer, default=0)
     cancellation_requested_at: Mapped[datetime | None] = mapped_column(
@@ -73,9 +75,9 @@ class NodeRun(Base, TimestampMixin):
     node_type: Mapped[str] = mapped_column(String(32))
     attempt: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(String(32), index=True)
-    input_json: Mapped[dict[str, Any]] = mapped_column(JSON)
-    output_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    input_json: Mapped[dict[str, Any]] = mapped_column(ArtifactJSON)
+    output_json: Mapped[dict[str, Any] | None] = mapped_column(ArtifactJSON, nullable=True)
+    error_json: Mapped[dict[str, Any] | None] = mapped_column(ArtifactJSON, nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     lease_expires_at: Mapped[datetime | None] = mapped_column(
@@ -99,7 +101,7 @@ class RunEvent(Base):
     )
     seq: Mapped[int] = mapped_column(Integer)
     type: Mapped[str] = mapped_column(String(80))
-    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(ArtifactJSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -164,7 +166,7 @@ class RunPresentation(Base, TimestampMixin):
     model: Mapped[str | None] = mapped_column(String(120), nullable=True)
     config_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
     prompt_template_digest: Mapped[str | None] = mapped_column(String(80), nullable=True)
-    error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_json: Mapped[dict[str, Any] | None] = mapped_column(ArtifactJSON, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     elapsed_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)

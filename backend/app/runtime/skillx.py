@@ -223,6 +223,14 @@ def load_manifest(package_root: Path) -> dict[str, Any]:
         output_schema = json.loads(
             _safe_file(package_root, interface["outputSchema"]).read_text(encoding="utf-8")
         )
+        if interface.get("uiSchema") is not None:
+            if not isinstance(interface["uiSchema"], str):
+                raise SkillXValidationError("uiSchema 必须是包内 JSON 文件路径")
+            ui_schema = json.loads(
+                _safe_file(package_root, interface["uiSchema"]).read_text(encoding="utf-8")
+            )
+            if not isinstance(ui_schema, dict):
+                raise SkillXValidationError("uiSchema 必须是 JSON 对象")
         Draft202012Validator.check_schema(input_schema)
         Draft202012Validator.check_schema(output_schema)
         if input_schema.get("type") != "object" or output_schema.get("type") != "object":
@@ -235,6 +243,14 @@ def load_manifest(package_root: Path) -> dict[str, Any]:
             if not file_name or not callable_name:
                 raise SkillXValidationError("Python callable 入口格式无效")
             _safe_file(package_root, file_name)
+        else:
+            prompt = interface.get("prompt", {})
+            if not isinstance(prompt, dict) or not prompt.get("entry"):
+                raise SkillXValidationError(f"模型接口 {interface_name} 缺少 prompt.entry")
+            _safe_file(package_root, prompt["entry"])
+            requested = interface.get("agent", {}).get("allowedCapabilities", [])
+            if not set(requested).issubset(interface.get("capabilities", [])):
+                raise SkillXValidationError("Agent allowedCapabilities 必须是接口依赖的子集")
     return manifest
 
 
@@ -304,6 +320,7 @@ async def execute_direct(
     inputs: dict[str, Any],
     cancellation_check: Callable[[], None] = lambda: None,
     secrets: dict[str, str] | None = None,
+    capability_client: Any | None = None,
 ) -> NodeResult:
     input_errors = sorted(
         Draft202012Validator(loaded.input_schema).iter_errors(inputs),
@@ -340,6 +357,7 @@ async def execute_direct(
         result = function(
             request,
             SkillXContext(
+                capabilities=capability_client or DeniedCapabilityClient(),
                 secrets=SecretAccessor(secrets),
                 cancellation_check=cancellation_check,
             ),

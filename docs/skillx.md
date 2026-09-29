@@ -26,9 +26,11 @@ SkillX 的目标不是取代 MCP、Agent Skills 或工作流系统，而是在�
 Agent Skills：说明如何完成任务
 MCP：提供原子工具和外部系统访问能力
 SkillX：提供可调用、有契约的领域能力
-Workflow：编排多个 SkillX、MCP 和控制节点
+Workflow：能力的一种内部实现，编排其他能力、MCP 和控制节点
 Component：向最终用户提供表单化任务入口
 ```
+
+对调用方而言，工作流与代码、LLM、Agent 实现遵循同一能力契约。外层 Agent 根据用途和输入输出选择能力，不需要根据实现类型选择不同调用协议。实现类型属于 Host 的执行绑定；诊断与维护仍可查看内部图和执行记录。
 
 ---
 
@@ -3105,3 +3107,53 @@ SkillX 的最终目标是让同一个能力同时具备：
 对用户可审计
 对安全策略可约束
 ```
+
+
+## 本仓库运行时与编排约束（2026-09）
+
+稳定业务能力应优先封装为 SkillX，Workflow 只保存能力引用和编排；固定映射、条件、输入输出及审批可以保留控制节点。无法形成稳定契约的步骤保留 LLM/Agent 节点并记录原因。
+
+注册发布保存不可变包目录与依赖锁；同一版本不可修改实现、提示词或 Schema。Direct 的传递依赖不得进入模型接口。Agent 的 `allowedCapabilities` 必须是接口声明依赖的子集，最终仍由 Host 检查依赖及授权。
+
+手动与 Agent 调用共用持久化 Invocation，Direct/LLM/Agent 三类接口均可直调。人工确认仅授权当前快照，不构成未来默认许可。生成和维护需要通过能力契约及完整工作流验证；正常完成既有契约不触发修订 Agent。
+
+当前实现范围、发布验证器限制和 HTTP 接口见 [任务运行时说明](task-runtime.md)。本节不将尚未完成的通用外部副作用验证器标记为已实现。
+
+## 本仓库统一调用 Profile：`skillx.host-callable/v1`
+
+本 Profile 是 Host 扩展，不改变已有 `skillx.dev/v1alpha1` 文件包中 Direct、LLM、Agent 的校验语义。平台原生 Workflow 发布后自动暴露同一种能力契约，无需生成重复包或搬迁历史版本。它的内部实现是锁定的工作流图。可移植 `.skillx` 文件包内直接声明工作流实现不在当前实现范围。
+
+### 发现与契约
+
+`GET /api/capability-catalog` 返回当前可发现版本；`GET /api/capability-versions/{id}/contract` 返回锁定版本契约；`GET /api/capabilities/{id}/versions` 返回两类能力的版本列表。
+
+契约包含 `id`（不可变能力版本标识）、`capabilityId`、`name`、`version`、`digest` 和 `interfaces`。接口包含用途、`inputSchema`、`outputSchema`、可选 `uiSchema`、执行限制、权限要求与副作用说明。公开契约 MUST NOT 要求调用方读取 `kind`、`runtime`、节点图或内部执行器类型。权限说明不构成授权，执行仍由 Host 和节点原有授权机制约束。
+
+平台原生工作流的默认接口名为 `execute`；包接口保留作者定义的名称。调用方从契约读取接口名。工作流历史整数版本映射为字符串，不伪装成包 SemVer。
+
+### 调用与生命周期
+
+外层 Agent 的调用统一为：
+
+```json
+{
+  "key": "operation-1",
+  "kind": "capability",
+  "arguments": {
+    "capabilityVersionId": "immutable-version-id",
+    "interface": "execute",
+    "input": {}
+  },
+  "reason": "该能力满足当前目标"
+}
+```
+
+面板直接调用 `POST /api/capability-versions/{id}/invocations`，请求包含 `interface`、`input`、`idempotencyKey`。两类实现均返回 HTTP 202 和持久化 Invocation；不启动外层 Agent 决策。状态、结果、错误、取消与人工交互共用 Invocation 协议，内部使用模型不影响这一约定。
+
+Host MUST 在幂等检查之前解析统一请求；旧 `workflow/skillx` 调用与统一调用使用相同执行身份。相同 scope/key 不得重复创建执行或改变输入。取消工作流型 Invocation MUST 传播到对应 Run 和待回答卡片。工作流内部启动失败 MUST 落为 Invocation 错误，不能永久留在派发状态。
+
+### 组合与学习
+
+工作流以 `capability_call` 引用任意已发布能力，config 必须包含 `capabilityVersionId`、`interface` 和 `digest`。Host 发布时解析为包节点或展开锁定工作流，沿用循环、8 层深度、输入输出及权限检查。旧 `skillx/workflow_call` 节点继续兼容。已发布父能力不跟随子能力更新。
+
+单次成功复用不因内部实现不同而触发学习；多次成功调用构成的编排或探索可以进入后台复用判断。学习上下文包含任务状态、结果、对话、人工回答与决策证据。后台维护等待所属 Task 终结，面板调用以 Run 终结为边界。学习器可以生成 `capability_call`，验证时展开完整图；缺少受支持的执行证据仍保留候选。修订权限检查必须作用于展开后的实现，不能通过统一引用绕过原权限限制。

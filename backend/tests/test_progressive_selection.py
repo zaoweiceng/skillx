@@ -13,7 +13,6 @@ from app.api.routes import (
     _canonical_message_evidence,
     _select_workflow_candidate,
     _verify_binding_sources,
-    create_message,
 )
 from app.application.agent_host import AgentHostError
 from app.application.agent_run import AgentRunWorker
@@ -41,6 +40,7 @@ from app.infrastructure.database import (
     WorkflowDisclosureCall,
     WorkflowVersion,
 )
+from tests.selection_harness import selection_message as create_message
 
 STUB = Path(__file__).resolve().parents[2] / "examples" / "traex_stub.py"
 

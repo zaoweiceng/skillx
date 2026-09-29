@@ -13,6 +13,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.infrastructure.payloads import ArtifactJSON
+
 from .base import Base, TimestampMixin, utcnow
 
 
@@ -40,7 +42,7 @@ class Message(Base):
         ForeignKey("conversations.id", ondelete="CASCADE"), index=True
     )
     role: Mapped[str] = mapped_column(String(20))
-    content_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    content_json: Mapped[dict[str, Any]] = mapped_column(ArtifactJSON)
     turn_id: Mapped[str | None] = mapped_column(
         ForeignKey("conversation_turns.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -87,10 +89,10 @@ class ConversationRun(Base, TimestampMixin):
     )
     status: Mapped[str] = mapped_column(String(20))
     run_type: Mapped[str] = mapped_column(String(24), default="agent_run")
-    input_json: Mapped[dict[str, Any]] = mapped_column(JSON)
-    output_json: Mapped[dict[str, Any]] = mapped_column(JSON)
+    input_json: Mapped[dict[str, Any]] = mapped_column(ArtifactJSON)
+    output_json: Mapped[dict[str, Any]] = mapped_column(ArtifactJSON)
     trajectory_json: Mapped[dict[str, Any]] = mapped_column(JSON)
-    error_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_json: Mapped[dict[str, Any] | None] = mapped_column(ArtifactJSON, nullable=True)
     # 长任务持久化状态机：queued → running → succeeded|failed|cancelled。
     # 存在、状态与事件都不依赖 HTTP 连接或进程内存，可跨进程恢复。
     config_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)

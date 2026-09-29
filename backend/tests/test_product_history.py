@@ -19,7 +19,6 @@ from app.domain.workflow import WorkflowDefinition
 from app.infrastructure.database import (
     Component,
     Conversation,
-    ConversationRun,
     ConversationTurn,
     ModelUsage,
     Run,
@@ -35,7 +34,7 @@ from tests.fixtures import deterministic_workflow
 STUB = Path(__file__).resolve().parents[2] / "examples" / "traex_stub.py"
 
 
-async def test_disabled_conversation_fences_workflow_capabilities() -> None:
+async def test_legacy_workflow_mode_does_not_bypass_durable_task() -> None:
     async with SessionLocal() as session, session.begin():
         conversation = Conversation(
             id=str(uuid4()),
@@ -51,19 +50,14 @@ async def test_disabled_conversation_fences_workflow_capabilities() -> None:
             session,
         )
 
-    assert response["assistant"]["type"] == "agent_run"
-    assert response["assistant"]["workflowModeSnapshot"] == "disabled"
+    from app.infrastructure.models.tasks import Task
+
+    assert response["assistant"]["type"] == "task"
     async with SessionLocal() as session:
-        run = await session.scalar(select(ConversationRun))
+        task = await session.get(Task, response["taskId"])
         turn = await session.scalar(select(ConversationTurn))
-    assert run is not None
-    assert turn is not None
-    assert run.turn_id == turn.id
-    assert turn.workflow_mode_snapshot == "disabled"
-    assert not any(
-        item.startswith("workflow.")
-        for item in run.config_json["allowedCapabilities"]
-    )
+        assert task is not None and task.status == "queued"
+        assert turn is not None and task.turn_id == turn.id
 
 
 async def test_usage_ledger_deduplicates_call_attempt_and_reports_partial() -> None:
@@ -217,9 +211,7 @@ async def test_llm_presentation_unavailable_does_not_switch_agent(
     monkeypatch.setattr(settings, "llm_runtime_type", "unavailable")
     monkeypatch.setattr(settings, "agent_runtime_type", "fixture")
     monkeypatch.setattr(settings, "agent_command", [sys.executable, str(STUB)])
-    monkeypatch.setattr(
-        settings, "agent_allowed_executables", [Path(sys.executable).name]
-    )
+    monkeypatch.setattr(settings, "agent_allowed_executables", [Path(sys.executable).name])
     definition = deterministic_workflow()
     compiled = WorkflowCompiler().compile(definition)
     now = utcnow()

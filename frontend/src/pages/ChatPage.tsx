@@ -1,3 +1,4 @@
+import TaskPanel from '@/components/TaskPanel'
 import { useState } from 'react'
 import { Button, Input, Tag } from 'antd'
 import Form from '@rjsf/core'
@@ -19,7 +20,7 @@ import { AgentSelector } from '@/features/runtime/AgentSelector'
 
 export default function ChatPage() {
   const [runtimePending, setRuntimePending] = useState(false)
-  const { turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, workflowMode, workflowSelectionAvailable, switchingMode, clock, optimisticStartedAt, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill } = useConversation()
+  const { turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, clock, optimisticStartedAt, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill } = useConversation()
 
   // 候选卡片绑定产生它的用户消息：取该助手消息之前最近的一条用户消息文本，
   // 而不是全局最近 prompt，避免继续 Agent 时误用无关的新输入。
@@ -415,16 +416,6 @@ export default function ChatPage() {
           >
             <Bot size={14} />
           </Button>
-          <Button
-            className={`workflow-mode-toggle ${workflowMode}`}
-            htmlType="button"
-            aria-pressed={workflowMode === 'enabled'}
-            disabled={switchingMode}
-            onClick={toggleWorkflowMode}
-          >
-            <Workflow size={14} />
-            工作流：{workflowMode === 'enabled' ? '开启' : '关闭'}
-          </Button>
           <Tag variant="filled">Agent 工作空间</Tag>
         </div>
       </header>
@@ -587,6 +578,7 @@ export default function ChatPage() {
                     ))}
                   </ol>
                 )}
+                {message.content.taskId && <TaskPanel id={message.content.taskId} />}
                 {message.content.type === 'component_candidate' && renderCandidate(message)}
                 {message.content.type === 'workflow_candidates' &&
                   renderWorkflowCandidates(message)}
@@ -632,11 +624,7 @@ export default function ChatPage() {
           </div>
           <form className="chat-composer" onSubmit={send}>
             <span className="composer-mode-note">
-              {workflowMode === 'enabled' && workflowSelectionAvailable === false
-                ? '自动选择不可用；请关闭工作流后继续通用 Agent'
-                : workflowMode === 'enabled'
-                  ? 'Agent 可按需发现并自动执行工作流'
-                : '由所选 Agent 执行任务'}
+              Agent 自动调用能力；需要你决策时会显示交互卡片
               {optimisticStartedAt !== null &&
                 ` · ${((clock - optimisticStartedAt) / 1000).toFixed(1)}s`}
             </span>

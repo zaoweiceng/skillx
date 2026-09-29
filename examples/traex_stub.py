@@ -249,6 +249,80 @@ def main() -> int:
     allowed = json.loads(args.allowed_tools) if args.allowed_tools else []
     output_schema = json.loads(args.output_schema) if args.output_schema else {}
 
+    if output_schema.get("title") == "TaskDecision":
+        context = json.loads(args.prompt.split("\n", 1)[1])
+        calls = context["calls"]
+        answers = context["humanAnswers"]
+        output = {
+            "action": "complete",
+            "summary": "完成问候",
+            "completionCriteria": ["输出问候"],
+            "remaining": [],
+            "calls": [],
+            "questions": [],
+            "evidence": [],
+            "answer": "",
+        }
+        if calls:
+            output["evidence"] = [x["id"] for x in calls if x["status"] == "succeeded"]
+            output["answer"] = json.dumps(calls[-1]["output"], ensure_ascii=False)
+        elif "[[HUMAN]]" in context["goal"] and not answers:
+            output.update(
+                action="human.request",
+                questions=[
+                    {
+                        "key": "name",
+                        "kind": "information",
+                        "title": "请提供姓名",
+                        "reason": "问候需要姓名",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"name": {"type": "string", "title": "姓名"}},
+                            "required": ["name"],
+                        },
+                    }
+                ],
+            )
+        else:
+            workflow = next(
+                x
+                for x in context["catalog"]["capabilities"]
+                if any(word in json.dumps(x, ensure_ascii=False) for word in ("greeting", "问候"))
+            )
+            name = (
+                answers[0]["answer"]["name"] if answers
+                else context["state"].get("userInputs", {}).get("name", "Alice")
+            )
+            output.update(
+                action="dispatch",
+                calls=[
+                    {
+                        "key": "greet",
+                        "kind": "capability",
+                        "arguments": {
+                            "capabilityVersionId": workflow["id"],
+                            "interface": "execute",
+                            "input": {"name": name},
+                        },
+                        "reason": "复用问候能力",
+                    }
+                ],
+            )
+        emit(
+            {
+                "type": "agent.completed",
+                "payload": {
+                    "steps": 1,
+                    "totalTokens": 20,
+                    "output": output,
+                    "outputProvenance": generative_output_provenance(
+                        output, [], "task-v1"
+                    ),
+                },
+            }
+        )
+        return 0
+
     if "WorkflowBindingExtraction" in args.prompt:
         schema_match = re.search(r"^inputSchema=(.*)$", args.prompt, re.MULTILINE)
         required_match = re.search(r"^required=(.*)$", args.prompt, re.MULTILINE)

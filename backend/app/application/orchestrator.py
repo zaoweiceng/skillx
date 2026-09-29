@@ -34,7 +34,7 @@ from app.application.expressions import ExpressionError, resolve_mapping
 from app.application.mcp import MCPConfigurationError, MCPLockDriftError, resolve_mcp_node
 from app.application.retries import auto_retry_allowed
 from app.application.run_events import append_event as append_event
-from app.application.runtime_profiles import workflow_profiles
+from app.application.runtime_profiles import agent_snapshot, workflow_profiles
 from app.application.security import redact
 from app.application.structured_generation import runtime_snapshot_for_definition
 from app.config import get_settings
@@ -97,6 +97,7 @@ class Orchestrator:
         component_id: str | None = None,
         owner_id: str = "local-user",
         turn_id: str | None = None,
+        automatic_recovery: bool = False,
     ) -> Run:
         definition = WorkflowDefinition.model_validate(workflow_version.definition_json)
         await validate_workflow_capabilities(session, definition)
@@ -113,6 +114,9 @@ class Orchestrator:
             input_json=inputs,
             runtime_snapshot_json={
                 **runtime_snapshot_for_definition(definition),
+                **({"automaticRecovery": {
+                    "agentRuntimeSnapshot": await agent_snapshot(session, None)
+                }} if automatic_recovery else {}),
                 "nodeProfiles": (
                     workflow_version.validation_json["nodeProfiles"]
                     if "nodeProfiles" in (workflow_version.validation_json or {})
@@ -138,6 +142,7 @@ class Orchestrator:
         inputs: dict[str, Any],
         owner_id: str = "local-user",
         turn_id: str | None = None,
+        automatic_recovery: bool = False,
     ) -> Run:
         from app.application.plans import verify_plan_snapshot
 
@@ -156,6 +161,9 @@ class Orchestrator:
             input_json=inputs,
             runtime_snapshot_json={
                 **runtime_snapshot_for_definition(definition),
+                **({"automaticRecovery": {
+                    "agentRuntimeSnapshot": await agent_snapshot(session, None)
+                }} if automatic_recovery else {}),
                 "nodeProfiles": await workflow_profiles(session, definition),
             },
         )
@@ -309,13 +317,11 @@ class Orchestrator:
             return run
 
         waiting = [item for item in latest.values() if item.status == "waiting_user"]
-        if waiting:
-            run.status = "waiting_approval"
-            return run
         # 等待恢复审批：保持 waiting_approval，直到人工批准（→recovering）或拒绝（→failed）。
-        if any(item.approval_status == "pending" for item in active_checkpoints):
-            run.status = "waiting_approval"
-            return run
+        recovery_wait = any(
+            item.approval_status == "pending" or item.status == "awaiting_user"
+            for item in active_checkpoints
+        )
         if run.status == "waiting_approval":
             run.status = "running"
 
@@ -332,7 +338,10 @@ class Orchestrator:
         for node_id, output in substitutions.items():
             if output:
                 values[node_id] = output
-        statuses = {node_id: item.status for node_id, item in latest.items()}
+        statuses = {
+            node_id: "waiting_user" if item.id in under_recovery else item.status
+            for node_id, item in latest.items()
+        }
         on_errors = {node_id: node.on_error for node_id, node in nodes.items()}
         raw_outputs = {
             node_id: item.output_json or {} for node_id, item in latest.items()
@@ -391,6 +400,14 @@ class Orchestrator:
             await self._handle_fatal(session, run, definition, fatal[0])
             return run
 
+        active = any(item.status in {"ready", "running", "retry_waiting"}
+                     for item in latest.values())
+        paused = bool(waiting or recovery_wait) and not active
+        self._set_wait_clock(run, paused)
+        if paused:
+            run.status = "waiting_approval"
+            return run
+
         output_node = next(node for node in nodes.values() if node.type == NodeType.OUTPUT)
         output_run = latest.get(output_node.id)
         if output_run and output_run.status == "succeeded":
@@ -425,9 +442,24 @@ class Orchestrator:
         started = _aware(run.started_at)
         if not started:
             return False
+        snapshot = run.runtime_snapshot_json or {}
+        paused = snapshot.get("pausedSeconds", 0)
+        if snapshot.get("waitingSince"):
+            paused += (utcnow() - datetime.fromisoformat(snapshot["waitingSince"])).total_seconds()
         return utcnow() >= started + timedelta(
-            seconds=definition.spec.policies.max_duration_seconds
+            seconds=definition.spec.policies.max_duration_seconds + paused
         )
+
+    @staticmethod
+    def _set_wait_clock(run: Run, waiting: bool) -> None:
+        snapshot = dict(run.runtime_snapshot_json or {})
+        if waiting and not snapshot.get("waitingSince"):
+            snapshot["waitingSince"] = utcnow().isoformat()
+        elif not waiting and snapshot.get("waitingSince"):
+            snapshot["pausedSeconds"] = snapshot.get("pausedSeconds", 0) + (
+                utcnow() - datetime.fromisoformat(snapshot.pop("waitingSince"))
+            ).total_seconds()
+        run.runtime_snapshot_json = snapshot
 
     @staticmethod
     def _edge_ready(
@@ -552,13 +584,7 @@ class Orchestrator:
         definition: WorkflowDefinition,
         failed_node_run: NodeRun,
     ) -> None:
-        """致命失败处理：命中显式 fallback 时冻结 checkpoint。
-
-        - 可自动恢复（错误码在 fallback.on 且非危险类）且无需审批 → ``recovering``；
-        - ``requireUserApproval=true`` → 先建 checkpoint 并进入 ``waiting_approval``，
-          等待人工批准/拒绝，不直接失败（A-03 / P2-3）；
-        - 否则按原语义 fail run。Direct/MCP/Browser 失败不隐式升级为 Agent。
-        """
+        """Freeze explicit or task-owned recovery without changing the published graph."""
 
         from app.application.recovery import build_checkpoint, is_recoverable
 
@@ -588,6 +614,7 @@ class Orchestrator:
                 session, run, failed_node_run, checkpoint_id=checkpoint.id
             )
             checkpoint.approval_status = "pending"
+            self._set_wait_clock(run, True)
             run.status = "waiting_approval"
             await self._create_recovery_approval(
                 session, run, failed_node_run, node, checkpoint, error_code
@@ -624,6 +651,39 @@ class Orchestrator:
                 },
             )
             return
+        automatic = (run.runtime_snapshot_json or {}).get("automaticRecovery")
+        if automatic and fallback is None and existing is None and error_code:
+            count = await session.scalar(
+                select(func.count()).select_from(ExecutionCheckpoint).where(
+                    ExecutionCheckpoint.run_id == run.id
+                )
+            )
+            # No model can establish whether an uncertain external operation committed.
+            unsafe = {
+                "UNKNOWN_OUTCOME", "PERMISSION_DENIED", "AUTHENTICATION_FAILED",
+                "CONFIRMATION_DENIED", "RECOVERY_REJECTED", "MODEL_AUTH_FAILED",
+                "MODEL_NOT_CONFIGURED", "MODEL_RUNTIME_UNAVAILABLE", "TRAE_AUTH_REQUIRED",
+                "TRAE_NOT_INSTALLED", "MODEL_RUNTIME_CONFIG_DRIFT", "APPROVAL_SNAPSHOT_CHANGED",
+            }
+            if count < 3 and error_code not in unsafe:
+                checkpoint = await build_checkpoint(session, run, definition, failed_node_run)
+                snapshot = dict(checkpoint.snapshot_json)
+                snapshot["fallbackConfig"] = {
+                    **automatic, "automatic": True, "allowedCapabilities": [],
+                    "maxSteps": 4, "maxTotalTokens": get_settings().agent_max_total_tokens,
+                }
+                checkpoint.snapshot_json = snapshot
+                checkpoint.digest = digest_json(snapshot)
+                await self._record_observation(
+                    session, run, failed_node_run, checkpoint_id=checkpoint.id
+                )
+                run.status = "recovering"
+                await append_event(session, run.id, "run.recovery_requested", {
+                    "runId": run.id, "checkpointId": checkpoint.id,
+                    "failedNode": failed_node_run.node_id, "errorCode": error_code,
+                    "automatic": True,
+                })
+                return
         # 记录失败观测（受控 WorkflowPatch 的后端事实来源）：不进入恢复的致命失败按
         # fingerprint 聚合，供 eligibility 计算是否可复现。
         await self._record_observation(session, run, failed_node_run)
@@ -898,6 +958,15 @@ class WorkerService:
                 .where(NodeRun.run_id == run.id, NodeRun.status == "running")
                 .scalar_subquery()
             )
+            from app.application.workflow_resources import conflicting_nodes
+
+            conflicts = await conflicting_nodes(session, definition)
+            conflict_slots = (
+                select(func.count()).select_from(NodeRun).where(
+                    NodeRun.run_id == run.id, NodeRun.status == "running",
+                    NodeRun.node_id.in_(conflicts),
+                ).scalar_subquery()
+            )
             result = await session.execute(
                 update(NodeRun)
                 .where(
@@ -905,6 +974,7 @@ class WorkerService:
                     NodeRun.status.in_(["ready", "retry_waiting"]),
                     NodeRun.attempt == candidate.attempt,
                     running_slots < max_parallel,
+                    conflict_slots == 0 if candidate.node_id in conflicts else True,
                 )
                 .values(
                     status="running",

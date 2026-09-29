@@ -11,6 +11,7 @@ from app.api.routes import (
 from app.application.compiler import WorkflowCompiler
 from app.application.conversation import candidate_snapshot_digest
 from app.application.orchestrator import WorkerService
+from app.application.tasks import TaskDriver
 from app.infrastructure.database import (
     Component,
     Conversation,
@@ -19,6 +20,7 @@ from app.infrastructure.database import (
     Workflow,
     WorkflowVersion,
 )
+from app.infrastructure.models.tasks import Task
 from tests.fixtures import deterministic_workflow
 
 
@@ -64,16 +66,12 @@ async def test_conversation_confirmed_component_hands_control_to_workflow() -> N
             session,
         )
 
-    assert response["assistant"]["type"] == "component_run"
-    run_id = response["assistant"]["runId"]
-    worker = WorkerService("conversation-worker")
-    for _ in range(3):
-        assert await worker.run_once()
+    assert response["assistant"]["type"] == "task"
     async with SessionLocal() as session:
-        run = await session.get(Run, run_id)
-        assert run is not None
-        assert run.status == "succeeded"
-        assert run.output_json == {"message": "你好，Alice"}
+        task = await session.get(Task, response["taskId"])
+        assert task.status == "queued"
+        assert task.state_json["userInputs"] == {"name": "Alice"}
+        assert task.state_json["componentHint"] == component.id
 
 
 async def test_unbound_conversation_reports_selection_unavailable_without_model() -> None:
@@ -86,10 +84,12 @@ async def test_unbound_conversation_reports_selection_unavailable_without_model(
             MessageCreate(content="分析这个新任务"),
             session,
         )
-    assert response["assistant"]["type"] == "workflow_selection"
-    assert response["assistant"]["state"] == "unavailable"
-    assert response["assistant"]["code"] == "WORKFLOW_SELECTION_UNAVAILABLE"
-    assert response["assistant"]["selectionMode"] == "unavailable"
+    assert response["assistant"]["type"] == "task"
+    await TaskDriver().poll_once()
+    async with SessionLocal() as session:
+        task = await session.get(Task, response["taskId"])
+        assert task.status == "failed"
+        assert task.error_json["code"] in {"MODEL_NOT_CONFIGURED", "TRAE_NOT_INSTALLED"}
 
 
 async def _seed_greeting_component(name: str, description: str) -> tuple[str, str]:
@@ -138,8 +138,8 @@ async def test_unconfigured_selector_does_not_use_component_heuristic() -> None:
             session,
         )
     assistant = response["assistant"]
-    assert assistant["type"] == "workflow_selection"
-    assert assistant["code"] == "WORKFLOW_SELECTION_UNAVAILABLE"
+    assert assistant["type"] == "task"
+    assert assistant["taskId"] == response["taskId"]
     assert "candidateSnapshotDigest" not in assistant
 
 

@@ -54,49 +54,46 @@ def probed_real_product_stack(real_product_stack: DemoStack) -> DemoStack:
     return real_product_stack
 
 
+def poll_task(client, task_id, timeout=180):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = client.get(f"/tasks/{task_id}")
+        assert response.status_code == 200, response.text
+        task = response.json()
+        if task["status"] in {"succeeded", "failed", "blocked", "cancelled", "waiting_user"}:
+            return task
+        time.sleep(0.25)
+    raise AssertionError(f"Task timed out: {task}")
+
+
 def test_real_product_workflow_on(probed_real_product_stack: DemoStack) -> None:
     with _client(probed_real_product_stack) as client:
-        enabled = client.post("/conversations", json={"title": "real-workflow-on"}).json()
+        conversation = client.post("/conversations", json={"title": "real-auto-workflow"}).json()
         selected = client.post(
-            f"/conversations/{enabled['id']}/messages",
+            f"/conversations/{conversation['id']}/messages",
             json={"content": "请问候名叫 Alice 的人，姓名参数是 Alice"},
         )
-        assert selected.status_code == 201, selected.text
-        selected_assistant = selected.json()["assistant"]
-        assert selected_assistant["state"] == "workflow_run", selected_assistant
-        assert selected_assistant["bindingSources"]
-        assert selected_assistant["bindingSources"][0]["serverVerified"] is True
-        workflow_run = poll_run(client, selected_assistant["runId"], timeout=120)
-        assert workflow_run["status"] == "succeeded", workflow_run
-        assert workflow_run["output"] == {"message": "你好，Alice"}
-        refreshed = client.get(f"/conversations/{enabled['id']}").json()
-        persisted = refreshed["messages"][-1]["content"]
-        assert persisted["runId"] == selected_assistant["runId"]
-        assert persisted["bindingSources"][0]["serverVerified"] is True
+        assert selected.status_code == 202, selected.text
+        task = poll_task(client, selected.json()["taskId"])
+        assert task["status"] == "succeeded", task
+        calls = [x for x in task["invocations"] if x.get("runId")]
+        assert calls, task
+        assert calls[0]["output"] == {"message": "你好，Alice"}
+        assert not task["learning"], task
+        assert "Alice" in task["output"]["text"]
 
 
 def test_real_product_workflow_off(probed_real_product_stack: DemoStack) -> None:
     with _client(probed_real_product_stack) as client:
-        disabled = client.post("/conversations", json={"title": "real-workflow-off"}).json()
-        mode = client.patch(
-            f"/conversations/{disabled['id']}/workflow-mode",
-            json={"workflowMode": "disabled"},
-        )
-        assert mode.status_code == 200, mode.text
-        answered = client.post(
-            f"/conversations/{disabled['id']}/messages",
+        conversation = client.post("/conversations", json={"title": "real-general-answer"}).json()
+        answer = client.post(
+            f"/conversations/{conversation['id']}/messages",
             json={"content": "用一句话说明今天适合专注完成一件事"},
         )
-        assert answered.status_code == 201, answered.text
-        answer_id = answered.json()["assistant"]["conversationRunId"]
-        answer = poll_conversation_run(client, answer_id, timeout=120)
-        assert answer["status"] == "succeeded", answer
-        assert isinstance(answer["output"].get("reply"), str)
-        events = client.get(f"/conversation-runs/{answer_id}/events").json()
-        assert not any(
-            str(item.get("payload", {}).get("capabilityRef", "")).startswith("workflow.")
-            for item in events
-        )
+        assert answer.status_code == 202, answer.text
+        task = poll_task(client, answer.json()["taskId"])
+        assert task["status"] == "succeeded", task
+        assert task["output"].get("text"), task
 
 
 def test_real_product_running_cancellation(
@@ -145,7 +142,7 @@ def test_real_product_distill_publish_discover_and_reuse(
         )
         assert disabled.status_code == 200, disabled.text
         explored = client.post(
-            f"/conversations/{source['id']}/messages",
+            f"/conversations/{source['id']}/agent-runs",
             json={
                 "content": (
                     "请调用 lookup.table 工具查询 key 为 q2 的本地示例数据，"
@@ -153,8 +150,8 @@ def test_real_product_distill_publish_discover_and_reuse(
                 )
             },
         )
-        assert explored.status_code == 201, explored.text
-        conversation_run_id = explored.json()["assistant"]["conversationRunId"]
+        assert explored.status_code == 202, explored.text
+        conversation_run_id = explored.json()["conversationRunId"]
         exploration = poll_conversation_run(client, conversation_run_id, timeout=180)
         assert exploration["status"] == "succeeded", exploration.get("error")
         events = client.get(f"/conversation-runs/{conversation_run_id}/events").json()
@@ -229,36 +226,15 @@ def test_real_product_distill_publish_discover_and_reuse(
             f"/conversations/{reuse['id']}/messages",
             json={"content": "查询标识 q3 对应的本地示例数据并用一句中文告诉我结果"},
         )
-        assert selected.status_code == 201, selected.text
-        assistant = selected.json()["assistant"]
-        assert assistant["state"] == "workflow_run", assistant
-        assert assistant["agentAction"] in {"run_full", "run_fragment", "compose"}
-        successful_results = [
-            item
-            for item in assistant["toolTimeline"]
-            if item["type"] == "tool.result" and item["status"] == "succeeded"
-        ]
-        levels = {item.get("level") for item in successful_results}
-        assert {"L0", "L1"} <= levels, assistant["toolTimeline"]
-        if assistant["agentAction"] != "run_full":
-            assert "L2" in levels, assistant["toolTimeline"]
-        assert assistant["bindingSources"], assistant
-        assert all(source["serverVerified"] is True for source in assistant["bindingSources"]), (
-            assistant["bindingSources"]
-        )
-        # Agent 可选择直接 run_full，也可生成锁定同一版本的 plan/fragment；不可变 ref
-        # 才是两种执行形态共同的版本身份。
-        assert any(
-            ref == published_version["workflowRef"] or workflow_id in ref
-            for ref in assistant["refs"]
-        ), assistant
-        reused_run = poll_run(client, assistant["runId"], timeout=180)
+        assert selected.status_code == 202, selected.text
+        task = poll_task(client, selected.json()["taskId"])
+        assert task["status"] == "succeeded", task
+        calls = [x for x in task["invocations"] if x.get("runId")]
+        assert any(x["request"]["versionId"] == version_id for x in calls), task
+        reused_run = poll_run(client, calls[0]["runId"], timeout=180)
         assert reused_run["status"] == "succeeded", reused_run
-        reused_reply = str(reused_run["output"].get("reply", ""))
-        assert "第三季度" in reused_reply, reused_run["output"]
-        assert "营收持平" in reused_reply, reused_run["output"]
-        refreshed = client.get(f"/conversations/{reuse['id']}").json()
-        assert refreshed["messages"][-1]["content"]["runId"] == assistant["runId"]
+        assert "第三季度" in str(reused_run["output"]), reused_run
+        assert "营收持平" in str(reused_run["output"]), reused_run
 
 
 def test_real_product_checkpoint_recovery(probed_real_product_stack: DemoStack) -> None:
@@ -339,3 +315,107 @@ def test_real_product_selected_model(real_product_stack: DemoStack) -> None:
         assert result["executor"]["model"] == selected
         assert result["output"].get("reply"), result
         print(f"Real TraeX selected model verified: {selected}")
+
+
+def test_real_task_human_and_multiple_dispatch(probed_real_product_stack: DemoStack) -> None:
+    with _client(probed_real_product_stack) as client:
+        conversation = client.post("/conversations", json={"title": "real-human-task"}).json()
+        accepted = client.post(
+            f"/conversations/{conversation['id']}/messages",
+            json={
+                "content": "先问我需要问候谁，收到姓名后执行问候工作流；"
+                "然后根据问候结果，再调用一次同一个工作流问候 Bob，最后汇报两份结果。"
+            },
+        )
+        assert accepted.status_code == 202, accepted.text
+        task_id = accepted.json()["taskId"]
+        waiting = poll_task(client, task_id)
+        assert waiting["status"] == "waiting_user", waiting
+        question = next(q for q in waiting["interactions"] if q["status"] == "pending")
+        fields = question["request"]["inputSchema"]["properties"]
+        answer = {name: "Alice" for name in fields}
+        response = client.post(
+            f"/human-interactions/{question['id']}/answer",
+            json={
+                "revision": question["revision"],
+                "snapshotDigest": question["snapshotDigest"],
+                "idempotencyKey": "real-answer",
+                "answer": answer,
+            },
+        )
+        assert response.status_code == 200, response.text
+        task = poll_task(client, task_id)
+        assert task["status"] == "succeeded", task
+        calls = [c for c in task["invocations"] if c.get("runId")]
+        assert len(calls) == 2, task
+        assert {c["request"]["input"]["name"] for c in calls} == {"Alice", "Bob"}
+        assert not task["learning"]
+
+
+def test_real_task_code_and_skillx_learning(probed_real_product_stack: DemoStack) -> None:
+    with _client(probed_real_product_stack) as client:
+        conversation = client.post("/conversations", json={"title": "real-code-learning"}).json()
+        response = client.post(
+            f"/conversations/{conversation['id']}/messages",
+            json={
+                "content": "以后会反复需要这个确定性业务计算：输入整数 units 和整数 "
+                "unit_price，输出 total=units*unit_price。请通过生成并实际执行 Python "
+                "代码算 units=7、unit_price=13 的结果，标准输出为 JSON 对象 {total:91}。"
+            },
+        )
+        assert response.status_code == 202, response.text
+        task_id = response.json()["taskId"]
+        task = poll_task(client, task_id)
+        assert task["status"] == "succeeded", task
+        assert any(
+            c["kind"] == "code" and c["status"] == "succeeded" for c in task["invocations"]
+        ), task
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            task = client.get(f"/tasks/{task_id}").json()
+            jobs = task["learning"]
+            if jobs and jobs[0]["status"] in {"published", "blocked", "skipped"}:
+                break
+            time.sleep(0.5)
+        assert jobs and jobs[0]["status"] == "published", jobs
+        version = jobs[0]["result"]["workflowVersionId"]
+        manual = client.post(
+            f"/workflow-versions/{version}/runs", json={"input": {"units": 3, "unit_price": 11}}
+        )
+        assert manual.status_code == 202, manual.text
+        run = poll_run(client, manual.json()["id"], timeout=60)
+        assert run["status"] == "succeeded", run
+        assert run["output"] == {"total": 33}, run
+
+
+def test_real_model_skill_materialization_and_manual_execution(probed_real_product_stack):
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    backend = Path(__file__).resolve().parents[1]
+    probe = subprocess.run(
+        [sys.executable, "-m", "real_provider_tests.model_skill_probe"],
+        cwd=backend, env=probed_real_product_stack._env,
+        capture_output=True, text=True, timeout=400,
+    )
+    assert probe.returncode == 0, probe.stderr[-4000:]
+    published = json.loads(probe.stdout.strip().splitlines()[-1])
+    assert published["proof"]["status"] == "passed"
+    assert len(published["proof"]["examples"]) == 2
+    with _client(probed_real_product_stack) as client:
+        response = client.post(f"/capability-versions/{published['versionId']}/invocations", json={
+            "interface": "execute", "input": {"text": "This is wonderful!"},
+            "idempotencyKey": "model-probe-manual",
+        })
+        assert response.status_code == 202, response.text
+        invocation_id = response.json()["id"]
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            item = client.get(f"/invocations/{invocation_id}").json()
+            if item["status"] in {"succeeded", "failed", "cancelled"}:
+                break
+            time.sleep(0.25)
+        assert item["status"] == "succeeded", item
+        assert item["output"] == {"sentiment": "positive"}, item

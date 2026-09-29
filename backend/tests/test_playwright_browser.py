@@ -205,7 +205,7 @@ async def pending_approval(run_id: str) -> Approval:
                 Approval.status == "pending",
             )
         )
-        assert approval is not None
+        assert approval is not None, str((await session.get(Run, run_id)).error_json)
         return approval
 
 

@@ -13,6 +13,8 @@ class NodeType(StrEnum):
     OUTPUT = "output"
     APPROVAL = "approval"
     SKILLX = "skillx"
+    WORKFLOW_CALL = "workflow_call"
+    CAPABILITY_CALL = "capability_call"
     MCP = "mcp"
     LLM = "llm"
     AGENT = "agent"

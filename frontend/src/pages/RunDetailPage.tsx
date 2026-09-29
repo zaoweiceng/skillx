@@ -14,6 +14,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
 import { api, type Approval, type Run } from '@/api/client'
+import { request } from '@/api/http'
+import HumanInteractionCard, { type HumanInteraction } from '@/components/HumanInteractionCard'
 import { HandoffPanel } from '@/features/runtime/HandoffPanel'
 import { StatusBadge } from '@/components/StatusBadge'
 import { useRunEvents, useRunStream } from '@/hooks/useRunStream'
@@ -27,6 +29,15 @@ function JsonBlock({ value }: { value: unknown }) {
 export default function RunDetailPage() {
   const { id } = useParams()
   const [run, setRun] = useState<Run>()
+  const [interactions, setInteractions] = useState<HumanInteraction[]>([])
+  useEffect(() => {
+    let active = true
+    const load = () => request<HumanInteraction[]>(`/runs/${id}/human-interactions`)
+      .then(value => { if (active) setInteractions(value) }).catch(() => {})
+    void load()
+    const timer = setInterval(load, 1500)
+    return () => { active = false; clearInterval(timer) }
+  }, [id])
   const [error, setError] = useState('')
   const [historyLoaded, setHistoryLoaded] = useState(false)
   const [streamAfter, setStreamAfter] = useState(0)
@@ -194,8 +205,12 @@ export default function RunDetailPage() {
       </header>
 
       {error && <div className="error-panel">{error}</div>}
+      {interactions.map(item => <HumanInteractionCard key={item.id} item={item} onAnswered={() => {
+        void request<HumanInteraction[]>(`/runs/${id}/human-interactions`).then(setInteractions)
+        refresh()
+      }} />)}
       {(run.approvals ?? [])
-        .filter((item) => item.status === 'pending')
+        .filter((item) => item.status === 'pending' && !interactions.some(card => card.request.approvalId === item.id))
         .map((approval) => (
           <section className="approval-banner" key={approval.id}>
             <div className="approval-icon">
