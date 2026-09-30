@@ -4,13 +4,18 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import ComponentsPage from '@/pages/ComponentsPage'
 import SettingsPage from '@/pages/SettingsPage'
+import { defaultWorkflow } from '@/lib/defaultWorkflow'
 
 const listComponents = vi.fn()
+const listWorkflows = vi.fn()
 const getHealth = vi.fn()
+
+vi.mock('@/api/http', () => ({ request: vi.fn().mockResolvedValue([]) }))
 
 vi.mock('@/api/client', () => ({
   api: {
     listComponents: (...args: unknown[]) => listComponents(...args),
+    listWorkflows: (...args: unknown[]) => listWorkflows(...args),
     getHealth: (...args: unknown[]) => getHealth(...args),
   },
 }))
@@ -21,17 +26,15 @@ afterEach(() => {
 })
 
 describe('产品状态页面', () => {
-  it('按 executionClass 筛选组件并暴露 aria-pressed', async () => {
+  it('按发布状态筛选统一工作流列表并暴露 aria-pressed', async () => {
+    listWorkflows.mockResolvedValue([
+      { id: 'draft', name: '草稿工作流', definition: defaultWorkflow },
+      { id: 'published', name: '已发布工作流', definition: defaultWorkflow },
+    ])
     listComponents.mockResolvedValue([
       {
-        id: 'zero',
-        name: '零模型组件',
-        description: '',
-        executionClass: 'zero_llm',
-        visibility: 'private',
-      },
-      {
         id: 'agent',
+        workflowId: 'published',
         name: 'Agent 组件',
         description: '',
         executionClass: 'agent',
@@ -43,14 +46,18 @@ describe('产品状态页面', () => {
         <ComponentsPage />
       </MemoryRouter>,
     )
-    await waitFor(() => expect(screen.getByText('零模型组件')).toBeInTheDocument())
-    fireEvent.click(screen.getByRole('button', { name: 'Agent 工作流' }))
-    expect(screen.getByRole('button', { name: 'Agent 工作流' })).toHaveAttribute(
+    await waitFor(() => expect(screen.getByText('草稿工作流')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: '已发布' }))
+    expect(screen.getByRole('button', { name: '已发布' })).toHaveAttribute(
       'aria-pressed',
       'true',
     )
-    expect(screen.getByText('Agent 组件')).toBeInTheDocument()
-    expect(screen.queryByText('零模型组件')).not.toBeInTheDocument()
+    expect(screen.getByText('已发布工作流')).toBeInTheDocument()
+    expect(screen.queryByText('草稿工作流')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /^草\s*稿$/ }))
+    expect(screen.getByRole('button', { name: /^草\s*稿$/ })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByText('草稿工作流')).toBeInTheDocument()
+    expect(screen.queryByText('已发布工作流')).not.toBeInTheDocument()
   })
 
   it('fixture 仅显示协议事实，自动选择保持不可用', async () => {

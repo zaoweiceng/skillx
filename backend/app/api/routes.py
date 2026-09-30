@@ -3718,8 +3718,11 @@ async def create_message(
             session, conversation.agent_profile_id, conversation.traex_model,
             conversation.reasoning_effort, conversation.model_profile_id, conversation.agent_model,
         )
-        if image_runtime["type"] != "pi" or not image_runtime.get("model_options", {}).get("images"):
-            raise HTTPException(422, "当前模型未声明支持图片，请在模型设置中勾选‘支持图片’，并选择多模态模型")
+        supports_images = image_runtime.get("model_options", {}).get("images")
+        if image_runtime["type"] != "pi" or not supports_images:
+            raise HTTPException(
+                422, "当前模型未声明支持图片，请在模型设置中勾选‘支持图片’，并选择多模态模型"
+            )
     content = body.content.strip() or ("请分析这些图片。" if body.images else body.content)
     selected_directory = (
         body.working_directory if "working_directory" in body.model_fields_set
@@ -3769,7 +3772,9 @@ async def create_message(
     # below is allowed to inherit this SQLite write lock.
     await session.commit()
     from app.application.tasks import enqueue_task
-    task = await enqueue_task(session, conversation, turn.id, content, runtime_snapshot=image_runtime)
+    task = await enqueue_task(
+        session, conversation, turn.id, content, runtime_snapshot=image_runtime
+    )
     task.state_json = {"userInputs": body.inputs or {}, "componentHint": body.component_id,
                        "workingDirectory": selected_directory}
     if body.reference_files:
@@ -3805,7 +3810,9 @@ async def chat_image(message_id: str, image_id: str, session: AsyncSession = Dep
     path = image_path(reference)
     if not path.is_file():
         raise HTTPException(404, "图片不存在")
-    return FileResponse(path, media_type=reference["mimeType"], headers={"X-Content-Type-Options": "nosniff"})
+    return FileResponse(
+        path, media_type=reference["mimeType"], headers={"X-Content-Type-Options": "nosniff"}
+    )
 
 
 async def _unbound_conversation_message(

@@ -590,6 +590,7 @@ def test_observation_bounds_structured_results_without_mutating_evidence():
 
 def test_code_call_rejects_nested_arguments_before_dispatch():
     from pydantic import ValidationError
+
     from app.application.task_contracts import TaskCall
 
     with pytest.raises(ValidationError, match="不能包在 input 中"):

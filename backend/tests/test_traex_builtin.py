@@ -135,7 +135,9 @@ async def test_builtin_bridge_round_trips_host_tool_result(
     monkeypatch.setattr(get_settings(), "artifact_root", tmp_path)
     executable = _fake_traex(tmp_path)
     result = await AgentHost(
-        adapter=TraeXBuiltinAdapter([str(executable)], model="selected-test-model", reasoning_effort="high")
+        adapter=TraeXBuiltinAdapter(
+            [str(executable)], model="selected-test-model", reasoning_effort="high"
+        )
     ).execute(
         AgentHostRequest(
             run_id="builtin-round-trip",
@@ -172,7 +174,9 @@ async def test_builtin_bridge_maps_auth_failure(
     executable = _fake_traex(tmp_path, fail_auth=True)
     with pytest.raises(AgentHostError) as error:
         await AgentHost(
-            adapter=TraeXBuiltinAdapter([str(executable)], model="selected-test-model", reasoning_effort="high")
+            adapter=TraeXBuiltinAdapter(
+                [str(executable)], model="selected-test-model", reasoning_effort="high"
+            )
         ).execute(
             AgentHostRequest(
                 run_id="builtin-auth",
@@ -481,6 +485,7 @@ async def test_native_envelope_larger_than_default_stream_buffer(tmp_path, monke
 
 def test_terminal_accepts_single_json_fence_but_not_arbitrary_prose():
     import json
+
     from app.runtime.traex_builtin import _parse_terminal
 
     assert _parse_terminal('```json\n{"reply":"ok"}\n```') == {"reply": "ok"}
