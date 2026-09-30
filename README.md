@@ -1,165 +1,140 @@
 # SkillX
 
-**Turn agent exploration into reusable, durable workflows.**
+**把 Agent 探索出的做法，变成可复用、可持久执行的工作流。**
 
-[中文](README.zh-CN.md) · [Getting started](#quick-start) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md) · [MIT license](LICENSE)
+[English](README.en.md) · [贡献指南](CONTRIBUTING.md) · [安全说明](SECURITY.md) · [MIT 许可](LICENSE)
 
-SkillX is a local-first workspace for AI agents, reusable skills, and visual workflows.
-Start with a conversation, let an agent explore a task, and turn repeatable work into
-versioned capabilities. A separate worker executes workflows with persisted state,
-explicit approvals, and execution traces.
+SkillX 是一个本地优先的 AI 工作空间，把对话、Agent、技能和可视化工作流连接起来。
+你可以先用自然语言完成任务，再把稳定做法沉淀为带版本的能力，由独立 Worker 执行，
+并通过人工审批、检查点和执行轨迹管理运行过程。
 
-SkillX is in active development. The current UI and most detailed design documents
-are in Chinese. It is intended for a trusted, single-user local environment; it is
-not a hardened public or multi-tenant service.
+项目仍在积极开发，当前界面及主要设计文档为中文。适用于受信任的单用户本地环境，
+尚不适合直接作为公网服务或多租户平台部署。
 
-## What you can do
+## 主要能力
 
-- **Work through chat:** manage conversations, attach images for compatible models,
-  inspect model requests and responses, and track token usage.
-- **Connect models and agents:** configure OpenAI-compatible model services in the
-  UI. Pi is the default agent runtime; TraeX and managed adapters are optional.
-- **Build visual workflows:** connect nodes, map structured inputs, validate graphs,
-  and publish immutable versions with locked dependencies.
-- **Reuse capabilities:** combine workflows, portable SkillX packages, LLM nodes,
-  agents, and MCP tools behind a common invocation contract.
-- **Run and recover:** use a durable SQLite queue, human interaction cards,
-  checkpoints, bounded retries, and independent agent recovery.
-- **Manage skills:** import and manage skill content and inspect its published versions.
+- **对话与模型服务**：配置 OpenAI 兼容服务，使用默认 Pi Agent；兼容模型支持图片输入、推理强度与用量统计。
+- **可视化工作流**：拖放节点、映射输入、校验图结构，发布不可变版本并锁定依赖。
+- **能力复用**：工作流、SkillX 包、LLM、Agent 和 MCP 工具使用统一调用契约。
+- **持久执行与恢复**：SQLite 队列、独立 Worker、人工交互卡片、取消、重试和失败接力。
+- **轨迹与技能管理**：查看模型请求和返回，管理技能内容及版本。
 
-Automatic conversion of an agent trace into a reusable capability is intentionally
-limited: only supported cases can be validated and published automatically. Arbitrary
-generated code and new side effects still require review. MCP Streamable HTTP support
-also has limitations; see [capability status](docs/capability-status.md).
+自动固化只覆盖可验证的受支持场景；任意生成代码和新副作用仍需审核。
+MCP Streamable HTTP 等实现限制见[能力状态](docs/capability-status.md)。
 
-## Quick start
+![SkillX 工作流列表](docs/screenshots/workflow-library.jpg)
 
-Requires **Python 3.12 or 3.13**, **[uv](https://docs.astral.sh/uv/getting-started/installation/)**,
-**Node.js 22.19+**, **npm**, and **Git**. The launcher uses Bash and POSIX process/file
-locking; use macOS, Linux, or WSL on Windows.
+## 快速开始
 
-From your clone of this repository:
+需要 Python **3.12–3.13**、[uv](https://docs.astral.sh/uv/getting-started/installation/)、
+Node.js **22.19+**、npm 和 Git。启动脚本适用于 macOS / Linux；Windows 请使用 WSL。
+
+克隆仓库并启动：
 
 ```bash
+git clone https://github.com/zaoweiceng/skillx.git
+cd skillx
 ./dev.sh
 ```
 
-The launcher installs locked dependencies and Chromium, runs database migrations,
-loads demo capabilities, and starts the API, worker, and frontend.
+脚本安装锁定的依赖和 Chromium，执行数据库迁移及示例初始化，然后启动 API、Worker 和前端。
 
-- Workspace: <http://127.0.0.1:5173>
-- API documentation: <http://127.0.0.1:8000/docs>
-- Logs: `.dev/logs/`
+- 工作空间：<http://127.0.0.1:5173>
+- API 文档：<http://127.0.0.1:8000/docs>
+- 本地日志：`.dev/logs/`
 
-Open **Settings → Model services and agents**, add your provider's base URL, API key,
-and model identifier, and test the connection. Pi uses this configuration for chat.
-Model calls use your provider account and may incur charges. Browsing the UI and
-running fixture-based tests do not require a model API key.
-
-Press `Ctrl+C` to stop all services. Restart the launcher after backend changes;
-frontend changes use Vite hot reload.
+打开「设置 → 模型服务与 Agent」，添加服务 Base URL、API Key 和模型，测试连接后即可使用 Pi 对话。
+模型调用使用你自己的服务账号，可能产生费用。浏览界面和运行 fixture 测试不需要模型密钥。
+按 `Ctrl+C` 停止全部服务；后端变更后重启脚本，前端支持热更新。
 
 ```bash
-./dev.sh --setup-only                     # Install and initialize, without starting services
-./dev.sh --skip-install                   # Reuse dependencies already installed
-API_PORT=8001 FRONTEND_PORT=5174 ./dev.sh  # Override local ports
+./dev.sh --setup-only                     # 仅安装和初始化
+./dev.sh --skip-install                   # 已有依赖时跳过安装
+API_PORT=8001 FRONTEND_PORT=5174 ./dev.sh  # 自定义本地端口
 ```
 
-Normal upgrades use incremental migrations and preserve data. Back up the local
-database and runtime files before upgrading. `./dev.sh --reset-db` is a destructive
-recovery option for incompatible legacy databases: it deletes historical data and
-published versions. It is **not** a normal installation or upgrade step.
+正常升级会执行增量迁移，不需要重置数据库。升级前请备份本地数据。
+`./dev.sh --reset-db` 仅用于不兼容旧数据库的破坏性重建，会删除历史数据和已发布版本，
+不要把它当成正常安装或升级步骤。
 
-## Configuration and local data
+## 运行第一个示例
 
-Defaults work without an environment file. To customize them, copy
-[`backend/.env.example`](backend/.env.example) to `backend/.env`.
-API and worker must share the same database, artifact root, and credential directory.
-The frontend uses `/api` by default; `dev.sh` sets its API target automatically.
+不配置模型服务，也可以先运行内置的「问候工作流」体验完整流程：
 
-| Setting | Purpose / default |
+1. 在「工作流」列表找到「问候工作流」，点击「编辑」。
+2. 点击「生成问候」节点，查看输入映射和模板；画布支持拖放节点与连线。
+3. 在页面下方「手动运行 v1」输入姓名，例如 `SkillX`，点击「启动已发布版本」。
+4. 在运行详情查看节点状态、事件记录和结果 `你好，SkillX`。这个示例不调用模型。
+
+编辑草稿不会改变已发布版本。需要让修改生效时，保存草稿、执行静态检查，再发布新版本。
+
+![可视化编辑问候工作流](docs/screenshots/workflow-editor.jpg)
+
+![问候工作流的节点状态与实际运行结果](docs/screenshots/workflow-run.jpg)
+
+## 配置与安全边界
+
+默认不需要 `.env`。需要修改配置时，把 `backend/.env.example` 复制为 `backend/.env`。
+API 和 Worker 必须共用数据库、Artifact 路径与凭据目录。通过启动脚本运行时，下列相对路径以 `backend/` 为基准。
+
+| 配置项 | 用途与默认值 |
 | --- | --- |
-| `SKILLX_DATABASE_URL` | SQLite database, `sqlite+aiosqlite:///./skillx.db` |
-| `SKILLX_ARTIFACT_ROOT` | Local artifacts, `./artifacts` |
-| `SKILLX_CAPABILITY_ROOT` | Trusted SkillX packages, `../capabilities/skillx` |
-| `SKILLX_RUNTIME_CREDENTIALS_PATH` | Local provider-key files, `./.runtime-credentials` |
-| `SKILLX_AUTO_CREATE_SCHEMA` | Keep `false`; use Alembic migrations |
+| `SKILLX_DATABASE_URL` | SQLite 数据库，`sqlite+aiosqlite:///./skillx.db` |
+| `SKILLX_ARTIFACT_ROOT` | 本地产物，`./artifacts` |
+| `SKILLX_CAPABILITY_ROOT` | 可信 SkillX 包，`../capabilities/skillx` |
+| `SKILLX_RUNTIME_CREDENTIALS_PATH` | 模型密钥文件，`./.runtime-credentials` |
+| `SKILLX_AGENT_RUNTIME_TYPE` | 示例配置使用 `pi`；默认安装项目内 Pi SDK |
+| `SKILLX_AUTO_CREATE_SCHEMA` | 保持 `false`，通过 Alembic 迁移管理数据库 |
 
-Relative backend paths are resolved from `backend/` when using the launcher.
-Provider keys entered in Settings are stored as restricted local files; database
-records retain references. These files are **not encrypted at rest**. Conversations,
-images, artifacts, and execution traces can also contain sensitive data. Keep all
-runtime data out of Git and inspect logs before sharing them.
+高级运行时、直接 LLM 和失败接力配置见[运行时适配器](docs/runtime-adapters.md)。
 
-Advanced agent, direct-LLM, and recovery configuration is documented in
-[runtime adapters](docs/runtime-adapters.md). SkillX packages execute code and are
-not sandboxed merely by using a Python virtual environment. Only install trusted
-packages and configure trusted tools. The API has no application-level user
-authentication; keep the default loopback binding.
+模型密钥保存在 `backend/.runtime-credentials/` 的受限文件中，数据库只保存引用，
+但密钥文件并未加密。对话、图片、轨迹和 Artifact 也可能包含敏感信息，不能提交到 Git。
+API 没有用户认证层，请保持默认仅监听本机。只安装可信技能和工具，Python venv 不是安全沙箱。
 
-## Architecture
+## 开发与验证
 
-```text
-React workspace ── REST / SSE ── FastAPI
-                                  │
-                             SQLite state
-                                  │
-                           Independent worker
-                                  │
-                   SkillX / LLM / Agent / MCP / Browser
-```
-
-The host validates contracts, permissions, and execution budgets. Published workflow
-versions and capability dependencies are immutable. Models participate through
-explicit LLM and agent execution paths; approved external side effects remain under
-host control.
-
-```text
-backend/       FastAPI, domain contracts, orchestration, workers, migrations, tests
-frontend/      React, TypeScript, Ant Design, and the visual workflow editor
-bridges/pi/    Project-local Pi SDK bridge
-capabilities/  Example portable SkillX packages
-examples/      Workflow and local integration examples
-docs/          Specifications and operating guides
-tools/         Development and documentation checks
-```
-
-## Development and checks
-
-Initialize dependencies with `./dev.sh --setup-only`, then run from the repository root:
+先执行 `./dev.sh --setup-only` 安装开发依赖，再运行：
 
 ```bash
-make quality-check      # Backend checks, migrations, frontend tests/build, documentation
-make demo-check         # Adds API + worker black-box integration tests
-make browser-ui-check   # Browser UI acceptance tests (requires Chromium)
+make quality-check
+make demo-check
+make browser-ui-check
 ```
 
-`make browser-install` installs Chromium separately. Optional TraeX checks require an
-installed and authenticated real provider: `make traex-real-check` and
-`make traex-real-product-check`. They are not evidence of a working provider when
-skipped. CI uses local fixtures and does not require your API keys.
+浏览器测试需要 Chromium，可通过 `make browser-install` 单独安装。
+真实 TraeX 测试是可选项，需要本机安装并登录；fixture 通过不等于真实模型服务验证通过。
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for individual commands and contribution guidelines.
+## 架构与目录
 
-## Documentation
+React 工作空间通过 REST / SSE 连接 FastAPI。SQLite 保存工作流版本和执行状态，
+独立 Worker 调用 SkillX、LLM、Agent、MCP 或浏览器执行任务。
+Host 校验契约、权限和执行预算；已发布版本和已锁定依赖保持不可变。
 
-- [Capability status and implementation limits](docs/capability-status.md)
-- [Task lifecycle and human interactions](docs/task-runtime.md)
-- [Runtime adapters and recovery](docs/runtime-adapters.md)
-- [SkillX package specification](docs/skillx.md)
-- [Managed skills](docs/managed-skills.md)
-- [Database schema](docs/schema.md)
-- [Design](docs/workflow-design-doc.md) and [development guide](docs/workflow-dev-doc.md)
-- [Demo acceptance scenarios](docs/demo-acceptance.md)
+```text
+backend/       API、领域契约、编排、Worker、迁移与测试
+frontend/      对话、设置、执行轨迹与可视化编辑器
+bridges/pi/    项目内 Pi SDK 适配桥
+capabilities/  可移植 SkillX 示例包
+examples/      工作流与本地集成示例
+docs/          规范、使用说明与截图
+tools/         开发与文档检查工具
+```
 
-`STEP/`, `REPLAY/`, and `review/` retain historical design and verification records;
-their results describe the versions and dates recorded there, not the current build.
+## 文档
 
-## Contributing and license
+- [能力状态与实现边界](docs/capability-status.md)
+- [任务生命周期与人工交互](docs/task-runtime.md)
+- [运行时适配器与恢复](docs/runtime-adapters.md)
+- [SkillX 包规范](docs/skillx.md)
+- [Skills 管理](docs/managed-skills.md)
+- [数据库结构](docs/schema.md)
+- [产品设计](docs/workflow-design-doc.md)与[开发说明](docs/workflow-dev-doc.md)
+- [演示验收场景](docs/demo-acceptance.md)
 
-Bug reports, documentation improvements, and focused pull requests are welcome.
-Follow the [contribution guide](CONTRIBUTING.md) and [code of conduct](CODE_OF_CONDUCT.md).
-For vulnerabilities, follow the private reporting instructions in [SECURITY.md](SECURITY.md).
+## 贡献与许可
 
-Copyright © 2026 zaoweiceng. SkillX is licensed under the [MIT License](LICENSE).
-Third-party dependencies retain their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+贡献请遵循 [CONTRIBUTING.md](CONTRIBUTING.md)；漏洞请按 [SECURITY.md](SECURITY.md) 私下报告。
+`STEP/`、`REPLAY/` 和 `review/` 为历史设计与验收记录，结论仅对应记录中的版本和日期。
+
+Copyright © 2026 zaoweiceng。采用 [MIT License](LICENSE)；第三方依赖保留各自许可证。
