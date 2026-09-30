@@ -28,8 +28,9 @@ class TaskCall(BaseModel):
     key: str = Field(min_length=1, max_length=120)
     kind: Literal["capability", "tool", "code", "install", "model"]
     arguments: dict[str, Any] = Field(
-        description="code: {language: python|javascript, source: string}; "
-        "tool: {capabilityRef: string, input: object}. Do not wrap code arguments inside input."
+        description="code 调用：{language: python|javascript, source: 字符串}；"
+        "tool 调用：{capabilityRef: 字符串, input: 对象}。"
+        "code 的 language 和 source 必须直接放在 arguments 中，不能包在 input 中。"
     )
     reason: str = Field(min_length=1)
 

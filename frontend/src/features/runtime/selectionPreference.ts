@@ -5,7 +5,9 @@ export function readSelectionPreference(): Selection {
     const saved = JSON.parse(localStorage.getItem(KEY) ?? 'null')
     if (saved && (saved.agentProfileId === null || typeof saved.agentProfileId === 'string') &&
         (saved.traexModel === null || typeof saved.traexModel === 'string')) {
+      if (saved.agentProfileId === 'builtin-traex' || (!saved.agentProfileId && saved.traexModel)) return { agentProfileId: null, traexModel: null }
       return { agentProfileId: saved.agentProfileId, traexModel: saved.traexModel,
+        ...(typeof saved.modelProfileId === 'string' && typeof saved.model === 'string' ? { modelProfileId: saved.modelProfileId, model: saved.model } : {}),
         reasoningEffort: ['low', 'medium', 'high'].includes(saved.reasoningEffort) ? saved.reasoningEffort : null }
     }
   } catch { /* Storage can be unavailable; conversation settings remain authoritative. */ }

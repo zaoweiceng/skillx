@@ -8,7 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.runtime_profiles import agent_snapshot, list_profiles, save_profile
 from app.infrastructure.database import Conversation, RuntimeProfile, get_session
-from app.infrastructure.runtime_credentials import discard_runtime_key, resolve_runtime_key, store_runtime_key
+from app.infrastructure.runtime_credentials import (
+    discard_runtime_key,
+    resolve_runtime_key,
+    store_runtime_key,
+)
 from app.runtime.traex_models import list_traex_models, validate_traex_model
 
 router = APIRouter(prefix="/runtime-profiles", tags=["Runtime profiles"])
@@ -100,7 +104,9 @@ async def persist(body: ProfileInput, session: AsyncSession, profile_id: str | N
                 new_reference = store_runtime_key(key)
                 config["apiKeyEnv"] = new_reference
             elif existing and existing.kind == "model":
-                config["apiKeyEnv"] = config.get("apiKeyEnv") or existing.config_json.get("apiKeyEnv")
+                config["apiKeyEnv"] = config.get("apiKeyEnv") or existing.config_json.get(
+                    "apiKeyEnv"
+                )
             if not config.get("apiKeyEnv"):
                 raise ValueError("请输入 API Key")
             if not config.get("models"):
@@ -114,6 +120,8 @@ async def persist(body: ProfileInput, session: AsyncSession, profile_id: str | N
             is_default=body.isDefault,
             active=body.active,
         )
+        if item.kind == "agent" and item.active and config.get("adapter") == "pi":
+            await agent_snapshot(session, item.id)
         await session.commit()
         return view(item)
     except (ValueError, LookupError) as exc:
@@ -172,8 +180,14 @@ async def select_agent(
         raise HTTPException(404, "对话不存在")
     try:
         await validate_traex_model(body.traexModel)
-        await agent_snapshot(session, body.agentProfileId, body.traexModel, body.reasoningEffort,
-                             body.modelProfileId, body.model)
+        await agent_snapshot(
+            session,
+            body.agentProfileId,
+            body.traexModel,
+            body.reasoningEffort,
+            body.modelProfileId,
+            body.model,
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     conversation.agent_profile_id = body.agentProfileId
@@ -228,7 +242,11 @@ async def probe(profile_id: str, session: AsyncSession = Depends(get_session)):
             await session.rollback()
             await OpenAICompatibleAdapter(
                 LLMRuntimeConfig(
-                    "openai_compatible", config["baseUrl"], config["model"], config["apiKeyEnv"]
+                    "openai_compatible",
+                    config["baseUrl"],
+                    config["model"],
+                    config["apiKeyEnv"],
+                    credential_configured=bool(resolve_runtime_key(config["apiKeyEnv"])),
                 ),
                 timeout_seconds=config.get("timeoutSeconds", 60),
                 structured_mode=config.get("structuredMode", "json_schema"),

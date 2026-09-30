@@ -11,9 +11,8 @@ from typing import Any, Protocol
 
 import httpx
 
-from app.infrastructure.runtime_credentials import resolve_runtime_key
-
 from app.application.runtime_config import AgentRuntimeConfig, agent_runtime_config
+from app.infrastructure.runtime_credentials import resolve_runtime_key
 from app.runtime.agent_contracts import AdapterError as AdapterError
 from app.runtime.agent_contracts import AgentRunRequest as AgentRunRequest
 

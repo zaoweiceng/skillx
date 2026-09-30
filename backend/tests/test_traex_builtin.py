@@ -361,7 +361,7 @@ async def test_builtin_bridge_rejects_untrusted_working_directory(
     assert error.value.code == "TRAE_WORKDIR_UNTRUSTED"
 
 
-def test_runtime_auto_discovers_builtin_traex(
+def test_runtime_defaults_to_pi_even_when_traex_is_installed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = get_settings()
@@ -377,15 +377,15 @@ def test_runtime_auto_discovers_builtin_traex(
 
     runtime = agent_runtime_config()
 
-    assert runtime.type == "traex_builtin"
-    assert runtime.source == "auto_discovered"
-    assert runtime.provider == "traex"
-    assert runtime.protocol == "traex-cli-jsonl+mcp"
+    assert runtime.type == "pi"
+    assert runtime.source == "builtin_default"
+    assert runtime.provider == "pi"
+    assert runtime.protocol == "host-ndjson"
     assert runtime.adapter_digest.startswith("sha256:")
     assert "SKILLX_AGENT_API_KEY" not in os.environ
 
 
-async def test_missing_builtin_traex_has_actionable_error(
+async def test_unconfigured_builtin_pi_has_actionable_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -410,7 +410,7 @@ async def test_missing_builtin_traex_has_actionable_error(
             )
         )
 
-    assert error.value.code == "TRAE_NOT_INSTALLED"
+    assert error.value.code == "MODEL_NOT_CONFIGURED"
 
 
 def _descriptor(capability_ref: str) -> dict[str, object]:

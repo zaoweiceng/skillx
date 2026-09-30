@@ -1,14 +1,8 @@
+import os
 from dataclasses import dataclass, field
-from typing import Any
-from typing import Literal
+from typing import Any, Literal
 
 from app.domain.serialization import digest_json
-
-
-def _has_key(reference: str) -> bool:
-    from app.infrastructure.runtime_credentials import resolve_runtime_key
-
-    return bool(resolve_runtime_key(reference))
 
 
 @dataclass(frozen=True)
@@ -18,6 +12,7 @@ class LLMRuntimeConfig:
     model: str | None
     api_key_env: str
     source: str = "split"
+    credential_configured: bool = False
 
     @property
     def configured(self) -> bool:
@@ -25,7 +20,7 @@ class LLMRuntimeConfig:
             self.type == "openai_compatible"
             and self.endpoint
             and self.model
-            and _has_key(self.api_key_env)
+            and (self.credential_configured or bool(os.environ.get(self.api_key_env)))
         )
 
     @property
@@ -60,6 +55,7 @@ class AgentRuntimeConfig:
     adapter_version: str
     adapter_digest: str
     source: str = "split"
+    credential_configured: bool = False
     reasoning_effort: str | None = None
     model_options: dict[str, Any] = field(default_factory=dict)
 
@@ -68,7 +64,11 @@ class AgentRuntimeConfig:
         if self.type == "unavailable" or not self.command:
             return False
         if self.type in {"openai_sidecar", "pi"}:
-            return bool(self.endpoint and self.model and _has_key(self.api_key_env))
+            return bool(
+                self.endpoint
+                and self.model
+                and (self.credential_configured or bool(os.environ.get(self.api_key_env)))
+            )
         return True
 
     @property
@@ -89,4 +89,3 @@ class AgentRuntimeConfig:
                 "modelOptions": self.model_options,
             }
         )
-

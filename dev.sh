@@ -65,12 +65,20 @@ if [ "$SKIP_INSTALL" = 0 ]; then
   for package in frontend bridges/pi; do
     marker="$ROOT/.dev/$(echo "$package" | tr / -).lock"
     if [ ! -d "$ROOT/$package/node_modules" ] || ! cmp -s "$ROOT/$package/package-lock.json" "$marker"; then
-      (cd "$ROOT/$package" && npm ci)
+      if [ "$package" = bridges/pi ]; then
+        (cd "$ROOT/$package" && npm ci --ignore-scripts)
+      else
+        (cd "$ROOT/$package" && npm ci)
+      fi
       cp "$ROOT/$package/package-lock.json" "$marker"
     fi
   done
   (cd "$ROOT/backend" && uv run playwright install chromium)
 fi
+(cd "$ROOT/bridges/pi" && node bridge.mjs --probe) >/dev/null || {
+  echo 'Pi SDK 缺失或版本不匹配，请去掉 --skip-install 或运行 make pi-install' >&2
+  exit 1
+}
 PYTHON="$ROOT/backend/.venv/bin/python"
 [ -x "$PYTHON" ] || { echo '缺少后端依赖，请去掉 --skip-install' >&2; exit 1; }
 [ -f "$ROOT/frontend/node_modules/vite/bin/vite.js" ] || { echo '缺少前端依赖，请去掉 --skip-install' >&2; exit 1; }
@@ -102,6 +110,16 @@ else
   fi
 fi
 (cd "$ROOT/backend" && "$PYTHON" -m app.seed)
+(cd "$ROOT/backend" && "$PYTHON" - <<'PY'
+import asyncio
+from app.infrastructure.database import SessionLocal
+from app.application.runtime_profiles import initialize_profiles
+async def initialize():
+    async with SessionLocal() as session:
+        await initialize_profiles(session)
+asyncio.run(initialize())
+PY
+)
 [ "$SETUP_ONLY" = 0 ] || { echo '初始化完成'; exit 0; }
 (cd "$ROOT/backend" && exec "$PYTHON" -m uvicorn app.main:app --host 127.0.0.1 --port "$API_PORT") > "$ROOT/.dev/logs/api.log" 2>&1 &
 pids+=("$!")

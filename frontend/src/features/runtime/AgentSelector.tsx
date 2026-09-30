@@ -6,7 +6,7 @@ import styles from './picker.module.css'
 import { readSelectionPreference, saveSelectionPreference, initializeSelectionPreference } from './selectionPreference'
 import { TraexModelSelect } from './TraexModelSelect'
 
-export type Selection = { agentProfileId: string | null; traexModel: string | null; reasoningEffort?: ReasoningEffort | null }
+export type Selection = { agentProfileId: string | null; traexModel: string | null; reasoningEffort?: ReasoningEffort | null; modelProfileId?: string | null; model?: string | null }
 export function AgentSelector({ conversationId, onBusyChange, draftSelection, onDraftChange }: { conversationId: string; draftSelection?: Selection; onDraftChange?: (selection: Selection) => void; onBusyChange?: (busy: boolean) => void }) {
   const [profiles, setProfiles] = useState<Profile[]>([])
   const [selection, setSelection] = useState<Selection>(readSelectionPreference)
@@ -37,7 +37,10 @@ export function AgentSelector({ conversationId, onBusyChange, draftSelection, on
   }
   const currentSelection = !conversationId && draftSelection ? draftSelection : selection
   const active = profiles.find(item => currentSelection.agentProfileId ? item.id === currentSelection.agentProfileId : item.kind === 'agent' && item.isDefault)
-  const piModel = profiles.find(item => item.id === active?.config.modelProfileId)?.config.model ?? ''
+  const services = profiles.filter(item => item.kind === 'model' && item.active)
+  const piService = services.find(item => item.id === (currentSelection.modelProfileId || active?.config.modelProfileId)) ?? services.find(item => item.isDefault)
+  const piModel = currentSelection.model || active?.config.model || piService?.config.model || ''
+  const supportsReasoning = piService?.config.models?.find(model => model.id === piModel)?.reasoning || /^(gpt-[56]|o[34])/i.test(piModel)
   return <div className="agent-picker">
     <Select size="small" variant="borderless" className={styles.trigger} classNames={{ popup: { root: styles.popup } }}
       popupMatchSelectWidth={260} popupRender={menu => <><div className={styles.menuHeading}>选择执行体</div>{menu}</>} aria-label="Agent 执行体" value={currentSelection.agentProfileId ?? ''} disabled={busy || !loaded}
@@ -49,7 +52,12 @@ export function AgentSelector({ conversationId, onBusyChange, draftSelection, on
       reasoningEffort={currentSelection.reasoningEffort}
       onReasoningChange={value => void select({ ...currentSelection, reasoningEffort: value })}
       onChange={value => void select({ ...currentSelection, traexModel: value, reasoningEffort: null })} />}
-    {active?.config.adapter === 'pi' && /^(gpt-[56]|o[34])/i.test(piModel) && <ReasoningSelect
+    {active?.config.adapter === 'pi' && <Select aria-label="Pi 模型" size="small" variant="borderless" disabled={busy || !loaded}
+      style={{ minWidth: 160, maxWidth: 280 }} value={currentSelection.modelProfileId && currentSelection.model ? JSON.stringify([currentSelection.modelProfileId, currentSelection.model]) : ''}
+      options={[{ value: '', label: piModel ? `默认 · ${piModel}` : '请先添加模型服务' }, ...services.map(service => ({ label: service.name,
+        options: (service.config.models ?? (service.config.model ? [{ id: service.config.model }] : [])).map(model => ({ value: JSON.stringify([service.id, model.id]), label: model.id })) }))]}
+      onChange={value => { const [modelProfileId, model] = value ? JSON.parse(value) as string[] : [null, null]; void select({ ...currentSelection, modelProfileId, model, reasoningEffort: null }) }} />}
+    {active?.config.adapter === 'pi' && supportsReasoning && <ReasoningSelect
       value={currentSelection.reasoningEffort} disabled={busy || !loaded}
       onChange={value => void select({ ...currentSelection, reasoningEffort: value })} />}
     <span className="selection-note">下次执行生效</span>

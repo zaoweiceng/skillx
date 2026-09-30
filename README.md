@@ -34,7 +34,7 @@ uv run python -m app.reset_database --confirm-reset
 | MCP STDIO | `available` | Registry、Tool Snapshot、Executor 与本地 E2E 已接通 |
 | MCP Streamable HTTP | `partial` | 已实现 initialize/会话 id/JSON+SSE、会话过期重连与 loopback E2E；仍缺流式增量消费与 Last-Event-ID 断点续传 |
 | LLM 节点 | `available` | Executor 已接通；真实运行需环境配置，测试用 Fake Adapter |
-| Agent/TraeX | `available` | 唯一 `AgentHost` 信任边界（ConversationRun 与 Workflow Agent 共用）：requested∩host_granted、判别联合事件契约、callId 配对、step/Token/time/payload 上限、输出 Schema 与取消；事件双投影，审计只存脱敏摘要与 Artifact 引用，Secret 不落库 |
+| Agent/TraeX | `available` | 唯一 `AgentHost` 信任边界（ConversationRun 与 Workflow Agent 共用）：requested∩host_granted、判别联合事件契约、callId 配对、step/Token/time/payload 上限、输出 Schema 与取消；事件双投影，工具审计存摘要，Pi 模型请求/返回脱敏后分片持久化，Secret 不落库 |
 | 通用对话调用组件 | `available` | 聊天自动创建 Task，按目标发现并派发锁定版本；补参使用持久化交互卡片，`/chat/:id` 可刷新恢复；独立 Agent 入口继续保留 |
 | 通用 Agent 探索与固化 | `available` | 自然入口与显式入口共用 Local Demo 受控只读策略（Browser/lookup/file/summarize）和消息契约；首次 Browser 正文由 Host Broker 获取，刷新后仍可观察并固化 |
 | 通用失败接力 | `available` | Host accepted PlanSnapshot 是 continuation execution source of truth；continuation 与 checkpoint CAS、Conversation assistant message 原子持久化；Chat 自动跟踪多代 lineage 并从可信 ConversationRun 回显最终 output/error；Browser、lookup、file 共用有界 ContinuationRequest |
@@ -101,15 +101,17 @@ SkillX 注册只接受 `SKILLX_CAPABILITY_ROOT` 下的相对路径。Secret API 
 `permissions.secrets.use` 声明的句柄会注入 SkillXContext。MCP STDIO 的
 `environment` 同样只接受 `{"API_KEY": {"secretRef": "name"}}`，禁止明文值。
 
-Local Demo 未显式配置 `SKILLX_AGENT_*` 时，会自动发现 PATH 中的 `traex`，使用仓库内
-受信 bridge 接入原生 JSONL 与每次 Run 隔离的 loopback MCP；不需要额外 LLM endpoint：
+Local Demo 默认使用 **Pi Agent（SDK 0.85.1）**，`./dev.sh` 自动安装项目内 Pi 和迁移数据库。
+打开设置 → 模型服务与 Agent，手动添加 Base URL、API Key 和多个模型。首个服务自动成为默认；
+对话输入区可选择具体服务/模型，以及已声明支持的推理强度。
 
-```bash
-traex login
-```
+每轮 LLM 请求、返回内容、工具调用、Token（含缓存读取/写入）和耗时会持久化，
+可在任务、Agent 和工作流的轨迹中展开查看。推理内容只记录服务实际返回的部分。
+密钥保存在 `backend/.runtime-credentials/` 的本机受限文件中，接口不回传密钥，数据库和运行快照只保存引用。
+API/Worker 必须使用同一个 `SKILLX_RUNTIME_CREDENTIALS_PATH`（默认在相同工作目录）。
 
-应用不读取或保存 TraeX token。Settings 主动探测成功且未过期后才开放语义选择。显式
-Agent 配置优先于自动发现；外部 managed adapter 仍可按原协议配置：
+首次升级会将默认执行体切换为 Pi；已创建运行仍使用原快照。TraeX 配置保留用于历史兼容。
+显式 managed adapter 仍可按原协议配置：
 
 ```bash
 export SKILLX_AGENT_RUNTIME_TYPE=traex_managed
@@ -180,8 +182,8 @@ MCP STDIO/HTTP 与契约漂移、Hybrid/真实 TraeX Agent、轨迹固化与发�
   `UNKNOWN_OUTCOME`，不得自动重试。
 - Secret 仅允许保存引用；当前仓库不提供明文 Secret 存储。
 
-### 界面与 TraeX 模型选择
+### 界面与模型选择
 
-前端使用 React + Ant Design，支持浅色、深色和移动端布局。对话输入区选择 TraeX 后，可从本机返回的模型列表中选择模型；设置页可以保存 Agent 的默认模型。切换仅影响后续执行，当前运行保持原模型。
+前端使用 React + Ant Design，支持浅色、深色和移动端布局。默认 Pi 可选择设置页中任一模型服务下的模型；一个服务支持多个模型及各自上下文窗口、最大输出 Token 和推理能力。切换仅影响后续执行，当前运行保持原模型。
 
 更新代码后停止旧启动脚本，再运行 `./dev.sh`，脚本会安装新增前端依赖并自动执行数据库增量迁移。无需重置数据库。

@@ -12,6 +12,7 @@ _test_directory = TemporaryDirectory(prefix="skillx-workflow-tests-")
 _test_database = Path(_test_directory.name) / "database.sqlite"
 os.environ["SKILLX_DATABASE_URL"] = f"sqlite+aiosqlite:///{_test_database}"
 os.environ["SKILLX_AGENT_BUILTIN_ENABLED"] = "false"
+os.environ["SKILLX_RUNTIME_CREDENTIALS_PATH"] = str(Path(_test_directory.name) / "keys")
 
 from app.infrastructure.database import Base, engine  # noqa: E402
 

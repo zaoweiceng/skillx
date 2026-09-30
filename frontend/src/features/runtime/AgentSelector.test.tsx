@@ -42,3 +42,20 @@ describe('Agent 和模型选择', () => {
     expect(JSON.parse(localStorage.getItem('skillx-last-runtime-selection')!).traexModel).toBe('new-model')
   })
 })
+
+it('selects a Pi model from another service and persists its exact service/model pair', async () => {
+  request.mockImplementation(async (path = '', method = 'GET', body?: unknown) => {
+    if (method === 'PUT') return body
+    if (path === '') return [
+      { id: 'pi', name: 'Pi', kind: 'agent', active: true, isDefault: true, config: { adapter: 'pi' } },
+      { id: 'service', name: 'My service', kind: 'model', active: true, isDefault: true, config: { model: 'first', models: [{ id: 'first' }, { id: 'second', reasoning: true }] } },
+    ]
+    return { agentProfileId: null, traexModel: null }
+  })
+  render(<AgentSelector conversationId="pi-conversation" />)
+  fireEvent.mouseDown(await screen.findByRole('combobox', { name: 'Pi 模型' }))
+  fireEvent.click(await screen.findByText('second'))
+  await waitFor(() => expect(request).toHaveBeenCalledWith('/conversations/pi-conversation', 'PUT', {
+    agentProfileId: null, traexModel: null, modelProfileId: 'service', model: 'second', reasoningEffort: null,
+  }))
+})

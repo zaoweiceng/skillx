@@ -16,6 +16,10 @@ import {
   type TaskCheckpointSummary,
 } from '@/api/client'
 
+const tokenNumber = new Intl.NumberFormat('en', {
+  notation: 'compact', maximumFractionDigits: 1,
+})
+
 export type Message = {
   id: string
   role: string
@@ -207,6 +211,22 @@ export function useConversation() {
     return () => window.clearInterval(timer)
   }, [turns, optimisticStartedAt])
 
+  const activeTaskTurns = turns.filter(turn => !turn.completedAt && messages.some(message =>
+    message.turnId === turn.id && message.content.taskId,
+  )).map(turn => turn.id).sort().join(',')
+  useEffect(() => {
+    if (!activeTaskTurns) return
+    let cancelled = false
+    let timer = 0
+    async function poll() {
+      try { await refresh() }
+      catch (reason) { if (!cancelled) setError(reason instanceof Error ? reason.message : '用量刷新失败') }
+      if (!cancelled) timer = window.setTimeout(poll, 1500)
+    }
+    timer = window.setTimeout(poll, 1500)
+    return () => { cancelled = true; window.clearTimeout(timer) }
+  }, [activeTaskTurns, refresh])
+
   // 订阅活动 Agent 运行的规范化事件，直到进入终态。
   useEffect(() => {
     if (!activeRunId) return
@@ -333,7 +353,7 @@ export function useConversation() {
         targetId = created.id
         pendingConversationRef.current = targetId
       }
-      if (!conversationId && (draftSelection.agentProfileId || draftSelection.traexModel || draftSelection.reasoningEffort)) {
+      if (!conversationId && (draftSelection.agentProfileId || draftSelection.traexModel || draftSelection.reasoningEffort || draftSelection.modelProfileId || draftSelection.model)) {
         await runtimeRequest(`/conversations/${targetId}`, 'PUT', draftSelection)
       }
       const result = await (workingDirectory ? api.sendMessage(targetId, text, referenceFiles, workingDirectory) : referenceFiles.length ? api.sendMessage(targetId, text, referenceFiles) : api.sendMessage(targetId, text))
@@ -444,12 +464,14 @@ export function useConversation() {
 
   function tokenLabel(turn?: ConversationTurn) {
     if (!turn) return null
-    if (turn.usage.state === 'pending') return 'Token 统计中'
+    if (turn.usage.state === 'pending') return turn.usage.totalTokens !== null
+      ? `已用 ${tokenNumber.format(turn.usage.totalTokens)} Token · 更新中`
+      : 'Token 等待模型上报'
     if (turn.usage.state === 'unavailable') return 'Token 不可用'
     if (turn.usage.state === 'partial') {
-      return `已统计 ${turn.usage.totalTokens ?? 0} Token，另有部分不可用`
+      return `已统计 ${tokenNumber.format(turn.usage.totalTokens ?? 0)} Token，另有部分不可用`
     }
-    return `${turn.usage.totalTokens ?? 0} Token`
+    return `${tokenNumber.format(turn.usage.totalTokens ?? 0)} Token`
   }
 
   async function startComponent(message: Message) {

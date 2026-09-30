@@ -1,0 +1,43 @@
+.trace { min-width: 0; margin-top: 12px; }
+.heading { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; font-size: 13px; color: var(--text); font-weight: 600; }
+.heading > span { margin-left: auto; font-size: 11px; color: var(--muted); font-weight: 400; }
+.collapse { border: 1px solid var(--line-soft) !important; background: var(--panel) !important; border-radius: 10px !important; overflow: hidden; }
+.collapse :global(.ant-collapse-header) { padding: 11px 12px !important; align-items: flex-start !important; }
+.collapse :global(.ant-collapse-title) { min-width: 0; }
+.collapse :global(.ant-collapse-expand-icon) { height: 20px !important; padding-inline-end: 8px !important; color: var(--muted); }
+.collapse :global(.ant-collapse-panel) { background: var(--panel) !important; border-top-color: var(--line-soft) !important; }
+.collapse :global(.ant-collapse-body) { padding: 12px !important; }
+.collapse :global(.ant-collapse-item) { border-bottom-color: var(--line-soft) !important; }
+.chevron, .expanded { transition: transform .15s ease; }
+.expanded { transform: rotate(90deg); }
+.callHeading { min-width: 0; }
+.callTitle { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; line-height: 20px; color: var(--text); font-weight: 500; }
+.callTitle > svg { flex-shrink: 0; color: var(--muted); }
+.callTitle > small { display: block; flex-basis: 100%; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; color: var(--muted); font-weight: 400; }
+.callMeta { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; color: var(--muted); font-size: 10px; line-height: 18px; margin-top: 3px; font-variant-numeric: tabular-nums; }
+.callMeta > span { display: inline-flex; align-items: center; gap: 4px; }
+.error { color: var(--danger); }
+.callBody { min-width: 0; }
+.metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.metrics > div { min-width: 0; padding: 9px 10px; border-radius: 7px; border: 1px solid var(--line-soft); background: var(--sidebar); }
+.metrics span { display: block; font-size: 10px; color: var(--muted); margin-bottom: 3px; }
+.metrics strong { display: flex; align-items: baseline; gap: 5px; font-size: 15px; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; }
+.metrics small { font-size: 9px; color: var(--muted); font-weight: 400; }
+.notice, .empty { margin: 0; padding: 12px 0; font-size: 11px; color: var(--muted); line-height: 1.8; }
+.tabs :global(.ant-tabs-nav) { margin: 12px 0 10px !important; }
+.tabs :global(.ant-tabs-tab) { font-size: 11px !important; padding: 7px 0 !important; }
+.tabs :global(.ant-tabs-tab + .ant-tabs-tab) { margin-left: 16px !important; }
+.tabs :global(.ant-tabs-tab-btn) { color: var(--muted) !important; }
+.tabs :global(.ant-tabs-tab-active .ant-tabs-tab-btn) { color: var(--text) !important; }
+.tabs :global(.ant-tabs-ink-bar) { background: var(--text) !important; }
+.thinking { max-height: 360px; overflow: auto; padding: 2px 4px; }
+.thinking > div { font-size: 12px; line-height: 1.85; }
+.codeBlock { border: 1px solid var(--line-soft); border-radius: 8px; overflow: hidden; min-width: 0; background: var(--code-bg); }
+.codeToolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--line-soft); color: var(--muted); font-size: 10px; background: var(--sidebar); }
+.codeToolbar > span { letter-spacing: .3px; }
+.codeToolbar button { display: flex; align-items: center; gap: 4px; padding: 2px 4px; background: transparent; color: var(--muted); font: inherit; border: 0; cursor: pointer; border-radius: 4px; }
+.codeToolbar button:hover { color: var(--text); background: var(--panel-raised); }
+.codeToolbar button:focus-visible { outline: 2px solid var(--focus); }
+.codeBlock pre { max-height: 420px; overflow: auto; padding: 12px; margin: 0; color: var(--text); font-family: 'SFMono-Regular', Consolas, monospace; font-size: 10.5px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; }
+.copyError { color: var(--danger); font-size: 10px; padding: 0 10px; }
+.thinking, .codeBlock pre { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }

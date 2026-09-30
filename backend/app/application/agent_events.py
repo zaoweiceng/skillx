@@ -17,7 +17,8 @@ from app.application.security import redact
 #
 # 005-A：validator 同时产出 runtime event（内部完整 payload，仅在进程内使用）与
 # audit event（写入数据库/API 的脱敏摘要——只含 callId、tool、字段名、结果摘要、
-# hash、字节数与 Artifact 引用）。Tool 原始参数/结果绝不进入数据库或事件 API。
+# hash、字节数与 Artifact 引用）。独立 Tool 事件只存摘要；Pi 的 model.trace 按用户
+# 配置采集完整模型请求/返回（含模型可见的上下文），由桥接器脱敏密钥后分片持久化。
 
 
 def _canonical_bytes(value: Any) -> int:
@@ -333,7 +334,7 @@ class AgentEventValidator:
 
     @staticmethod
     def _audit_event(event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """公开审计事件：只含 callId/能力键/字段摘要/结果摘要，绝不含原始参数/结果。"""
+        """工具审计保存摘要；模型轨迹保存已脱敏的分片与用量元数据。"""
 
         key_field = _CALL_STARTED.get(event_type) or _CALL_COMPLETED.get(event_type)
         if key_field is not None:

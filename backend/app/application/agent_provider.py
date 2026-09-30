@@ -12,11 +12,10 @@ from typing import Any
 from uuid import uuid4
 
 from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
-from app.infrastructure.runtime_credentials import resolve_runtime_key
-
 from app.application.runtime_config import agent_runtime_config, llm_runtime_config
 from app.application.tool_broker import ToolAdapterRegistry, ToolExecutionContext
 from app.config import get_settings
+from app.infrastructure.runtime_credentials import resolve_runtime_key
 
 _probe_cache: dict[str, tuple[dict[str, Any], datetime, datetime]] = {}
 
@@ -127,7 +126,8 @@ def _protocol_available() -> tuple[bool, str]:
     if executable.name not in runtime.allowed_executables:
         return False, f"Agent executable 未在 allowlist: {executable.name}"
     if runtime.type == "pi":
-        package = Path(__file__).resolve().parents[3] / "bridges/pi/node_modules/@earendil-works/pi-coding-agent/package.json"
+        package = (Path(__file__).resolve().parents[3]
+                   / "bridges/pi/node_modules/@earendil-works/pi-coding-agent/package.json")
         if not package.is_file() or json.loads(package.read_text()).get("version") != "0.85.1":
             return False, "Pi 0.85.1 未安装，请运行 ./dev.sh 或 make pi-install"
     return True, (
@@ -216,7 +216,7 @@ async def provider_readiness() -> dict[str, Any]:
         elif runtime.type in {"openai_sidecar", "pi"} and (
             not runtime.endpoint or not runtime.model or not key_configured
         ):
-            summary = "Agent sidecar endpoint、model 或 API key 未完整配置"
+            summary = "请在设置页面配置模型服务的 Base URL、模型和 API Key"
         elif not adapter_trusted:
             summary = "Agent adapter 可执行，但 digest 未受信，语义选择保持不可用"
         elif _last_probe is None:
@@ -353,7 +353,7 @@ async def probe_provider() -> dict[str, Any]:
     if not protocol_available:
         raise ValueError(protocol_summary)
     if runtime.type in {"openai_sidecar", "pi"} and not runtime.configured:
-        raise ValueError("Agent sidecar endpoint、model 或 API key 未完整配置")
+        raise ValueError("请在设置页面配置模型服务的 Base URL、模型和 API Key")
     if not adapter_trusted:
         raise ValueError("Agent adapter digest 未在可信列表，不能执行付费语义探测")
     _next_probe_at = now + timedelta(seconds=settings.provider_probe_cooldown_seconds)

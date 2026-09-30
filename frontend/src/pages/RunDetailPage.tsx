@@ -18,6 +18,7 @@ import { request } from '@/api/http'
 import HumanInteractionCard, { type HumanInteraction } from '@/components/HumanInteractionCard'
 import { HandoffPanel } from '@/features/runtime/HandoffPanel'
 import { StatusBadge } from '@/components/StatusBadge'
+import { LLMTrace } from '@/components/LLMTrace'
 import { useRunEvents, useRunStream } from '@/hooks/useRunStream'
 
 const EMPTY_EVENTS: never[] = []
@@ -307,6 +308,7 @@ export default function RunDetailPage() {
             )}
           </div>
           <div className="event-list">
+            <LLMTrace events={events} />
             {events.length === 0 && (
               <div className="event-empty">
                 <Clock size={16} />{' '}

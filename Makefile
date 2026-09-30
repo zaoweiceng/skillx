@@ -7,7 +7,7 @@ export UV_CACHE_DIR
 demo-check: quality-check e2e-check
 
 # 较快的静态/单元/进程内集成检查，不含黑盒子进程 E2E。
-quality-check: backend-check migration-check frontend-check doc-chain-check
+quality-check: pi-check backend-check migration-check frontend-check doc-chain-check
 
 backend-check:
 	cd backend && uv run ruff check app tests real_provider_tests migrations e2e ../examples/local_weather_mcp.py ../examples/traex_stub.py ../examples/openai_agent_sidecar.py ../examples/local_form_site.py
@@ -55,11 +55,14 @@ doc-chain-check:
 	cd tools && python3 -m unittest -q test_check_doc_chain.py
 	python3 tools/check_doc_chain.py
 
-.PHONY: api-types pi-check
+.PHONY: api-types pi-check pi-install
 api-types:
 	@schema=$$(mktemp /tmp/skillx-openapi.XXXXXX) && \
 		uv run --directory backend python ../tools/export_openapi.py $$schema && \
 		cd frontend && npx --no-install openapi-typescript $$schema -o src/api/schema.d.ts
 
 pi-check:
-	cd bridges/pi && npm ci && npm run check && npm run probe
+	cd bridges/pi && npm run check && npm run probe
+
+pi-install:
+	cd bridges/pi && npm ci --ignore-scripts && npm run probe

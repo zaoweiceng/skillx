@@ -1,5 +1,10 @@
 import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager } from '@earendil-works/pi-coding-agent';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+
+const sdkVersion = JSON.parse(readFileSync(new URL('./node_modules/@earendil-works/pi-coding-agent/package.json', import.meta.url), 'utf8')).version;
+if (sdkVersion !== '0.85.1') throw new Error('Pi SDK version mismatch; run make pi-install');
 
 const args = Object.fromEntries(process.argv.slice(2).reduce((items, value, index, all) => {
   if (value.startsWith('--')) items.push([value.slice(2), all[index + 1]]);
@@ -7,7 +12,7 @@ const args = Object.fromEntries(process.argv.slice(2).reduce((items, value, inde
 }, []));
 const emit = (type, payload) => process.stdout.write(JSON.stringify({ type, payload }) + '\n');
 if ('probe' in args) {
-  console.log(JSON.stringify({ installed: true, sdk: '0.85.1', protocol: 'host-ndjson', providerVerified: false }));
+  console.log(JSON.stringify({ installed: true, sdk: sdkVersion, protocol: 'host-ndjson', providerVerified: false }));
   process.exit(0);
 }
 const pending = new Map();
@@ -74,7 +79,11 @@ try {
   });
   await runtime.setRuntimeApiKey('skillx', key);
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
-  const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, systemPrompt: 'Complete only the supplied task using authorized tools. Return the requested JSON output.' });
+  const systemPrompt = '你是任务执行 Agent。仅使用 Host 授权的工具完成给定任务。'
+    + '除用户明确要求其他语言外，分析思考、执行说明和最终回答默认使用简体中文；代码、协议字段、标识符和引用原文保留原样。'
+    + '最终消息必须且只能是一个符合以下 JSON Schema 的 JSON 对象，不得添加 Markdown 代码围栏、正文、注释或其他文字：'
+    + (args['output-schema'] ?? '{}');
+  const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, systemPrompt });
   await loader.reload();
   const descriptors = JSON.parse(args['tool-descriptors'] ?? '[]');
   const tools = descriptors.map((descriptor, index) => ({
@@ -98,7 +107,7 @@ try {
     maxTokens: Math.min(options.maxOutputTokens ?? 8192, Number(args['max-tokens'] ?? 20000)),
   });
   session.agent.onPayload = payload => {
-    requestId = `pi-llm-${steps + 1}`; startedAt = performance.now();
+    requestId = randomUUID(); startedAt = performance.now();
     emit('model.request.dispatched', { attempt: steps + 1, requestId, model: modelId, provider: 'pi', startedAt: new Date().toISOString() });
     trace(requestId, 'request', payload);
   };
@@ -116,7 +125,7 @@ try {
       const durationMs = startedAt === undefined ? 0 : Math.round(performance.now() - startedAt);
       trace(requestId ?? `pi-llm-${steps + 1}`, 'response', {
         model: modelId, content: event.message.content.map(item => {
-          const { thoughtSignature: _signature, ...content } = item; return content;
+          const { thoughtSignature: _signature, thinkingSignature: _thinkingSignature, ...content } = item; return content;
         }), stopReason: event.message.stopReason, error: event.message.errorMessage,
         usage: { input: usage.input ?? 0, output: outputTokens, cacheRead: usage.cacheRead ?? 0, cacheWrite: usage.cacheWrite ?? 0, totalTokens: inputTokens + outputTokens },
         durationMs,
@@ -127,7 +136,7 @@ try {
       if (steps > Number(args['max-steps'] ?? 6) || totalTokens > Number(args['max-tokens'] ?? 20000)) void session.abort();
     }
   });
-  emit('agent.plan', { summary: 'Pi executes with Host-authorized tools' });
+  emit('agent.plan', { summary: 'Pi 使用 Host 授权的工具执行任务' });
   await session.prompt(args.prompt);
   const message = [...session.state.messages].reverse().find(item => item.role === 'assistant');
   if (!message || ['error', 'aborted'].includes(message.stopReason)) throw new Error(message?.errorMessage || 'Pi model request failed or aborted');

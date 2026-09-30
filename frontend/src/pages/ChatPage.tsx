@@ -1,5 +1,6 @@
 import MarkdownContent from '@/components/MarkdownContent'
 import { TaskTrace } from '@/features/chat/TaskTrace'
+import { LLMTrace } from '@/components/LLMTrace'
 import TaskPanel from '@/components/TaskPanel'
 import { useState } from 'react'
 import { Button, Tag } from 'antd'
@@ -377,7 +378,7 @@ export default function ChatPage() {
       )
     }
     return (
-      <ol className="trace-timeline" aria-label="Agent 轨迹">
+      <><LLMTrace events={traceEvents} /><ol className="trace-timeline" aria-label="Agent 轨迹">
         {traceEvents.map((event) => (
           <li className="trace-item" key={event.seq}>
             <span className="trace-type">{event.type}</span>
@@ -397,7 +398,7 @@ export default function ChatPage() {
             )}
           </li>
         ))}
-      </ol>
+      </ol></>
     )
   }
 

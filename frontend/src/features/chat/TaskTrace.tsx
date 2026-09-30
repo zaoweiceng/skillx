@@ -1,8 +1,12 @@
-import { useEffect, useState } from 'react'
-import { Alert, Collapse } from 'antd'
+import { useEffect, useMemo, useState } from 'react'
+import { Alert } from 'antd'
+import { Brain, CheckCheck, Wrench } from 'lucide-react'
 import { request } from '@/api/http'
-import styles from '@/components/TaskProgress.module.css'
-import { summarizeProgress } from '@/components/taskProgressEvents'
+import styles from './TaskTrace.module.css'
+import { taskTraceSteps } from './taskTraceSteps'
+import { LLMTrace } from '@/components/LLMTrace'
+import { collectModelCalls } from '@/components/llmTraceData'
+import { RawTraceEvents } from '@/components/RawTraceEvents'
 
 type Event = { id: number; type: string; payload: Record<string, unknown>; createdAt: string }
 export function TaskTrace({ id }: { id: string }) {
@@ -27,21 +31,24 @@ export function TaskTrace({ id }: { id: string }) {
   }, [id])
   const calls = new Set(events.filter(event => event.type === 'invocation.queued').map(event => event.payload.id))
   const results = new Set(events.filter(event => ['invocation.succeeded', 'invocation.failed'].includes(event.type)).map(event => event.payload.id))
-  const steps = summarizeProgress(events)
+  const steps = useMemo(() => taskTraceSteps(events), [events])
+  const modelCalls = useMemo(() => collectModelCalls(events), [events])
+  const callNumbers = new Map(modelCalls.map((call, index) => [call.id, index + 1]))
   return <div className={styles.trace} aria-label="任务执行轨迹">
     {error && <Alert type="error" title={error} />}
     {!events.length && !error && <p className="hint">正在读取任务轨迹…</p>}
-    <p className={styles.summary}>{calls.size ? `${calls.size} 项操作 · ${results.size} 项已返回` : '等待实际操作'}</p>
-    <ol className={styles.traceSteps}>{steps.map(step => <li key={step.id}>
-      <div className={styles.stepHeading}><span>{step.label}</span><time>{new Date(step.createdAt).toLocaleTimeString()}</time></div>
-      {step.detail && <p className={styles.detail}>{step.detail}</p>}
+    <div className={styles.summary}>
+      <span><Brain size={12} /><strong>{modelCalls.length}</strong>轮分析</span>
+      <span><Wrench size={12} /><strong>{calls.size}</strong>项操作</span>
+      <span><CheckCheck size={12} /><strong>{results.size}</strong>项已返回</span>
+    </div>
+    <ol className={styles.steps}>{steps.map((step, index) => <li key={step.id}>
+      <span className={styles.marker}>{index + 1}</span><div className={styles.content}>
+        <div className={styles.heading}><span>{step.label}</span><time>{new Date(step.createdAt).toLocaleTimeString()}</time></div>
+        {step.detail && <p className={styles.detail}>{step.detail}</p>}
+        <LLMTrace events={step.events} embedded callNumbers={callNumbers} />
+      </div>
     </li>)}</ol>
-    {events.length > 0 && <Collapse ghost size="small" items={[{
-      key: 'raw', label: `原始事件 · ${events.length}`,
-      children: <div className={styles.rawEvents}>{events.map(event => <details key={event.id}>
-        <summary>{event.type} · {new Date(event.createdAt).toLocaleTimeString()}</summary>
-        <pre>{JSON.stringify(event.payload, null, 2)}</pre>
-      </details>)}</div>,
-    }]} />}
+    {events.length > 0 && <RawTraceEvents events={events} />}
   </div>
 }

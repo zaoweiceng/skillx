@@ -232,3 +232,87 @@ async def test_file_tool_uses_conversation_task_directory(tmp_path):
         call = await session.get(Invocation, call_id)
         assert call.status == "succeeded", call.error_json
         assert "selected workspace" in str(call.output_json)
+
+
+async def test_running_task_exposes_committed_model_usage_without_waiting_for_completion():
+    from app.infrastructure.models.tasks import TaskEvent
+
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="live usage")
+        session.add(conversation)
+        await session.flush()
+        turn = ConversationTurn(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            workflow_mode_snapshot="enabled",
+            status="processing",
+        )
+        session.add(turn)
+        await session.flush()
+        task = Task(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            turn_id=turn.id,
+            goal="live",
+            status="deciding",
+            total_tokens=0,
+        )
+        session.add(task)
+        await session.flush()
+        for kind, payload in [
+            ("model.request.dispatched", {"requestId": "first", "model": "pi-model"}),
+            (
+                "agent.step.completed",
+                {
+                    "requestId": "first",
+                    "inputTokens": 1000,
+                    "outputTokens": 234,
+                    "usageComplete": True,
+                },
+            ),
+            ("model.request.dispatched", {"requestId": "second", "model": "pi-model"}),
+        ]:
+            session.add(
+                TaskEvent(
+                    task_id=task.id,
+                    type="agent.audit",
+                    payload_json={"type": kind, "payload": payload},
+                )
+            )
+        await session.flush()
+        usage = await usage_summary(session, turn.id)
+        assert usage["state"] == "pending"
+        assert usage["totalTokens"] == 1234
+        assert usage["stages"][1]["totalTokens"] is None
+        task.total_tokens = 1234
+        assert (await usage_summary(session, turn.id))["totalTokens"] == 1234
+        task.status = "cancelled"
+        usage = await usage_summary(session, turn.id)
+        assert usage["state"] == "partial" and usage["totalTokens"] == 1234
+
+
+async def test_first_model_request_without_usage_remains_unknown():
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="waiting usage")
+        session.add(conversation)
+        await session.flush()
+        turn = ConversationTurn(
+            id=str(uuid4()),
+            conversation_id=conversation.id,
+            workflow_mode_snapshot="enabled",
+            status="processing",
+        )
+        session.add(turn)
+        await session.flush()
+        session.add(
+            Task(
+                id=str(uuid4()),
+                conversation_id=conversation.id,
+                turn_id=turn.id,
+                goal="waiting",
+                status="deciding",
+                total_tokens=0,
+            )
+        )
+        await session.flush()
+        assert (await usage_summary(session, turn.id))["totalTokens"] is None

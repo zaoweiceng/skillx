@@ -8,9 +8,8 @@ from typing import Any, Literal, Protocol
 import httpx
 from jsonschema import Draft202012Validator
 
-from app.infrastructure.runtime_credentials import resolve_runtime_key
-
 from app.application.runtime_config import LLMRuntimeConfig, llm_runtime_config
+from app.infrastructure.runtime_credentials import resolve_runtime_key
 
 
 @dataclass(frozen=True)
@@ -185,7 +184,8 @@ class OpenAICompatibleAdapter:
         if self.structured_mode != "json_schema":
             request.pop("response_format")
             request["messages"][0]["content"] += (
-                "\nReturn only a JSON object matching this schema: " + json.dumps(output_schema)
+                "\n仅返回一个符合以下 JSON Schema 的 JSON 对象，不得添加其他文字："
+                + json.dumps(output_schema, ensure_ascii=False)
             )
             if self.structured_mode == "json_object":
                 request["response_format"] = {"type": "json_object"}

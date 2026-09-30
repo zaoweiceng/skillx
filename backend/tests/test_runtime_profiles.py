@@ -4,7 +4,6 @@ from dataclasses import asdict
 from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
 
 from app.api.runtime_profiles import ProfileInput
 from app.application.agent_run import enqueue_agent_run
@@ -12,19 +11,20 @@ from app.application.runtime_profiles import agent_snapshot, restore_agent_snaps
 from app.infrastructure.database import Conversation, SessionLocal
 
 
-def test_credentials_must_be_references() -> None:
-    with pytest.raises(ValidationError):
-        ProfileInput.model_validate(
-            {
-                "name": "bad",
-                "kind": "model",
-                "config": {
-                    "baseUrl": "https://example.com/v1",
-                    "model": "test",
-                    "apiKey": "secret",
-                },
-            }
-        )
+def test_manual_credentials_are_write_only() -> None:
+    body = ProfileInput.model_validate(
+        {
+            "name": "service",
+            "kind": "model",
+            "config": {
+                "baseUrl": "https://example.com/v1",
+                "models": [{"id": "first"}, {"id": "second"}],
+                "apiKey": "secret",
+            },
+        }
+    )
+    assert body.config.model == "first"
+    assert "secret" not in str(body.model_dump())
 
 
 async def test_queued_run_keeps_pi_config_after_profile_edit(monkeypatch):
@@ -93,30 +93,36 @@ async def test_inactive_agent_is_not_silently_replaced():
             await agent_snapshot(session, agent.id)
 
 
-async def test_pi_default_requires_verified_current_configuration():
+async def test_pi_default_does_not_require_a_previous_probe():
     async with SessionLocal() as session, session.begin():
-        with pytest.raises(ValueError, match="探测成功"):
-            await save_profile(
-                session,
-                profile_id=None,
-                name="pi",
-                kind="agent",
-                config={"adapter": "pi", "modelProfileId": "missing"},
-                is_default=True,
-                active=True,
-            )
+        item = await save_profile(
+            session,
+            profile_id=None,
+            name="pi",
+            kind="agent",
+            config={"adapter": "pi"},
+            is_default=True,
+            active=True,
+        )
+        assert item.is_default
 
 
 async def test_traex_conversation_model_is_frozen_and_not_shared(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda _: "/usr/bin/traex")
     async with SessionLocal() as session, session.begin():
         profile = await save_profile(
-            session, profile_id=None, name="TraeX", kind="agent",
+            session,
+            profile_id=None,
+            name="TraeX",
+            kind="agent",
             config={"adapter": "traex", "model": "profile-model"},
-            is_default=True, active=True,
+            is_default=True,
+            active=True,
         )
         conversation = Conversation(
-            id=str(uuid4()), title="model selection", agent_profile_id=profile.id,
+            id=str(uuid4()),
+            title="model selection",
+            agent_profile_id=profile.id,
             traex_model="first-model",
         )
         session.add(conversation)

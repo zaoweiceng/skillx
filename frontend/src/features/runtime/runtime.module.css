@@ -12,3 +12,7 @@
 .form label { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }.form :global(.ant-checkbox-wrapper) { flex-direction: row; }
 .full, .actions { grid-column: 1 / -1; }.full { color: var(--muted); font-size: 12px; }.actions { display: flex; justify-content: flex-end; gap: 10px; padding-top: 12px; }
 @media (max-width: 600px) { .form { grid-template-columns: 1fr; }.group { padding: 16px; }.heading { align-items: start; }.cards { grid-template-columns: minmax(0, 1fr); } }
+
+.modelRow { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--border-color, #ddd); margin-bottom: 12px; }
+.modelRow > label:first-child { flex: 1; min-width: 160px; }
+.modelRow > label { display: flex; flex-direction: column; gap: 6px; }

@@ -1,0 +1,15 @@
+.trace { padding: 16px; min-width: 0; color: var(--text); overflow-wrap: anywhere; }
+.summary { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding-bottom: 14px; margin-bottom: 18px; border-bottom: 1px solid var(--line-soft); color: var(--muted); font-size: 11px; }
+.summary > span { display: inline-flex; align-items: center; gap: 5px; background: var(--sidebar); border: 1px solid var(--line-soft); padding: 4px 7px; border-radius: 6px; }
+.summary strong { font-weight: 500; color: var(--text); font-variant-numeric: tabular-nums; }
+.steps { list-style: none; padding: 0; margin: 0; }
+.steps > li { position: relative; display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 10px; padding-bottom: 22px; }
+.steps > li::before { content: ''; position: absolute; top: 25px; bottom: 3px; left: 9px; width: 1px; background: var(--line-soft); }
+.steps > li:last-child { padding-bottom: 0; }
+.steps > li:last-child::before { display: none; }
+.marker { display: grid; place-items: center; height: 20px; width: 20px; border: 1px solid var(--line); border-radius: 50%; background: var(--panel); color: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; }
+.content { min-width: 0; padding-top: 1px; }
+.heading { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; font-size: 12px; font-weight: 500; line-height: 1.8; }
+.heading > span { flex: 1; min-width: 100px; }
+.heading > time { color: var(--muted); font-size: 9px; font-weight: 400; font-variant-numeric: tabular-nums; }
+.detail { margin: 5px 0 0; font-size: 11px; font-weight: 400; color: var(--muted); line-height: 1.8; white-space: pre-wrap; max-height: 150px; overflow: auto; scrollbar-width: thin; }

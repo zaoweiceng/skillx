@@ -3,7 +3,7 @@ import { readSelectionPreference, saveSelectionPreference } from './selectionPre
 afterEach(() => localStorage.clear())
 it('remembers the latest explicit selection including reasoning for new conversations', () => {
   saveSelectionPreference({agentProfileId: null, traexModel: 'model-a', reasoningEffort: 'high'})
-  expect(readSelectionPreference()).toEqual({agentProfileId: null, traexModel: 'model-a', reasoningEffort: 'high'})
+  expect(readSelectionPreference()).toEqual({agentProfileId: null, traexModel: null})
   saveSelectionPreference({agentProfileId: 'traex', traexModel: 'model-b', reasoningEffort: 'low'})
   expect(readSelectionPreference()).toEqual({agentProfileId: 'traex', traexModel: 'model-b', reasoningEffort: 'low'})
 })

@@ -113,7 +113,7 @@ async def record_model_usage(
 
 
 async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
-    from app.infrastructure.models.tasks import Invocation, Task
+    from app.infrastructure.models.tasks import Invocation, Task, TaskEvent
 
     task = await session.scalar(select(Task).where(Task.turn_id == turn_id))
     if task is not None:
@@ -126,7 +126,6 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
                 select(Invocation).where(
                     Invocation.task_id == task.id,
                     Invocation.run_id.is_not(None),
-                    Invocation.status.in_(["succeeded", "failed", "cancelled", "blocked"]),
                 )
             )
         ).all()
@@ -150,10 +149,79 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
             )
             total += max(0, measured - recorded)
         terminal = task.status in {"succeeded", "failed", "cancelled", "blocked"}
+        # Pi emits durable IDs and explicit usage completeness for each actual call.
+        # Count from persisted events so cancellation/restarts retain the same evidence.
+        audit_events = (
+            await session.scalars(
+                select(TaskEvent)
+                .where(TaskEvent.task_id == task.id, TaskEvent.type == "agent.audit")
+                .order_by(TaskEvent.id)
+            )
+        ).all()
+        stages = {}
+        for event in audit_events:
+            envelope = event.payload_json
+            payload = envelope.get("payload") or {}
+            request_id = payload.get("requestId")
+            if not request_id:
+                continue
+            if envelope.get("type") == "model.request.dispatched":
+                stages[request_id] = {
+                    "stage": "task_decision",
+                    "provider": payload.get("provider"),
+                    "model": payload.get("model"),
+                    "runtimeType": "pi",
+                    "totalTokens": None,
+                    "complete": False,
+                    "attempted": True,
+                    "dispatched": True,
+                    "completed": False,
+                }
+            elif envelope.get("type") == "agent.step.completed":
+                stages.setdefault(request_id, {})
+                stages[request_id].update(
+                    {
+                        "inputTokens": payload.get("inputTokens", 0),
+                        "outputTokens": payload.get("outputTokens", 0),
+                        "cacheReadTokens": payload.get("cacheReadTokens", 0),
+                        "cacheWriteTokens": payload.get("cacheWriteTokens", 0),
+                        "durationMs": payload.get("durationMs"),
+                        "totalTokens": payload.get("inputTokens", 0)
+                        + payload.get("outputTokens", 0),
+                        "complete": payload.get("usageComplete") is True,
+                        "completed": True,
+                    }
+                )
+        for call in calls:
+            for row in (
+                await session.scalars(select(ModelUsage).where(ModelUsage.run_id == call.run_id))
+            ).all():
+                stages[row.call_id] = {
+                    "stage": row.stage,
+                    "provider": row.provider,
+                    "model": row.model,
+                    "runtimeType": row.runtime_type,
+                    "totalTokens": row.total_tokens,
+                    "complete": row.usage_complete,
+                    "attempted": True,
+                    "dispatched": row.request_dispatched_at is not None,
+                    "completed": row.completed_at is not None,
+                }
+        measured = sum(stage.get("totalTokens") or 0 for stage in stages.values())
+        # Step events commit before a decision/run finishes and updates the task
+        # counter. Expose those measurements immediately without adding them twice.
+        total = max(total, measured)
+        complete = (
+            bool(stages)
+            and measured == total
+            and all(stage.get("complete") for stage in stages.values())
+        )
         return {
-            "state": ("partial" if total else "unavailable") if terminal else "pending",
+            "state": ("complete" if complete else "partial" if total else "unavailable")
+            if terminal
+            else "pending",
             "totalTokens": total if total else None,
-            "stages": [],
+            "stages": list(stages.values()),
         }
     rows = (
         await session.scalars(
