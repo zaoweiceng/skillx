@@ -1,0 +1,32 @@
+name: Bug report
+description: Report reproducible incorrect behavior (English or Chinese).
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: "For security issues, follow SECURITY.md. Remove keys, personal data, and private URLs from logs."
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and expected behavior
+      description: What happened, and what should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the smallest workflow or configuration that demonstrates the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Commit, OS, Python and Node versions, browser, and runtime adapter (no credentials).
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted logs or screenshots

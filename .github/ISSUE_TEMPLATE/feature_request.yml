@@ -1,0 +1,17 @@
+name: Feature request
+description: Explain a user problem and the outcome you need (English or Chinese).
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome and alternatives
+      description: Describe the behavior that would help and any alternatives you tried.
+    validations:
+      required: true

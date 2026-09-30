@@ -64,9 +64,10 @@ Pi 每次执行使用内存会话、独立进程与目录；不加载项目/用�
 
 ## 数据与验收
 
-数据库迁移已合并为 `0001_refactored`，不保留旧版本和历史数据。
-旧数据库需先停止 API/Worker，在 `backend` 目录执行 `uv run python -m app.reset_database --confirm-reset`，
-再按 README 执行 seed 并启动服务。新数据库使用 `uv run alembic upgrade head`。
+当前迁移链从 `0001_refactored` 开始，包含后续增量迁移。正常启动时 `./dev.sh`
+执行 `alembic upgrade head`，保留当前迁移链的数据。新数据库也使用同一迁移命令。
+仅更早且不兼容的旧数据库可能需要重建；先备份并停止 API/Worker，再自行选择
+`./dev.sh --reset-db`。该命令会永久删除历史数据和已发布版本，不是正常升级步骤。
 
 验证命令：
 

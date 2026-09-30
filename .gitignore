@@ -30,3 +30,23 @@ capabilities/skillx/generated/
 
 .runtime-credentials/
 .pi-runtime/
+
+# Private local configuration and runtime data
+.env.*
+!.env.example
+!.env.*.example
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
+*.pem
+*.key
+*.p12
+*.pfx
+coverage/
+htmlcov/
+.secrets.baseline
+gitleaks*.json
+*.bundle
