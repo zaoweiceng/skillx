@@ -1,6 +1,8 @@
 """API credential isolation, model selection and the default migration contract."""
 
 import json
+import os
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -8,7 +10,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from app.application.runtime_profiles import agent_snapshot, initialize_profiles, save_profile
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.infrastructure.database import Conversation, RuntimeProfile, SessionLocal
 from app.infrastructure.runtime_credentials import resolve_runtime_key
 from app.main import app
@@ -18,6 +20,24 @@ from app.main import app
 async def client():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as value:
         yield value
+
+
+def test_example_environment_loads_and_selects_pi_bridge(monkeypatch):
+    from app.application.runtime_config import agent_runtime_config
+
+    for name in tuple(os.environ):
+        if name.startswith(("SKILLX_AGENT_", "SKILLX_TRAEX_")):
+            monkeypatch.delenv(name)
+    example = Path(__file__).resolve().parents[1] / ".env.example"
+    settings = Settings(_env_file=example)
+    monkeypatch.setattr("app.application.runtime_config.get_settings", lambda: settings)
+
+    runtime = agent_runtime_config()
+
+    assert runtime.type == "pi"
+    assert Path(runtime.command[-1]).is_file()
+    assert Path(runtime.command[-1]).name == "bridge.mjs"
+    assert runtime.allowed_executables == ("node",)
 
 
 async def test_model_service_keys_are_private_and_rotations_preserve_snapshots(

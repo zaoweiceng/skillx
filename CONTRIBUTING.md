@@ -41,7 +41,7 @@ must be reported separately from local fixture tests. If changing an API schema,
 run `make api-types` and include the generated TypeScript update. Add a new Alembic
 migration instead of editing a migration that users may already have applied.
 
-Keep dependency locks in sync and use public registries. Do not commit database
+Keep dependency locks in sync. Do not commit database
 files, provider keys, `.env` files, generated artifacts, logs, or screenshots with
 private data. Before submitting, inspect `git diff --cached` and, with Gitleaks installed:
 

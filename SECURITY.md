@@ -29,13 +29,9 @@ no guaranteed response time or paid bounty program.
   can contain private information even when API keys are redacted. Review them before sharing.
 - Side effects with unknown outcomes need human verification before retrying.
 
-## Before publishing a fork or a release
+## Credential leaks
 
 Scan both the checkout and full Git history with Gitleaks or an equivalent tool.
-Check author/committer metadata, tags, Git notes, private hostnames, and package
-registry URLs separately: secret scanners do not cover every privacy risk.
-Do not push local assistant notes, backups, or runtime data. Push the intended branch
-explicitly; avoid `git push --mirror` from a working repository.
 
 If a real credential has been committed, revoke or rotate it first, then remove it
 from all affected history and coordinate with anyone who has a clone. Rewriting
