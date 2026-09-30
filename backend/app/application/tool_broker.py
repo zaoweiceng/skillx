@@ -295,10 +295,14 @@ class LocalReadAdapter:
     ) -> dict[str, Any]:
         root = context.working_directory.resolve()
         target = (root / arguments["path"]).resolve()
-        if not target.is_relative_to(root) or not target.is_file():
+        if not target.is_relative_to(root):
             raise ToolBrokerError(
                 "PERMISSION_DENIED", "read.local 只能读取任务工作目录内的普通文件"
             )
+        if target.is_dir():
+            raise ToolBrokerError("INVALID_INPUT", "目标是目录，请使用代码列出目录，再读取具体文件")
+        if not target.is_file():
+            raise ToolBrokerError("NOT_FOUND", "目标文件不存在或不是普通文件")
         content = await asyncio.to_thread(target.read_bytes)
         if len(content) > 64 * 1024:
             raise ToolBrokerError("PAYLOAD_TOO_LARGE", "read.local 文件超过 64 KiB")

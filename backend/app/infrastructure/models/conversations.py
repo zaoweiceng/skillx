@@ -30,7 +30,10 @@ class Conversation(Base, TimestampMixin):
         ForeignKey("components.id"), nullable=True
     )
     agent_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    model_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    agent_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    working_directory: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     traex_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     workflow_mode: Mapped[str] = mapped_column(String(16), default="enabled")
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

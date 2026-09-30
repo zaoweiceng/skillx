@@ -35,7 +35,7 @@ describe('统一能力执行面板', () => {
   it.each(['capabilities', 'workflows'])('%s 入口使用相同契约和调用协议', async route => {
     request.mockImplementation(async (path: string) => {
       if (path === '/capabilities/example/versions') return [{
-        id: 'locked-version', version: '1', interfaces: {execute: {
+        id: 'locked-version', version: '1', name: 'greeting', displayName: '问候生成', description: '根据姓名生成问候语', interfaces: {execute: {
           inputSchema: {type: 'object', required: ['name'], properties: {name: {type: 'string', title: '姓名'}}},
           outputSchema: {type: 'object'}, uiSchema: {name: {'ui:placeholder': '输入姓名'}},
         }},
@@ -55,7 +55,8 @@ describe('统一能力执行面板', () => {
     ))
     const call = request.mock.calls.find(([url]) => url.endsWith('/invocations') && !url.includes('?'))
     expect(JSON.parse(call![1].body)).toEqual({interface: 'execute', input: {name: 'Ada'}, idempotencyKey: expect.any(String)})
-    expect(screen.getByRole('heading', {name: '能力手动执行'})).toBeInTheDocument()
+    expect(screen.getByRole('heading', {name: '问候生成'})).toBeInTheDocument()
+    expect(screen.getByText('根据姓名生成问候语')).toBeInTheDocument()
   })
 
   it('同一历史条目展示详情并通过 Invocation 取消', async () => {

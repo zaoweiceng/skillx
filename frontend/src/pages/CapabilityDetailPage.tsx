@@ -5,12 +5,13 @@ import Form from '@/components/SchemaForm'
 import validator from '@rjsf/validator-ajv8'
 import { Link, useParams } from 'react-router-dom'
 import { request } from '@/api/http'
+import { capabilityDescription } from '@/lib/capabilityPresentation'
 import { rjsfSchema } from '@/lib/utils'
 import HumanInteractionCard, { type HumanInteraction } from '@/components/HumanInteractionCard'
 
-type Version = {id: string; version: string; interfaces: Record<string, {uiSchema?: Record<string, unknown>; inputSchema: Record<string, unknown>; outputSchema: Record<string, unknown>}>}
+type Version = {id: string; version: string; name?: string; displayName?: string; description?: string; interfaces: Record<string, {description?: string; uiSchema?: Record<string, unknown>; inputSchema: Record<string, unknown>; outputSchema: Record<string, unknown>}>}
 type Invocation = {id: string; status: string; output: unknown; error: unknown; runId?: string; interactions?: HumanInteraction[]}
-export default function CapabilityDetailPage() {
+export default function CapabilityDetailPage({ workflow = false }: {workflow?: boolean}) {
   const {id} = useParams()
   const [versions, setVersions] = useState<Version[]>([])
   const [versionId, setVersionId] = useState('')
@@ -27,9 +28,9 @@ export default function CapabilityDetailPage() {
   const contract = version?.interfaces[iface]
   async function execute(input: unknown) {setBusy(true); setError(''); try {await request(`/capability-versions/${versionId}/invocations`, {method: 'POST', body: JSON.stringify({interface: iface, input, idempotencyKey: crypto.randomUUID()})}); setRevision(x => x + 1)} catch (e) {setError(String(e))} finally {setBusy(false)}}
   return <div className="page capability-detail-page">
-    <Link className="back-link" to="/capabilities"><ArrowLeft size={15} />返回能力列表</Link>
+    <Link className="back-link" to={workflow ? "/workflows" : "/capabilities"}><ArrowLeft size={15} />{workflow ? "返回工作流列表" : "返回 SkillX 列表"}</Link>
     <header className="page-header compact-header">
-      <div><span className="eyebrow">工作空间 / 执行</span><h1>能力手动执行</h1><p>选择版本和接口，填写参数后运行，并在下方查看执行记录。</p></div>
+      <div><span className="eyebrow">工作空间 / 执行</span><h1>{version?.displayName || version?.name || (workflow ? "工作流" : "能力")}</h1>{version && <p>{capabilityDescription(version)}</p>}</div>
     </header>
     {error && <Alert type="error" title={error} showIcon />}
     <Card title="运行配置" className="execution-card">

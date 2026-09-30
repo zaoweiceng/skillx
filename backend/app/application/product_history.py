@@ -23,6 +23,7 @@ from app.infrastructure.database import (
     ConversationTurn,
     ModelUsage,
     Run,
+    RunEvent,
     RunPresentation,
     SessionLocal,
     WorkflowVersion,
@@ -74,12 +75,7 @@ async def record_model_usage(
 ) -> None:
     now = utcnow()
     if total_tokens is None and input_tokens is not None and output_tokens is not None:
-        total_tokens = (
-            input_tokens
-            + output_tokens
-            + (cached_tokens or 0)
-            + (reasoning_tokens or 0)
-        )
+        total_tokens = input_tokens + output_tokens + (cached_tokens or 0) + (reasoning_tokens or 0)
     await session.execute(
         sqlite_insert(ModelUsage)
         .values(
@@ -117,6 +113,48 @@ async def record_model_usage(
 
 
 async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
+    from app.infrastructure.models.tasks import Invocation, Task
+
+    task = await session.scalar(select(Task).where(Task.turn_id == turn_id))
+    if task is not None:
+        # Task counters already contain decisions, direct calls and recorded run usage.
+        # Legacy SkillX nodes can expose metrics without ModelUsage rows. Only add
+        # the unaccounted remainder, never add a run's ledger twice.
+        total = task.total_tokens or 0
+        calls = (
+            await session.scalars(
+                select(Invocation).where(
+                    Invocation.task_id == task.id,
+                    Invocation.run_id.is_not(None),
+                    Invocation.status.in_(["succeeded", "failed", "cancelled", "blocked"]),
+                )
+            )
+        ).all()
+        for run_id in {call.run_id for call in calls}:
+            recorded = (
+                await session.scalar(
+                    select(func.sum(ModelUsage.total_tokens)).where(ModelUsage.run_id == run_id)
+                )
+                or 0
+            )
+            events = (
+                await session.scalars(
+                    select(RunEvent).where(
+                        RunEvent.run_id == run_id, RunEvent.type == "node.completed"
+                    )
+                )
+            ).all()
+            measured = sum(
+                (event.payload_json.get("metrics") or {}).get("totalTokens", 0) or 0
+                for event in events
+            )
+            total += max(0, measured - recorded)
+        terminal = task.status in {"succeeded", "failed", "cancelled", "blocked"}
+        return {
+            "state": ("partial" if total else "unavailable") if terminal else "pending",
+            "totalTokens": total if total else None,
+            "stages": [],
+        }
     rows = (
         await session.scalars(
             select(ModelUsage)
@@ -131,9 +169,7 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
         agent_run = await session.scalar(
             select(ConversationRun.id).where(ConversationRun.turn_id == turn_id).limit(1)
         )
-        workflow_runs = (
-            await session.scalars(select(Run).where(Run.turn_id == turn_id))
-        ).all()
+        workflow_runs = (await session.scalars(select(Run).where(Run.turn_id == turn_id))).all()
         may_have_called_model = agent_run is not None or (
             turn is not None and turn.status == "error"
         )
@@ -155,13 +191,9 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
         if may_have_called_model:
             return {"state": "unavailable", "totalTokens": None, "stages": []}
         return {"state": "zero", "totalTokens": 0, "stages": []}
-    dispatched_rows = [
-        item for item in rows if item.request_dispatched_at is not None
-    ]
+    dispatched_rows = [item for item in rows if item.request_dispatched_at is not None]
     counted = sum(
-        item.total_tokens or 0
-        for item in dispatched_rows
-        if item.total_tokens is not None
+        item.total_tokens or 0 for item in dispatched_rows if item.total_tokens is not None
     )
     known = [item for item in dispatched_rows if item.total_tokens is not None]
     if not known:
@@ -223,7 +255,9 @@ async def turn_view(session: AsyncSession, turn: ConversationTurn) -> dict[str, 
         "acceptedAt": rfc3339(turn.accepted_at),
         "firstResponseAt": rfc3339(turn.first_response_at),
         "completedAt": rfc3339(turn.completed_at),
-        "elapsedMs": turn.elapsed_ms,
+        "elapsedMs": turn.elapsed_ms
+        if turn.elapsed_ms is not None
+        else (elapsed_ms(turn.accepted_at, turn.completed_at) if turn.completed_at else None),
         "usage": await usage_summary(session, turn.id),
     }
 
@@ -311,9 +345,7 @@ def _normalized_presentation_policy_shape(policy: dict[str, Any]) -> dict[str, A
     enabled = bool(policy.get("enabled", False))
     return {
         "enabled": enabled,
-        "audience": str(
-            policy.get("audience", "end_user" if enabled else "internal")
-        ),
+        "audience": str(policy.get("audience", "end_user" if enabled else "internal")),
         "producer": str(policy.get("producer", "template")),
         "template": str(policy.get("template", "执行结果：{json}")),
         "prompt": str(policy.get("prompt", "")),
@@ -371,16 +403,12 @@ def validate_presentation_decision(metadata: dict[str, Any]) -> None:
     policy = metadata.get("presentationPolicy")
     if not isinstance(policy, dict):
         raise ValueError("Presentation decision 缺少最终 presentationPolicy")
-    if decision.get("proposalDigest") != digest_json(
-        metadata["presentationPolicyProposal"]
-    ):
+    if decision.get("proposalDigest") != digest_json(metadata["presentationPolicyProposal"]):
         raise ValueError("Presentation proposal digest 与审阅决定不一致")
     if decision.get("policyDigest") != digest_json(policy):
         raise ValueError("Presentation policy digest 与审阅决定不一致")
     status = decision.get("status")
-    proposal_policy = _policy_from_presentation_proposal(
-        metadata["presentationPolicyProposal"]
-    )
+    proposal_policy = _policy_from_presentation_proposal(metadata["presentationPolicyProposal"])
     normalized_policy = _normalized_presentation_policy_shape(policy)
     if status == "accepted" and normalized_policy != proposal_policy:
         raise ValueError("accepted Presentation policy 与规范化 proposal 不一致")
@@ -402,9 +430,7 @@ def validate_presentation_template(
     try:
         parsed = list(_FORMATTER.parse(template))
     except ValueError as exc:
-        raise ValueError(
-            f"metadata.presentationPolicy.template 花括号无效: {exc}"
-        ) from exc
+        raise ValueError(f"metadata.presentationPolicy.template 花括号无效: {exc}") from exc
     for _literal, field_name, format_spec, conversion in parsed:
         if field_name is None:
             continue
@@ -415,8 +441,7 @@ def validate_presentation_template(
             )
         if format_spec or conversion:
             raise ValueError(
-                "metadata.presentationPolicy.template 不支持格式说明或转换: "
-                f"{{{field_name}}}"
+                f"metadata.presentationPolicy.template 不支持格式说明或转换: {{{field_name}}}"
             )
         field_schema = properties.get(field_name)
         if (
@@ -480,11 +505,7 @@ class PresentationDriver:
                     )
                     == 1
                 )
-                .where(
-                    ~select(RunPresentation.id)
-                    .where(RunPresentation.run_id == Run.id)
-                    .exists()
-                )
+                .where(~select(RunPresentation.id).where(RunPresentation.run_id == Run.id).exists())
                 .order_by(Run.finished_at, Run.id)
                 .limit(1)
             )
@@ -501,9 +522,7 @@ class PresentationDriver:
                 producer=policy["producer"],
                 config_digest=digest_json(policy),
                 prompt_template_digest=digest_json(
-                    policy["template"]
-                    if policy["producer"] == "template"
-                    else policy["prompt"]
+                    policy["template"] if policy["producer"] == "template" else policy["prompt"]
                 ),
                 started_at=now,
             )
@@ -556,8 +575,7 @@ class PresentationDriver:
                         StructuredGenerationRequest(
                             call_id=f"presentation:{item.id}",
                             prompt=(
-                                f"{policy['prompt']}\n"
-                                f"JSON={json.dumps(output, ensure_ascii=False)}"
+                                f"{policy['prompt']}\nJSON={json.dumps(output, ensure_ascii=False)}"
                             ),
                             output_schema={
                                 "type": "object",
@@ -567,9 +585,7 @@ class PresentationDriver:
                             },
                             max_output_tokens=policy["maxLength"],
                             working_directory=(
-                                get_settings().artifact_root
-                                / run.id
-                                / f"presentation-{item.id}"
+                                get_settings().artifact_root / run.id / f"presentation-{item.id}"
                             ),
                         ),
                         run.runtime_snapshot_json,
@@ -594,9 +610,7 @@ class PresentationDriver:
                     now = utcnow()
                     item.status = "failed"
                     error_code = (
-                        exc.code
-                        if isinstance(exc, ModelRuntimeError)
-                        else "PRESENTATION_FAILED"
+                        exc.code if isinstance(exc, ModelRuntimeError) else "PRESENTATION_FAILED"
                     )
                     item.error_json = persisted_error(
                         {
@@ -724,13 +738,9 @@ async def finalize_ready_turns(session: AsyncSession) -> int:
     ).all()
     completed = 0
     for turn in turns:
-        workflow_runs = (
-            await session.scalars(select(Run).where(Run.turn_id == turn.id))
-        ).all()
+        workflow_runs = (await session.scalars(select(Run).where(Run.turn_id == turn.id))).all()
         agent_runs = (
-            await session.scalars(
-                select(ConversationRun).where(ConversationRun.turn_id == turn.id)
-            )
+            await session.scalars(select(ConversationRun).where(ConversationRun.turn_id == turn.id))
         ).all()
         if not workflow_runs and not agent_runs:
             if turn.status in {"ask_user", "error", "cancelled"}:

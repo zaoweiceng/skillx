@@ -190,6 +190,16 @@ def _runtime_identity(events: list[dict[str, Any]]) -> tuple[str | None, str | N
     return provider, model
 
 
+def _parse_terminal(text: str) -> dict:
+    # Accept only an entire JSON document, optionally wrapped in a single code
+    # fence. Never extract a convenient object from arbitrary prose/reasoning.
+    text = text.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n```", text, re.DOTALL)
+    if fenced:
+        text = fenced.group(1)
+    return json.loads(text)
+
+
 class TraeXBuiltinAdapter:
     """Bridge the native ``traex exec`` JSONL/MCP protocol to AgentHost events."""
 
@@ -261,6 +271,24 @@ class TraeXBuiltinAdapter:
             "read-only",
             "--ignore-user-config",
             "--ignore-rules",
+            # --allowed-tool only grants Bash patterns; it is NOT a tool allowlist.
+            # Native operations bypass Host evidence, so expose only the MCP bridge.
+            *[
+                part
+                for feature in (
+                    "shell_tool",
+                    "unified_exec",
+                    "apply_patch_freeform",
+                    "multi_agent",
+                    "multi_agent_v2",
+                    "browser_use",
+                    "browser_use_external",
+                    "computer_use",
+                    "image_generation",
+                    "code_mode_host",
+                )
+                for part in ("--disable", feature)
+            ],
             # 工作目录已确认位于平台本轮隔离根目录内（非 Git 仓库）：显式跳过 Git 仓库检查，
             # 但保留 read-only sandbox、忽略用户配置/规则、空 hooks/plugins/skills 与 allowlist；
             # 跳过 Git 检查不等于放宽文件或工具权限。
@@ -288,7 +316,37 @@ class TraeXBuiltinAdapter:
                 else []
             ),
             *allowed_tools,
-            request.prompt,
+            # TraeX's legacy tool registry uses exact, case-sensitive names;
+            # '*' does not disable it. Keep the MCP descriptors available.
+            *[
+                part
+                for name in (
+                    "Read",
+                    "Write",
+                    "Edit",
+                    "Bash",
+                    "Agent",
+                    "ListAgents",
+                    "Skill",
+                    "TaskCreate",
+                    "TaskGet",
+                    "TaskList",
+                    "TaskUpdate",
+                    "exec",
+                    "wait",
+                    "Monitor",
+                    "SendMessage",
+                    "TaskStop",
+                    "TaskOutput",
+                    "WebSearch",
+                    "WebFetch",
+                )
+                if not descriptors or name not in {"exec", "wait"}
+                for part in ("--disallowed-tool", name)
+            ],
+            request.prompt + "\n\n输出要求：最终消息只允许一个符合下列 JSON Schema 的 JSON 对象。"
+            "不要 Markdown 代码围栏，不要在 JSON 前后附加说明。\n"
+            + json.dumps(request.output_schema, ensure_ascii=False, separators=(",", ":")),
         ]
         process = await asyncio.create_subprocess_exec(
             *command,
@@ -297,6 +355,8 @@ class TraeXBuiltinAdapter:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=_safe_environment(),
+            # Native envelopes can exceed the normalized Host payload limit.
+            limit=1024 * 1024,
         )
         self._processes[run_id] = process
         self._tool_evidence[run_id] = []
@@ -324,7 +384,12 @@ class TraeXBuiltinAdapter:
                     tool_task = asyncio.create_task(queue.get())
                 if stdout_task not in done:
                     continue
-                line = stdout_task.result()
+                try:
+                    line = stdout_task.result()
+                except ValueError as exc:
+                    raise TraeXBridgeError(
+                        "AGENT_EVENT_TOO_LARGE", "TraeX 原生事件超过 1 MiB 接收上限"
+                    ) from exc
                 if not line:
                     break
                 stdout_task = asyncio.create_task(process.stdout.readline())
@@ -344,6 +409,14 @@ class TraeXBuiltinAdapter:
                 safe_event_summaries.append(_safe_event_summary(event))
                 event_type = event.get("type")
                 item = event.get("item") or {}
+                if item.get("type") in {"command_execution", "file_change"}:
+                    (working_directory / f".traex-native-{run_key}.json").write_text(
+                        json.dumps(item, ensure_ascii=False)[:10000], encoding="utf-8"
+                    )
+                    raise TraeXBridgeError(
+                        "AGENT_PROTOCOL_INCOMPATIBLE",
+                        "TraeX 尝试了平台调用链之外的原生操作，已停止本轮执行",
+                    )
                 if event_type in {
                     "thread.started",
                     "turn.started",
@@ -421,11 +494,16 @@ class TraeXBuiltinAdapter:
                 output_path.read_text(encoding="utf-8") if output_path.is_file() else last_message
             )
             try:
-                output = json.loads(output_text)
+                output = _parse_terminal(output_text)
             except json.JSONDecodeError as exc:
+                # Keep bounded local evidence to diagnose provider-format failures;
+                # do not leak the model text into a user-facing error or retry prompt.
+                (working_directory / f".traex-invalid-{run_key}.txt").write_text(
+                    output_text[: 1024 * 1024], encoding="utf-8"
+                )
                 raise TraeXBridgeError(
                     "MODEL_MALFORMED_OUTPUT",
-                    "TraeX 未返回严格 JSON 终态",
+                    f"模型返回格式无效（{len(output_text)} 字符，JSON 解析位置 {exc.pos}）",
                 ) from exc
             if not isinstance(output, dict):
                 raise TraeXBridgeError(

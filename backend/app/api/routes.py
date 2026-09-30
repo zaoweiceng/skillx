@@ -24,9 +24,9 @@ from app.api.schemas import ComponentConfirm as ComponentConfirm
 from app.api.schemas import ComponentCreate as ComponentCreate
 from app.api.schemas import ContractPatchApply as ContractPatchApply
 from app.api.schemas import ConversationCreate as ConversationCreate
+from app.api.schemas import ConversationDirectoryUpdate, ConversationTitleUpdate
 from app.api.schemas import ConversationModeUpdate as ConversationModeUpdate
 from app.api.schemas import ConversationRunCreate as ConversationRunCreate
-from app.api.schemas import ConversationTitleUpdate
 from app.api.schemas import Decision as Decision
 from app.api.schemas import DisclosureSessionCreate as DisclosureSessionCreate
 from app.api.schemas import DraftUpdate as DraftUpdate
@@ -3620,6 +3620,27 @@ async def update_conversation_workflow_mode(
     }
 
 
+@router.put("/conversations/{conversation_id}/working-directory")
+async def update_conversation_directory(
+    conversation_id: str, body: ConversationDirectoryUpdate,
+    session: AsyncSession = Depends(get_session),
+):
+    from app.application.local_execution import validate_working_directory
+
+    item = await session.get(Conversation, conversation_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(404, "对话不存在")
+    try:
+        item.working_directory = (
+            str(validate_working_directory(body.working_directory))
+            if body.working_directory else None
+        )
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, "无法使用工作目录：" + str(exc)) from exc
+    await session.commit()
+    return {"workingDirectory": item.working_directory}
+
+
 @router.get("/conversations/{conversation_id}")
 async def get_conversation(
     conversation_id: str, session: AsyncSession = Depends(get_session)
@@ -3642,6 +3663,7 @@ async def get_conversation(
     return {
         "id": item.id,
         "title": item.title,
+        "workingDirectory": item.working_directory,
         "boundComponentId": item.bound_component_id,
         "workflowMode": item.workflow_mode,
         "lastMessageAt": (
@@ -3661,6 +3683,25 @@ async def get_conversation(
     }
 
 
+@router.get("/workspace-directories")
+async def workspace_directories(path: str | None = None):
+    from pathlib import Path
+
+    from app.application.local_execution import validate_working_directory
+
+    try:
+        root = validate_working_directory(path or str(Path.home()))
+        directories = sorted(
+            [entry for entry in root.iterdir()
+             if not entry.name.startswith(".") and entry.is_dir()],
+            key=lambda entry: entry.name.casefold(),
+        )
+        return {"path": str(root), "parent": str(root.parent),
+                "directories": [{"name": entry.name, "path": str(entry)} for entry in directories]}
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, "无法访问目录：" + str(exc)) from exc
+
+
 @router.post("/conversations/{conversation_id}/messages", status_code=202)
 async def create_message(
     conversation_id: str,
@@ -3670,6 +3711,17 @@ async def create_message(
     conversation = await session.get(Conversation, conversation_id)
     if conversation is None or conversation.deleted_at is not None:
         raise HTTPException(404, "对话不存在")
+    selected_directory = (
+        body.working_directory if "working_directory" in body.model_fields_set
+        else conversation.working_directory
+    )
+    if selected_directory:
+        from app.application.local_execution import validate_working_directory
+        try:
+            selected_directory = str(validate_working_directory(selected_directory))
+        except (OSError, ValueError) as exc:
+            raise HTTPException(400, "无法使用工作目录：" + str(exc)) from exc
+    conversation.working_directory = selected_directory
     accepted_at = utcnow()
     turn = ConversationTurn(
         id=str(uuid4()),
@@ -3703,7 +3755,8 @@ async def create_message(
     await session.commit()
     from app.application.tasks import enqueue_task
     task = await enqueue_task(session, conversation, turn.id, body.content)
-    task.state_json = {"userInputs": body.inputs or {}, "componentHint": body.component_id}
+    task.state_json = {"userInputs": body.inputs or {}, "componentHint": body.component_id,
+                       "workingDirectory": selected_directory}
     if body.reference_files:
         task.state_json = {
             **task.state_json,

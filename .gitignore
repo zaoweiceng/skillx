@@ -27,3 +27,6 @@ bridges/*/node_modules/
 # Immutable runtime copies and automatically validated candidates
 capabilities/skillx/.versions/
 capabilities/skillx/generated/
+
+.runtime-credentials/
+.pi-runtime/

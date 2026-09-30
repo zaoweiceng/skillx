@@ -137,26 +137,15 @@ def agent_runtime_config() -> AgentRuntimeConfig:
             source="legacy_explicit_agent_mapping",
         )
 
-    traex = shutil.which("traex") if settings.agent_builtin_enabled else None
-    if traex:
-        bridge = Path(__file__).resolve().parents[1] / "runtime" / "traex_builtin.py"
-        bridge_digest = (
-            "sha256:" + hashlib.sha256(bridge.read_bytes()).hexdigest()
-            if bridge.is_file()
-            else "sha256:missing"
-        )
+    if settings.agent_builtin_enabled:
+        bridge = Path(__file__).resolve().parents[3] / "bridges/pi/bridge.mjs"
         return AgentRuntimeConfig(
-            type="traex_builtin",
-            command=(traex,),
-            allowed_executables=(Path(traex).name,),
-            endpoint=None,
-            model=settings.agent_model,
-            api_key_env=settings.agent_api_key_env,
-            protocol="traex-cli-jsonl+mcp",
-            provider="traex",
-            adapter_version="traex-builtin/v1",
-            adapter_digest=bridge_digest,
-            source="auto_discovered",
+            type="pi", command=(shutil.which("node") or "node", str(bridge)),
+            allowed_executables=("node",), endpoint=settings.agent_endpoint,
+            model=settings.agent_model, api_key_env=settings.agent_api_key_env,
+            protocol="host-ndjson", provider="pi", adapter_version="pi-sdk-bridge/v1",
+            adapter_digest="sha256:" + hashlib.sha256(bridge.read_bytes()).hexdigest(),
+            source="builtin_default",
         )
 
     return AgentRuntimeConfig(

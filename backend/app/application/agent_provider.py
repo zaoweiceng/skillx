@@ -12,6 +12,8 @@ from typing import Any
 from uuid import uuid4
 
 from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
+from app.infrastructure.runtime_credentials import resolve_runtime_key
+
 from app.application.runtime_config import agent_runtime_config, llm_runtime_config
 from app.application.tool_broker import ToolAdapterRegistry, ToolExecutionContext
 from app.config import get_settings
@@ -124,6 +126,10 @@ def _protocol_available() -> tuple[bool, str]:
         return False, f"Agent executable 不存在: {command[0]}"
     if executable.name not in runtime.allowed_executables:
         return False, f"Agent executable 未在 allowlist: {executable.name}"
+    if runtime.type == "pi":
+        package = Path(__file__).resolve().parents[3] / "bridges/pi/node_modules/@earendil-works/pi-coding-agent/package.json"
+        if not package.is_file() or json.loads(package.read_text()).get("version") != "0.85.1":
+            return False, "Pi 0.85.1 未安装，请运行 ./dev.sh 或 make pi-install"
     return True, (
         "原生 TraeX JSONL + 本轮 loopback MCP bridge 可启动"
         if runtime.type == "traex_builtin"
@@ -202,7 +208,7 @@ async def provider_readiness() -> dict[str, Any]:
     )
     summary = protocol_summary
     if provider_type == "real":
-        key_configured = bool(os.environ.get(runtime.api_key_env))
+        key_configured = bool(resolve_runtime_key(runtime.api_key_env))
         if not protocol_available:
             summary = protocol_summary
         elif runtime.type == "traex_builtin" and auth_status == "auth_required":

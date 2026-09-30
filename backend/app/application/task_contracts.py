@@ -26,9 +26,25 @@ class HumanRequest(BaseModel):
 class TaskCall(BaseModel):
     model_config = ConfigDict(extra="forbid")
     key: str = Field(min_length=1, max_length=120)
-    kind: Literal["capability", "tool", "code", "install"]
-    arguments: dict[str, Any]
+    kind: Literal["capability", "tool", "code", "install", "model"]
+    arguments: dict[str, Any] = Field(
+        description="code: {language: python|javascript, source: string}; "
+        "tool: {capabilityRef: string, input: object}. Do not wrap code arguments inside input."
+    )
     reason: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def valid_code_arguments(self):
+        if self.kind == "code":
+            if (
+                self.arguments.get("language") not in {"python", "javascript"}
+                or not isinstance(self.arguments.get("source"), str)
+                or not self.arguments["source"].strip()
+            ):
+                raise ValueError(
+                    "code.arguments 必须直接包含 language 和非空 source，不能包在 input 中"
+                )
+        return self
 
     @model_validator(mode="before")
     @classmethod

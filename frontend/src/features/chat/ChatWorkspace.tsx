@@ -21,8 +21,12 @@ function savedWidth() {
   }
 }
 
-export function ChatWorkspace({ sidebar, children, collapsed = false, trace }: { sidebar: ReactNode; children: ReactNode; collapsed?: boolean; trace?: ReactNode }) {
+export function ChatWorkspace({ sidebar, children, collapsed = false, trace, traceOpen = false }: { sidebar: ReactNode; children: ReactNode; collapsed?: boolean; trace?: ReactNode; traceOpen?: boolean }) {
   const [width, setWidth] = useState(savedWidth)
+  const [traceWidth, setTraceWidth] = useState(() => {
+    try { return Math.max(240, Math.min(640, Number(localStorage.getItem('skillx-chat-trace-width')) || 320)) }
+    catch { return 320 }
+  })
   const [compact, setCompact] = useState(() => window.matchMedia(COMPACT_QUERY).matches)
 
   useEffect(() => {
@@ -44,6 +48,12 @@ export function ChatWorkspace({ sidebar, children, collapsed = false, trace }: {
   }
 
   return <div className="chat-layout">
+    <ConfigProvider theme={{components: { Splitter: {splitBarSize: 1, splitTriggerSize: 12} }}}>
+    <Splitter className={styles.workspaceSplitter}
+      onResize={sizes => { if (traceOpen) setTraceWidth(sizes[1]) }}
+      onResizeEnd={sizes => { if (traceOpen) { try { localStorage.setItem('skillx-chat-trace-width', String(sizes[1])) } catch { /* Storage is optional. */ } } }}
+      onDraggerDoubleClick={() => { setTraceWidth(320); try { localStorage.setItem('skillx-chat-trace-width', '320') } catch { /* Storage is optional. */ } }}>
+    <Splitter.Panel min={280} className={styles.conversationPanel}>
     {compact ? <>{!collapsed && sidebar}{children}</> : <ConfigProvider theme={{components: {
       Splitter: {splitBarSize: 1, splitTriggerSize: 12},
     }}}>
@@ -59,6 +69,11 @@ export function ChatWorkspace({ sidebar, children, collapsed = false, trace }: {
         </Splitter.Panel>
       </Splitter>
     </ConfigProvider>}
-    {trace}
+    </Splitter.Panel>
+    <Splitter.Panel size={traceOpen ? traceWidth : 0} min={traceOpen ? 240 : 0} max="60%" resizable={traceOpen} className={styles.tracePanel}>
+      {trace}
+    </Splitter.Panel>
+    </Splitter>
+    </ConfigProvider>
   </div>
 }

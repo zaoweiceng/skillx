@@ -55,16 +55,16 @@ export default function ComponentDetailPage() {
   }
 
   if (error && !component) return <div className="page error-panel">{error}</div>
-  if (!component?.definition) return <div className="page loading-panel">正在加载组件契约...</div>
+  if (!component?.definition) return <div className="page loading-panel">正在加载工作流...</div>
 
   const manifest = component.capabilityManifest
   const business = component.businessView
   const technical = component.technicalView
   return (
     <div className="page detail-page component-detail-page">
-      <Link className="back-link" to="/components"><ArrowLeft size={15} /> 返回组件</Link>
+      <Link className="back-link" to="/workflows"><ArrowLeft size={15} /> 返回工作流</Link>
       <header className="page-header compact-header">
-        <div><span className="eyebrow">工作空间 / 组件</span><h1>{component.name}</h1><p>{component.description || '填写参数，启动已发布的工作流。'}</p></div>
+        <div><span className="eyebrow">工作空间 / 工作流</span><h1>{component.name}</h1><p>{manifest?.summary || component.description || '暂无简介'}</p></div>
         <Tag>{{zero_llm: '零 LLM', hybrid: '局部 LLM', agent: 'Agent 工作流'}[component.executionClass]}</Tag>
       </header>
 

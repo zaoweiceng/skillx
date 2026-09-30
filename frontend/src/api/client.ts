@@ -848,9 +848,11 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ workflowMode }),
     }),
+  updateConversationDirectory: (id: string, workingDirectory: string | null) => request<{workingDirectory: string | null}>(`/conversations/${id}/working-directory`, {method: "PUT", body: JSON.stringify({workingDirectory})}),
   getConversation: (id: string) =>
     request<{
       id: string
+      workingDirectory?: string | null
       title: string
       boundComponentId: string | null
       workflowMode: 'enabled' | 'disabled'
@@ -864,14 +866,15 @@ export const api = {
       }>
       turns: ConversationTurn[]
     }>(`/conversations/${id}`),
-  sendMessage: (id: string, content: string, referenceFiles?: ChatReferenceFile[]) =>
+  workspaceDirectories: (path?: string) => request<{path: string; parent: string; directories: {name: string; path: string}[]}>(`/workspace-directories${path ? `?path=${encodeURIComponent(path)}` : ""}`),
+  sendMessage: (id: string, content: string, referenceFiles?: ChatReferenceFile[], workingDirectory?: string) =>
     request<{
       userMessageId: string
       assistant: ChatMessageContent
       turn: ConversationTurn
     }>(
       `/conversations/${id}/messages`,
-      { method: 'POST', body: JSON.stringify({ content, ...(referenceFiles?.length ? { referenceFiles } : {}) }) },
+      { method: 'POST', body: JSON.stringify({ content, ...(workingDirectory ? { workingDirectory } : {}), ...(referenceFiles?.length ? { referenceFiles } : {}) }) },
     ),
   confirmComponent: (
     conversationId: string,

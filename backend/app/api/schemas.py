@@ -96,6 +96,7 @@ class ChatReferenceFile(BaseModel):
 
 
 class MessageCreate(BaseModel):
+    working_directory: str | None = Field(default=None, alias="workingDirectory", max_length=4096)
     content: str
     component_id: str | None = Field(default=None, alias="componentId")
     inputs: dict[str, Any] | None = None
@@ -201,3 +202,7 @@ class ConversationTitleUpdate(BaseModel):
     @classmethod
     def trim_title(cls, value):
         return value.strip() if isinstance(value, str) else value
+
+
+class ConversationDirectoryUpdate(BaseModel):
+    working_directory: str | None = Field(alias="workingDirectory", max_length=4096)

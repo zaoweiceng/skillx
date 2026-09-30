@@ -1002,6 +1002,40 @@ export interface paths {
         patch: operations["update_conversation_workflow_mode_api_conversations__conversation_id__workflow_mode_patch"];
         trace?: never;
     };
+    "/api/conversations/{conversation_id}/working-directory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Update Conversation Directory */
+        put: operations["update_conversation_directory_api_conversations__conversation_id__working_directory_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/workspace-directories": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Workspace Directories */
+        get: operations["workspace_directories_api_workspace_directories_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/conversations/{conversation_id}/messages": {
         parameters: {
             query?: never;
@@ -1827,6 +1861,11 @@ export interface components {
             /** Boundcomponentid */
             boundComponentId?: string | null;
         };
+        /** ConversationDirectoryUpdate */
+        ConversationDirectoryUpdate: {
+            /** Workingdirectory */
+            workingDirectory: string | null;
+        };
         /** ConversationModeUpdate */
         ConversationModeUpdate: {
             /** Workflowmode */
@@ -1964,6 +2003,8 @@ export interface components {
         };
         /** MessageCreate */
         MessageCreate: {
+            /** Workingdirectory */
+            workingDirectory?: string | null;
             /** Content */
             content: string;
             /** Componentid */
@@ -1974,6 +2015,26 @@ export interface components {
             } | null;
             /** Referencefiles */
             referenceFiles?: components["schemas"]["ChatReferenceFile"][];
+        };
+        /** ModelConfig */
+        ModelConfig: {
+            /** Id */
+            id: string;
+            /**
+             * Reasoning
+             * @default false
+             */
+            reasoning: boolean;
+            /**
+             * Contextwindow
+             * @default 128000
+             */
+            contextWindow: number;
+            /**
+             * Maxoutputtokens
+             * @default 8192
+             */
+            maxOutputTokens: number;
         };
         /** PlanCreate */
         PlanCreate: {
@@ -2013,6 +2074,10 @@ export interface components {
             baseUrl?: string | null;
             /** Model */
             model?: string | null;
+            /** Models */
+            models?: components["schemas"]["ModelConfig"][] | null;
+            /** Apikey */
+            apiKey?: string | null;
             /**
              * Timeoutseconds
              * @default 60
@@ -2091,6 +2156,10 @@ export interface components {
             reasoningEffort?: ("low" | "medium" | "high") | null;
             /** Traexmodel */
             traexModel?: string | null;
+            /** Modelprofileid */
+            modelProfileId?: string | null;
+            /** Model */
+            model?: string | null;
         };
         /** TaskCheckpointAnswer */
         TaskCheckpointAnswer: {
@@ -4255,6 +4324,72 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_conversation_directory_api_conversations__conversation_id__working_directory_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationDirectoryUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    workspace_directories_api_workspace_directories_get: {
+        parameters: {
+            query?: {
+                path?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
             /** @description Validation Error */

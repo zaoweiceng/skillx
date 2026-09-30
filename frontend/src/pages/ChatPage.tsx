@@ -1,3 +1,5 @@
+import MarkdownContent from '@/components/MarkdownContent'
+import { TaskTrace } from '@/features/chat/TaskTrace'
 import TaskPanel from '@/components/TaskPanel'
 import { useState } from 'react'
 import { Button, Tag } from 'antd'
@@ -27,7 +29,7 @@ import { AgentSelector } from '@/features/runtime/AgentSelector'
 export default function ChatPage() {
   const [historyCollapsed, setHistoryCollapsed] = useStoredBoolean('skillx-history-collapsed')
   const [runtimePending, setRuntimePending] = useState(false)
-  const { draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill } = useConversation()
+  const { refresh, workingDirectory, changeWorkingDirectory, draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill } = useConversation()
 
   // 候选卡片绑定产生它的用户消息：取该助手消息之前最近的一条用户消息文本，
   // 而不是全局最近 prompt，避免继续 Agent 时误用无关的新输入。
@@ -364,6 +366,8 @@ export default function ChatPage() {
   }
 
   function renderTrace() {
+    const taskId = [...messages].reverse().find(message => message.content.taskId)?.content.taskId
+    if (taskId) return traceOpen ? <TaskTrace key={taskId} id={taskId} /> : null
     if (!activeRunId || traceEvents.length === 0) {
       return (
         <div className="trace-empty">
@@ -429,7 +433,7 @@ export default function ChatPage() {
           </Button>
         </div>
       </header>
-      <ChatWorkspace collapsed={historyCollapsed} trace={
+      <ChatWorkspace collapsed={historyCollapsed} traceOpen={traceOpen} trace={
         <aside id="execution-trace-sidebar" className="trace-sidebar" aria-label="执行轨迹" hidden={!traceOpen}>
           <div className="panel-heading">
             <div>
@@ -505,7 +509,7 @@ export default function ChatPage() {
               </span>
               <div>
                 <small>{message.role === 'assistant' ? 'SkillX Agent' : '用户'}</small>
-                <p>{message.content.text}</p>
+                {!message.content.taskId && (message.role === 'assistant' ? <MarkdownContent>{message.content.text ?? ''}</MarkdownContent> : <p>{message.content.text}</p>)}
                 {!!message.content.referenceFiles?.length && <div className={styles.attachments}>
                   {message.content.referenceFiles.map((file, index) => <Tag key={`${file.name}-${index}`}>{file.name}</Tag>)}
                 </div>}
@@ -601,7 +605,7 @@ export default function ChatPage() {
                     ))}
                   </ol>
                 )}
-                {message.content.taskId && <TaskPanel id={message.content.taskId} />}
+                {message.content.taskId && <TaskPanel id={message.content.taskId} onFinished={refresh} />}
                 {message.content.type === 'component_candidate' && renderCandidate(message)}
                 {message.content.type === 'workflow_candidates' &&
                   renderWorkflowCandidates(message)}
@@ -647,6 +651,7 @@ export default function ChatPage() {
           </div>
           <ChatComposer key={conversationId} input={input} onInputChange={setInput}
             sending={sending} disabled={sending || runtimePending} onSend={send}
+            workingDirectory={workingDirectory} onWorkingDirectoryChange={changeWorkingDirectory}
             controls={<AgentSelector key={conversationId} conversationId={conversationId} draftSelection={draftSelection} onDraftChange={setDraftSelection} onBusyChange={setRuntimePending} />} />
         </section>
 

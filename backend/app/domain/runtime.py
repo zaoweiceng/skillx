@@ -1,8 +1,14 @@
-import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 from typing import Literal
 
 from app.domain.serialization import digest_json
+
+
+def _has_key(reference: str) -> bool:
+    from app.infrastructure.runtime_credentials import resolve_runtime_key
+
+    return bool(resolve_runtime_key(reference))
 
 
 @dataclass(frozen=True)
@@ -19,7 +25,7 @@ class LLMRuntimeConfig:
             self.type == "openai_compatible"
             and self.endpoint
             and self.model
-            and os.environ.get(self.api_key_env)
+            and _has_key(self.api_key_env)
         )
 
     @property
@@ -55,13 +61,14 @@ class AgentRuntimeConfig:
     adapter_digest: str
     source: str = "split"
     reasoning_effort: str | None = None
+    model_options: dict[str, Any] = field(default_factory=dict)
 
     @property
     def configured(self) -> bool:
         if self.type == "unavailable" or not self.command:
             return False
         if self.type in {"openai_sidecar", "pi"}:
-            return bool(self.endpoint and self.model and os.environ.get(self.api_key_env))
+            return bool(self.endpoint and self.model and _has_key(self.api_key_env))
         return True
 
     @property
@@ -79,7 +86,7 @@ class AgentRuntimeConfig:
                 "adapterVersion": self.adapter_version,
                 "adapterDigest": self.adapter_digest,
                 "reasoningEffort": self.reasoning_effort,
+                "modelOptions": self.model_options,
             }
         )
-
 

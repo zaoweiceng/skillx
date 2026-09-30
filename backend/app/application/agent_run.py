@@ -203,7 +203,7 @@ async def enqueue_agent_run(
         runtime_snapshot
         if runtime_snapshot is not None
         else await agent_snapshot(session, conversation.agent_profile_id, conversation.traex_model,
-            conversation.reasoning_effort)
+            conversation.reasoning_effort, conversation.model_profile_id, conversation.agent_model)
     )
     now = utcnow()
     conversation_run = ConversationRun(

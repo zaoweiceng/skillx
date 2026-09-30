@@ -3,12 +3,13 @@ import { useEffect, useState } from 'react'
 import { type Profile, runtimeRequest } from './api'
 import { ReasoningSelect, type ReasoningEffort } from './ReasoningSelect'
 import styles from './picker.module.css'
+import { readSelectionPreference, saveSelectionPreference, initializeSelectionPreference } from './selectionPreference'
 import { TraexModelSelect } from './TraexModelSelect'
 
 export type Selection = { agentProfileId: string | null; traexModel: string | null; reasoningEffort?: ReasoningEffort | null }
 export function AgentSelector({ conversationId, onBusyChange, draftSelection, onDraftChange }: { conversationId: string; draftSelection?: Selection; onDraftChange?: (selection: Selection) => void; onBusyChange?: (busy: boolean) => void }) {
   const [profiles, setProfiles] = useState<Profile[]>([])
-  const [selection, setSelection] = useState<Selection>({ agentProfileId: null, traexModel: null })
+  const [selection, setSelection] = useState<Selection>(readSelectionPreference)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [loaded, setLoaded] = useState(false)
@@ -19,18 +20,18 @@ export function AgentSelector({ conversationId, onBusyChange, draftSelection, on
     setLoaded(false)
     Promise.all([
       runtimeRequest<Profile[]>('', 'GET', undefined, controller.signal),
-      conversationId ? runtimeRequest<Selection>(`/conversations/${conversationId}`, 'GET', undefined, controller.signal) : Promise.resolve({ agentProfileId: null, traexModel: null }),
+      conversationId ? runtimeRequest<Selection>(`/conversations/${conversationId}`, 'GET', undefined, controller.signal) : Promise.resolve(readSelectionPreference()),
     ]).then(([items, selected]) => {
-      if (!controller.signal.aborted) { setProfiles(items); setSelection(selected); setError(''); setLoaded(true) }
+      if (!controller.signal.aborted) { if (conversationId) initializeSelectionPreference(selected); setProfiles(items); setSelection(selected); setError(''); setLoaded(true) }
     }).catch(() => { if (!controller.signal.aborted) setError('执行体配置加载失败') })
     return () => controller.abort()
   }, [conversationId])
   async function select(next: Selection) {
-    if (!conversationId) { onDraftChange?.(next); setSelection(next); return }
+    if (!conversationId) { saveSelectionPreference(next); onDraftChange?.(next); setSelection(next); return }
     setBusy(true)
     try {
       const saved = await runtimeRequest<Selection>(`/conversations/${conversationId}`, 'PUT', next)
-      setSelection(saved); setError('')
+      setSelection(saved); saveSelectionPreference(saved); setError('')
     } catch (reason) { setError(reason instanceof Error ? reason.message : '切换失败') }
     finally { setBusy(false) }
   }

@@ -62,7 +62,7 @@
 .composerActions { flex-shrink: 0; }
 .composerActions :global(.ant-btn) { width: 34px; height: 34px; padding: 0; }
 .composerActions :global(.ant-btn-primary) { width: 36px; height: 36px; }
-.attachments { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.attachments { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; padding: 2px 4px; margin-bottom: 12px; }
 .attachments :global(.ant-tag) { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 @media (max-width: 600px) {
   .composer { width: 100%; padding: 12px; border-radius: 22px; margin-inline: 0; }
@@ -94,3 +94,37 @@
   .page :global(.chat-layout:has(.trace-sidebar:not([hidden]))) { overflow-x: auto; }
   .page :global(.chat-layout:has(.trace-sidebar:not([hidden])) > .message-column) { flex: 1 0 280px; }
 }
+
+/* Keep reading and inspection in independently scrollable, resizable columns. */
+.workspaceSplitter .conversationPanel { display: flex; min-width: 0; overflow: hidden; }
+.conversationPanel > :global(.message-column) { flex: 1; }
+.workspaceSplitter .tracePanel { overflow: hidden; }
+.page :global(.trace-sidebar) { width: 100%; margin: 0; border: 0; background: var(--bg); }
+.page :global(.trace-sidebar .panel-heading) { position: sticky; top: 0; z-index: 1; background: var(--bg); padding: 12px 18px; }
+.page :global(.message-stream) { padding: 28px 24px; }
+.page :global(.message) { display: block; max-width: 720px; margin: 0 auto 32px; }
+.page :global(.message-avatar), .page :global(.message > div > small) { display: none; }
+.page :global(.message.user > div) { display: flex; flex-direction: column; align-items: flex-end; }
+.page :global(.message.user p) { max-width: 88%; padding: 12px 18px; border-radius: 22px; background: var(--panel-raised); font-size: 14px; line-height: 1.75; }
+.page :global(.message.assistant p) { padding: 8px 0; font-size: 14px; line-height: 1.9; }
+.page :global(.turn-metrics) { gap: 10px; margin: 0 0 4px; opacity: .75; }
+.page :global(.turn-metrics .metric-chip) { border: 0; background: transparent; padding: 0; font-size: 11px; color: var(--muted); }
+.page :global(.task-state) { display: inline-block; font-size: 11px; color: var(--muted); }
+.page :global(.task-actions) { margin-top: 10px; }
+.page :global(.task-actions .ant-btn) { color: var(--muted); font-size: 12px; padding-inline: 6px; }
+.page :global(.task-details .ant-collapse-header) { padding: 7px 4px !important; color: var(--muted) !important; font-size: 12px; }
+.page :global(.task-details pre), .page :global(.trace-event-payload) { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; line-height: 1.65; padding: 12px; background: var(--panel-raised); border-radius: 10px; margin: 0; }
+.page :global(.task-trace-events .ant-collapse-header) { align-items: center; padding: 12px 0 !important; }
+.page :global(.task-trace-events .ant-collapse-content-box) { padding: 0 0 12px !important; }
+.page :global(.task-trace-events .ant-collapse-item) { border-bottom: 1px solid var(--line-soft); }
+.page :global(.trace-event-label) { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; font-weight: 400; }
+.page :global(.trace-event-label time) { flex-shrink: 0; white-space: nowrap; font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
+@media (max-width: 700px) {
+  .page :global(.chat-layout:has(.trace-sidebar:not([hidden]))) > .workspaceSplitter { min-width: 560px; }
+  .page :global(.chat-layout) { overflow-x: auto; }
+  .page :global(.message-stream) { padding: 20px 12px; }
+}
+
+.attachments .directoryTag { display: inline-flex; min-width: 0; max-width: 100%; margin-inline-end: 0; white-space: nowrap; }
+.directoryTag > svg, .directoryTag > :global(.ant-tag-close-icon) { flex-shrink: 0; }
+.directoryPath { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

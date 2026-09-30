@@ -32,17 +32,6 @@ async def save_profile(
         raise ValueError("不能改变配置类型")
     if is_default and not active:
         raise ValueError("默认配置不能停用")
-    if is_default and kind == "agent" and config.get("adapter") == "pi":
-        probe = item.probe_json if item is not None else None
-        if (
-            item is None
-            or item.config_json != config
-            or not probe
-            or probe.get("status") != "available"
-            or probe.get("runtimeDigest")
-            != restore_agent_snapshot(await agent_snapshot(session, item.id)).digest
-        ):
-            raise ValueError("Pi 必须按当前模型配置探测成功后才能设为默认")
     if is_default:
         await session.execute(
             update(RuntimeProfile).where(RuntimeProfile.kind == kind).values(is_default=False)
@@ -71,7 +60,7 @@ async def with_reasoning(runtime, effort):
         if not selected or effort not in selected.get("reasoningEfforts", []):
             raise ValueError("请先选择支持调节推理强度的模型")
     elif runtime.type == "pi":
-        if not (runtime.model or "").lower().startswith(("gpt-5", "gpt-6", "o3", "o4")):
+        if not (runtime.model_options.get("reasoning") or (runtime.model or "").lower().startswith(("gpt-5", "gpt-6", "o3", "o4"))):
             raise ValueError("当前 Pi 模型未声明支持推理强度")
     else:
         raise ValueError("当前执行体不支持推理强度")
@@ -81,6 +70,7 @@ async def with_reasoning(runtime, effort):
 async def agent_snapshot(
     session: AsyncSession, profile_id: str | None, traex_model: str | None = None,
     reasoning_effort: str | None = None,
+    model_profile_id: str | None = None, model_id: str | None = None,
 ) -> dict[str, Any]:
     profile = (
         await session.get(RuntimeProfile, profile_id)
@@ -134,9 +124,25 @@ async def agent_snapshot(
         import shutil
         from pathlib import Path
 
-        model = await session.get(RuntimeProfile, config.get("modelProfileId"))
+        selected_profile_id = model_profile_id or config.get("modelProfileId")
+        model = (
+            await session.get(RuntimeProfile, selected_profile_id) if selected_profile_id
+            else await session.scalar(select(RuntimeProfile).where(
+                RuntimeProfile.kind == "model", RuntimeProfile.is_default.is_(True)
+            ))
+        )
+        if model is None and not selected_profile_id:
+            # A fresh install remains usable for settings/health before a key is added.
+            return asdict(replace(current, type="pi", reasoning_effort=None))
         if model is None or model.kind != "model" or not model.active:
             raise ValueError("Pi 需要有效的模型配置")
+        selected_model = model_id or config.get("model") or model.config_json["model"]
+        options = next((entry for entry in model.config_json.get("models", [])
+                        if entry["id"] == selected_model), None)
+        if options is None and model.config_json.get("models"):
+            raise ValueError("所选模型不属于此服务")
+        options = options or {"id": selected_model}
+        options = {**options, "timeoutSeconds": model.config_json.get("timeoutSeconds", 60)}
         bridge = Path(__file__).resolve().parents[3] / "bridges/pi/bridge.mjs"
         runtime = replace(
             current,
@@ -146,7 +152,8 @@ async def agent_snapshot(
             provider="pi",
             protocol="host-ndjson",
             endpoint=model.config_json["baseUrl"],
-            model=model.config_json["model"],
+            model=selected_model,
+            model_options=options,
             api_key_env=model.config_json["apiKeyEnv"],
             adapter_version="pi-sdk-bridge/v1",
             source="profile",
@@ -225,40 +232,35 @@ async def workflow_profiles(session: AsyncSession, definition: Any) -> dict[str,
 
 
 async def initialize_profiles(session: AsyncSession) -> None:
-    """Import environment defaults once; never replace saved user choices."""
+    """Install Pi once and migrate the former builtin default, preserving frozen runs."""
     from app.application.runtime_config import llm_runtime_config
+    from app.infrastructure.database import Conversation
 
-    if await session.scalar(select(RuntimeProfile.id).limit(1)) is not None:
-        return
     runtime = agent_runtime_config()
-    if runtime.type == "fixture":
+    if runtime.type in {"fixture", "unavailable"}:
         return
-    if runtime.type == "traex_builtin":
-        session.add(
-            RuntimeProfile(
-                id="builtin-traex",
-                name="TraeX",
-                kind="agent",
-                config_json={"adapter": "traex"},
-                is_default=True,
-                active=True,
-            )
-        )
+    builtin = await session.get(RuntimeProfile, "builtin-pi")
+    if builtin is None:
+        await session.execute(update(RuntimeProfile).where(RuntimeProfile.kind == "agent")
+                              .values(is_default=False))
+        await session.execute(update(Conversation).where(
+            Conversation.agent_profile_id == "builtin-traex"
+        ).values(agent_profile_id=None, traex_model=None, reasoning_effort=None))
+        session.add(RuntimeProfile(
+            id="builtin-pi", name="Pi Agent", kind="agent", config_json={"adapter": "pi"},
+            is_default=True, active=True,
+        ))
     model = llm_runtime_config()
-    if model.type == "openai_compatible" and model.endpoint and model.model:
-        session.add(
-            RuntimeProfile(
-                id="environment-model",
-                name="环境变量模型服务",
-                kind="model",
-                config_json={
-                    "baseUrl": model.endpoint,
-                    "model": model.model,
-                    "apiKeyEnv": model.api_key_env,
-                    "structuredMode": "json_schema",
-                },
-                is_default=True,
-                active=True,
-            )
-        )
+    default_model = await session.scalar(select(RuntimeProfile.id).where(
+        RuntimeProfile.kind == "model", RuntimeProfile.is_default.is_(True)))
+    if default_model is None and model.type == "openai_compatible" and model.endpoint and model.model:
+        existing = await session.get(RuntimeProfile, "environment-model")
+        if existing is None:
+            session.add(RuntimeProfile(
+                id="environment-model", name="环境变量模型服务", kind="model",
+                config_json={"baseUrl": model.endpoint, "model": model.model,
+                             "models": [{"id": model.model}], "apiKeyEnv": model.api_key_env,
+                             "structuredMode": "json_schema"},
+                is_default=True, active=True,
+            ))
     await session.commit()

@@ -270,7 +270,7 @@ class AgentHost:
                     "TRAE_NOT_INSTALLED",
                     "PATH 中未发现受支持的 traex，请先安装 TraeX",
                 )
-            raise AgentHostError("MODEL_NOT_CONFIGURED", "TraeX Runtime 尚未配置")
+            raise AgentHostError("MODEL_NOT_CONFIGURED", "Agent 尚未配置，请在设置中添加模型服务和 API Key")
         try:
             return default_agent_registry().create(runtime)
         except AdapterError as exc:

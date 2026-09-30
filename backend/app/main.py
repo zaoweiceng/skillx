@@ -68,6 +68,7 @@ async def selected_runtime(request: Request, call_next):
         return await call_next(request)
     profile_id = None
     traex_model = None
+    reasoning_effort = model_profile_id = model_id = None
     parts = request.url.path.split("/")
     async with SessionLocal() as session:
         if len(parts) > 3 and parts[2] == "conversations":
@@ -75,8 +76,12 @@ async def selected_runtime(request: Request, call_next):
             if conversation is not None:
                 profile_id = conversation.agent_profile_id
                 traex_model = conversation.traex_model
+                reasoning_effort = conversation.reasoning_effort
+                model_profile_id = conversation.model_profile_id
+                model_id = conversation.agent_model
         try:
-            runtime = restore_agent_snapshot(await agent_snapshot(session, profile_id, traex_model))
+            runtime = restore_agent_snapshot(await agent_snapshot(session, profile_id, traex_model,
+                reasoning_effort, model_profile_id, model_id))
         except OperationalError:
             if request.url.path == "/api/health/ready":
                 return await call_next(request)
@@ -96,7 +101,8 @@ async def validation_error(request: Request, exc: RequestValidationError) -> JSO
             "error": {
                 "code": "REQUEST_VALIDATION_FAILED",
                 "message": "请求参数校验失败",
-                "details": exc.errors(),
+                "details": [{"loc": error["loc"], "type": error["type"],
+                             "msg": error["msg"]} for error in exc.errors()],
                 "requestId": request_id,
             }
         },

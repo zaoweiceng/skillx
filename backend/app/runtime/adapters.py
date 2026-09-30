@@ -11,6 +11,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from app.infrastructure.runtime_credentials import resolve_runtime_key
+
 from app.application.runtime_config import AgentRuntimeConfig, agent_runtime_config
 from app.runtime.agent_contracts import AdapterError as AdapterError
 from app.runtime.agent_contracts import AgentRunRequest as AgentRunRequest
@@ -293,13 +295,14 @@ class SubprocessAgentAdapter:
         provider_environment = {
             "SKILLX_AGENT_ENDPOINT": runtime.endpoint or "",
             "SKILLX_AGENT_MODEL": runtime.model or "",
+            "SKILLX_PI_MODEL_OPTIONS": json.dumps(runtime.model_options),
             "SKILLX_REASONING_EFFORT": runtime.reasoning_effort or "",
             "SKILLX_AGENT_API_KEY_ENV": runtime.api_key_env,
             "SKILLX_MODEL_ENDPOINT": runtime.endpoint or "",
             "SKILLX_MODEL_NAME": runtime.model or "",
             "SKILLX_MODEL_API_KEY_ENV": runtime.api_key_env,
         }
-        api_key = os.environ.get(runtime.api_key_env)
+        api_key = resolve_runtime_key(runtime.api_key_env)
         if api_key:
             provider_environment[runtime.api_key_env] = api_key
         process = await asyncio.create_subprocess_exec(

@@ -83,3 +83,10 @@ body { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto 
   .execution-card > .ant-card-body, .component-detail-page .ant-card > .ant-card-body { padding: 16px; }
   .component-detail-page .component-graph-card > .ant-card-body { padding: 0; }
 }
+
+.workflow-card-main { display: block; color: inherit; flex: 1; }
+.workflow-card-main:hover { color: inherit; }
+.component-card .card-metrics a { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); }
+
+article.component-card { display: flex; flex-direction: column; }
+article.component-card .card-metrics { margin-top: auto; padding-top: 18px; }

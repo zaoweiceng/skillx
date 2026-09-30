@@ -2,16 +2,15 @@ import { App as AntApp, Button, ConfigProvider, Divider, Tooltip, theme } from '
 import { useEffect } from 'react'
 import { useStoredBoolean } from '@/hooks/useStoredBoolean'
 import zhCN from 'antd/locale/zh_CN'
-import { Blocks, Bot, Boxes, Cable, Moon, PanelLeftClose, PanelLeftOpen, Plus, Settings, Sun } from 'lucide-react'
+import { Blocks, Bot, Cable, Moon, PanelLeftClose, PanelLeftOpen, Plus, Settings, Sun } from 'lucide-react'
 import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useTheme } from '@/hooks/useTheme'
 import styles from './shell.module.css'
 
 const navigation = [
   { to: '/chat', label: '对话', description: '与 Agent 一起完成任务', icon: Bot },
-  { to: '/components', label: '组件', description: '可复用的任务能力', icon: Boxes },
-  { to: '/workflows', label: '工作流', description: '编排与发布', icon: Cable },
-  { to: '/capabilities', label: '能力', description: '工具与连接', icon: Blocks },
+  { to: '/workflows', label: '工作流', description: '编排、运行与复用', icon: Cable },
+  { to: '/capabilities', label: 'SkillX', description: '工具与连接', icon: Blocks },
   { to: '/settings', label: '系统', description: '模型与运行时', icon: Settings },
 ]
 
@@ -19,11 +18,12 @@ export default function AppShell() {
   const { isDark, toggleTheme } = useTheme()
   const navigate = useNavigate()
   const { pathname } = useLocation()
+  const navigationPath = pathname.startsWith('/components') ? '/workflows' : pathname
   const [collapsed, setCollapsed] = useStoredBoolean('skillx-navigation-collapsed')
   useEffect(() => {
-    const page = navigation.find(item => pathname.startsWith(item.to))?.label
+    const page = navigation.find(item => navigationPath.startsWith(item.to))?.label
     document.title = page ? `${page} · SkillX 智能工作空间` : 'SkillX · 智能工作空间'
-  }, [pathname])
+  }, [navigationPath])
   return <ConfigProvider locale={zhCN} button={{ autoInsertSpace: false }} theme={{
     algorithm: isDark ? theme.darkAlgorithm : theme.defaultAlgorithm,
     token: {
@@ -57,7 +57,7 @@ export default function AppShell() {
           <div className={styles.navCaption}>工作空间</div>
           <nav className={styles.navigation} aria-label="主导航">
             {navigation.map(({ to, label, description, icon: Icon }) => <NavLink key={to} to={to} aria-label={label} title={collapsed ? label : undefined}
-              className={({ isActive }) => `${styles.navItem} ${isActive ? styles.active : ''}`}>
+              className={({ isActive }) => `${styles.navItem} ${isActive || (to === '/workflows' && navigationPath === '/workflows') ? styles.active : ''}`}>
               <Icon size={19} strokeWidth={1.7} /><span>{label}<small>{description}</small></span>
             </NavLink>)}
             <Button className={styles.mobileTheme} type="text" icon={isDark ? <Moon size={18} /> : <Sun size={18} />}

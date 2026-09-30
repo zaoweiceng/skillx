@@ -56,6 +56,8 @@ async def test_same_public_contract_dispatches_and_persists_result(
         expected = {"characters": 11, "nonWhitespaceCharacters": 10, "words": 2}
     async with SessionLocal() as session:
         contract = (await resolve_callable(session, version.id)).contract
+        assert contract["displayName"].strip()
+        assert contract["description"].strip()
         assert set(contract["interfaces"][interface]) >= {"inputSchema", "outputSchema"}
         assert "kind" not in contract["interfaces"][interface]
         assert "runtime" not in contract["interfaces"][interface]
@@ -110,6 +112,7 @@ async def test_catalog_and_outer_agent_never_need_implementation(tmp_path, monke
         "tool",
         "code",
         "install",
+        "model",
     ]
 
     async def decide(self, request, **kwargs):

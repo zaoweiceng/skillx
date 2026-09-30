@@ -94,6 +94,19 @@ async def task_view(session, task):
     learning = list(
         await session.scalars(select(LearningJob).where(LearningJob.task_id == task.id))
     )
+    decisions = list(
+        await session.scalars(
+            select(TaskEvent)
+            .where(TaskEvent.task_id == task.id, TaskEvent.type == "task.decision")
+            .order_by(TaskEvent.id)
+        )
+    )
+    reasons = {
+        call["key"]: call.get("reason", "")
+        for event in decisions
+        for call in event.payload_json.get("calls", [])
+        if "key" in call
+    }
     return {
         "id": task.id,
         "status": task.status,
@@ -103,7 +116,14 @@ async def task_view(session, task):
         "error": task.error_json,
         "decisions": task.decisions,
         "totalTokens": task.total_tokens,
-        "invocations": [invocation_view(x) for x in calls],
+        "invocations": [
+            {
+                **invocation_view(x),
+                "reason": reasons.get(x.call_key),
+                "workingDirectory": task.state_json.get("workingDirectory"),
+            }
+            for x in calls
+        ],
         "interactions": [human_view(x) for x in questions],
         "approvals": approvals,
         "learning": [
@@ -304,11 +324,14 @@ async def invocations(versionId: str | None = None, session=Depends(get_session)
     result = []
     for item in rows:
         interactions = await session.scalars(
-            select(HumanInteraction).where(or_(
-                HumanInteraction.call_key == "approve:" + item.id,
-                HumanInteraction.request_json["runId"].as_string() == item.run_id
-                if item.run_id else False,
-            ))
+            select(HumanInteraction).where(
+                or_(
+                    HumanInteraction.call_key == "approve:" + item.id,
+                    HumanInteraction.request_json["runId"].as_string() == item.run_id
+                    if item.run_id
+                    else False,
+                )
+            )
         )
         result.append(
             {**invocation_view(item), "interactions": [human_view(x) for x in interactions]}
@@ -346,7 +369,8 @@ async def cancel_invocation(invocation_id: str, session=Depends(get_session)):
                 or_(
                     HumanInteraction.call_key == "approve:" + item.id,
                     HumanInteraction.request_json["runId"].as_string() == item.run_id
-                    if item.run_id else False,
+                    if item.run_id
+                    else False,
                 ),
                 HumanInteraction.status == "pending",
             )
@@ -396,11 +420,14 @@ async def task_artifacts(task_id: str, session=Depends(get_session)):
     from app.infrastructure.payloads import task_payload_references
 
     for digest, reference in (await task_payload_references(session, task_id)).items():
-        records.append({
-            "path": "payloads/" + digest + ".json",
-            "size": reference["size"], "digest": "sha256:" + digest,
-            "mediaType": reference["mediaType"],
-        })
+        records.append(
+            {
+                "path": "payloads/" + digest + ".json",
+                "size": reference["size"],
+                "digest": "sha256:" + digest,
+                "mediaType": reference["mediaType"],
+            }
+        )
     return records
 
 
@@ -450,7 +477,9 @@ async def invocation_stream(invocation_id: str, request: Request, after: int = 0
 
 @router.get("/runs/{run_id}/human-interactions")
 async def run_interactions(run_id: str, session=Depends(get_session)):
-    rows = await session.scalars(select(HumanInteraction).where(
-        HumanInteraction.request_json["runId"].as_string() == run_id
-    ).order_by(HumanInteraction.created_at))
+    rows = await session.scalars(
+        select(HumanInteraction)
+        .where(HumanInteraction.request_json["runId"].as_string() == run_id)
+        .order_by(HumanInteraction.created_at)
+    )
     return [human_view(item) for item in rows]

@@ -155,6 +155,30 @@ class ModelRequestPayload(_PayloadBase):
     attempt: StrictInt = Field(default=1, ge=1)
 
 
+class ModelTracePayload(_PayloadBase):
+    requestId: str = Field(min_length=1, max_length=100)
+    phase: Literal["request", "response"]
+    chunkIndex: StrictInt = Field(ge=0)
+    chunkCount: StrictInt = Field(ge=1)
+    data: str
+
+
+class ModelTraceEvent(BaseModel):
+    type: Literal["model.trace"]
+    payload: ModelTracePayload
+
+
+class ModelResponsePayload(_PayloadBase):
+    requestId: str = Field(min_length=1)
+    status: StrictInt = Field(ge=100, le=599)
+    latencyMs: StrictInt = Field(ge=0)
+
+
+class ModelResponseEvent(BaseModel):
+    type: Literal["model.response.started"]
+    payload: ModelResponsePayload
+
+
 class AgentPlanEvent(BaseModel):
     type: Literal["agent.plan"]
     payload: PlanPayload
@@ -233,7 +257,9 @@ AgentEvent = Annotated[
     | ToolRequestedEvent
     | ToolResultEvent
     | LogEvent
-    | ModelRequestDispatchedEvent,
+    | ModelRequestDispatchedEvent
+    | ModelTraceEvent
+    | ModelResponseEvent,
     Field(discriminator="type"),
 ]
 
@@ -380,12 +406,16 @@ class AgentEventValidator:
                     "step": payload.get("step"),
                     "inputTokens": payload.get("inputTokens", 0),
                     "outputTokens": payload.get("outputTokens", 0),
+                    **{key: payload[key] for key in (
+                        "requestId", "model", "provider", "durationMs", "cacheReadTokens",
+                        "cacheWriteTokens", "usageComplete",
+                    ) if key in payload},
                 },
             }
-        if event_type == "model.request.dispatched":
+        if event_type in {"model.request.dispatched", "model.response.started", "model.trace"}:
             return {
                 "type": event_type,
-                "payload": {"attempt": payload.get("attempt", 1)},
+                "payload": redact(payload),
             }
         if event_type == "agent.plan":
             audit = {"summary": payload.get("summary", "")}

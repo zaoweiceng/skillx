@@ -35,6 +35,10 @@ import urllib.request
 args = sys.argv[1:]
 assert args[args.index("--model") + 1] == "selected-test-model"
 assert 'model_reasoning_effort="high"' in args
+for native_tool in ("Read", "Write", "Bash", "WebFetch"):
+    assert any(args[i:i+2] == ["--disallowed-tool", native_tool] for i in range(len(args)-1))
+for feature in ("shell_tool", "unified_exec", "apply_patch_freeform", "multi_agent"):
+    assert any(args[i:i+2] == ["--disable", feature] for i in range(len(args)-1))
 print(json.dumps({{"type": "thread.started", "thread_id": "test"}}), flush=True)
 print(json.dumps({{"type": "turn.started"}}), flush=True)
 if {fail_auth!r}:
@@ -459,4 +463,46 @@ def test_tool_descriptor_map_fails_closed_on_collision(
     with pytest.raises(TraeXBridgeError) as error:
         _tool_descriptor_map([_descriptor("cap.one"), _descriptor("cap.two")])
 
+    assert error.value.code == "AGENT_PROTOCOL_INCOMPATIBLE"
+
+
+async def test_native_envelope_larger_than_default_stream_buffer(tmp_path, monkeypatch):
+    monkeypatch.setattr(get_settings(), "artifact_root", tmp_path)
+    executable = _fake_native_terminal(
+        tmp_path, event_type="turn.completed", message="x" * 70000,
+        output='{"reply":"ok"}',
+    )
+    result = await AgentHost(adapter=TraeXBuiltinAdapter([str(executable)])).execute(
+        AgentHostRequest(run_id="large-native-event", prompt="probe",
+                         output_schema=OUTPUT_SCHEMA, working_directory=tmp_path / "run")
+    )
+    assert result.output == {"reply": "ok"}
+
+
+def test_terminal_accepts_single_json_fence_but_not_arbitrary_prose():
+    import json
+    from app.runtime.traex_builtin import _parse_terminal
+
+    assert _parse_terminal('```json\n{"reply":"ok"}\n```') == {"reply": "ok"}
+    with pytest.raises(json.JSONDecodeError):
+        _parse_terminal('Here is a guess: {"reply":"ok"}')
+
+
+async def test_native_command_cannot_bypass_host_evidence(tmp_path, monkeypatch):
+    monkeypatch.setattr(get_settings(), "artifact_root", tmp_path)
+    executable = _fake_native_terminal(
+        tmp_path, event_type="turn.completed", output='{"reply":"ok"}'
+    )
+    body = executable.read_text()
+    body = body.replace(
+        'raise SystemExit(0)',
+        'print(json.dumps({"type":"item.started","item":{"type":"command_execution",'
+        '"command":"pwd"}}), flush=True)\nraise SystemExit(0)',
+    )
+    executable.write_text(body)
+    with pytest.raises(AgentHostError) as error:
+        await AgentHost(adapter=TraeXBuiltinAdapter([str(executable)])).execute(
+            AgentHostRequest(run_id="native-bypass", prompt="probe",
+                             output_schema=OUTPUT_SCHEMA, working_directory=tmp_path / "run")
+        )
     assert error.value.code == "AGENT_PROTOCOL_INCOMPATIBLE"

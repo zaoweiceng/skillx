@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
 import httpx
 from jsonschema import Draft202012Validator
+
+from app.infrastructure.runtime_credentials import resolve_runtime_key
 
 from app.application.runtime_config import LLMRuntimeConfig, llm_runtime_config
 
@@ -98,7 +99,7 @@ class OpenAICompatibleAdapter:
                 async with client.stream(
                     "POST",
                     completion_endpoint(runtime.endpoint),
-                    headers={"authorization": f"Bearer {os.environ[runtime.api_key_env]}"},
+                    headers={"authorization": f"Bearer {resolve_runtime_key(runtime.api_key_env)}"},
                     json={
                         "model": runtime.model,
                         "messages": messages,
@@ -162,7 +163,7 @@ class OpenAICompatibleAdapter:
         runtime = self.runtime or llm_runtime_config()
         if not runtime.configured or not runtime.endpoint or not runtime.model:
             raise ModelRuntimeError("MODEL_RUNTIME_UNAVAILABLE", "Direct LLM Runtime 未配置")
-        api_key = os.environ.get(runtime.api_key_env)
+        api_key = resolve_runtime_key(runtime.api_key_env)
         if not api_key:
             raise ModelRuntimeError(
                 "MODEL_RUNTIME_UNAVAILABLE",

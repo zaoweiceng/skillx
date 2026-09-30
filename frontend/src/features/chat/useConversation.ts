@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { runtimeRequest } from '@/features/runtime/api'
+import { readSelectionPreference } from '@/features/runtime/selectionPreference'
 import type { Selection } from '@/features/runtime/AgentSelector'
 
 import {
@@ -27,7 +28,8 @@ export function useConversation() {
   const navigate = useNavigate()
   const sendingRef = useRef(false)
   const pendingConversationRef = useRef('')
-  const [draftSelection, setDraftSelection] = useState<Selection>({ agentProfileId: null, traexModel: null })
+  const [draftSelection, setDraftSelection] = useState<Selection>(readSelectionPreference)
+  const [workingDirectory, setWorkingDirectory] = useState<string>()
   const [conversationId, setConversationId] = useState(routeConversationId ?? '')
   const [messages, setMessages] = useState<Message[]>([])
   const [turns, setTurns] = useState<ConversationTurn[]>([])
@@ -75,7 +77,9 @@ export function useConversation() {
 
   useEffect(() => {
     setConversationId(routeConversationId ?? '')
+    if (!routeConversationId) setDraftSelection(readSelectionPreference())
     pendingConversationRef.current = ''
+    setWorkingDirectory(undefined)
     setInput('')
     setError('')
   }, [routeConversationId])
@@ -92,6 +96,7 @@ export function useConversation() {
   const refresh = useCallback(async () => {
     if (!conversationId) return
     const conversation = await api.getConversation(conversationId)
+    setWorkingDirectory(conversation.workingDirectory ?? undefined)
     setMessages(conversation.messages)
     setTurns(conversation.turns ?? [])
     setWorkflowMode(conversation.workflowMode ?? 'enabled')
@@ -307,7 +312,7 @@ export function useConversation() {
     }
   }, [activeWorkflowRunIds, refresh])
 
-  async function send(event: FormEvent, referenceFiles: ChatReferenceFile[] = []) {
+  async function send(event: FormEvent, referenceFiles: ChatReferenceFile[] = [], workingDirectory?: string) {
     event.preventDefault()
     if (!input.trim() || sendingRef.current) return false
     sendingRef.current = true
@@ -331,7 +336,7 @@ export function useConversation() {
       if (!conversationId && (draftSelection.agentProfileId || draftSelection.traexModel || draftSelection.reasoningEffort)) {
         await runtimeRequest(`/conversations/${targetId}`, 'PUT', draftSelection)
       }
-      const result = await api.sendMessage(targetId, text, ...(referenceFiles.length ? [referenceFiles] as const : []))
+      const result = await (workingDirectory ? api.sendMessage(targetId, text, referenceFiles, workingDirectory) : referenceFiles.length ? api.sendMessage(targetId, text, referenceFiles) : api.sendMessage(targetId, text))
       if (
         result.assistant.conversationRunId &&
         (result.assistant.type === 'agent_run' || result.assistant.runType === 'agent_run')
@@ -358,12 +363,22 @@ export function useConversation() {
     }
   }
 
+  async function changeWorkingDirectory(value: string | undefined) {
+    try {
+      if (conversationId) await api.updateConversationDirectory(conversationId, value ?? null)
+      setWorkingDirectory(value)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : '保存工作目录失败')
+    }
+  }
+
   function createNewConversation() {
     pendingConversationRef.current = ''
+    setWorkingDirectory(undefined)
     setInput('')
     setError('')
     setHistoryOpen(false)
-    setDraftSelection({ agentProfileId: null, traexModel: null })
+    setDraftSelection(readSelectionPreference())
     navigate('/chat')
   }
 
@@ -423,7 +438,7 @@ export function useConversation() {
     if (!turn) return null
     const elapsed =
       turn.elapsedMs ??
-      Math.max(0, clock - new Date(turn.acceptedAt).getTime())
+      Math.max(0, (turn.completedAt ? new Date(turn.completedAt).getTime() : clock) - new Date(turn.acceptedAt).getTime())
     return `${(elapsed / 1000).toFixed(1)}s`
   }
 
@@ -502,5 +517,5 @@ export function useConversation() {
     }
   }
 
-  return { draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, workflowMode, workflowSelectionAvailable, switchingMode, clock, optimisticStartedAt, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill }
+  return { refresh, workingDirectory, changeWorkingDirectory, draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, workflowMode, workflowSelectionAvailable, switchingMode, clock, optimisticStartedAt, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill }
 }

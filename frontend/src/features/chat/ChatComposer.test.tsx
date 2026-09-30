@@ -12,7 +12,7 @@ function textFile(name: string, content: string) {
 
 function composer(onSend = vi.fn().mockResolvedValue(true)) {
   render(<ChatComposer input="总结附件" onInputChange={() => {}} disabled={false} sending={false}
-    controls={<span>模型</span>} onSend={onSend} />)
+    controls={<span>模型</span>} onSend={onSend} onWorkingDirectoryChange={() => {}} />)
   return onSend
 }
 
@@ -22,7 +22,7 @@ describe('对话参考文件', () => {
     fireEvent.change(screen.getByLabelText('参考文件'), {target: {files: [textFile('notes.md', '项目说明')]}})
     await screen.findByText('notes.md')
     fireEvent.click(screen.getByRole('button', {name: '发送'}))
-    await waitFor(() => expect(send).toHaveBeenCalledWith(expect.anything(), [{name: 'notes.md', content: '项目说明'}]))
+    await waitFor(() => expect(send).toHaveBeenCalledWith(expect.anything(), [{name: 'notes.md', content: '项目说明'}], undefined))
     await waitFor(() => expect(screen.queryByText('notes.md')).not.toBeInTheDocument())
   })
 

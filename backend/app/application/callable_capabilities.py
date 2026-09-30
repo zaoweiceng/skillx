@@ -91,12 +91,15 @@ async def resolve_callable(session, version_id: str) -> CallableCapability:
                     contract["permissions"],
                     {"model": {"invoke": True}},
                 )
+        metadata = skill.manifest_json.get("manifest", {}).get("metadata", {})
         return CallableCapability(
             "skillx",
             {
                 "id": skill.id,
                 "capabilityId": skill.capability_id,
                 "name": owner.name,
+                "displayName": metadata.get("displayName") or owner.name,
+                "description": metadata.get("description", ""),
                 "version": skill.version,
                 "status": "published",
                 "digest": skill.digest,
@@ -137,6 +140,8 @@ async def resolve_callable(session, version_id: str) -> CallableCapability:
             "id": workflow.id,
             "capabilityId": workflow.workflow_id,
             "name": owner.name,
+            "displayName": owner.name,
+            "description": semantic.get("summary") or definition.get("metadata", {}).get("description", ""),
             "version": str(workflow.version),
             "status": "published",
             "digest": workflow.digest,

@@ -53,6 +53,69 @@ class LearningProposal(BaseModel):
     workflowExamples: list[ContractExample] = Field(default_factory=list, max_length=8)
 
 
+def complete_single_skill_workflow(proposal: LearningProposal) -> None:
+    """A single validated capability has an unambiguous identity workflow.
+
+    This supplies structure, never invents tests, alters output or publishes without replay.
+    Multi-skill composition must still be specified explicitly by the learning agent.
+    """
+    if proposal.workflow is not None or len(proposal.skills) != 1:
+        return
+    skill = proposal.skills[0]
+    schemas = (skill.inputSchema, skill.outputSchema)
+    if any(schema.get("type") != "object" or not schema.get("properties") for schema in schemas):
+        return
+    if any(set(schema.get("required", [])) != set(schema["properties"]) for schema in schemas):
+        return
+    proposal.workflow = {
+        "apiVersion": "workflow.platform/v1",
+        "kind": "Workflow",
+        "metadata": {
+            "name": skill.name,
+            "capability": {
+                "summary": skill.description,
+                "useWhen": [skill.description],
+                "doNotUseWhen": ["超出输入输出契约的任务"],
+                "examples": [json.dumps(skill.examples[0].input, ensure_ascii=False)],
+                "tags": ["自动固化"],
+            },
+        },
+        "spec": {
+            "inputSchema": skill.inputSchema,
+            "outputSchema": skill.outputSchema,
+            "nodes": [
+                {"id": "input", "type": "input", "displayName": "输入"},
+                {
+                    "id": "execute",
+                    "type": "skillx",
+                    "displayName": skill.name[:120],
+                    "input": {
+                        key: "${input." + key + "}" for key in skill.inputSchema["properties"]
+                    },
+                    "config": {"generatedSkill": skill.name, "interface": "execute"},
+                    "timeoutSeconds": 120,
+                },
+                {
+                    "id": "output",
+                    "type": "output",
+                    "displayName": "输出",
+                    "input": {
+                        key: "${execute.output." + key + "}"
+                        for key in skill.outputSchema["properties"]
+                    },
+                },
+            ],
+            "edges": [
+                {"source": "input", "target": "execute"},
+                {"source": "execute", "target": "output"},
+            ],
+            "policies": {"maxDurationSeconds": 180, "maxParallelNodes": 1},
+        },
+    }
+    if not proposal.workflowExamples:
+        proposal.workflowExamples = [example.model_copy(deep=True) for example in skill.examples]
+
+
 def observed_output(invocation):
     output = invocation.output_json
     if invocation.kind == "code":
@@ -206,7 +269,10 @@ async def materialize_skill(proposal: SkillProposal, job_id: str, evidence: dict
         Draft202012Validator(proposal.inputSchema).validate(example.input)
         async with asyncio.timeout(30):
             result = await execute_in_subprocess(
-                root, "execute", f"{job_id}-{index}", example.input,
+                root,
+                "execute",
+                f"{job_id}-{index}",
+                example.input,
                 dependency_handler=fixture_handler(fixtures),
             )
         if result.status != "succeeded" or result.output != example.expected:
@@ -216,9 +282,14 @@ async def materialize_skill(proposal: SkillProposal, job_id: str, evidence: dict
     from app.application.clean_validation import validate_clean_package
 
     await validate_clean_package(root, proposal.examples, proposal.outputSchema, fixtures=fixtures)
-    (root / "dependency-validation.json").write_text(json.dumps({
-        "locks": dependency_locks, "fixtures": fixtures,
-    }))
+    (root / "dependency-validation.json").write_text(
+        json.dumps(
+            {
+                "locks": dependency_locks,
+                "fixtures": fixtures,
+            }
+        )
+    )
     (root / "tests.json").write_text(json.dumps([x.model_dump() for x in proposal.examples]))
     return root
 
@@ -248,7 +319,11 @@ class LearningDriver:
                 if call and call.task_id:
                     owner = await session.get(Task, call.task_id)
                     if owner and owner.status not in {
-                        "succeeded", "failed", "blocked", "cancelled", "manual",
+                        "succeeded",
+                        "failed",
+                        "blocked",
+                        "cancelled",
+                        "manual",
                     }:
                         continue
                 task_id = (
@@ -260,9 +335,7 @@ class LearningDriver:
                     {"version": observation.workflow_version_id, "failure": observation.fingerprint}
                 )
                 if await session.scalar(
-                    select(LearningJob.id).where(
-                        LearningJob.fingerprint == fingerprint
-                    )
+                    select(LearningJob.id).where(LearningJob.fingerprint == fingerprint)
                 ):
                     continue
                 if not await session.get(Task, task_id):
@@ -297,7 +370,10 @@ class LearningDriver:
                     )
                 session.add(
                     LearningJob(
-                        id=str(uuid4()), task_id=task_id, kind="repair", fingerprint=fingerprint,
+                        id=str(uuid4()),
+                        task_id=task_id,
+                        kind="repair",
+                        fingerprint=fingerprint,
                         result_json={"observationId": observation.id},
                     )
                 )
@@ -378,7 +454,9 @@ class LearningDriver:
                 "kind": kind,
                 "finalState": task.state_json,
                 "outcome": {
-                    "status": task.status, "output": task.output_json, "error": task.error_json,
+                    "status": task.status,
+                    "output": task.output_json,
+                    "error": task.error_json,
                 },
                 "catalog": await task_catalog(session),
                 "calls": [
@@ -395,30 +473,46 @@ class LearningDriver:
             from app.infrastructure.database import Message
             from app.infrastructure.models.tasks import HumanInteraction, TaskEvent
 
-            context["sessionMessages"] = [
-                {"role": row.role, "content": row.content_json}
-                for row in await session.scalars(select(Message).where(
-                    Message.conversation_id == task.conversation_id,
-                    Message.created_at <= task.updated_at,
-                ).order_by(Message.created_at))
-            ] if task.conversation_id else []
+            context["sessionMessages"] = (
+                [
+                    {"role": row.role, "content": row.content_json}
+                    for row in await session.scalars(
+                        select(Message)
+                        .where(
+                            Message.conversation_id == task.conversation_id,
+                            Message.created_at <= task.updated_at,
+                        )
+                        .order_by(Message.created_at)
+                    )
+                ]
+                if task.conversation_id
+                else []
+            )
             context["humanAnswers"] = [
                 {"kind": row.kind, "request": row.request_json, "answer": row.answer_json}
-                for row in await session.scalars(select(HumanInteraction).where(
-                    HumanInteraction.task_id == task.id
-                ).order_by(HumanInteraction.created_at))
+                for row in await session.scalars(
+                    select(HumanInteraction)
+                    .where(HumanInteraction.task_id == task.id)
+                    .order_by(HumanInteraction.created_at)
+                )
             ]
             context["decisions"] = [
-                row.payload_json for row in await session.scalars(select(TaskEvent).where(
-                    TaskEvent.task_id == task.id, TaskEvent.type == "task.decision"
-                ).order_by(TaskEvent.id))
+                row.payload_json
+                for row in await session.scalars(
+                    select(TaskEvent)
+                    .where(TaskEvent.task_id == task.id, TaskEvent.type == "task.decision")
+                    .order_by(TaskEvent.id)
+                )
             ]
             if observation_id:
                 from app.infrastructure.database import FailureObservation, NodeRun
 
                 failure = await session.get(FailureObservation, observation_id)
-                failed_node = (await session.get(NodeRun, failure.source_node_run_id)
-                               if failure and failure.source_node_run_id else None)
+                failed_node = (
+                    await session.get(NodeRun, failure.source_node_run_id)
+                    if failure and failure.source_node_run_id
+                    else None
+                )
                 context["failure"] = {
                     "workflowVersionId": failure.workflow_version_id if failure else None,
                     "nodeId": failure.node_id if failure else None,
@@ -427,6 +521,16 @@ class LearningDriver:
                     "recoveredOutcome": failure.recovered_outcome_json if failure else None,
                 }
             runtime = restore_agent_snapshot(task.runtime_json)
+            from app.application.model_materialization import model_runtime
+
+            available_kinds = ["direct", "agent"]
+            llm_runtime = await model_runtime(session, "llm")
+            if llm_runtime.get("modelSnapshot"):
+                available_kinds.append("llm")
+            context["availableSkillKinds"] = available_kinds
+            proposal_schema = LearningProposal.model_json_schema()
+            kind_schema = proposal_schema["$defs"]["SkillProposal"]["properties"]["kind"]
+            kind_schema["enum"] = available_kinds
         proposal = None
         if kind == "repair":
             from app.application.automatic_repair import revise_from_failure
@@ -481,6 +585,15 @@ class LearningDriver:
                         "暂时性网络错误、拒绝授权、缺信息选择 skip。"
                         "稳定的模型任务可生成 kind=agent 或 llm 的 SkillX，提供 prompt；"
                         "禁止绑定当次人工授权，模型候选也须通过真实模型的不同输入业务断言。"
+                        "model 调用的 output 是原始模型证据，input.input 是业务输入；"
+                        "仅可选择 availableSkillKinds 中的接口类型。"
+                        "使用 kind=agent 可通过本地真实 Agent 模型执行，不需要额外 LLM API 配置。"
+                        "单个稳定能力也应发布成可调用 Workflow；"
+                        "只有一个新 SkillX 时允许 workflow=null，"
+                        "由平台按原输入输出契约生成直通编排。"
+                        "部分可固化任务只保留稳定子步骤，临时建议不要纳入契约。"
+                        "sourceInvocationId 必须精确使用 calls.id；"
+                        "code 的 expected 必须等于 stdout 解析后的完整JSON对象。"
                         "确定性能力优先 kind=direct；提供独立纯 Python execu"
                         "te(request, context)，参数来自 request.input 字典，返回输出 dict；"
                         "至少两个不同输入测试，原任务测试使用真实 so"
@@ -492,6 +605,9 @@ class LearningDriver:
                         "依赖验证仅使用原任务真实调用的精确输入输出，缺少证据保留候选。"
                         "必须有 input 和 output 节点；参考 workflowExample 的完整格式，"
                         "metadata.capability 包含 summary/useWhen/doNotUseWhen/examples/tags。"
+                        "Workflow 节点仅允许 input/output/skillx/condition/transform/"
+                        "capability_call/workflow_call。"
+                        "即使 SkillX 接口是 agent 或 llm，引用它的节点也必须 type=skillx。"
                         "Workflow 必须符合 workflowSchema（apiVersion/kind/metadata/spec），"
                         "节点引用使用 ${input.field} 和 ${node.output.field}。引用新能力时"
                         "config={generatedSkill:名称,inter"
@@ -505,12 +621,16 @@ class LearningDriver:
                         "Policy，必要时明确基版本 baseVersionId。\n"
                         + json.dumps(context, ensure_ascii=False)
                     ),
-                    output_schema=LearningProposal.model_json_schema(),
+                    output_schema=proposal_schema,
                     max_steps=1,
                     max_duration_seconds=120,
                 )
             )
             proposal = LearningProposal.model_validate(result.output)
+            if any(skill.kind not in available_kinds for skill in proposal.skills):
+                raise ValueError("候选使用了当前未配置的模型接口")
+            if kind == "distill" and proposal.decision == "candidate":
+                complete_single_skill_workflow(proposal)
             if proposal.decision == "skip":
                 status, output = "skipped", {"reason": proposal.reason}
             else:
@@ -541,9 +661,15 @@ class LearningDriver:
                             node["config"]["capabilityVersionId"] = registered[name]
                     # A model cannot auto-publish untested side effects or arbitrary nodes.
                     if any(
-                        n["type"] not in {
-                            "input", "output", "skillx", "condition", "transform",
-                            "capability_call", "workflow_call",
+                        n["type"]
+                        not in {
+                            "input",
+                            "output",
+                            "skillx",
+                            "condition",
+                            "transform",
+                            "capability_call",
+                            "workflow_call",
                         }
                         for n in definition["spec"]["nodes"]
                     ):
@@ -554,9 +680,7 @@ class LearningDriver:
                         from app.infrastructure.database import FailureObservation
 
                         failed_versions = {
-                            x.request_json.get("versionId")
-                            for x in calls
-                            if x.kind == "workflow"
+                            x.request_json.get("versionId") for x in calls if x.kind == "workflow"
                         }
                         if proposal.baseVersionId not in failed_versions:
                             raise ValueError("修订基版本不属于本次故障")
@@ -614,7 +738,10 @@ class LearningDriver:
                     from app.application.learning_validation import validate_candidate
 
                     await validate_candidate(
-                        session, definition, proposal.workflowExamples, evidence,
+                        session,
+                        definition,
+                        proposal.workflowExamples,
+                        evidence,
                         generated_ids=set(registered.values()),
                     )
                     published = await publish_workflow(
@@ -631,9 +758,13 @@ class LearningDriver:
                     }
                     status = "published"
         except Exception as exc:
+            diagnostics = getattr(exc, "diagnostics", None)
+            reason = str(exc)
+            if diagnostics:
+                reason += ": " + "; ".join(f"{d.path}: {d.message}" for d in diagnostics)
             status, output = (
                 "queued" if attempts < 3 else "blocked",
-                {"reason": str(exc), "proposal": proposal.model_dump() if proposal else None},
+                {"reason": reason, "proposal": proposal.model_dump() if proposal else None},
             )
         async with SessionLocal() as session, session.begin():
             current = await session.get(LearningJob, job_id)

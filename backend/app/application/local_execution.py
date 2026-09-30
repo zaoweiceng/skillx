@@ -31,12 +31,35 @@ def task_directory(scope: str) -> Path:
     return root
 
 
+def validate_working_directory(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError("工作目录必须是绝对路径")
+    path = path.resolve(strict=True)
+    if not path.is_dir():
+        raise ValueError("所选路径不是目录")
+    if not os.access(path, os.R_OK | os.X_OK):
+        raise ValueError("工作目录不可访问")
+    return path
+
+
 async def execute_local(
-    scope: str, invocation_id: str, kind: str, args: dict, cancelled, allow_system: bool = False
+    scope: str,
+    invocation_id: str,
+    kind: str,
+    args: dict,
+    cancelled,
+    allow_system: bool = False,
+    working_directory: str | None = None,
 ):
     if not get_settings().task_local_execution_enabled:
         raise PermissionError("本机代码执行尚未授权")
     root = task_directory(scope)
+    cwd = (
+        validate_working_directory(working_directory)
+        if working_directory and kind == "code"
+        else root
+    )
     home = root / ".home"
     home.mkdir(exist_ok=True)
     evidence = root / ".executions" / invocation_id
@@ -63,7 +86,7 @@ async def execute_local(
     async def run(argv: list[str], label: str):
         request_path = evidence / (label + ".request")
         result_path = evidence / (label + ".result.json")
-        request = {"argv": argv, "cwd": str(root), "env": env, "timeout": 300}
+        request = {"argv": argv, "cwd": str(cwd), "env": env, "timeout": 300}
         request["digest"] = digest_json(request)
         try:
             with request_path.open("x") as stream:

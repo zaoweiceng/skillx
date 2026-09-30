@@ -10,6 +10,7 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite+aiosqlite:///./skillx.db"
     artifact_root: Path = Path("./artifacts")
+    runtime_credentials_path: Path = Path("./.runtime-credentials")
     capability_root: Path = Path("../capabilities/skillx")
     cors_origins: list[str] = ["http://localhost:5173"]
     worker_id: str = "worker-local"

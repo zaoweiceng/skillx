@@ -1,0 +1,29 @@
+apiVersion: skillx.dev/v1alpha1
+kind: SkillX
+metadata:
+  description: 浏览器验收：通过嵌套 SkillX 统计文本
+  name: qa-nested-text-stats
+  version: 1.0.0
+spec:
+  capabilities:
+    stats:
+      kind: skillx
+      ref: text-stats@1.0.0#count
+  defaultInterface: execute
+  guide:
+    entry: SKILL.md
+  interfaces:
+    execute:
+      capabilities:
+      - stats
+      description: 嵌套调用文本统计
+      effects: []
+      execution:
+        idempotency: inherent
+        timeoutSeconds: 30
+      inputSchema: input.json
+      kind: direct
+      outputSchema: output.json
+      runtime:
+        entry: execute.py:execute
+        protocol: skillx.python-callable/v1

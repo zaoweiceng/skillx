@@ -507,3 +507,92 @@ async def test_system_install_is_host_authorized_and_denial_is_not_reasked():
         assert repeated.error_json["code"] == "PERMISSION_DENIED"
         questions = list(await session.scalars(select(HumanInteraction)))
         assert len(questions) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_goal_does_not_kill_task_claim_loop(monkeypatch):
+    import asyncio
+
+    from app.application.tasks import cancel_task
+
+    cancelled_id = await make_task("cancel me")
+    next_id = await make_task("next task")
+    attempts = 0
+
+    async def execute(self, request, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            async with SessionLocal() as session, session.begin():
+                await cancel_task(session, await session.get(Task, cancelled_id))
+            raise asyncio.CancelledError
+        return AgentHostResult(output={"action": "complete", "summary": "done",
+                                      "answer": "done", "completionCriteria": ["done"],
+                                      "evidence": []})
+
+    monkeypatch.setattr(AgentHost, "execute", execute)
+    driver = TaskDriver()
+    assert await driver.poll_once()
+    assert await driver.poll_once()
+    async with SessionLocal() as session:
+        assert (await session.get(Task, cancelled_id)).status == "cancelled"
+        assert (await session.get(Task, next_id)).status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_worker_shutdown_still_propagates_cancellation(monkeypatch):
+    import asyncio
+    task_id = await make_task()
+    entered = asyncio.Event()
+
+    async def execute(self, request, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(AgentHost, "execute", execute)
+    poll = asyncio.create_task(TaskDriver().poll_once())
+    await asyncio.wait_for(entered.wait(), 5)
+    poll.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await poll
+
+    async with SessionLocal() as session:
+        task = await session.get(Task, task_id)
+        assert task.status == "queued"
+        assert task.lease_token is None
+
+
+async def test_malformed_terminal_retries_are_bounded(monkeypatch):
+    from app.runtime.traex_builtin import TraeXBridgeError
+
+    task_id = await make_task()
+
+    async def malformed(self, request, **kwargs):
+        raise TraeXBridgeError("MODEL_MALFORMED_OUTPUT", "invalid terminal")
+
+    monkeypatch.setattr(AgentHost, "execute", malformed)
+    driver = TaskDriver()
+    for expected in ("queued", "queued", "failed"):
+        assert await driver.poll_once()
+        async with SessionLocal() as session:
+            assert (await session.get(Task, task_id)).status == expected
+
+
+def test_observation_bounds_structured_results_without_mutating_evidence():
+    from app.application.task_context import observation
+
+    original = {"stdout": __import__('json').dumps({"files": ["file"] * 1000, "body": "x" * 5000})}
+    result = observation(original)
+    assert result["stdout"]["files"]["totalItems"] == 1000
+    assert result["stdout"]["body"]["truncated"]
+    assert len(original["stdout"]) > 10000
+
+
+def test_code_call_rejects_nested_arguments_before_dispatch():
+    from pydantic import ValidationError
+    from app.application.task_contracts import TaskCall
+
+    with pytest.raises(ValidationError, match="不能包在 input 中"):
+        TaskCall(key="read", kind="code", reason="read files", arguments={
+            "input": {"language": "python", "source": "print('ok')"}
+        })

@@ -1,3 +1,4 @@
+import { workflowDescription } from '@/lib/capabilityPresentation'
 import { Button } from 'antd'
 import Form from '@/components/SchemaForm'
 import validator from '@rjsf/validator-ajv8'
@@ -190,13 +191,13 @@ export default function WorkflowEditorPage() {
         reviewed.draftDigest,
         reviewed.draftMetadata?.replayEvidenceId,
       )
-      const component = await api.createComponent(
+      await api.createComponent(
         reviewed.name,
-        '由工作流编辑器发布的锁定版本组件。',
+        workflowDescription(reviewed.definition.metadata),
         version.id,
       )
       setNotice(
-        `已发布不可变版本 v${version.version}，组件入口 ${component.id.slice(0, 8)} 已创建`,
+        `已发布不可变版本 v${version.version}，已添加至工作流列表`,
       )
       if (typeof api.listWorkflowVersions === 'function') {
         setVersions(await api.listWorkflowVersions(id))
@@ -253,6 +254,7 @@ export default function WorkflowEditorPage() {
         <div>
           <span className="eyebrow">DRAFT REVISION {workflow.draftRevision}</span>
           <h1>{workflow.name}</h1>
+            <p>{workflowDescription(workflow.definition.metadata)}</p>
         </div>
         <div className="run-header-actions">
           <Button className="button ghost" onClick={toggleJson} disabled={busy || publishing}>

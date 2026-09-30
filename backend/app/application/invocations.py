@@ -12,7 +12,11 @@ from sqlalchemy import func, select, update
 from sqlalchemy.orm import aliased
 
 from app.application.compiler import digest_json
-from app.application.local_execution import execute_local, task_directory
+from app.application.local_execution import (
+    execute_local,
+    task_directory,
+    validate_working_directory,
+)
 from app.application.runtime_profiles import agent_snapshot
 from app.application.security import redact
 from app.application.task_budget import now, record_activity
@@ -101,6 +105,19 @@ async def enqueue_invocation(
         Draft202012Validator(version.definition_json["spec"]["inputSchema"]).validate(
             arguments.get("input", {})
         )
+    elif kind == "model":
+        if task is None:
+            raise ValueError("模型探索需要 Task")
+        if set(arguments) - {"prompt", "input", "outputSchema"}:
+            raise ValueError("模型调用包含未知字段")
+        if not isinstance(arguments.get("prompt"), str) or not arguments["prompt"].strip():
+            raise ValueError("模型调用需要独立任务 prompt")
+        if not isinstance(arguments.get("input"), dict):
+            raise ValueError("模型调用 input 必须是对象")
+        schema = arguments.get("outputSchema", {})
+        Draft202012Validator.check_schema(schema)
+        if schema.get("type") != "object":
+            raise ValueError("模型输出必须是 object Schema")
     elif kind == "tool":
         if arguments.get("capabilityRef") not in get_settings().agent_host_capabilities:
             raise PermissionError("工具未获得 Host 授权")
@@ -163,7 +180,19 @@ async def enqueue_invocation(
             session,
             task.id,
             "invocation.queued",
-            {"id": invocation.id, "kind": kind, "request": arguments},
+            {
+                "id": invocation.id,
+                "kind": kind,
+                "request": arguments,
+                "reason": next(
+                    (
+                        c.get("reason")
+                        for c in task.state_json.get("calls", [])
+                        if c.get("key") == key
+                    ),
+                    None,
+                ),
+            },
         )
     if needs_approval:
         if task is None:
@@ -250,10 +279,16 @@ class InvocationDriver:
                                 NodeRun.run_id == run.id, NodeRun.node_type != "approval"
                             )
                         )
-                        await record_activity(session, waiting.task_id, "run:" + run.id, [
-                            (n.started_at, n.finished_at) for n in node_runs
-                            if n.finished_at and n.started_at
-                        ])
+                        await record_activity(
+                            session,
+                            waiting.task_id,
+                            "run:" + run.id,
+                            [
+                                (n.started_at, n.finished_at)
+                                for n in node_runs
+                                if n.finished_at and n.started_at
+                            ],
+                        )
                         tokens = await session.scalar(
                             select(func.sum(ModelUsage.total_tokens)).where(
                                 ModelUsage.run_id == run.id
@@ -345,7 +380,9 @@ class InvocationDriver:
                 try:
                     async with session.begin_nested():
                         run = await Orchestrator().create_run(
-                            session, version, item.request_json.get("input", {}),
+                            session,
+                            version,
+                            item.request_json.get("input", {}),
                             automatic_recovery=True,
                         )
                 except Exception as exc:
@@ -355,9 +392,15 @@ class InvocationDriver:
                         "message": str(exc),
                     }
                     if item.task_id:
-                        emit(session, item.task_id, "invocation.failed", {
-                            "id": item.id, "error": item.error_json,
-                        })
+                        emit(
+                            session,
+                            item.task_id,
+                            "invocation.failed",
+                            {
+                                "id": item.id,
+                                "error": item.error_json,
+                            },
+                        )
                     return True
                 item.run_id, item.status = run.id, "waiting_execution"
                 return True
@@ -376,6 +419,10 @@ class InvocationDriver:
             if item.kind in {"code", "install"} and "activeStartedAt" not in item.runtime_json:
                 item.runtime_json = {**item.runtime_json, "activeStartedAt": now().isoformat()}
             invocation_id, kind, args, scope = item.id, item.kind, item.request_json, item.scope
+            task_context = await session.get(Task, item.task_id) if item.task_id else None
+            working_directory = (
+                (task_context.state_json or {}).get("workingDirectory") if task_context else None
+            )
             runtime_json = item.runtime_json
             approval = await session.scalar(
                 select(HumanInteraction).where(HumanInteraction.call_key == "approve:" + item.id)
@@ -387,8 +434,11 @@ class InvocationDriver:
                 and approval.request_json.get("operation") == item.request_json
             )
 
-        started = (datetime.fromisoformat(runtime_json["activeStartedAt"])
-                   if runtime_json.get("activeStartedAt") else now())
+        started = (
+            datetime.fromisoformat(runtime_json["activeStartedAt"])
+            if runtime_json.get("activeStartedAt")
+            else now()
+        )
         tokens = 0
 
         async def cancelled():
@@ -402,8 +452,54 @@ class InvocationDriver:
             async with asyncio.timeout(300):
                 if kind in {"code", "install"}:
                     output = await execute_local(
-                        scope, invocation_id, kind, args, cancelled, allow_system=effect_approved
+                        scope,
+                        invocation_id,
+                        kind,
+                        args,
+                        cancelled,
+                        allow_system=effect_approved,
+                        **({"working_directory": working_directory} if working_directory else {}),
                     )
+                elif kind == "model":
+                    from app.application.agent_host import AgentHost, AgentHostRequest
+                    from app.application.runtime_profiles import restore_agent_snapshot
+
+                    async def audit_sink(runtime_event, audit_event):
+                        async with SessionLocal() as audit_session, audit_session.begin():
+                            current = await audit_session.get(Invocation, invocation_id)
+                            if (
+                                current
+                                and current.lease_token == token
+                                and current.status == "running"
+                            ):
+                                emit(
+                                    audit_session,
+                                    current.task_id,
+                                    "agent.audit",
+                                    {
+                                        "invocationId": invocation_id,
+                                        **audit_event,
+                                    },
+                                )
+
+                    result = await AgentHost(runtime=restore_agent_snapshot(runtime_json)).execute(
+                        AgentHostRequest(
+                            run_id="model-" + invocation_id,
+                            prompt=args["prompt"]
+                            + "\n输入数据：\n"
+                            + json.dumps(args["input"], ensure_ascii=False),
+                            output_schema=args["outputSchema"],
+                            working_directory=task_directory(scope) / "model" / invocation_id,
+                            requested_capabilities=(),
+                            max_steps=1,
+                            max_duration_seconds=120,
+                            max_total_tokens=get_settings().agent_max_total_tokens,
+                        ),
+                        event_sink=audit_sink,
+                        cancellation=cancelled,
+                    )
+                    output, tokens = result.output, result.total_tokens
+                    Draft202012Validator(args["outputSchema"]).validate(output)
                 elif kind == "tool":
                     from app.application.tool_broker import (
                         ToolAdapterRegistry,
@@ -412,7 +508,13 @@ class InvocationDriver:
 
                     output = await ToolAdapterRegistry().execute(
                         args["capabilityRef"],
-                        ToolExecutionContext(scope, invocation_id, task_directory(scope)),
+                        ToolExecutionContext(
+                            scope,
+                            invocation_id,
+                            validate_working_directory(working_directory)
+                            if working_directory
+                            else task_directory(scope),
+                        ),
                         args.get("input", {}),
                     )
                 else:
@@ -438,12 +540,16 @@ class InvocationDriver:
                                 )
                                 if current.task_id:
                                     await record_activity(
-                                        session, current.task_id, "invocation:" + current.id,
+                                        session,
+                                        current.task_id,
+                                        "invocation:" + current.id,
                                         [(started, now())],
                                     )
-                                    await session.execute(update(Task).where(
-                                        Task.id == current.task_id
-                                    ).values(total_tokens=Task.total_tokens + tokens))
+                                    await session.execute(
+                                        update(Task)
+                                        .where(Task.id == current.task_id)
+                                        .values(total_tokens=Task.total_tokens + tokens)
+                                    )
                                     emit(
                                         session,
                                         current.task_id,
@@ -455,6 +561,8 @@ class InvocationDriver:
             error = None
             status = "succeeded"
         except asyncio.CancelledError:
+            if asyncio.current_task().cancelling():
+                raise
             return True
         except Exception as exc:
             if kind in {"code", "install"} and isinstance(exc, TimeoutError):
@@ -467,8 +575,9 @@ class InvocationDriver:
             current = await session.get(Invocation, invocation_id)
             if current.status == "running" and current.lease_token == token:
                 if current.task_id:
-                    await record_activity(session, current.task_id, "invocation:" + current.id,
-                                          [(started, now())])
+                    await record_activity(
+                        session, current.task_id, "invocation:" + current.id, [(started, now())]
+                    )
                     await session.execute(
                         update(Task)
                         .where(Task.id == current.task_id)

@@ -174,8 +174,8 @@ export default function RunDetailPage() {
 
   return (
     <div className="page">
-      <Link className="back-link" to="/components">
-        <ArrowLeft size={15} /> 返回组件
+      <Link className="back-link" to="/workflows">
+        <ArrowLeft size={15} /> 返回工作流
       </Link>
       <header className="run-header">
         <div>

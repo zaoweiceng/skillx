@@ -3,19 +3,22 @@ import { ArrowUp, FileText, FolderOpen, Paperclip } from 'lucide-react'
 import { useRef, useState, type FormEvent, type ReactNode } from 'react'
 import type { ChatReferenceFile } from '@/api/client'
 import styles from './chat.module.css'
+import { DirectoryPicker } from './DirectoryPicker'
 
 const MAX_FILES = 8
 const MAX_FILE_BYTES = 128 * 1024
 const MAX_TOTAL_BYTES = 256 * 1024
 
-export function ChatComposer({ input, onInputChange, disabled, sending, controls, onSend, directoryControl }: {
+export function ChatComposer({ input, onInputChange, disabled, sending, controls, onSend, directoryControl, workingDirectory, onWorkingDirectoryChange }: {
+  workingDirectory?: string
+  onWorkingDirectoryChange: (path: string | undefined) => void
   input: string
   onInputChange: (value: string) => void
   disabled: boolean
   sending: boolean
   controls: ReactNode
   directoryControl?: ReactNode
-  onSend: (event: FormEvent, files: ChatReferenceFile[]) => Promise<boolean>
+  onSend: (event: FormEvent, files: ChatReferenceFile[], workingDirectory?: string) => Promise<boolean>
 }) {
   const fileInput = useRef<HTMLInputElement>(null)
   const [files, setFiles] = useState<ChatReferenceFile[]>([])
@@ -55,11 +58,15 @@ export function ChatComposer({ input, onInputChange, disabled, sending, controls
     event.preventDefault()
     if (disabled || reading || !input.trim()) return
     setError('')
-    if (await onSend(event, files)) setFiles([])
+    if (await onSend(event, files, workingDirectory)) setFiles([])
   }
 
   return <form className={styles.composer} onSubmit={submit}>
-    {files.length > 0 && <Flex gap={6} wrap className={styles.attachments}>
+    {(workingDirectory || files.length > 0) && <Flex gap={6} wrap className={styles.attachments}>
+      {workingDirectory && <Tag className={styles.directoryTag} icon={<FolderOpen size={13} />} closable={!sending}
+      onClose={event => { event.preventDefault(); onWorkingDirectoryChange(undefined) }} title={workingDirectory}>
+        <span className={styles.directoryPath}>{workingDirectory}</span>
+      </Tag>}
       {files.map((file, index) => <Tag key={`${file.name}-${index}`} icon={<FileText size={13} />}
         closable={!sending} onClose={() => setFiles(current => current.filter((_, i) => i !== index))}>
         {file.name}
@@ -70,7 +77,7 @@ export function ChatComposer({ input, onInputChange, disabled, sending, controls
     <div className={styles.composerToolbar}>
       <div className={styles.composerOptions}>{controls}</div>
       <Flex gap={8} align="center" className={styles.composerActions}>
-        {directoryControl ?? <Tooltip title="选择工作目录"><Button type="text" aria-label="选择工作目录" icon={<FolderOpen size={19} />} disabled /></Tooltip>}
+        {directoryControl ?? <DirectoryPicker value={workingDirectory} onChange={onWorkingDirectoryChange} disabled={sending} />}
         <Tooltip title="添加参考文件（文本、代码、Markdown，单个不超过 128 KB）">
           <Button type="text" aria-label="添加参考文件" icon={<Paperclip size={20} />} disabled={sending || reading}
             loading={reading} onClick={() => fileInput.current?.click()} />
