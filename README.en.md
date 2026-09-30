@@ -27,18 +27,13 @@ not a hardened public or multi-tenant service.
   checkpoints, bounded retries, and independent agent recovery.
 - **Manage skills:** import and manage skill content and inspect its published versions.
 
-Automatic conversion of an agent trace into a reusable capability is intentionally
-limited: only supported cases can be validated and published automatically. Arbitrary
-generated code and new side effects still require review. MCP Streamable HTTP support
-also has limitations; see [capability status](docs/capability-status.md).
-
 ![SkillX workflow library](docs/screenshots/workflow-library.jpg)
 
 ## Quick start
 
 Requires **Python 3.12 or 3.13**, **[uv](https://docs.astral.sh/uv/getting-started/installation/)**,
 **Node.js 22.19+**, **npm**, and **Git**. The launcher uses Bash and POSIX process/file
-locking; use macOS, Linux, or WSL on Windows.
+locking; use macOS or Linux.
 
 Clone the repository and start the workspace:
 
@@ -73,22 +68,6 @@ Normal upgrades use incremental migrations and preserve data. Back up the local
 database and runtime files before upgrading. `./dev.sh --reset-db` is a destructive
 recovery option for incompatible legacy databases: it deletes historical data and
 published versions. It is **not** a normal installation or upgrade step.
-
-## Run your first workflow
-
-Try the built-in **问候工作流** (greeting workflow) without configuring a model:
-
-1. Open **工作流** (Workflows), find the greeting workflow, and choose **编辑** (Edit).
-2. Select **生成问候** (Generate greeting) to inspect its input mapping and template.
-3. Under **手动运行 v1** (Run v1), enter a name such as `SkillX` and start the published version.
-4. Inspect node states, events, and the actual output `你好，SkillX`. This example makes no model calls.
-
-Editing a draft does not change a published version. Save, validate, and publish a
-new version when you want to run your changes.
-
-![Editing the greeting workflow](docs/screenshots/workflow-editor.jpg)
-
-![Completed workflow and actual result](docs/screenshots/workflow-run.jpg)
 
 ## Configuration and local data
 
@@ -172,14 +151,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for individual commands and contribution 
 - [Design](docs/workflow-design-doc.md) and [development guide](docs/workflow-dev-doc.md)
 - [Demo acceptance scenarios](docs/demo-acceptance.md)
 
-`STEP/`, `REPLAY/`, and `review/` retain historical design and verification records;
-their results describe the versions and dates recorded there, not the current build.
-
-## Contributing and license
-
-Bug reports, documentation improvements, and focused pull requests are welcome.
-Follow the [contribution guide](CONTRIBUTING.md) and [code of conduct](CODE_OF_CONDUCT.md).
-For vulnerabilities, follow the private reporting instructions in [SECURITY.md](SECURITY.md).
+## License
 
 Copyright © 2026 zaoweiceng. SkillX is licensed under the [MIT License](LICENSE).
 Third-party dependencies retain their own licenses; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -19,15 +19,12 @@ SkillX 是一个本地优先的 AI 工作空间，把对话、Agent、技能和�
 - **持久执行与恢复**：SQLite 队列、独立 Worker、人工交互卡片、取消、重试和失败接力。
 - **轨迹与技能管理**：查看模型请求和返回，管理技能内容及版本。
 
-自动固化只覆盖可验证的受支持场景；任意生成代码和新副作用仍需审核。
-MCP Streamable HTTP 等实现限制见[能力状态](docs/capability-status.md)。
-
 ![SkillX 工作流列表](docs/screenshots/workflow-library.jpg)
 
 ## 快速开始
 
 需要 Python **3.12–3.13**、[uv](https://docs.astral.sh/uv/getting-started/installation/)、
-Node.js **22.19+**、npm 和 Git。启动脚本适用于 macOS / Linux；Windows 请使用 WSL。
+Node.js **22.19+**、npm 和 Git。启动脚本适用于 macOS / Linux。
 
 克隆仓库并启动：
 
@@ -56,21 +53,6 @@ API_PORT=8001 FRONTEND_PORT=5174 ./dev.sh  # 自定义本地端口
 正常升级会执行增量迁移，不需要重置数据库。升级前请备份本地数据。
 `./dev.sh --reset-db` 仅用于不兼容旧数据库的破坏性重建，会删除历史数据和已发布版本，
 不要把它当成正常安装或升级步骤。
-
-## 运行第一个示例
-
-不配置模型服务，也可以先运行内置的「问候工作流」体验完整流程：
-
-1. 在「工作流」列表找到「问候工作流」，点击「编辑」。
-2. 点击「生成问候」节点，查看输入映射和模板；画布支持拖放节点与连线。
-3. 在页面下方「手动运行 v1」输入姓名，例如 `SkillX`，点击「启动已发布版本」。
-4. 在运行详情查看节点状态、事件记录和结果 `你好，SkillX`。这个示例不调用模型。
-
-编辑草稿不会改变已发布版本。需要让修改生效时，保存草稿、执行静态检查，再发布新版本。
-
-![可视化编辑问候工作流](docs/screenshots/workflow-editor.jpg)
-
-![问候工作流的节点状态与实际运行结果](docs/screenshots/workflow-run.jpg)
 
 ## 配置与安全边界
 
@@ -132,9 +114,6 @@ tools/         开发与文档检查工具
 - [产品设计](docs/workflow-design-doc.md)与[开发说明](docs/workflow-dev-doc.md)
 - [演示验收场景](docs/demo-acceptance.md)
 
-## 贡献与许可
-
-贡献请遵循 [CONTRIBUTING.md](CONTRIBUTING.md)；漏洞请按 [SECURITY.md](SECURITY.md) 私下报告。
-`STEP/`、`REPLAY/` 和 `review/` 为历史设计与验收记录，结论仅对应记录中的版本和日期。
+## 许可
 
 Copyright © 2026 zaoweiceng。采用 [MIT License](LICENSE)；第三方依赖保留各自许可证。
