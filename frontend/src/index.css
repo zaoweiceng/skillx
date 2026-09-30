@@ -25,7 +25,11 @@
   --field: #2f2f2f;
   --code-bg: #171717;
   --overlay: #171717;
-  --focus: rgba(140, 140, 140, 0.34);
+  --focus: rgba(139, 152, 167, .35);
+  --control-hover: #30343b;
+  --control-selected: #343d49;
+  --control-selected-hover: #414d5c;
+  --control-border: #8b98a7;
   --notice-border: #446453;
   --notice-bg: rgba(51, 122, 87, 0.14);
   --notice-text: #89d3ad;
@@ -60,7 +64,11 @@
   --field: #ffffff;
   --code-bg: #f3f5f4;
   --overlay: #f9f9f9;
-  --focus: rgba(100, 100, 100, 0.3);
+  --focus: rgba(134, 149, 167, .3);
+  --control-hover: #f4f6f8;
+  --control-selected: #edf1f5;
+  --control-selected-hover: #e3eaf2;
+  --control-border: #8695a7;
   --notice-border: #397353;
   --notice-bg: #e8f4ec;
   --notice-text: #205d3d;
@@ -249,10 +257,10 @@ button {
 .theme-toggle:focus-visible,
 button:focus-visible,
 a:focus-visible,
-input:focus-visible,
-textarea:focus-visible,
+input:focus-visible:not([class*="ant-"]),
+textarea:focus-visible:not([class*="ant-"]),
 select:focus-visible {
-  outline: 3px solid var(--focus);
+  outline: 2px solid var(--focus);
   outline-offset: 2px;
 }
 
@@ -955,8 +963,8 @@ select:focus-visible {
 }
 
 .event-item strong {
-  color: #bec8ca;
-  font-size: 9px;
+  color: var(--text);
+  font-size: 12px;
 }
 
 .event-item small {
@@ -964,7 +972,7 @@ select:focus-visible {
   overflow: hidden;
   color: var(--muted);
   font-family: "SFMono-Regular", monospace;
-  font-size: 8px;
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1701,8 +1709,8 @@ select:focus-visible {
 .inspector-field input:focus-visible,
 .inspector-field textarea:focus-visible,
 .inspector-field select:focus-visible {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
+  border-color: var(--control-border);
+  box-shadow: 0 0 0 2px var(--focus);
   outline: none;
 }
 

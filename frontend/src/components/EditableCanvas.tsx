@@ -47,12 +47,12 @@ function toNode(item: NodeDefinition, x: number, y: number, selected: boolean): 
     },
     style: {
       width: 170,
-      border: `1px solid ${selected ? '#e8ede9' : nodeColors[item.type] ?? '#82959f'}`,
+      border: `1px solid ${selected ? 'var(--control-border)' : 'var(--line)'}`,
       borderLeft: `4px solid ${nodeColors[item.type] ?? '#82959f'}`,
-      borderRadius: 3,
-      background: selected ? '#1c2b34' : '#142028',
-      color: '#e8ede9',
-      boxShadow: '0 8px 24px rgba(0, 0, 0, .24)',
+      borderRadius: 10,
+      background: selected ? 'var(--control-selected)' : 'var(--panel)',
+      color: 'var(--text)',
+      boxShadow: selected ? '0 0 0 2px var(--focus)' : '0 2px 8px rgba(0, 0, 0, .06)',
     },
   }
 }
@@ -144,14 +144,14 @@ export function EditableCanvas({
         onNodeClick={(_, node) => onSelectNode(node.id)}
         deleteKeyCode={['Backspace', 'Delete']}
       >
-        <Background color="#293840" gap={24} size={1} />
+        <Background color="var(--line-soft)" gap={24} size={1} />
         <Controls showInteractive={false} />
         <MiniMap
           nodeColor={(node) =>
             nodeColors[definition.spec.nodes.find((item) => item.id === node.id)?.type ?? ''] ??
             '#82959f'
           }
-          maskColor="rgba(7, 13, 17, .72)"
+          maskColor="var(--graph-mask)"
         />
       </ReactFlow>
     </div>

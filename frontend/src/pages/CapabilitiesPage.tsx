@@ -24,8 +24,8 @@ export default function CapabilitiesPage() {
       locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无匹配的能力" /> }}
       columns={[
         { title: '名称', dataIndex: 'name', render: (name, item) => <div><Link to={`/capabilities/${item.capabilityId}`}><strong>{item.displayName || name}</strong></Link><div className="table-secondary">{capabilityDescription(item)}</div></div> },
-        { title: '接口', render: (_, item) => Object.keys(item.interfaces).map(name => <Tag key={name}>{name}</Tag>) },
-        { title: '当前版本', dataIndex: 'version', render: value => <code>{value}</code> },
+        { title: '接口', width: 140, render: (_, item) => Object.keys(item.interfaces).map(name => <Tag key={name}>{name}</Tag>) },
+        { title: '当前版本', width: 110, dataIndex: 'version', render: value => <code>{value}</code> },
       ]} />
   </div>
 }

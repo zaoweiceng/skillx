@@ -90,3 +90,72 @@ body { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto 
 
 article.component-card { display: flex; flex-direction: column; }
 article.component-card .card-metrics { margin-top: auto; padding-top: 18px; }
+
+/* Keep controls and detail surfaces consistent across routes and portal popups. */
+.ant-select-dropdown { padding: 6px; border: 1px solid var(--line-soft); border-radius: 12px; }
+.ant-select-dropdown .ant-select-item { border-radius: 7px; }
+.ant-select-dropdown .ant-select-item-option-content { line-height: 1.6; }
+.ant-modal-body { max-height: min(72dvh, 760px); overflow-y: auto; scrollbar-gutter: stable; }
+.page .ant-card { border-color: var(--line-soft); }
+.page .ant-card-head { border-color: var(--line-soft); }
+.page .ant-alert { margin-bottom: 18px; }
+.page .ant-table-wrapper { border: 1px solid var(--line-soft); border-radius: 14px; }
+.page .ant-table { border-radius: 14px; }
+.page .ant-table-cell { font-size: 13px; }
+.page .ant-table-thead > tr > th { font-size: 12px; font-weight: 500; white-space: nowrap; }
+.page .ant-pagination { padding-inline: 16px; }
+.table-secondary { line-height: 1.7; }
+.component-card h2, .component-card p, .setting-card p { overflow-wrap: anywhere; }
+.component-card:hover { background: var(--panel); }
+.filter-strip { border: 0; padding-bottom: 0; }
+.panel { border-color: var(--line-soft); border-radius: 14px; overflow: hidden; }
+.panel-heading { border-color: var(--line-soft); gap: 12px; }
+.run-header-actions { flex-wrap: wrap; }
+.status-badge { border-radius: 6px; border-color: var(--line); background: var(--panel-raised); font-family: inherit; font-size: 11px; line-height: 1.5; letter-spacing: 0; }
+.status-badge.success { border-color: color-mix(in srgb, var(--status-success) 20%, var(--line-soft)); background: color-mix(in srgb, var(--status-success) 8%, var(--panel)); }
+.status-badge.active { border-color: color-mix(in srgb, var(--status-active) 20%, var(--line-soft)); background: color-mix(in srgb, var(--status-active) 8%, var(--panel)); }
+.status-badge.warning { border-color: color-mix(in srgb, var(--status-warning) 20%, var(--line-soft)); background: color-mix(in srgb, var(--status-warning) 8%, var(--panel)); }
+.status-badge.danger { border-color: color-mix(in srgb, var(--status-danger) 20%, var(--line-soft)); background: color-mix(in srgb, var(--status-danger) 8%, var(--panel)); }
+.event-item { padding: 14px 16px; grid-template-columns: 36px minmax(0, 1fr); }
+.event-item > span { color: var(--muted); font-size: 10px; padding-top: 2px; }
+.event-item > div { min-width: 0; }
+.event-item strong { font-weight: 500; }
+.event-item:hover, .node-row summary:hover { background: var(--control-hover); }
+.node-row strong { font-size: 13px; }.node-row small { font-size: 11px; line-height: 1.7; }
+.json-block { border-color: var(--line-soft); border-radius: 9px; padding: 14px; font-size: 12px; line-height: 1.8; }
+.source-editor { background: var(--code-bg); color: var(--text); font-size: 12px; }
+.source-editor:focus { box-shadow: inset 0 0 0 2px var(--focus); }
+.technical-evidence, .presentation-policy-editor { border-radius: 10px; }
+.workflow-graph .react-flow__minimap { border-color: var(--line-soft); border-radius: 8px; overflow: hidden; }
+.graph-node-label small { color: var(--muted); }
+.run-header h1 { font-size: 28px; font-weight: 600; letter-spacing: -.7px; }
+.node-panel, .event-panel { min-height: 0; align-self: start; }
+.run-layout .event-list, .run-layout .node-table { max-height: 420px; }
+.node-table > a.node-row { display: flex; align-items: center; gap: 12px; padding: 16px; color: var(--text); }
+.node-table > a.node-row:hover { background: var(--control-hover); }
+.node-table > a.node-row > div { min-width: 0; overflow-wrap: anywhere; }
+.node-table > a.node-row svg { flex-shrink: 0; color: var(--muted); }
+
+@media (max-width: 1050px) {
+  .palette-panel, .inspector-panel { min-height: 0; }
+  .palette-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); padding: 0 16px 16px; }
+  .inspector-panel > .inspector-empty { padding: 0 16px 16px; }
+}
+@media (max-width: 600px) {
+  .ant-modal { top: 24px; padding-bottom: 24px; }
+  .ant-modal-body { max-height: calc(100dvh - 156px); }
+  .page-header, .run-header { align-items: flex-start; gap: 16px; }
+  .run-header-actions { width: 100%; gap: 8px; }
+  .run-header-actions .ant-btn { flex: 1 1 calc(50% - 8px); }
+  .run-header h1 { font-size: 24px; }
+  .panel-heading { flex-wrap: wrap; padding: 16px; }
+  .node-detail { grid-template-columns: minmax(0, 1fr); padding: 0 14px 14px; }
+  .setting-card { grid-template-columns: 38px minmax(0, 1fr); gap: 12px; }
+  .setting-card > .status-badge { grid-column: 2; justify-self: start; }
+  .execution-options label { flex-basis: 100%; min-width: 0; }
+  .page .ant-card-head { padding-inline: 16px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .component-card { animation: none; transition: none; }
+  .component-card:hover { transform: none; }
+}

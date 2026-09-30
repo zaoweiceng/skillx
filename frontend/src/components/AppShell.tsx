@@ -16,6 +16,9 @@ const navigation = [
 
 export default function AppShell() {
   const { isDark, toggleTheme } = useTheme()
+  const controls = isDark
+    ? { hover: '#30343b', selected: '#343d49', selectedHover: '#414d5c', border: '#8b98a7', ring: 'rgba(139, 152, 167, .18)', text: '#ececec' }
+    : { hover: '#f4f6f8', selected: '#edf1f5', selectedHover: '#e3eaf2', border: '#8695a7', ring: 'rgba(134, 149, 167, .16)', text: '#171717' }
   const navigate = useNavigate()
   const { pathname } = useLocation()
   const navigationPath = pathname.startsWith('/components') ? '/workflows' : pathname
@@ -32,12 +35,31 @@ export default function AppShell() {
       colorBgBase: isDark ? '#212121' : '#ffffff',
       colorBgContainer: isDark ? '#262626' : '#ffffff',
       colorBorder: isDark ? '#424242' : '#e4e4e7',
+      colorBorderSecondary: isDark ? '#343434' : '#e5e5e5',
+      colorText: controls.text,
+      colorTextSecondary: isDark ? '#b4b4b4' : '#666666',
+      colorBgElevated: isDark ? '#292929' : '#ffffff',
+      controlItemBgHover: controls.hover,
+      controlItemBgActive: controls.selected,
+      controlItemBgActiveHover: controls.selectedHover,
+      controlOutline: controls.ring,
+      controlOutlineWidth: 2,
+      boxShadowSecondary: isDark ? '0 8px 28px rgba(0, 0, 0, .3)' : '0 8px 28px rgba(24, 39, 58, .1)',
       borderRadius: 10, controlHeight: 38, fontSize: 14,
       fontFamily: 'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", sans-serif',
     },
     components: {
       Button: { primaryShadow: 'none', defaultShadow: 'none' },
-      Select: { optionSelectedBg: isDark ? '#424242' : '#f0f0f0' },
+      Select: {
+        optionSelectedBg: controls.selected, optionSelectedColor: controls.text,
+        optionSelectedFontWeight: 500, optionActiveBg: controls.hover,
+        optionPadding: '8px 12px', optionHeight: 36,
+        activeBorderColor: controls.border, hoverBorderColor: controls.border,
+        activeOutlineColor: controls.ring,
+      },
+      Input: { activeBorderColor: controls.border, hoverBorderColor: controls.border, activeShadow: `0 0 0 2px ${controls.ring}` },
+      InputNumber: { activeBorderColor: controls.border, hoverBorderColor: controls.border, activeShadow: `0 0 0 2px ${controls.ring}` },
+      Table: { headerBg: isDark ? '#2b2b2b' : '#f7f8fa', headerColor: isDark ? '#b4b4b4' : '#666666', rowHoverBg: controls.hover, borderColor: isDark ? '#343434' : '#e5e5e5' },
       Segmented: { trackBg: isDark ? '#171717' : '#f3f3f3' },
     },
   }}>
