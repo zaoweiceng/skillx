@@ -304,8 +304,11 @@ export type WorkflowVersionSummary = {
 }
 
 export type ChatReferenceFile = { name: string; content: string }
+export type ChatImageInput = { name: string; mimeType: string; data: string }
+export type ChatImageReference = { name: string; url: string; mimeType?: string }
 
 export type ChatMessageContent = {
+  images?: ChatImageReference[]
   referenceFiles?: Array<{ name: string }>
   taskId?: string
   type: string
@@ -867,14 +870,14 @@ export const api = {
       turns: ConversationTurn[]
     }>(`/conversations/${id}`),
   workspaceDirectories: (path?: string) => request<{path: string; parent: string; directories: {name: string; path: string}[]}>(`/workspace-directories${path ? `?path=${encodeURIComponent(path)}` : ""}`),
-  sendMessage: (id: string, content: string, referenceFiles?: ChatReferenceFile[], workingDirectory?: string) =>
+  sendMessage: (id: string, content: string, referenceFiles?: ChatReferenceFile[], workingDirectory?: string, images?: ChatImageInput[]) =>
     request<{
       userMessageId: string
       assistant: ChatMessageContent
       turn: ConversationTurn
     }>(
       `/conversations/${id}/messages`,
-      { method: 'POST', body: JSON.stringify({ content, ...(workingDirectory ? { workingDirectory } : {}), ...(referenceFiles?.length ? { referenceFiles } : {}) }) },
+      { method: 'POST', body: JSON.stringify({ content, ...(workingDirectory ? { workingDirectory } : {}), ...(referenceFiles?.length ? { referenceFiles } : {}), ...(images?.length ? { images } : {}) }) },
     ),
   confirmComponent: (
     conversationId: string,

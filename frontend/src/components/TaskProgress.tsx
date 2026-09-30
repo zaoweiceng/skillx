@@ -5,8 +5,8 @@ import styles from './TaskProgress.module.css'
 
 import { progressLabel, summarizeProgress, kindLabels, type TaskEvent } from './taskProgressEvents'
 
-export default function TaskProgress({ id, finished, invocations }: {
-  id: string; finished: boolean; invocations: Array<{id: string; kind: string; status: string}>
+export default function TaskProgress({ id, finished, learningActive = false, invocations }: {
+  id: string; finished: boolean; learningActive?: boolean; invocations: Array<{id: string; kind: string; status: string}>
 }) {
   const [events, setEvents] = useState<TaskEvent[]>([])
   const [error, setError] = useState('')
@@ -34,12 +34,12 @@ export default function TaskProgress({ id, finished, invocations }: {
         setError(reason instanceof Error ? reason.message : '无法获取进度')
         more = true
       }
-      if (active && (!finished || more)) timer = setTimeout(poll, more ? 250 : 1000)
+      if (active && (!finished || learningActive || more)) timer = setTimeout(poll, more ? 250 : 1000)
     }
     void poll()
     const clock = finished ? undefined : setInterval(() => setNow(Date.now()), 1000)
     return () => { active = false; abort.abort(); clearTimeout(timer); clearInterval(clock) }
-  }, [id, finished])
+  }, [id, finished, learningActive])
   const steps = summarizeProgress(events)
   const latest = events.map(event => ({ ...event, label: progressLabel(event) })).filter(event => event.label).at(-1)
   const waiting = latest ? Math.max(0, Math.floor((now - Date.parse(latest.createdAt)) / 1000)) : 0

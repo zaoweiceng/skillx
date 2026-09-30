@@ -44,6 +44,7 @@
 .workspaceSplitter .historyPanel { padding-right: 12px; overflow: hidden; }
 .workspaceSplitter .historyPanel :global(.conversation-history) { height: 100%; }
 .workspaceSplitter .messagePanel { display: flex; min-width: 0; padding-left: 12px; overflow: hidden; }
+.workspaceSplitter .compactMessagePanel { padding-left: 0; }
 .workspaceSplitter .messagePanel :global(.message-column) { flex: 1; }
 .workspaceSplitter :global(.ant-splitter-bar-dragger)::before { background: var(--line-soft); }
 .workspaceSplitter :global(.ant-splitter-bar-dragger)::after { display: none; }
@@ -63,6 +64,14 @@
 .composerActions :global(.ant-btn) { width: 34px; height: 34px; padding: 0; }
 .composerActions :global(.ant-btn-primary) { width: 36px; height: 36px; }
 .attachments { display: flex; gap: 6px; flex-wrap: wrap; min-width: 0; padding: 2px 4px; margin-bottom: 12px; }
+.imageAttachments { display: flex; gap: 10px; flex-wrap: wrap; padding: 4px; margin-bottom: 10px; }
+.imageAttachment { position: relative; width: 76px; height: 76px; border: 1px solid var(--line-soft); border-radius: 12px; background: var(--panel-raised); }
+.imageAttachment :global(.ant-image), .imageAttachment :global(.ant-image-img), .imageAttachment :global(.ant-image-mask) { width: 100% !important; height: 100% !important; border-radius: 11px; object-fit: cover; }
+.imageAttachment :global(.ant-image-mask-info) { font-size: 10px; }
+.removeImage { position: absolute; right: -6px; top: -6px; display: grid; place-items: center; width: 22px; height: 22px; padding: 0; border-radius: 50%; border: 1px solid var(--line-soft); background: var(--panel); color: var(--text); box-shadow: 0 2px 6px #0002; cursor: pointer; z-index: 1; }
+.removeImage:hover { background: var(--panel-raised); }
+.removeImage:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.removeImage:disabled { cursor: default; opacity: .5; }
 .attachments :global(.ant-tag) { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 @media (max-width: 600px) {
   .composer { width: 100%; padding: 12px; border-radius: 22px; margin-inline: 0; }

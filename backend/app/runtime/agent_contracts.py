@@ -17,6 +17,7 @@ class AgentRunRequest:
     output_schema: dict[str, Any] = field(default_factory=dict)
     allowed_tools: list[str] = field(default_factory=list)
     tool_descriptors: list[dict[str, Any]] = field(default_factory=list)
+    images: list[dict[str, str]] = field(default_factory=list)
     max_steps: int = 8
     max_tokens: int = 1250000
     max_input_tokens: int = 1000000

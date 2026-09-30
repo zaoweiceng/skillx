@@ -7,6 +7,7 @@ import type { Selection } from '@/features/runtime/AgentSelector'
 import {
   api,
   ChatMessageContent,
+  type ChatImageInput,
   type ChatReferenceFile,
   ConversationRunEvent,
   type ConversationRunSummary,
@@ -332,18 +333,18 @@ export function useConversation() {
     }
   }, [activeWorkflowRunIds, refresh])
 
-  async function send(event: FormEvent, referenceFiles: ChatReferenceFile[] = [], workingDirectory?: string) {
+  async function send(event: FormEvent, referenceFiles: ChatReferenceFile[] = [], workingDirectory?: string, images: ChatImageInput[] = []) {
     event.preventDefault()
-    if (!input.trim() || sendingRef.current) return false
+    if ((!input.trim() && !images.length) || sendingRef.current) return false
     sendingRef.current = true
-    const text = input.trim()
+    const text = input.trim() || '请分析这些图片。'
     setInput('')
     setSending(true)
     setOptimisticStartedAt(Date.now())
     const optimistic: Message = {
       id: `local-${Date.now()}`,
       role: 'user',
-      content: { type: 'text', text, referenceFiles },
+      content: { type: 'text', text, referenceFiles, ...(images.length ? { images: images.map(image => ({ name: image.name, url: `data:${image.mimeType};base64,${image.data}` })) } : {}) },
     }
     setMessages((current) => [...current, optimistic])
     try {
@@ -356,7 +357,7 @@ export function useConversation() {
       if (!conversationId && (draftSelection.agentProfileId || draftSelection.traexModel || draftSelection.reasoningEffort || draftSelection.modelProfileId || draftSelection.model)) {
         await runtimeRequest(`/conversations/${targetId}`, 'PUT', draftSelection)
       }
-      const result = await (workingDirectory ? api.sendMessage(targetId, text, referenceFiles, workingDirectory) : referenceFiles.length ? api.sendMessage(targetId, text, referenceFiles) : api.sendMessage(targetId, text))
+      const result = await (images.length ? api.sendMessage(targetId, text, referenceFiles, workingDirectory, images) : workingDirectory ? api.sendMessage(targetId, text, referenceFiles, workingDirectory) : referenceFiles.length ? api.sendMessage(targetId, text, referenceFiles) : api.sendMessage(targetId, text))
       if (
         result.assistant.conversationRunId &&
         (result.assistant.type === 'agent_run' || result.assistant.runType === 'agent_run')

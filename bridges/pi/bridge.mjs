@@ -41,6 +41,9 @@ let session;
 let apiKey;
 let failureCode = 'MODEL_PROVIDER_ERROR';
 const scrub = value => {
+  if (typeof value === 'string' && /^data:image\/[\w.+-]+;base64,/.test(value)) {
+    return value.slice(0, value.indexOf(',')) + ',[图片数据已省略]';
+  }
   if (typeof value === 'string') return apiKey ? value.split(apiKey).join('[REDACTED]') : value;
   if (Array.isArray(value)) return value.map(scrub);
   if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) =>
@@ -68,6 +71,9 @@ try {
   const key = process.env[process.env.SKILLX_AGENT_API_KEY_ENV ?? 'SKILLX_AGENT_API_KEY'];
   apiKey = key;
   const options = JSON.parse(process.env.SKILLX_PI_MODEL_OPTIONS ?? '{}');
+  const imageReferences = JSON.parse(args.images ?? '[]');
+  if (imageReferences.length && !options.images) throw new Error('当前模型未声明支持图片输入');
+  const images = imageReferences.map(image => ({ type: 'image', mimeType: image.mimeType, data: readFileSync(image.path).toString('base64') }));
   if (!endpoint || !modelId || !key) throw new Error('Pi model configuration unavailable');
   const cwd = process.cwd();
   const agentDir = join(cwd, '.pi-runtime');
@@ -75,7 +81,7 @@ try {
   runtime.registerProvider('skillx', {
     baseUrl: endpoint.replace(/\/chat\/completions\/?$/, '').replace(/\/$/, ''),
     api: 'openai-completions',
-    models: [{ id: modelId, name: modelId, reasoning: options.reasoning || Boolean(process.env.SKILLX_REASONING_EFFORT), input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: options.contextWindow ?? 128000, maxTokens: options.maxOutputTokens ?? 8192 }],
+    models: [{ id: modelId, name: modelId, reasoning: options.reasoning || Boolean(process.env.SKILLX_REASONING_EFFORT), input: options.images ? ['text', 'image'] : ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: options.contextWindow ?? 128000, maxTokens: options.maxOutputTokens ?? 8192 }],
   });
   await runtime.setRuntimeApiKey('skillx', key);
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
@@ -137,7 +143,7 @@ try {
     }
   });
   emit('agent.plan', { summary: 'Pi 使用 Host 授权的工具执行任务' });
-  await session.prompt(args.prompt);
+  await session.prompt(args.prompt, { images, expandPromptTemplates: false });
   const message = [...session.state.messages].reverse().find(item => item.role === 'assistant');
   if (!message || ['error', 'aborted'].includes(message.stopReason)) throw new Error(message?.errorMessage || 'Pi model request failed or aborted');
   failureCode = 'MODEL_MALFORMED_OUTPUT';

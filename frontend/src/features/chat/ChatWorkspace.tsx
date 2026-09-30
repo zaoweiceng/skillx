@@ -54,21 +54,22 @@ export function ChatWorkspace({ sidebar, children, collapsed = false, trace, tra
       onResizeEnd={sizes => { if (traceOpen) { try { localStorage.setItem('skillx-chat-trace-width', String(sizes[1])) } catch { /* Storage is optional. */ } } }}
       onDraggerDoubleClick={() => { setTraceWidth(320); try { localStorage.setItem('skillx-chat-trace-width', '320') } catch { /* Storage is optional. */ } }}>
     <Splitter.Panel min={280} className={styles.conversationPanel}>
-    {compact ? <>{!collapsed && sidebar}{children}</> : <ConfigProvider theme={{components: {
+    {compact && !collapsed && sidebar}
+    <ConfigProvider theme={{components: {
       Splitter: {splitBarSize: 1, splitTriggerSize: 12},
     }}}>
       <Splitter className={styles.workspaceSplitter}
-        onResize={sizes => { if (!collapsed) setWidth(clampWidth(sizes[0])) }}
-        onResizeEnd={sizes => { if (!collapsed) persistWidth(sizes[0]) }}
+        onResize={sizes => { if (!compact && !collapsed) setWidth(clampWidth(sizes[0])) }}
+        onResizeEnd={sizes => { if (!compact && !collapsed) persistWidth(sizes[0]) }}
         onDraggerDoubleClick={() => persistWidth(DEFAULT_WIDTH)}>
-        <Splitter.Panel size={collapsed ? 0 : width} min={collapsed ? 0 : MIN_WIDTH} max={MAX_WIDTH} resizable={!collapsed} className={`${styles.historyPanel} ${collapsed ? styles.historyCollapsed : ''}`}>
-          {sidebar}
+        <Splitter.Panel size={compact || collapsed ? 0 : width} min={compact || collapsed ? 0 : MIN_WIDTH} max={MAX_WIDTH} resizable={!compact && !collapsed} className={`${styles.historyPanel} ${compact || collapsed ? styles.historyCollapsed : ''}`}>
+          {!compact && sidebar}
         </Splitter.Panel>
-        <Splitter.Panel min={280} className={styles.messagePanel}>
+        <Splitter.Panel min={280} className={`${styles.messagePanel} ${compact ? styles.compactMessagePanel : ''}`}>
           {children}
         </Splitter.Panel>
       </Splitter>
-    </ConfigProvider>}
+    </ConfigProvider>
     </Splitter.Panel>
     <Splitter.Panel size={traceOpen ? traceWidth : 0} min={traceOpen ? 240 : 0} max="60%" resizable={traceOpen} className={styles.tracePanel}>
       {trace}

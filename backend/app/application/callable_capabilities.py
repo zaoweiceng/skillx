@@ -141,7 +141,8 @@ async def resolve_callable(session, version_id: str) -> CallableCapability:
             "capabilityId": workflow.workflow_id,
             "name": owner.name,
             "displayName": owner.name,
-            "description": semantic.get("summary") or definition.get("metadata", {}).get("description", ""),
+            "description": semantic.get("summary")
+            or definition.get("metadata", {}).get("description", ""),
             "version": str(workflow.version),
             "status": "published",
             "digest": workflow.digest,
@@ -169,9 +170,21 @@ async def resolve_callable(session, version_id: str) -> CallableCapability:
 
 
 async def callable_catalog(session) -> list[dict]:
+    from app.infrastructure.models import ManagedSkill
+
+    managed = list(await session.scalars(select(ManagedSkill)))
+    hidden = {
+        skill.skillx_capability_id for skill in managed
+        if skill.skillx_capability_id and (
+            not skill.enabled or skill.deleted_at or not skill.skillx_version_id
+            or skill.converted_source_digest != skill.source_digest
+        )
+    }
     version_ids = list(
         await session.scalars(
-            select(Capability.current_version_id).where(Capability.current_version_id.is_not(None))
+            select(Capability.current_version_id).where(
+                Capability.current_version_id.is_not(None), Capability.id.not_in(hidden)
+            )
         )
     )
     version_ids.extend(

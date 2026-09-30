@@ -1,0 +1,8 @@
+.cardMain { border: 0; background: none; padding: 0; color: inherit; text-align: left; cursor: pointer; font: inherit; width: 100%; }
+.cardMain:focus-visible { outline: 2px solid var(--text); outline-offset: 6px; border-radius: 8px; }
+.version { color: var(--muted); font-size: 12px; margin: 0 0 16px; overflow-wrap: anywhere; }
+.disabled { opacity: .65; }
+.actions { gap: 8px; flex-wrap: wrap; }
+.code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+.schemas { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 20px; }
+@media (max-width: 600px) { .schemas { grid-template-columns: 1fr; gap: 0; } }

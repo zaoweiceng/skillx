@@ -34,6 +34,7 @@ from .runs import NodeRun as NodeRun
 from .runs import Run as Run
 from .runs import RunEvent as RunEvent
 from .runs import RunPresentation as RunPresentation
+from .skills import ManagedSkill as ManagedSkill
 from .tasks import HumanInteraction as HumanInteraction
 from .tasks import Invocation as Invocation
 from .tasks import LearningJob as LearningJob

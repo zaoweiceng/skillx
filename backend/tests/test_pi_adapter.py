@@ -1,6 +1,7 @@
 """Real Pi SDK against a deterministic local OpenAI protocol server."""
 
 import asyncio
+import base64
 import json
 import shutil
 from pathlib import Path
@@ -25,7 +26,10 @@ def test_registry_rejects_duplicate_registration() -> None:
 @pytest.mark.skipif(not shutil.which("node"), reason="Node is required for Pi SDK")
 @pytest.mark.parametrize("with_tool", [False, True])
 @pytest.mark.parametrize("effort", [None, "high"])
-async def test_pi_sdk_returns_validated_output(monkeypatch, tmp_path, with_tool, effort) -> None:
+@pytest.mark.parametrize("with_image", [False, True])
+async def test_pi_sdk_returns_validated_output(
+    monkeypatch, tmp_path, with_tool, effort, with_image
+) -> None:
     received = []
 
     async def respond(reader, writer):
@@ -98,12 +102,21 @@ async def test_pi_sdk_returns_validated_output(monkeypatch, tmp_path, with_tool,
     from app.application.runtime_config import agent_runtime_config
     from app.runtime.agent_registry import default_agent_registry
 
-    runtime = replace(agent_runtime_config(), reasoning_effort=effort)
+    runtime = replace(
+        agent_runtime_config(), reasoning_effort=effort, model_options={"images": with_image}
+    )
+    image_data = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8"
+        "/x8AAwMCAO+aBZkAAAAASUVORK5CYII="
+    )
+    image_file = tmp_path / "image.png"
+    image_file.write_bytes(base64.b64decode(image_data))
     try:
         result = await AgentHost(adapter=default_agent_registry().create(runtime)).execute(
             AgentHostRequest(
                 run_id=str(uuid4()),
                 prompt="Return reply ok",
+                images=[{"path": str(image_file), "mimeType": "image/png"}] if with_image else [],
                 requested_capabilities=("lookup.table",) if with_tool else (),
                 working_directory=tmp_path,
                 output_schema={
@@ -124,7 +137,25 @@ async def test_pi_sdk_returns_validated_output(monkeypatch, tmp_path, with_tool,
             for event in traces
             if event["payload"]["phase"] == "request"
         ]
-        assert requests == received
+        expected_requests = json.loads(json.dumps(received))
+        if with_image:
+            for request in expected_requests:
+                for message in request["messages"]:
+                    if isinstance(message.get("content"), list):
+                        for part in message["content"]:
+                            if part["type"] == "image_url":
+                                part["image_url"]["url"] = "data:image/png;base64,[图片数据已省略]"
+            assert image_data not in json.dumps(traces)
+            for request in received:
+                image_parts = [
+                    part
+                    for message in request["messages"]
+                    if isinstance(message.get("content"), list)
+                    for part in message["content"]
+                    if part["type"] == "image_url"
+                ]
+                assert image_parts[0]["image_url"]["url"] == f"data:image/png;base64,{image_data}"
+        assert requests == expected_requests
         responses = [
             json.loads(event["payload"]["data"])
             for event in traces

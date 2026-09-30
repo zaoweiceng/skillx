@@ -23,6 +23,7 @@ import { rjsfSchema } from '@/lib/utils'
 import styles from '@/features/chat/chat.module.css'
 import { ConversationHistoryItem } from '@/features/chat/ConversationHistoryItem'
 import { ChatComposer } from '@/features/chat/ChatComposer'
+import { ChatImageAttachments } from '@/features/chat/ChatImageAttachments'
 import { useStoredBoolean } from '@/hooks/useStoredBoolean'
 import { ChatWorkspace } from '@/features/chat/ChatWorkspace'
 import { AgentSelector } from '@/features/runtime/AgentSelector'
@@ -510,6 +511,7 @@ export default function ChatPage() {
               </span>
               <div>
                 <small>{message.role === 'assistant' ? 'SkillX Agent' : '用户'}</small>
+                {message.content.images && <ChatImageAttachments images={message.content.images} />}
                 {!message.content.taskId && (message.role === 'assistant' ? <MarkdownContent>{message.content.text ?? ''}</MarkdownContent> : <p>{message.content.text}</p>)}
                 {!!message.content.referenceFiles?.length && <div className={styles.attachments}>
                   {message.content.referenceFiles.map((file, index) => <Tag key={`${file.name}-${index}`}>{file.name}</Tag>)}

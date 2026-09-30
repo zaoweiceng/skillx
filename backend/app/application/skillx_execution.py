@@ -170,6 +170,7 @@ async def execute_skillx(
             ).execute(
                 AgentHostRequest(
                     run_id=invocation_id,
+                    include_managed_skills=False,
                     prompt=prompt,
                     output_schema=interface["outputSchema"],
                     working_directory=get_settings().artifact_root / "skillx" / invocation_id,

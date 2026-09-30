@@ -3711,6 +3711,16 @@ async def create_message(
     conversation = await session.get(Conversation, conversation_id)
     if conversation is None or conversation.deleted_at is not None:
         raise HTTPException(404, "对话不存在")
+    image_runtime = None
+    if body.images:
+        from app.application.runtime_profiles import agent_snapshot
+        image_runtime = await agent_snapshot(
+            session, conversation.agent_profile_id, conversation.traex_model,
+            conversation.reasoning_effort, conversation.model_profile_id, conversation.agent_model,
+        )
+        if image_runtime["type"] != "pi" or not image_runtime.get("model_options", {}).get("images"):
+            raise HTTPException(422, "当前模型未声明支持图片，请在模型设置中勾选‘支持图片’，并选择多模态模型")
+    content = body.content.strip() or ("请分析这些图片。" if body.images else body.content)
     selected_directory = (
         body.working_directory if "working_directory" in body.model_fields_set
         else conversation.working_directory
@@ -3737,24 +3747,29 @@ async def create_message(
         conversation_id=conversation.id,
         turn_id=turn.id,
         role="user",
-        content_json={"type": "text", "text": body.content, **({
+        content_json={"type": "text", "text": content, **({
             "referenceFiles": [{"name": item.name} for item in body.reference_files],
         } if body.reference_files else {})},
         created_at=accepted_at,
     )
+    if body.images:
+        from app.application.chat_images import store_images
+        user_message.content_json = {
+            **user_message.content_json, "images": store_images(body.images, user_message.id),
+        }
     session.add(user_message)
     await session.flush()
     turn.user_message_id = user_message.id
     conversation.last_message_at = accepted_at
     conversation.updated_at = accepted_at
     if conversation.title == "新对话":
-        title = " ".join(body.content.split())
+        title = " ".join(content.split())
         conversation.title = title[:32] + ("…" if len(title) > 32 else "")
     # Message acceptance is a short durable transaction. No model or Tool call
     # below is allowed to inherit this SQLite write lock.
     await session.commit()
     from app.application.tasks import enqueue_task
-    task = await enqueue_task(session, conversation, turn.id, body.content)
+    task = await enqueue_task(session, conversation, turn.id, content, runtime_snapshot=image_runtime)
     task.state_json = {"userInputs": body.inputs or {}, "componentHint": body.component_id,
                        "workingDirectory": selected_directory}
     if body.reference_files:
@@ -3762,6 +3777,8 @@ async def create_message(
             **task.state_json,
             "referenceFiles": [item.model_dump() for item in body.reference_files],
         }
+    if body.images:
+        task.state_json = {**task.state_json, "images": user_message.content_json["images"]}
     assistant_message = Message(
         id=str(uuid4()), conversation_id=conversation.id, turn_id=turn.id,
         role="assistant", content_json={"type": "task", "taskId": task.id, "text": "任务已接受"},
@@ -3773,6 +3790,22 @@ async def create_message(
     await session.commit()
     return {"taskId": task.id, "userMessageId": user_message.id,
             "assistant": assistant_message.content_json, "turn": await turn_view(session, turn)}
+
+
+@router.get("/chat-images/{message_id}/{image_id}", response_class=FileResponse)
+async def chat_image(message_id: str, image_id: str, session: AsyncSession = Depends(get_session)):
+    from app.application.chat_images import image_path
+
+    message = await session.get(Message, message_id)
+    conversation = await session.get(Conversation, message.conversation_id) if message else None
+    reference = next((item for item in (message.content_json.get("images", []) if message else [])
+                      if item["id"] == image_id), None)
+    if not reference or not conversation or conversation.deleted_at is not None:
+        raise HTTPException(404, "图片不存在")
+    path = image_path(reference)
+    if not path.is_file():
+        raise HTTPException(404, "图片不存在")
+    return FileResponse(path, media_type=reference["mimeType"], headers={"X-Content-Type-Options": "nosniff"})
 
 
 async def _unbound_conversation_message(

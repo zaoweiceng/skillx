@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import json
 from datetime import timedelta
-from typing import Literal
 from uuid import uuid4
 
 import yaml
 from jsonschema import Draft202012Validator
-from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import or_, select, update
 
-from app.application.agent_host import AgentHost, AgentHostRequest
 from app.application.compiler import WorkflowCompiler, digest_json
+from app.application.learning_contracts import ContractExample as ContractExample
+from app.application.learning_contracts import InstructionSkillProposal as InstructionSkillProposal
+from app.application.learning_contracts import LearningProposal as LearningProposal
+from app.application.learning_contracts import SkillProposal as SkillProposal
+from app.application.learning_contracts import SkillXProposal as SkillXProposal
 from app.application.runtime_profiles import restore_agent_snapshot
 from app.application.tasks import emit, task_catalog
 from app.config import get_settings
@@ -23,97 +25,103 @@ from app.runtime.skillx import load_manifest
 from app.runtime.skillx_host import execute_in_subprocess
 
 
-class ContractExample(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    input: dict
-    expected: dict
-    sourceInvocationId: str | None = None
-
-
-class SkillProposal(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    name: str = Field(pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-    description: str = Field(min_length=1)
-    inputSchema: dict
-    outputSchema: dict
-    kind: Literal["direct", "llm", "agent"] = "direct"
-    prompt: str = Field(default="", max_length=100000)
-    dependencies: dict = Field(default_factory=dict)
-    source: str = Field(default="", max_length=100000)
-    examples: list[ContractExample] = Field(min_length=2, max_length=8)
-
-
-class LearningProposal(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    decision: str = Field(pattern="^(skip|candidate)$")
-    reason: str
-    skills: list[SkillProposal] = Field(default_factory=list, max_length=8)
-    workflow: dict | None = None
-    baseVersionId: str | None = None
-    workflowExamples: list[ContractExample] = Field(default_factory=list, max_length=8)
-
-
-def complete_single_skill_workflow(proposal: LearningProposal) -> None:
-    """A single validated capability has an unambiguous identity workflow.
-
-    This supplies structure, never invents tests, alters output or publishes without replay.
-    Multi-skill composition must still be specified explicitly by the learning agent.
-    """
-    if proposal.workflow is not None or len(proposal.skills) != 1:
+def validate_learning_scope(proposal: LearningProposal, evidence: dict, kind: str) -> None:
+    if proposal.decision == "skip":
         return
-    skill = proposal.skills[0]
-    schemas = (skill.inputSchema, skill.outputSchema)
-    if any(schema.get("type") != "object" or not schema.get("properties") for schema in schemas):
-        return
-    if any(set(schema.get("required", [])) != set(schema["properties"]) for schema in schemas):
-        return
-    proposal.workflow = {
-        "apiVersion": "workflow.platform/v1",
-        "kind": "Workflow",
-        "metadata": {
-            "name": skill.name,
-            "capability": {
-                "summary": skill.description,
-                "useWhen": [skill.description],
-                "doNotUseWhen": ["超出输入输出契约的任务"],
-                "examples": [json.dumps(skill.examples[0].input, ensure_ascii=False)],
-                "tags": ["自动固化"],
+    if not proposal.skills and not proposal.skillx and not proposal.workflow:
+        raise ValueError("没有可复用产物，应选择 skip")
+    for skill in proposal.skills:
+        if any(
+            id not in evidence or evidence[id].status != "succeeded"
+            for id in skill.sourceInvocationIds
+        ):
+            raise ValueError("Skill 缺少所引用的成功执行证据")
+    if kind == "repair" and not proposal.workflow:
+        raise ValueError("工作流修复必须提供修订契约")
+    if proposal.workflow and kind != "repair":
+        if not proposal.workflowScope.strip() or not proposal.workflowSourceInvocationIds:
+            raise ValueError("工作流必须说明可复用片段的边界及来源调用")
+        if any(
+            id not in evidence or evidence[id].status != "succeeded"
+            for id in proposal.workflowSourceInvocationIds
+        ):
+            raise ValueError("工作流片段引用了不存在或未成功的调用")
+
+
+async def save_learned_skills(
+    session, proposal: LearningProposal, roots: dict, registered: dict, job_id: str
+) -> dict:
+    from app.application.managed_skills import parse_skill, save_skill
+    from app.infrastructure.models import CapabilityVersion, ManagedSkill
+
+    raw_ids, converted_ids = {}, {}
+    for skill in proposal.skills:
+        metadata, body = parse_skill(skill.content)
+        metadata.update(
+            {
+                "name": skill.name,
+                "description": skill.description,
+                "useWhen": skill.useWhen,
+                "x-learning-job-id": job_id,
+                "x-source-invocations": skill.sourceInvocationIds,
+            }
+        )
+        content = "---\n" + yaml.safe_dump(metadata, allow_unicode=True) + "---\n\n" + body
+        # Do not overwrite a user's existing guide; identical guides can be reused.
+        candidates = await session.scalars(
+            select(ManagedSkill).where(
+                ManagedSkill.name == skill.name,
+                ManagedSkill.description == skill.description,
+                ManagedSkill.deleted_at.is_(None),
+            )
+        )
+        existing = next(
+            (
+                candidate
+                for candidate in candidates
+                if parse_skill(candidate.content)[1] == body
+                and parse_skill(candidate.content)[0].get("useWhen") == skill.useWhen
+            ),
+            None,
+        )
+        managed = existing or await save_skill(
+            session,
+            {
+                "name": skill.name,
+                "displayName": skill.displayName or skill.name,
+                "description": skill.description,
+                "content": content,
+                "enabled": True,
             },
-        },
-        "spec": {
-            "inputSchema": skill.inputSchema,
-            "outputSchema": skill.outputSchema,
-            "nodes": [
-                {"id": "input", "type": "input", "displayName": "输入"},
-                {
-                    "id": "execute",
-                    "type": "skillx",
-                    "displayName": skill.name[:120],
-                    "input": {
-                        key: "${input." + key + "}" for key in skill.inputSchema["properties"]
-                    },
-                    "config": {"generatedSkill": skill.name, "interface": "execute"},
-                    "timeoutSeconds": 120,
-                },
-                {
-                    "id": "output",
-                    "type": "output",
-                    "displayName": "输出",
-                    "input": {
-                        key: "${execute.output." + key + "}"
-                        for key in skill.outputSchema["properties"]
-                    },
-                },
-            ],
-            "edges": [
-                {"source": "input", "target": "execute"},
-                {"source": "execute", "target": "output"},
-            ],
-            "policies": {"maxDurationSeconds": 180, "maxParallelNodes": 1},
-        },
-    }
-    if not proposal.workflowExamples:
-        proposal.workflowExamples = [example.model_copy(deep=True) for example in skill.examples]
+        )
+        raw_ids[skill.name] = managed.id
+    for skill in proposal.skillx:
+        version = await session.get(CapabilityVersion, registered[skill.name])
+        managed = await session.scalar(
+            select(ManagedSkill).where(
+                ManagedSkill.skillx_capability_id == version.capability_id,
+                ManagedSkill.deleted_at.is_(None),
+            )
+        )
+        if managed:
+            raise ValueError("该 SkillX 已有受管理的版本，请复用其契约，避免覆盖现有 Skill")
+        root = roots[skill.name]
+        managed = await save_skill(
+            session,
+            {
+                "name": skill.name,
+                "displayName": skill.name,
+                "description": skill.description,
+                "content": (root / "SKILL.md").read_text(),
+                "enabled": True,
+            },
+            imported=root,
+        )
+        managed.skillx_capability_id = version.capability_id
+        managed.skillx_version_id = version.id
+        managed.converted_source_digest = managed.source_digest
+        converted_ids[skill.name] = managed.id
+    return {"skills": raw_ids, "skillx": registered, "skillxSkills": converted_ids}
 
 
 def observed_output(invocation):
@@ -212,8 +220,11 @@ async def materialize_skill(proposal: SkillProposal, job_id: str, evidence: dict
     root = get_settings().capability_root.resolve() / "generated" / job_id / proposal.name
     root.mkdir(parents=True, exist_ok=True)
     (root / "SKILL.md").write_text(
-        f"---\nname: {proposal.name}\ndescription: {proposal.description}\n"
-        f"---\n{proposal.description}\n"
+        "---\n"
+        + yaml.safe_dump(
+            {"name": proposal.name, "description": proposal.description}, allow_unicode=True
+        )
+        + f"---\n{proposal.description}\n"
     )
     (root / "input.json").write_text(json.dumps(proposal.inputSchema))
     (root / "output.json").write_text(json.dumps(proposal.outputSchema))
@@ -406,6 +417,7 @@ class LearningDriver:
                 job.status = "published"
                 job.result_json = {
                     "workflowVersionId": published.id,
+                    **published.definition_json.get("metadata", {}).get("learningArtifacts", {}),
                     "reason": "从已提交的发布证据恢复",
                 }
                 job.lease_token, job.lease_expires_at = None, None
@@ -463,6 +475,7 @@ class LearningDriver:
                     {
                         "id": x.id,
                         "kind": x.kind,
+                        "status": x.status,
                         "input": x.request_json,
                         "output": x.output_json,
                         "error": x.error_json,
@@ -528,9 +541,16 @@ class LearningDriver:
             if llm_runtime.get("modelSnapshot"):
                 available_kinds.append("llm")
             context["availableSkillKinds"] = available_kinds
-            proposal_schema = LearningProposal.model_json_schema()
-            kind_schema = proposal_schema["$defs"]["SkillProposal"]["properties"]["kind"]
-            kind_schema["enum"] = available_kinds
+            from app.infrastructure.models import ManagedSkill
+
+            context["existingSkills"] = [
+                {"id": skill.id, "name": skill.name, "description": skill.description}
+                for skill in await session.scalars(
+                    select(ManagedSkill).where(
+                        ManagedSkill.enabled.is_(True), ManagedSkill.deleted_at.is_(None)
+                    )
+                )
+            ]
         proposal = None
         if kind == "repair":
             from app.application.automatic_repair import revise_from_failure
@@ -571,90 +591,68 @@ class LearningDriver:
                         current.lease_token, current.lease_expires_at = None, None
                 return True
         try:
-            result = await AgentHost(runtime=runtime).execute(
-                AgentHostRequest(
-                    run_id="learning-" + job_id,
-                    working_directory=get_settings().artifact_root / "learning" / job_id,
-                    prompt=(
-                        "分析这次探索是否值得复用，或是否存"
-                        "在稳定工作流缺陷。正常复用不应修改。"
-                        "先复用已有 SkillX，稳定业务能力抽象为"
-                        " SkillX，再用 Workflow 编排。"
-                        "不机械包装每次工具调用，不把实"
-                        "例值、人工授权或首次结果写死。"
-                        "暂时性网络错误、拒绝授权、缺信息选择 skip。"
-                        "稳定的模型任务可生成 kind=agent 或 llm 的 SkillX，提供 prompt；"
-                        "禁止绑定当次人工授权，模型候选也须通过真实模型的不同输入业务断言。"
-                        "model 调用的 output 是原始模型证据，input.input 是业务输入；"
-                        "仅可选择 availableSkillKinds 中的接口类型。"
-                        "使用 kind=agent 可通过本地真实 Agent 模型执行，不需要额外 LLM API 配置。"
-                        "单个稳定能力也应发布成可调用 Workflow；"
-                        "只有一个新 SkillX 时允许 workflow=null，"
-                        "由平台按原输入输出契约生成直通编排。"
-                        "部分可固化任务只保留稳定子步骤，临时建议不要纳入契约。"
-                        "sourceInvocationId 必须精确使用 calls.id；"
-                        "code 的 expected 必须等于 stdout 解析后的完整JSON对象。"
-                        "确定性能力优先 kind=direct；提供独立纯 Python execu"
-                        "te(request, context)，参数来自 request.input 字典，返回输出 dict；"
-                        "至少两个不同输入测试，原任务测试使用真实 so"
-                        "urceInvocationId 和对应结果。"
-                        "source 禁止外部 I/O 或未声明依赖，直接用 request.input 读取参数。"
-                        "可用 dependencies 声明已观察到的只读 SkillX（kind=skillx，"
-                        "ref=名称@精确版本#接口）或 Host 操作（kind=host-operator，ref=能力名）；"
-                        "异步代码通过 await context.capabilities.call(别名, 参数) 调用。"
-                        "依赖验证仅使用原任务真实调用的精确输入输出，缺少证据保留候选。"
-                        "必须有 input 和 output 节点；参考 workflowExample 的完整格式，"
-                        "metadata.capability 包含 summary/useWhen/doNotUseWhen/examples/tags。"
-                        "Workflow 节点仅允许 input/output/skillx/condition/transform/"
-                        "capability_call/workflow_call。"
-                        "即使 SkillX 接口是 agent 或 llm，引用它的节点也必须 type=skillx。"
-                        "Workflow 必须符合 workflowSchema（apiVersion/kind/metadata/spec），"
-                        "节点引用使用 ${input.field} 和 ${node.output.field}。引用新能力时"
-                        "config={generatedSkill:名称,inter"
-                        "face:execute}；其余 SkillX 使用已发布版本。"
-                        "Workflow 同样提供 workflowExampl"
-                        "es（两个不同输入及期望输出，至少一个关联原任务证据）。"
-                        "目录中的能力统一使用 capability_call 节点，config 包含"
-                        " capabilityVersionId（目录 id）、interface 和 digest；不需要判断内部实现。"
-                        "授权回答只解释历史行为，禁止转成后续默认授权。"
-                        "保留原语义目录 metadata 和 presentation"
-                        "Policy，必要时明确基版本 baseVersionId。\n"
-                        + json.dumps(context, ensure_ascii=False)
-                    ),
-                    output_schema=proposal_schema,
-                    max_steps=1,
-                    max_duration_seconds=120,
-                )
+            from app.application.learning_agents import LearningAgentPipeline
+
+            pipeline = LearningAgentPipeline(job_id, task_id, token, runtime)
+            proposal = await pipeline.generate(
+                context,
+                materializer=lambda skill, source_ids: materialize_skill(
+                    skill, job_id, {id: evidence[id] for id in source_ids}
+                ),
             )
-            proposal = LearningProposal.model_validate(result.output)
-            if any(skill.kind not in available_kinds for skill in proposal.skills):
+            if any(skill.kind not in available_kinds for skill in proposal.skillx):
                 raise ValueError("候选使用了当前未配置的模型接口")
-            if kind == "distill" and proposal.decision == "candidate":
-                complete_single_skill_workflow(proposal)
+            validate_learning_scope(proposal, evidence, kind)
             if proposal.decision == "skip":
                 status, output = "skipped", {"reason": proposal.reason}
             else:
-                roots = {
-                    skill.name: await materialize_skill(skill, job_id, evidence)
-                    for skill in proposal.skills
-                }
-                if not proposal.workflow:
-                    raise ValueError("缺少工作流契约，保留能力候选")
+                roots = pipeline.materialized_roots
                 async with SessionLocal() as session:
+                    await pipeline._owned_job(session)
                     from copy import deepcopy
 
                     from app.api.schemas import PublishRequest
                     from app.application.capabilities import register_skillx
                     from app.application.workflow_publishing import publish_workflow
 
-                    definition = deepcopy(proposal.workflow)
-                    definition.setdefault("metadata", {})["learningJobId"] = job_id
                     registered = {}
                     for name, root in roots.items():
                         _, version = await register_skillx(
                             session, str(root.relative_to(get_settings().capability_root.resolve()))
                         )
                         registered[name] = version.id
+                    artifacts = await save_learned_skills(
+                        session, proposal, roots, registered, job_id
+                    )
+                    if not proposal.workflow:
+                        # Commit standalone capabilities and job completion together.
+                        current = await session.get(LearningJob, job_id)
+                        if current.lease_token != token:
+                            raise ValueError("固化任务租约已失效")
+                        output = {
+                            **artifacts,
+                            "reason": proposal.reason,
+                            "agentStages": current.result_json.get("agentStages", {}),
+                        }
+                        current.status, current.result_json = "published", output
+                        current.lease_token, current.lease_expires_at = None, None
+                        emit(
+                            session,
+                            task_id,
+                            "learning.published",
+                            {"jobId": job_id, "kind": kind, **output},
+                        )
+                        await session.commit()
+                        return True
+                    definition = deepcopy(proposal.workflow)
+                    definition.setdefault("metadata", {}).update(
+                        {
+                            "learningJobId": job_id,
+                            "learningArtifacts": artifacts,
+                            "reuseScope": proposal.workflowScope,
+                            "sourceInvocationIds": proposal.workflowSourceInvocationIds,
+                        }
+                    )
                     for node in definition["spec"]["nodes"]:
                         name = node.get("config", {}).pop("generatedSkill", None)
                         if name:
@@ -744,6 +742,7 @@ class LearningDriver:
                         evidence,
                         generated_ids=set(registered.values()),
                     )
+                    await pipeline._owned_job(session)
                     published = await publish_workflow(
                         workflow.id,
                         PublishRequest(
@@ -753,7 +752,8 @@ class LearningDriver:
                     )
                     output = {
                         "workflowVersionId": published["id"],
-                        "skills": registered,
+                        **artifacts,
+                        "scope": proposal.workflowScope,
                         "reason": proposal.reason,
                     }
                     status = "published"
@@ -762,6 +762,13 @@ class LearningDriver:
             reason = str(exc)
             if diagnostics:
                 reason += ": " + "; ".join(f"{d.path}: {d.message}" for d in diagnostics)
+            if proposal and proposal.workflow and pipeline.workflow_name:
+                from app.application.learning_agents import LearningLeaseLost
+
+                try:
+                    await pipeline.invalidate("workflow", pipeline.workflow_name, reason)
+                except LearningLeaseLost:
+                    pass
             status, output = (
                 "queued" if attempts < 3 else "blocked",
                 {"reason": reason, "proposal": proposal.model_dump() if proposal else None},
@@ -771,6 +778,7 @@ class LearningDriver:
             if current.lease_token == token:
                 if observation_id:
                     output["observationId"] = observation_id
+                output["agentStages"] = current.result_json.get("agentStages", {})
                 current.status, current.result_json = status, output
                 current.lease_token, current.lease_expires_at = None, None
                 emit(

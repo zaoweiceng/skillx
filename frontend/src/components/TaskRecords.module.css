@@ -18,3 +18,8 @@
 .resultKey { color: var(--text); font-size: 12px; }
 .reason { overflow-wrap: anywhere; }
 .heading .status { padding: 2px 8px; border-radius: 6px; background: var(--panel-raised); color: var(--muted); }
+.stages { display: grid; gap: 8px; margin: 10px 0; }
+.stage { padding: 12px; border-left: 2px solid var(--line-soft); border-radius: 0 8px 8px 0; background: var(--panel-raised); }
+.stage .heading { flex-wrap: wrap; margin-bottom: 6px; }
+.stage .heading .error { margin-left: auto; }
+.stageMeta { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 11px; overflow-wrap: anywhere; }

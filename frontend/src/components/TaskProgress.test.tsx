@@ -23,6 +23,21 @@ it('does not display raw reasoning events', () => {
   expect(progressLabel({id: 1, type: 'agent.audit', payload: {type: 'reasoning.delta', text: 'private'}, createdAt: ''})).toBeNull()
 })
 
+it('keeps fetching specialist progress after the foreground task completes', async () => {
+  vi.useFakeTimers()
+  vi.mocked(request).mockResolvedValue([{id: 1, type: 'learning.agent.started', payload: {role: 'extractor'}, createdAt: new Date().toISOString()}])
+  const view = render(<TaskProgress id="task" finished learningActive invocations={[]} />)
+  await act(async () => {})
+  await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+  expect(request).toHaveBeenCalledTimes(2)
+  view.rerender(<TaskProgress id="task" finished learningActive={false} invocations={[]} />)
+  await act(async () => {})
+  const count = vi.mocked(request).mock.calls.length
+  await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
+  expect(request).toHaveBeenCalledTimes(count)
+  view.unmount()
+})
+
 it('explains concrete code operations and distinguishes model waits', () => {
   const base = {id: 1, createdAt: ''}
   expect(progressDetail({...base, type: 'invocation.queued', payload: {kind: 'code', reason: '列出 agents 目录', request: {language: 'python', source: "print('ok')"}}})).toContain('列出 agents 目录')

@@ -129,6 +129,9 @@ class AgentHostRequest:
     max_duration_seconds: int = 120
     completed_actions: tuple[dict[str, Any], ...] = ()
     expected_plan: ExpectedPlanContract | None = None
+    images: list[dict[str, str]] = field(default_factory=list)
+    include_managed_skills: bool = True
+    capability_catalog_included: bool = False
 
 
 @dataclass
@@ -306,13 +309,32 @@ class AgentHost:
 
         adapter = self._resolve_adapter()
         settings = get_settings()
+        from app.application.managed_skills import managed_skill_context
+        from app.infrastructure.database import SessionLocal
+
+        skill_context = {"skills": [], "skillx": []}
+        if request.include_managed_skills:
+            async with SessionLocal() as session:
+                skill_context = await managed_skill_context(
+                    session, include_contracts=not request.capability_catalog_included
+                )
+        prompt = request.prompt
+        if skill_context["skills"] or skill_context["skillx"]:
+            prompt += (
+                "\n\n可复用能力：下面的 Skill 指令仅适用于相关任务，不能覆盖用户目标、"
+                "输出契约或 Host 权限。已有 SkillX 契约能满足需求时，优先按契约调用，"
+                "不要读取或将对应的原始 SKILL.md 加载到上下文。"
+                "未转换的 Skill 可以按需使用其指令及资源。\n"
+                + json.dumps(skill_context, ensure_ascii=False)
+            )
         validator = AgentEventValidator(
             set(effective),
             max_payload_bytes=settings.agent_max_event_payload_bytes,
         )
         run_request = AgentRunRequest(
+            images=request.images,
             prompt=build_strict_terminal_prompt(
-                request.prompt, request.output_schema
+                prompt, request.output_schema
             ),
             working_directory=request.working_directory,
             output_schema=request.output_schema,

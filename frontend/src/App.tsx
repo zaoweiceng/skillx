@@ -9,6 +9,7 @@ import ChatPage from '@/pages/ChatPage'
 const ComponentDetailPage = lazy(() => import('@/pages/ComponentDetailPage'))
 const RunDetailPage = lazy(() => import('@/pages/RunDetailPage'))
 const SettingsPage = lazy(() => import('@/pages/SettingsPage'))
+const SkillsPage = lazy(() => import('@/pages/SkillsPage'))
 const WorkflowEditorPage = lazy(() => import('@/pages/WorkflowEditorPage'))
 const WorkflowExecutePage = lazy(() => import('@/pages/WorkflowExecutePage'))
 const WorkflowsPage = lazy(() => import('@/pages/WorkflowsPage'))
@@ -32,6 +33,7 @@ export default function App() {
           <Route path="/capabilities/:id" element={<CapabilityDetailPage />} />
           <Route path="/capabilities" element={<CapabilitiesPage />} />
           <Route path="/settings" element={<SettingsPage />} />
+          <Route path="/skills" element={<SkillsPage />} />
           <Route path="*" element={<Navigate to="/chat" replace />} />
         </Route>
       </Routes>

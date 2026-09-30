@@ -12,11 +12,12 @@ it('saves a service with a manual key and multiple models', async () => {
   fireEvent.change(screen.getByRole('textbox', { name: 'Base URL' }), { target: { value: 'https://example.com/v1' } })
   fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'manual-secret' } })
   fireEvent.change(screen.getByRole('textbox', { name: '模型 ID 1' }), { target: { value: 'model-first' } })
+  fireEvent.click(screen.getByRole('checkbox', { name: '支持图片 1' }))
   fireEvent.click(screen.getByRole('button', { name: '添加模型' }))
   fireEvent.change(screen.getByRole('textbox', { name: '模型 ID 2' }), { target: { value: 'model-second' } })
   fireEvent.click(screen.getByRole('button', { name: /保\s*存/ }))
   await waitFor(() => expect(request).toHaveBeenCalledWith('', 'POST', expect.objectContaining({
-    kind: 'model', config: expect.objectContaining({ apiKey: 'manual-secret', model: 'model-first', models: [expect.objectContaining({ id: 'model-first' }), expect.objectContaining({ id: 'model-second' })] }),
+    kind: 'model', config: expect.objectContaining({ apiKey: 'manual-secret', model: 'model-first', models: [expect.objectContaining({ id: 'model-first', images: true }), expect.objectContaining({ id: 'model-second', images: false })] }),
   })))
 })
 it('editing a service never prepopulates the key and blank retains its reference', async () => {

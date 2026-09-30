@@ -12,6 +12,7 @@ from sqlalchemy.exc import OperationalError
 from app.api.handoffs import router as handoffs_router
 from app.api.routes import router
 from app.api.runtime_profiles import router as profiles_router
+from app.api.skills import router as skills_router
 from app.api.tasks import router as tasks_router
 from app.config import get_settings
 from app.infrastructure.database import Conversation, SessionLocal, init_database
@@ -52,6 +53,7 @@ app.include_router(router, prefix="/api")
 app.include_router(tasks_router, prefix="/api")
 app.include_router(profiles_router, prefix="/api")
 app.include_router(handoffs_router, prefix="/api")
+app.include_router(skills_router, prefix="/api")
 
 
 @app.middleware("http")

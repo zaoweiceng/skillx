@@ -1053,6 +1053,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/chat-images/{message_id}/{image_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Chat Image */
+        get: operations["chat_image_api_chat_images__message_id___image_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/conversations/{conversation_id}/confirm-component": {
         parameters: {
             query?: never;
@@ -1734,6 +1751,94 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/skills": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Skills */
+        get: operations["list_skills_api_skills_get"];
+        put?: never;
+        /** Create Skill */
+        post: operations["create_skill_api_skills_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/skills/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Preview Skill */
+        post: operations["preview_skill_api_skills_preview_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/skills/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Import Skill */
+        post: operations["import_skill_api_skills_import_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/skills/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Skill */
+        get: operations["get_skill_api_skills__id__get"];
+        /** Update Skill */
+        put: operations["update_skill_api_skills__id__put"];
+        post?: never;
+        /** Delete Skill */
+        delete: operations["delete_skill_api_skills__id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/skills/{id}/convert": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Convert */
+        post: operations["convert_api_skills__id__convert_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1806,6 +1911,18 @@ export interface components {
             input: {
                 [key: string]: unknown;
             };
+        };
+        /** ChatImage */
+        ChatImage: {
+            /** Name */
+            name: string;
+            /**
+             * Mimetype
+             * @enum {string}
+             */
+            mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+            /** Data */
+            data: string;
         };
         /** ChatReferenceFile */
         ChatReferenceFile: {
@@ -1890,6 +2007,17 @@ export interface components {
         ConversationTitleUpdate: {
             /** Title */
             title: string;
+        };
+        /** ConversionExample */
+        ConversionExample: {
+            /** Input */
+            input: {
+                [key: string]: unknown;
+            };
+            /** Expected */
+            expected: {
+                [key: string]: unknown;
+            };
         };
         /** Decision */
         Decision: {
@@ -2013,6 +2141,8 @@ export interface components {
             inputs?: {
                 [key: string]: unknown;
             } | null;
+            /** Images */
+            images?: components["schemas"]["ChatImage"][];
             /** Referencefiles */
             referenceFiles?: components["schemas"]["ChatReferenceFile"][];
         };
@@ -2025,6 +2155,11 @@ export interface components {
              * @default false
              */
             reasoning: boolean;
+            /**
+             * Images
+             * @default false
+             */
+            images: boolean;
             /**
              * Contextwindow
              * @default 128000
@@ -2160,6 +2295,57 @@ export interface components {
             modelProfileId?: string | null;
             /** Model */
             model?: string | null;
+        };
+        /** SkillContent */
+        SkillContent: {
+            /** Content */
+            content: string;
+        };
+        /** SkillConversion */
+        SkillConversion: {
+            /**
+             * Kind
+             * @enum {string}
+             */
+            kind: "direct" | "agent" | "existing";
+            /** Expectedrevision */
+            expectedRevision: number;
+            /** Inputschema */
+            inputSchema?: {
+                [key: string]: unknown;
+            };
+            /** Outputschema */
+            outputSchema?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Source
+             * @default
+             */
+            source: string;
+            /** Examples */
+            examples?: components["schemas"]["ConversionExample"][];
+        };
+        /** SkillImport */
+        SkillImport: {
+            /** Path */
+            path: string;
+        };
+        /** SkillInput */
+        SkillInput: {
+            /** Name */
+            name: string;
+            /** Displayname */
+            displayName: string;
+            /** Description */
+            description: string;
+            /** Content */
+            content: string;
+            /**
+             * Enabled
+             * @default true
+             */
+            enabled: boolean;
         };
         /** TaskCheckpointAnswer */
         TaskCheckpointAnswer: {
@@ -4440,6 +4626,36 @@ export interface operations {
             };
         };
     };
+    chat_image_api_chat_images__message_id___image_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                message_id: string;
+                image_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     confirm_component_api_conversations__conversation_id__confirm_component_post: {
         parameters: {
             query?: never;
@@ -5706,6 +5922,255 @@ export interface operations {
         responses: {
             /** @description Successful Response */
             202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_skills_api_skills_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    create_skill_api_skills_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SkillInput"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_skill_api_skills_preview_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SkillContent"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    import_skill_api_skills_import_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SkillImport"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_skill_api_skills__id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_skill_api_skills__id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SkillInput"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_skill_api_skills__id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    convert_api_skills__id__convert_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SkillConversion"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
                 headers: {
                     [name: string]: unknown;
                 };

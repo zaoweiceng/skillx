@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom'
 import { useState } from 'react'
 import { request } from '@/api/http'
 import styles from './TaskRecords.module.css'
+import { learningRoleLabels } from './taskProgressEvents'
 
 type Invocation = { id: string; kind: string; status: string; runId?: string; output: unknown; error: unknown; request?: Record<string, unknown>; reason?: string; workingDirectory?: string }
 type Learning = { id: string; kind: string; status: string; result: unknown }
@@ -32,6 +33,28 @@ function ResultPreview({ value }: { value: unknown }) {
   const text = format(parsed)
   if ([...text.slice(0, 1000)].filter(char => char === '\ufffd' || (char.charCodeAt(0) < 32 && !'\n\r\t'.includes(char))).length > 3) return <div className={styles.reason}>输出含非文本字符，已折叠；可展开查看完整内容。</div>
   return <div className={styles.reason}>{text.slice(0, 240)}{text.length > 240 ? '…（展开查看完整输出）' : ''}</div>
+}
+function LearningStages({ value }: { value: unknown }) {
+  const stages = Object.entries(record(value))
+  if (!stages.length) return null
+  const labels: Record<string, string> = { running: '执行中', completed: '已完成', failed: '执行失败', needs_revision: '等待修订' }
+  const tokens = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 })
+  return <div className={styles.stages} aria-label="后台专业 Agent 阶段">{stages.map(([key, raw]) => {
+    const stage = record(raw)
+    const invalid = stage.status === 'failed' || stage.status === 'needs_revision'
+    return <div className={styles.stage} key={key}>
+      <div className={styles.heading}><strong>{learningRoleLabels[String(stage.role)] ?? String(stage.role)}</strong><span className={invalid ? styles.error : styles.status}>{labels[String(stage.status)] ?? String(stage.status)}</span></div>
+      <div className={styles.stageMeta}>
+        {!!stage.name && <span>{String(stage.name)}</span>}
+        {typeof stage.attempt === 'number' && stage.attempt > 1 && <span>第 {stage.attempt} 次尝试</span>}
+        {typeof stage.totalTokens === 'number' && <span>{tokens.format(stage.totalTokens)} Token</span>}
+        {typeof stage.durationMs === 'number' && <span>{(stage.durationMs / 1000).toFixed(1)} 秒</span>}
+        {!!stage.validationStatus && <span>{({ passed: '执行验证通过', running: '执行验证中', failed: '执行验证失败' } as Record<string, string>)[String(stage.validationStatus)]}</span>}
+      </div>
+      {invalid && !!stage.error && <p className={styles.error}>{String(stage.error)}</p>}
+      {stage.output != null && <Collapse ghost size="small" items={[{ key: 'draft', label: '查看阶段产物', children: <pre className={styles.output}>{format(stage.output)}</pre> }]} />}
+    </div>
+  })}</div>
 }
 export default function TaskRecords({ id, invocations, learning }: { id: string; invocations: Invocation[]; learning: Learning[] }) {
   const [downloading, setDownloading] = useState(false)
@@ -81,9 +104,13 @@ export default function TaskRecords({ id, invocations, learning }: { id: string;
           <Collapse ghost size="small" items={[{key: 'raw', label: '原始数据', children: <pre className={styles.output}>{format({request: item.request, output: item.output, error: item.error})}</pre>}]} />
         </div>
       }) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无调用记录" />},
-      ...(learning.length ? [{key: 'learning', label: '工作流固化', children: learning.map(item => <div className={styles.call} key={item.id}>
-        <div className={styles.heading}><Workflow size={15} /><strong>{item.kind === 'repair' ? '工作流修复' : '工作流固化'}</strong><span className={styles.status}>{statusLabels[item.status] ?? item.status}</span></div>
+      ...(learning.length ? [{key: 'learning', label: '能力提炼与固化', children: learning.map(item => <div className={styles.call} key={item.id}>
+        <div className={styles.heading}><Workflow size={15} /><strong>{item.kind === 'repair' ? '工作流修复' : '可复用能力提炼'}</strong><span className={styles.status}>{statusLabels[item.status] ?? item.status}</span></div>
         {typeof record(item.result).reason === 'string' && <div className={styles.reason}>{String(record(item.result).reason)}</div>}
+        {typeof record(item.result).scope === 'string' && <div className={styles.reason}>复用边界：{String(record(item.result).scope)}</div>}
+        {Object.keys(record(record(item.result).skills)).length > 0 && <p>Skill：{Object.keys(record(record(item.result).skills)).join('、')}</p>}
+        {Object.keys(record(record(item.result).skillx)).length > 0 && <p>SkillX：{Object.keys(record(record(item.result).skillx)).join('、')}</p>}
+        <LearningStages value={record(item.result).agentStages} />
         <Collapse ghost size="small" items={[{key: 'raw', label: '原始数据', children: <pre className={styles.output}>{format(item.result)}</pre>}]} />
       </div>)}] : []),
     ]} />

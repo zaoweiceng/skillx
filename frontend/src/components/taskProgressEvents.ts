@@ -1,6 +1,6 @@
 export type TaskEvent = { id: number; type: string; payload: Record<string, unknown>; createdAt: string }
 const labels: Record<string, string> = {
-  'learning.published': '已固化为工作流', 'learning.blocked': '固化受阻', 'learning.queued': '等待后台固化', 'learning.skipped': '无需固化',
+  'learning.published': '已提取可复用能力', 'learning.blocked': '固化受阻', 'learning.queued': '等待提炼可复用能力', 'learning.skipped': '没有需要固化的可复用片段',
   'task.decision_rejected': '模型返回格式不符合要求，正在重试',
   'task.requeued': '服务重启，任务已重新排队',
   'task.accepted': '任务已接受', 'task.succeeded': '任务完成', 'task.failed': '任务失败',
@@ -14,7 +14,21 @@ const labels: Record<string, string> = {
   'tool.requested': '正在调用工具', 'tool.completed': '工具执行完成',
 }
 export const kindLabels: Record<string, string> = { code: '代码', model: '模型', tool: '工具', capability: '能力', workflow: '工作流', skillx: 'SkillX', install: '依赖安装' }
+export const learningRoleLabels: Record<string, string> = { extractor: '片段提炼 Agent', skill: 'Skill 整理 Agent', skillx: 'SkillX 构建 Agent', workflow: '工作流编排 Agent' }
 export function progressLabel(event: TaskEvent): string | null {
+  const stageActions: Record<string, string> = {
+    'learning.agent.started': '正在执行', 'learning.agent.completed': '已完成',
+    'learning.agent.failed': '执行失败', 'learning.agent.validation_failed': '验证失败，等待修订',
+    'learning.validation.started': '正在验证执行结果', 'learning.validation.completed': '执行验证通过',
+  }
+  if (stageActions[event.type]) return `${learningRoleLabels[String(event.payload.role)] ?? '能力整理 Agent'} · ${stageActions[event.type]}${event.payload.name ? ` · ${event.payload.name}` : ''}`
+  if (event.type === 'learning.published') {
+    const count = (value: unknown) => value && typeof value === 'object' ? Object.keys(value).length : 0
+    const parts = [event.payload.workflowVersionId ? '工作流片段' : '',
+      count(event.payload.skills) ? `${count(event.payload.skills)} 个 Skill` : '',
+      count(event.payload.skillx) ? `${count(event.payload.skillx)} 个 SkillX` : ''].filter(Boolean)
+    return parts.length ? `已固化 ${parts.join(' · ')}` : labels[event.type]
+  }
   if (event.type === 'task.decision') return typeof event.payload.summary === 'string' ? event.payload.summary : '已确定下一步操作'
   if (event.type === 'agent.audit') {
     // Only surface execution metadata, never raw model reasoning or structured output fragments.
@@ -27,6 +41,7 @@ export function progressLabel(event: TaskEvent): string | null {
 
 export function progressDetail(event: TaskEvent): string | null {
   const payload = event.payload
+  if (event.type.startsWith('learning.')) return [payload.scope, payload.reason, payload.error].filter(value => typeof value === 'string' && value).join('；') || null
   if (event.type === 'task.decision_rejected') return '模型已响应，但结果未通过任务契约校验；系统将携带校验反馈重试。'
   if (event.type === 'task.accepted') return null
   if (event.type === 'task.decision') {

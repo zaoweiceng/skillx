@@ -1,12 +1,14 @@
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, expect, it, vi } from 'vitest'
 import { useConversation } from './useConversation'
 import type { ConversationTurn } from '@/api/client'
 
 const getConversation = vi.fn()
+const sendMessage = vi.fn()
 vi.mock('@/api/client', () => ({ api: {
   getConversation: (...args: unknown[]) => getConversation(...args),
+  sendMessage: (...args: unknown[]) => sendMessage(...args),
   getHealth: async () => ({ workflowSelectionMode: 'real' }),
   listConversations: async () => ({ items: [], nextCursor: null }),
 } }))
@@ -17,12 +19,27 @@ function Probe() {
   const { tokenLabel, turnFor, messages } = useConversation()
   return <p>{tokenLabel(messages[0] ? turnFor(messages[0]) : undefined)}</p>
 }
+function SendImageProbe() {
+  const { send } = useConversation()
+  return <form onSubmit={event => void send(event, [], undefined, [{ name: 'image.png', mimeType: 'image/png', data: 'image-data' }])}>
+    <button type="submit">发送图片</button>
+  </form>
+}
 const snapshot = (tokens: number | null, completed = false) => ({ id: 'conversation',
   messages: [{ id: 'message', turnId: 'turn', role: 'assistant', content: { type: 'task', taskId: 'task' } }],
   turns: [{ ...turn, completedAt: completed ? new Date().toISOString() : null,
     usage: { state: completed ? 'complete' : 'pending', totalTokens: tokens, stages: [] } }],
 })
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.resetAllMocks() })
+it('submits image-only messages through the API with a separate image payload', async () => {
+  getConversation.mockResolvedValue({ id: 'conversation', messages: [], turns: [] })
+  sendMessage.mockResolvedValue({ assistant: { type: 'task', taskId: 'task' } })
+  render(<MemoryRouter initialEntries={['/chat/conversation']}><Routes><Route path="/chat/:id" element={<SendImageProbe />} /></Routes></MemoryRouter>)
+  await act(async () => {})
+  fireEvent.click(screen.getByRole('button', { name: '发送图片' }))
+  await waitFor(() => expect(sendMessage).toHaveBeenCalledWith('conversation', '请分析这些图片。', [], undefined,
+    [{ name: 'image.png', mimeType: 'image/png', data: 'image-data' }]))
+})
 it('updates known token counts during execution and stops polling after completion', async () => {
   vi.useFakeTimers()
   getConversation.mockResolvedValueOnce(snapshot(null)).mockResolvedValueOnce(snapshot(1234)).mockResolvedValue(snapshot(2345, true))

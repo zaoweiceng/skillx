@@ -13,6 +13,6 @@ export async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const detail = payload.error?.message ?? payload.detail?.message ?? payload.detail
     throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail))
   }
+  if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
 }
-

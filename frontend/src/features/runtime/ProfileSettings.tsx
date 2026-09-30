@@ -5,8 +5,8 @@ import { type Profile, runtimeRequest } from './api'
 import { TraexModelSelect } from './TraexModelSelect'
 import styles from './runtime.module.css'
 
-type Model = { id: string; reasoning: boolean; contextWindow: number; maxOutputTokens: number }
-const newModel = (): Model => ({ id: '', reasoning: false, contextWindow: 128000, maxOutputTokens: 8192 })
+type Model = { id: string; reasoning: boolean; images: boolean; contextWindow: number; maxOutputTokens: number }
+const newModel = (): Model => ({ id: '', reasoning: false, images: false, contextWindow: 128000, maxOutputTokens: 8192 })
 const empty = { name: '', kind: 'model' as Profile['kind'], active: true, isDefault: false,
   config: { adapter: 'pi' as 'traex' | 'pi', modelProfileId: '', baseUrl: '', model: '', apiKey: '', apiKeyEnv: '', models: [newModel()], structuredMode: 'json_schema', timeoutSeconds: 60 } }
 export function ProfileSettings() {
@@ -88,6 +88,7 @@ export function ProfileSettings() {
             <label>上下文 Token<InputNumber aria-label={`上下文 Token ${index + 1}`} min={1024} max={10000000} value={model.contextWindow} onChange={value => editModel(index, { contextWindow: value ?? 128000 })} /></label>
             <label>最大输出 Token<InputNumber aria-label={`最大输出 Token ${index + 1}`} min={1} max={model.contextWindow} value={model.maxOutputTokens} onChange={value => editModel(index, { maxOutputTokens: value ?? 8192 })} /></label>
             <Checkbox checked={model.reasoning} onChange={event => editModel(index, { reasoning: event.target.checked })}>支持推理</Checkbox>
+            <Checkbox aria-label={`支持图片 ${index + 1}`} checked={model.images} onChange={event => editModel(index, { images: event.target.checked })}>支持图片</Checkbox>
             <Button aria-label={`删除模型 ${index + 1}`} icon={<Trash2 size={14} />} disabled={draft.config.models.length === 1} onClick={() => setDraft({ ...draft, config: { ...draft.config, models: draft.config.models.filter((_, position) => position !== index), model: draft.config.model === model.id ? '' : draft.config.model } })} />
           </div>)}<Button icon={<Plus size={14} />} onClick={() => setDraft({ ...draft, config: { ...draft.config, models: [...draft.config.models, newModel()] } })}>添加模型</Button></div>
           <label>默认模型<Select aria-label="服务默认模型" value={draft.config.model || draft.config.models[0]?.id || undefined} onChange={model => setDraft({ ...draft, config: { ...draft.config, model } })} options={draft.config.models.filter(model => model.id).map(model => ({ value: model.id, label: model.id }))} /></label>

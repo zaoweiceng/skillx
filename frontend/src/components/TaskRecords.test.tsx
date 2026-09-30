@@ -26,3 +26,35 @@ it('shows purpose and compact results while keeping source and full output avail
   fireEvent.click(screen.getByText('查看执行代码'))
   expect(screen.getByText('print("secret source")')).toBeTruthy()
 })
+
+it('displays independently extracted guides and executable capabilities', () => {
+  render(<TaskRecords id="task" invocations={[]} learning={[{id: 'job', kind: 'distill', status: 'published', result: {
+    skills: {'analysis-guide': 'guide-id'}, skillx: {'format-report': 'cap-id'}, reason: '只提取复用部分',
+  }}]} />)
+  fireEvent.click(screen.getByText('能力提炼与固化'))
+  expect(screen.getByText('Skill：analysis-guide')).toBeInTheDocument()
+  expect(screen.getByText('SkillX：format-report')).toBeInTheDocument()
+  expect(screen.getByText('只提取复用部分')).toBeInTheDocument()
+  expect(screen.queryByText('工作流固化')).not.toBeInTheDocument()
+})
+
+it('shows specialist progress, validation feedback and compact usage', () => {
+  render(<TaskRecords id="task" invocations={[]} learning={[{id: 'job', kind: 'distill', status: 'queued', result: {
+    agentStages: {
+      extractor: {role: 'extractor', status: 'completed', totalTokens: 12500, output: {decision: 'candidate'}},
+      'skillx:format': {role: 'skillx', name: 'format', status: 'needs_revision', validationStatus: 'failed', error: '不同输入验证失败', attempt: 2},
+      'workflow:report': {role: 'workflow', name: 'report', status: 'running'},
+    },
+  }}]} />)
+  fireEvent.click(screen.getByText('能力提炼与固化'))
+  expect(screen.getByLabelText('后台专业 Agent 阶段')).toBeInTheDocument()
+  expect(screen.getByText('片段提炼 Agent')).toBeInTheDocument()
+  expect(screen.getByText('SkillX 构建 Agent')).toBeInTheDocument()
+  expect(screen.getByText('工作流编排 Agent')).toBeInTheDocument()
+  expect(screen.getByText('12.5K Token')).toBeInTheDocument()
+  expect(screen.getByText('不同输入验证失败')).toBeInTheDocument()
+  expect(screen.getByText('第 2 次尝试')).toBeInTheDocument()
+  expect(screen.queryByText(/"decision"/)).not.toBeInTheDocument()
+  fireEvent.click(screen.getByText('查看阶段产物'))
+  expect(screen.getByText(/"decision": "candidate"/)).toBeInTheDocument()
+})

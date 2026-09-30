@@ -22,6 +22,7 @@ class ModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(min_length=1, max_length=200, pattern=r"^\S+$")
     reasoning: bool = False
+    images: bool = False
     contextWindow: int = Field(default=128000, ge=1024, le=10000000)
     maxOutputTokens: int = Field(default=8192, ge=1, le=1000000)
 

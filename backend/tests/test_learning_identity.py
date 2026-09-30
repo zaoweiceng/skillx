@@ -5,21 +5,19 @@ import pytest
 from sqlalchemy import select
 
 from app.application.agent_host import AgentHost, AgentHostResult
-from app.application.compiler import WorkflowCompiler
 from app.application.invocations import InvocationDriver, enqueue_invocation
 from app.application.task_contracts import TaskCall
 from app.application.task_learning import (
     ContractExample,
     LearningProposal,
     SkillProposal,
-    complete_single_skill_workflow,
 )
 from app.application.tasks import finish_task
 from app.infrastructure.database import SessionLocal
 from app.infrastructure.models.tasks import Invocation, LearningJob, Task
 
 
-def test_identity_workflow_preserves_contract_and_examples():
+def test_standalone_skillx_is_not_automatically_wrapped_as_workflow():
     schema = {"type": "object", "properties": {"value": {"type": "integer"}}, "required": ["value"]}
     skill = SkillProposal(
         name="identity-test",
@@ -34,17 +32,11 @@ def test_identity_workflow_preserves_contract_and_examples():
             ContractExample(input={"value": 2}, expected={"value": 2}),
         ],
     )
-    proposal = LearningProposal(decision="candidate", reason="repeat", skills=[skill])
-    complete_single_skill_workflow(proposal)
-    assert proposal.workflow["spec"]["outputSchema"] == schema
-    assert proposal.workflowExamples[0].sourceInvocationId == "witness"
-    definition = proposal.workflow
-    definition["spec"]["nodes"][1]["config"] = {
-        "capabilityVersionId": str(uuid4()),
-        "interface": "execute",
-    }
-    WorkflowCompiler().compile(definition)
-    assert proposal.workflowExamples[1].input == {"value": 2}
+    proposal = LearningProposal(decision="candidate", reason="repeat", skillx=[skill])
+    assert proposal.workflow is None
+    assert proposal.workflowExamples == []
+    assert proposal.skillx[0].examples[0].sourceInvocationId == "witness"
+    assert proposal.skills == []
 
 
 @pytest.mark.asyncio

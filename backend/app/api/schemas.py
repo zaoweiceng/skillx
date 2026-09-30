@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -95,17 +95,31 @@ class ChatReferenceFile(BaseModel):
     content: str = Field(max_length=128 * 1024)
 
 
+class ChatImage(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    mime_type: Literal["image/png", "image/jpeg", "image/webp", "image/gif"] = Field(
+        alias="mimeType"
+    )
+    data: str = Field(min_length=1, max_length=7 * 1024 * 1024)
+
+
 class MessageCreate(BaseModel):
     working_directory: str | None = Field(default=None, alias="workingDirectory", max_length=4096)
     content: str
     component_id: str | None = Field(default=None, alias="componentId")
     inputs: dict[str, Any] | None = None
+    images: list[ChatImage] = Field(default_factory=list, max_length=8)
     reference_files: list[ChatReferenceFile] = Field(
         default_factory=list, alias="referenceFiles", max_length=8
     )
 
     @model_validator(mode="after")
     def validate_reference_files(self):
+        from app.application.chat_images import MAX_TOTAL_IMAGE_BYTES, decode_image
+
+        image_bytes = sum(len(decode_image(image.data, image.mime_type)) for image in self.images)
+        if image_bytes > MAX_TOTAL_IMAGE_BYTES:
+            raise ValueError("图片总大小不能超过 20 MB")
         sizes = [len(item.content.encode("utf-8")) for item in self.reference_files]
         if any(size > 128 * 1024 for size in sizes) or sum(sizes) > 256 * 1024:
             raise ValueError("参考文件单个不能超过 128 KB，总大小不能超过 256 KB")

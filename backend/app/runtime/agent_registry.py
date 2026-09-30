@@ -56,4 +56,9 @@ class PiAdapter(TraeXSubprocessAdapter):
     def extra_arguments(self, request: AgentRunRequest) -> list[str]:
         import json
 
-        return ["--tool-descriptors", json.dumps(request.tool_descriptors)]
+        return [
+            "--tool-descriptors",
+            json.dumps(request.tool_descriptors),
+            "--images",
+            json.dumps(request.images),
+        ]

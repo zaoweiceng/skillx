@@ -75,7 +75,7 @@ def test_alembic_builds_empty_database_to_head(tmp_path: Path) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(model_usage)")
         }
         component_columns = {row[1] for row in connection.execute("PRAGMA table_info(components)")}
-    assert revision == ("0008_pi_model_selection",)
+    assert revision == ("0009_managed_skills",)
     assert {"model_profile_id", "agent_model"} <= conversation_columns
     assert {
         "runs",
@@ -196,7 +196,7 @@ def test_reset_replaces_legacy_and_interrupted_migration_database(tmp_path: Path
     assert result.returncode == 0, result.stderr
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-            "0008_pi_model_selection",
+            "0009_managed_skills",
         )
         assert connection.execute("SELECT count(*) FROM conversations").fetchone() == (0,)
         assert (
@@ -218,7 +218,7 @@ def test_failed_sqlite_ddl_rolls_back_schema_and_revision(tmp_path: Path) -> Non
     (scripts / "versions" / "failure.py").write_text("""from alembic import op
 import sqlalchemy as sa
 revision = "injected_failure"
-down_revision = "0008_pi_model_selection"
+down_revision = "0009_managed_skills"
 def upgrade():
     op.create_table("_alembic_tmp_probe", sa.Column("id", sa.Integer()))
     raise RuntimeError("injected migration interruption")
@@ -240,7 +240,7 @@ def upgrade():
     assert result.returncode != 0 and "injected migration interruption" in result.stderr
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT version_num FROM alembic_version").fetchone() == (
-            "0008_pi_model_selection",
+            "0009_managed_skills",
         )
         assert (
             connection.execute(

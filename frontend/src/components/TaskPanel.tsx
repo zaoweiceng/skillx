@@ -33,7 +33,7 @@ export default function TaskPanel({ id, onFinished }: { id: string; onFinished?:
     {error && <Alert type="error" title={error} />}
     <span className="task-state">{({succeeded: '已完成', failed: '执行失败', cancelled: '已取消', blocked: '等待处理', running: '正在处理', deciding: '正在分析任务', waiting_execution: '正在执行调用', waiting_user: '等待你的回复', queued: '等待执行'} as Record<string, string>)[task?.status ?? 'queued'] ?? task?.status}</span>
     {task?.output.text && <MarkdownContent>{task.output.text}</MarkdownContent>}
-    <TaskProgress id={id} finished={finished} invocations={task?.invocations ?? []} />
+    <TaskProgress id={id} finished={finished} learningActive={task?.learning.some(job => ['running', 'queued'].includes(job.status))} invocations={task?.invocations ?? []} />
     {task?.error && <Alert type="error" title={task.error.message ?? '任务执行失败'} />}
     {task?.interactions.map(item => <HumanInteractionCard key={item.id} item={item} onAnswered={() => setRevision(x => x + 1)} />)}
     {task && !['succeeded', 'failed', 'cancelled', 'blocked'].includes(task.status) && <Button onClick={cancel}>取消任务</Button>}
