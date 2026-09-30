@@ -26,6 +26,7 @@ from app.api.schemas import ContractPatchApply as ContractPatchApply
 from app.api.schemas import ConversationCreate as ConversationCreate
 from app.api.schemas import ConversationModeUpdate as ConversationModeUpdate
 from app.api.schemas import ConversationRunCreate as ConversationRunCreate
+from app.api.schemas import ConversationTitleUpdate
 from app.api.schemas import Decision as Decision
 from app.api.schemas import DisclosureSessionCreate as DisclosureSessionCreate
 from app.api.schemas import DraftUpdate as DraftUpdate
@@ -3478,7 +3479,7 @@ async def list_conversations(
     query: str | None = Query(default=None, max_length=200),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    statement = select(Conversation)
+    statement = select(Conversation).where(Conversation.deleted_at.is_(None))
     if query:
         statement = statement.where(Conversation.title.contains(query.strip()))
     if cursor:
@@ -3546,6 +3547,48 @@ async def list_conversations(
     }
 
 
+@router.patch("/conversations/{conversation_id}")
+async def rename_conversation(
+    conversation_id: str,
+    body: ConversationTitleUpdate,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    item = await session.get(Conversation, conversation_id)
+    if item is None or item.deleted_at is not None:
+        raise HTTPException(404, "对话不存在")
+    item.title = body.title
+    await session.commit()
+    return {"id": item.id, "title": item.title}
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: str, session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
+    from app.application.tasks import TERMINAL, cancel_task
+    from app.infrastructure.models.tasks import Task
+
+    item = await session.get(Conversation, conversation_id)
+    if item is None:
+        raise HTTPException(404, "对话不存在")
+    if item.deleted_at is None:
+        # Retain execution audit references while removing the conversation from history.
+        item.deleted_at = utcnow()
+        tasks = await session.scalars(select(Task).where(
+            Task.conversation_id == item.id, Task.status.not_in(TERMINAL),
+        ))
+        for task in tasks:
+            await cancel_task(session, task)
+        runs = await session.scalars(select(ConversationRun).where(
+            ConversationRun.conversation_id == item.id,
+            ConversationRun.status.in_(["queued", "running"]),
+        ))
+        for run in runs:
+            await request_cancellation(session, run.id)
+        await session.commit()
+    return {"id": item.id, "deleted": True}
+
+
 @router.patch("/conversations/{conversation_id}/workflow-mode")
 async def update_conversation_workflow_mode(
     conversation_id: str,
@@ -3553,7 +3596,7 @@ async def update_conversation_workflow_mode(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     item = await session.get(Conversation, conversation_id)
-    if item is None:
+    if item is None or item.deleted_at is not None:
         raise HTTPException(404, "对话不存在")
     previous = item.workflow_mode
     item.workflow_mode = body.workflow_mode
@@ -3582,7 +3625,7 @@ async def get_conversation(
     conversation_id: str, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
     item = await session.get(Conversation, conversation_id)
-    if item is None:
+    if item is None or item.deleted_at is not None:
         raise HTTPException(404, "对话不存在")
     messages = (
         await session.scalars(
@@ -3625,7 +3668,7 @@ async def create_message(
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     conversation = await session.get(Conversation, conversation_id)
-    if conversation is None:
+    if conversation is None or conversation.deleted_at is not None:
         raise HTTPException(404, "对话不存在")
     accepted_at = utcnow()
     turn = ConversationTurn(
@@ -3642,7 +3685,9 @@ async def create_message(
         conversation_id=conversation.id,
         turn_id=turn.id,
         role="user",
-        content_json={"type": "text", "text": body.content},
+        content_json={"type": "text", "text": body.content, **({
+            "referenceFiles": [{"name": item.name} for item in body.reference_files],
+        } if body.reference_files else {})},
         created_at=accepted_at,
     )
     session.add(user_message)
@@ -3659,6 +3704,11 @@ async def create_message(
     from app.application.tasks import enqueue_task
     task = await enqueue_task(session, conversation, turn.id, body.content)
     task.state_json = {"userInputs": body.inputs or {}, "componentHint": body.component_id}
+    if body.reference_files:
+        task.state_json = {
+            **task.state_json,
+            "referenceFiles": [item.model_dump() for item in body.reference_files],
+        }
     assistant_message = Message(
         id=str(uuid4()), conversation_id=conversation.id, turn_id=turn.id,
         role="assistant", content_json={"type": "task", "taskId": task.id, "text": "任务已接受"},
@@ -5519,7 +5569,7 @@ async def confirm_component(
     """
 
     conversation = await session.get(Conversation, conversation_id)
-    if conversation is None:
+    if conversation is None or conversation.deleted_at is not None:
         raise HTTPException(404, "对话不存在")
     if conversation.workflow_mode != "enabled":
         raise HTTPException(
@@ -5613,7 +5663,7 @@ async def start_agent_run(
     """
 
     conversation = await session.get(Conversation, conversation_id)
-    if conversation is None:
+    if conversation is None or conversation.deleted_at is not None:
         raise HTTPException(404, "对话不存在")
     default_config = AgentRunConfig.default()
     requested_capabilities = _resolve_agent_capabilities(body.allowed_capabilities)
@@ -6028,7 +6078,8 @@ async def import_conversation_trajectory(
     由服务端 AgentRunService 创建，见 ``POST /conversations/{id}/agent-runs``。
     """
 
-    if await session.get(Conversation, conversation_id) is None:
+    conversation = await session.get(Conversation, conversation_id)
+    if conversation is None or conversation.deleted_at is not None:
         raise HTTPException(404, "对话不存在")
     run = ConversationRun(
         id=str(uuid4()),

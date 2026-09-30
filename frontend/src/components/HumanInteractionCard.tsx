@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { Alert, Button, Card, Tag } from 'antd'
-import Form from '@rjsf/core'
+import Form from '@/components/SchemaForm'
 import validator from '@rjsf/validator-ajv8'
 import { request } from '@/api/http'
 import { rjsfSchema } from '@/lib/utils'

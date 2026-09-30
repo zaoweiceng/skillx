@@ -303,7 +303,10 @@ export type WorkflowVersionSummary = {
   createdAt: string
 }
 
+export type ChatReferenceFile = { name: string; content: string }
+
 export type ChatMessageContent = {
+  referenceFiles?: Array<{ name: string }>
   taskId?: string
   type: string
   state?: string
@@ -818,6 +821,12 @@ export const api = {
       body: JSON.stringify({ title }),
       },
     ),
+  renameConversation: (id: string, title: string) =>
+    request<{ id: string; title: string }>(`/conversations/${id}`, {
+      method: 'PATCH', body: JSON.stringify({ title }),
+    }),
+  deleteConversation: (id: string) =>
+    request<{ id: string; deleted: boolean }>(`/conversations/${id}`, { method: 'DELETE' }),
   listConversations: (cursor?: string, query?: string) => {
     const params = new URLSearchParams({ limit: '30' })
     if (cursor) params.set('cursor', cursor)
@@ -855,14 +864,14 @@ export const api = {
       }>
       turns: ConversationTurn[]
     }>(`/conversations/${id}`),
-  sendMessage: (id: string, content: string) =>
+  sendMessage: (id: string, content: string, referenceFiles?: ChatReferenceFile[]) =>
     request<{
       userMessageId: string
       assistant: ChatMessageContent
       turn: ConversationTurn
     }>(
       `/conversations/${id}/messages`,
-      { method: 'POST', body: JSON.stringify({ content }) },
+      { method: 'POST', body: JSON.stringify({ content, ...(referenceFiles?.length ? { referenceFiles } : {}) }) },
     ),
   confirmComponent: (
     conversationId: string,

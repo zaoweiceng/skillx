@@ -293,6 +293,7 @@ class SubprocessAgentAdapter:
         provider_environment = {
             "SKILLX_AGENT_ENDPOINT": runtime.endpoint or "",
             "SKILLX_AGENT_MODEL": runtime.model or "",
+            "SKILLX_REASONING_EFFORT": runtime.reasoning_effort or "",
             "SKILLX_AGENT_API_KEY_ENV": runtime.api_key_env,
             "SKILLX_MODEL_ENDPOINT": runtime.endpoint or "",
             "SKILLX_MODEL_NAME": runtime.model or "",

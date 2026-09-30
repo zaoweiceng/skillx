@@ -1,5 +1,5 @@
 import { Button } from 'antd'
-import Form from '@rjsf/core'
+import Form from '@/components/SchemaForm'
 import validator from '@rjsf/validator-ajv8'
 import { ArrowLeft, CheckCircle2, Code2, Play, Plus, Save, Send } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useState } from 'react'

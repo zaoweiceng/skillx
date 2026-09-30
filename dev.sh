@@ -19,6 +19,13 @@ for argument in "$@"; do
     *) echo "未知参数：$argument" >&2; exit 2 ;;
   esac
 done
+# Keep the kernel lock across exec and in service children. An orphaned service
+# must also prevent a second worker from starting.
+if [ "${WORKFLOW_DEV_LOCKED:-}" != 1 ]; then
+  command -v python3 >/dev/null || { echo '缺少依赖：python3' >&2; exit 1; }
+  exec python3 "$ROOT/tools/dev_lock.py" "$ROOT/.dev" bash "$ROOT/dev.sh" "$@"
+fi
+unset WORKFLOW_DEV_LOCKED
 for executable in uv node npm curl; do
   command -v "$executable" >/dev/null || { echo "缺少依赖：$executable" >&2; exit 1; }
 done
@@ -30,11 +37,6 @@ for port in "$API_PORT" "$FRONTEND_PORT"; do
 done
 mkdir -p "$ROOT/.dev/logs"
 LOCK="$ROOT/.dev/lock"
-if ! mkdir "$LOCK" 2>/dev/null; then
-  echo '已有启动任务或上次异常退出留下 .dev/lock。确认服务已停止后删除该锁目录再试。' >&2
-  exit 1
-fi
-printf '%s\n' "$$" > "$LOCK/pid"
 pids=()
 cleanup() {
   trap - EXIT INT TERM
@@ -54,7 +56,6 @@ cleanup() {
     [ -z "$pid" ] || wait "$pid" 2>/dev/null || true
   done
   rm -f "$LOCK/pid"
-  rmdir "$LOCK"
 }
 trap cleanup EXIT
 trap 'exit 130' INT
@@ -83,6 +84,8 @@ for port in ports:
     if not 1 <= port <= 65535:
         raise SystemExit('端口必须在 1..65535 范围内')
     with socket.socket() as probe:
+        # Match server bind semantics: TIME_WAIT is not a listening service.
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             probe.bind(('127.0.0.1', port))
         except OSError:

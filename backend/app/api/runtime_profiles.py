@@ -94,15 +94,20 @@ async def edit(profile_id: str, body: ProfileInput, session: AsyncSession = Depe
 class Selection(BaseModel):
     model_config = ConfigDict(extra="forbid")
     agentProfileId: str | None = None
+    reasoningEffort: Literal["low", "medium", "high"] | None = None
     traexModel: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 @router.get("/conversations/{conversation_id}")
 async def get_selection(conversation_id: str, session: AsyncSession = Depends(get_session)):
     conversation = await session.get(Conversation, conversation_id)
-    if conversation is None:
+    if conversation is None or conversation.deleted_at is not None:
         raise HTTPException(404, "对话不存在")
-    return {"agentProfileId": conversation.agent_profile_id, "traexModel": conversation.traex_model}
+    return {
+        "agentProfileId": conversation.agent_profile_id,
+        "traexModel": conversation.traex_model,
+        "reasoningEffort": conversation.reasoning_effort,
+    }
 
 
 @router.put("/conversations/{conversation_id}")
@@ -112,17 +117,22 @@ async def select_agent(
     session: AsyncSession = Depends(get_session),
 ):
     conversation = await session.get(Conversation, conversation_id)
-    if conversation is None:
+    if conversation is None or conversation.deleted_at is not None:
         raise HTTPException(404, "对话不存在")
     try:
         await validate_traex_model(body.traexModel)
-        await agent_snapshot(session, body.agentProfileId, body.traexModel)
+        await agent_snapshot(session, body.agentProfileId, body.traexModel, body.reasoningEffort)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     conversation.agent_profile_id = body.agentProfileId
     conversation.traex_model = body.traexModel
+    conversation.reasoning_effort = body.reasoningEffort
     await session.commit()
-    return {"agentProfileId": conversation.agent_profile_id, "traexModel": conversation.traex_model}
+    return {
+        "agentProfileId": conversation.agent_profile_id,
+        "traexModel": conversation.traex_model,
+        "reasoningEffort": conversation.reasoning_effort,
+    }
 
 
 @router.post("/{profile_id}/probe")

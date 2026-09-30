@@ -103,17 +103,15 @@ def _safe_environment() -> dict[str, str]:
 
 def _error_code(stderr: str, events: list[dict[str, Any]]) -> str:
     text = (
-        stderr
-        + "\n"
-        + "\n".join(json.dumps(item, ensure_ascii=False) for item in events)
+        stderr + "\n" + "\n".join(json.dumps(item, ensure_ascii=False) for item in events)
     ).lower()
-    if any(marker in text for marker in (
-        "401", "unauthorized", "access token expired", "access token has expired"
-    )):
-        return "TRAE_AUTH_REQUIRED"
     if any(
         marker in text
-        for marker in ("trusted directory", "skip-git-repo-check", "not inside a")
+        for marker in ("401", "unauthorized", "access token expired", "access token has expired")
+    ):
+        return "TRAE_AUTH_REQUIRED"
+    if any(
+        marker in text for marker in ("trusted directory", "skip-git-repo-check", "not inside a")
     ):
         return "TRAE_WORKDIR_UNTRUSTED"
     if any(marker in text for marker in ("model unavailable", "model not found")):
@@ -132,9 +130,7 @@ def _usage(event: dict[str, Any]) -> dict[str, int]:
     input_tokens = int(raw.get("input_tokens") or raw.get("inputTokens") or 0)
     output_tokens = int(raw.get("output_tokens") or raw.get("outputTokens") or 0)
     total_tokens = int(
-        raw.get("total_tokens")
-        or raw.get("totalTokens")
-        or input_tokens + output_tokens
+        raw.get("total_tokens") or raw.get("totalTokens") or input_tokens + output_tokens
     )
     return {
         "input_tokens": input_tokens,
@@ -185,9 +181,7 @@ def _runtime_identity(events: list[dict[str, Any]]) -> tuple[str | None, str | N
         for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
-            raw_provider = candidate.get("modelProviderId") or candidate.get(
-                "model_provider_id"
-            )
+            raw_provider = candidate.get("modelProviderId") or candidate.get("model_provider_id")
             raw_model = candidate.get("model")
             if isinstance(raw_provider, str) and raw_provider:
                 provider = raw_provider
@@ -201,11 +195,14 @@ class TraeXBuiltinAdapter:
 
     supports_tool_descriptors = True
 
-    def __init__(self, command: list[str], model: str | None = None) -> None:
+    def __init__(
+        self, command: list[str], model: str | None = None, reasoning_effort: str | None = None
+    ) -> None:
         if not command or Path(command[0]).name != "traex":
             raise TraeXBridgeError("TRAE_NOT_INSTALLED", "未发现受支持的 traex")
         self.command = command
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._tool_results: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] = {}
         self._tool_evidence: dict[str, list[dict[str, Any]]] = {}
@@ -251,9 +248,7 @@ class TraeXBuiltinAdapter:
             await asyncio.sleep(0.01)
 
         allowed_tools = [
-            value
-            for name in descriptors
-            for value in ("--allowed-tool", f"mcp__skillx__{name}")
+            value for name in descriptors for value in ("--allowed-tool", f"mcp__skillx__{name}")
         ]
         if not allowed_tools:
             allowed_tools = ["--allowed-tool", "mcp__skillx____no_tools__"]
@@ -287,6 +282,11 @@ class TraeXBuiltinAdapter:
             "-c",
             "skills={}",
             *(["--model", self.model] if self.model else []),
+            *(
+                ["-c", f'model_reasoning_effort="{self.reasoning_effort}"']
+                if self.reasoning_effort
+                else []
+            ),
             *allowed_tools,
             request.prompt,
         ]
@@ -311,9 +311,7 @@ class TraeXBuiltinAdapter:
         recognized_events = 0
         try:
             if process.stdout is None:
-                raise TraeXBridgeError(
-                    "AGENT_PROTOCOL_INCOMPATIBLE", "TraeX stdout 不可用"
-                )
+                raise TraeXBridgeError("AGENT_PROTOCOL_INCOMPATIBLE", "TraeX stdout 不可用")
             stdout_task = asyncio.create_task(process.stdout.readline())
             tool_task = asyncio.create_task(queue.get())
             while True:
@@ -358,8 +356,7 @@ class TraeXBuiltinAdapter:
                     recognized_events += 1
                 if (
                     event_type in {"item.started", "item.completed"}
-                    and item.get("type")
-                    in {"agent_message", "reasoning", "mcp_tool_call"}
+                    and item.get("type") in {"agent_message", "reasoning", "mcp_tool_call"}
                     and not dispatched
                 ):
                     dispatched = True
@@ -385,9 +382,7 @@ class TraeXBuiltinAdapter:
             stderr = (await stderr_task).decode(errors="replace")
             input_tokens = int(usage.get("input_tokens") or 0)
             output_tokens = int(usage.get("output_tokens") or 0)
-            total_tokens = int(
-                usage.get("total_tokens") or input_tokens + output_tokens
-            )
+            total_tokens = int(usage.get("total_tokens") or input_tokens + output_tokens)
             if input_tokens or output_tokens:
                 yield {
                     "type": "agent.step.completed",
@@ -399,16 +394,12 @@ class TraeXBuiltinAdapter:
                 }
             if native_failure is not None:
                 native_message = _native_error_message(native_failure)
-                seen_types = ",".join(
-                    str(item.get("type")) for item in safe_event_summaries[-12:]
-                )
+                seen_types = ",".join(str(item.get("type")) for item in safe_event_summaries[-12:])
                 message = (
                     f"{native_message} [nativeTerminal={native_failure.get('type')};"
                     f" events={seen_types}]"
                 )
-                error_code = _error_code(
-                    f"{stderr}\n{message}", safe_event_summaries
-                )
+                error_code = _error_code(f"{stderr}\n{message}", safe_event_summaries)
                 raise TraeXBridgeError(error_code, message)
             if code != 0:
                 error_code = _error_code(stderr, safe_event_summaries)
@@ -420,18 +411,14 @@ class TraeXBuiltinAdapter:
                     stderr.strip() or f"TraeX 进程退出码: {code}",
                 )
             if not turn_completed:
-                evidence = ", ".join(
-                    str(item.get("type")) for item in safe_event_summaries[-8:]
-                )
+                evidence = ", ".join(str(item.get("type")) for item in safe_event_summaries[-8:])
                 raise TraeXBridgeError(
                     "AGENT_PROTOCOL_INCOMPATIBLE",
                     "TraeX 未报告受支持的 turn.completed 终态"
                     + (f"；已见事件: {evidence}" if recognized_events else ""),
                 )
             output_text = (
-                output_path.read_text(encoding="utf-8")
-                if output_path.is_file()
-                else last_message
+                output_path.read_text(encoding="utf-8") if output_path.is_file() else last_message
             )
             try:
                 output = json.loads(output_text)
@@ -445,9 +432,7 @@ class TraeXBuiltinAdapter:
                     "MODEL_MALFORMED_OUTPUT",
                     "TraeX 严格 JSON 终态不是对象",
                 )
-            schema_errors = list(
-                Draft202012Validator(request.output_schema).iter_errors(output)
-            )
+            schema_errors = list(Draft202012Validator(request.output_schema).iter_errors(output))
             if schema_errors:
                 raise TraeXBridgeError(
                     "MODEL_MALFORMED_OUTPUT",
@@ -455,17 +440,19 @@ class TraeXBuiltinAdapter:
                 )
             evidence = self._tool_evidence.get(run_id, [])
             provider, model = _runtime_identity(raw_events)
-            provenance = {
-                field: {
-                    "mode": "generative",
-                    "sourceCallIds": [item["callId"] for item in evidence],
-                    "evidenceDigests": [
-                        item["evidenceDigest"] for item in evidence
-                    ],
-                    "promptVersion": "traex-builtin/v1",
+            provenance = (
+                {
+                    field: {
+                        "mode": "generative",
+                        "sourceCallIds": [item["callId"] for item in evidence],
+                        "evidenceDigests": [item["evidenceDigest"] for item in evidence],
+                        "promptVersion": "traex-builtin/v1",
+                    }
+                    for field in output
                 }
-                for field in output
-            } if evidence else {}
+                if evidence
+                else {}
+            )
             yield {
                 "type": "agent.completed",
                 "payload": {
@@ -538,8 +525,7 @@ class TraeXBuiltinAdapter:
                             {
                                 "name": name,
                                 "description": (
-                                    "SkillX Host capability "
-                                    f"{descriptor['capabilityRef']}"
+                                    f"SkillX Host capability {descriptor['capabilityRef']}"
                                 ),
                                 "inputSchema": descriptor["inputSchema"],
                                 "outputSchema": descriptor["outputSchema"],
@@ -582,9 +568,7 @@ class TraeXBuiltinAdapter:
                             "content": [
                                 {
                                     "type": "text",
-                                    "text": json.dumps(
-                                        output, ensure_ascii=False
-                                    ),
+                                    "text": json.dumps(output, ensure_ascii=False),
                                 }
                             ],
                             "structuredContent": output,
@@ -615,9 +599,7 @@ class TraeXBuiltinAdapter:
 
         return app
 
-    async def send_tool_result(
-        self, run_id: str, result: dict[str, Any]
-    ) -> None:
+    async def send_tool_result(self, run_id: str, result: dict[str, Any]) -> None:
         call_id = str(result.get("payload", {}).get("callId", ""))
         future = self._tool_results.pop((run_id, call_id), None)
         if future is None or future.done():

@@ -24,7 +24,8 @@ def test_registry_rejects_duplicate_registration() -> None:
 
 @pytest.mark.skipif(not shutil.which("node"), reason="Node is required for Pi SDK")
 @pytest.mark.parametrize("with_tool", [False, True])
-async def test_pi_sdk_returns_validated_output(monkeypatch, tmp_path, with_tool) -> None:
+@pytest.mark.parametrize("effort", [None, "high"])
+async def test_pi_sdk_returns_validated_output(monkeypatch, tmp_path, with_tool, effort) -> None:
     received = []
 
     async def respond(reader, writer):
@@ -87,8 +88,14 @@ async def test_pi_sdk_returns_validated_output(monkeypatch, tmp_path, with_tool)
     monkeypatch.setattr(settings, "agent_model", "test-model")
     monkeypatch.setenv(settings.agent_api_key_env, "test-local-key")
     (tmp_path / "AGENTS.md").write_text("UNRELATED_PRIVATE_CONTEXT_NEVER_LOAD")
+    from dataclasses import replace
+
+    from app.application.runtime_config import agent_runtime_config
+    from app.runtime.agent_registry import default_agent_registry
+
+    runtime = replace(agent_runtime_config(), reasoning_effort=effort)
     try:
-        result = await AgentHost().execute(
+        result = await AgentHost(adapter=default_agent_registry().create(runtime)).execute(
             AgentHostRequest(
                 run_id=str(uuid4()),
                 prompt="Return reply ok",
@@ -105,6 +112,8 @@ async def test_pi_sdk_returns_validated_output(monkeypatch, tmp_path, with_tool)
         assert result.output == {"reply": "ok"}
         assert len(received) == (2 if with_tool else 1)
         assert received[0]["model"] == "test-model"
+        if effort:
+            assert received[0]["reasoning_effort"] == effort
         assert "UNRELATED_PRIVATE_CONTEXT_NEVER_LOAD" not in json.dumps(received)
         if with_tool:
             assert received[0]["tools"][0]["function"]["name"] == "host_tool_0"

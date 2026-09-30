@@ -1,9 +1,12 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
+import { runtimeRequest } from '@/features/runtime/api'
+import type { Selection } from '@/features/runtime/AgentSelector'
 
 import {
   api,
   ChatMessageContent,
+  type ChatReferenceFile,
   ConversationRunEvent,
   type ConversationRunSummary,
   type ConversationSummary,
@@ -22,7 +25,9 @@ export type Message = {
 export function useConversation() {
   const { id: routeConversationId } = useParams()
   const navigate = useNavigate()
-  const createRequestRef = useRef(false)
+  const sendingRef = useRef(false)
+  const pendingConversationRef = useRef('')
+  const [draftSelection, setDraftSelection] = useState<Selection>({ agentProfileId: null, traexModel: null })
   const [conversationId, setConversationId] = useState(routeConversationId ?? '')
   const [messages, setMessages] = useState<Message[]>([])
   const [turns, setTurns] = useState<ConversationTurn[]>([])
@@ -68,23 +73,12 @@ export function useConversation() {
     }
   }
 
-  // conversationId 写入路由：新对话创建后导航到 /chat/:id，刷新可恢复同一会话。
   useEffect(() => {
-    if (routeConversationId) {
-      createRequestRef.current = false
-      setConversationId(routeConversationId)
-      return
-    }
-    if (createRequestRef.current) return
-    createRequestRef.current = true
-    api
-      .createConversation('新对话')
-      .then((item) => navigate(`/chat/${item.id}`, { replace: true }))
-      .catch((reason: Error) => {
-        createRequestRef.current = false
-        setError(reason.message)
-      })
-  }, [routeConversationId, navigate])
+    setConversationId(routeConversationId ?? '')
+    pendingConversationRef.current = ''
+    setInput('')
+    setError('')
+  }, [routeConversationId])
 
   useEffect(() => {
     api
@@ -313,9 +307,10 @@ export function useConversation() {
     }
   }, [activeWorkflowRunIds, refresh])
 
-  async function send(event: FormEvent) {
+  async function send(event: FormEvent, referenceFiles: ChatReferenceFile[] = []) {
     event.preventDefault()
-    if (!input.trim() || !conversationId) return
+    if (!input.trim() || sendingRef.current) return false
+    sendingRef.current = true
     const text = input.trim()
     setInput('')
     setSending(true)
@@ -323,34 +318,70 @@ export function useConversation() {
     const optimistic: Message = {
       id: `local-${Date.now()}`,
       role: 'user',
-      content: { type: 'text', text },
+      content: { type: 'text', text, referenceFiles },
     }
     setMessages((current) => [...current, optimistic])
     try {
-      const result = await api.sendMessage(conversationId, text)
+      let targetId = conversationId || pendingConversationRef.current
+      if (!targetId) {
+        const created = await api.createConversation('新对话')
+        targetId = created.id
+        pendingConversationRef.current = targetId
+      }
+      if (!conversationId && (draftSelection.agentProfileId || draftSelection.traexModel || draftSelection.reasoningEffort)) {
+        await runtimeRequest(`/conversations/${targetId}`, 'PUT', draftSelection)
+      }
+      const result = await api.sendMessage(targetId, text, ...(referenceFiles.length ? [referenceFiles] as const : []))
       if (
         result.assistant.conversationRunId &&
         (result.assistant.type === 'agent_run' || result.assistant.runType === 'agent_run')
       ) {
         setActiveRunId(result.assistant.conversationRunId)
       }
-      await refresh()
+      if (!conversationId) {
+        pendingConversationRef.current = ''
+        navigate(`/chat/${targetId}`, { replace: true })
+      } else {
+        await refresh()
+      }
       await refreshHistory()
+      return true
     } catch (reason) {
+      setInput(text)
+      setMessages(current => current.filter(message => message.id !== optimistic.id))
       setError(reason instanceof Error ? reason.message : '发送失败')
+      return false
     } finally {
+      sendingRef.current = false
       setSending(false)
       setOptimisticStartedAt(null)
     }
   }
 
-  async function createNewConversation() {
-    try {
-      const item = await api.createConversation('新对话')
-      await refreshHistory()
-      navigate(`/chat/${item.id}`)
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '新建对话失败')
+  function createNewConversation() {
+    pendingConversationRef.current = ''
+    setInput('')
+    setError('')
+    setHistoryOpen(false)
+    setDraftSelection({ agentProfileId: null, traexModel: null })
+    navigate('/chat')
+  }
+
+  async function renameConversation(id: string, title: string) {
+    const updated = await api.renameConversation(id, title)
+    setHistory(current => current.map(item => item.id === id ? { ...item, title: updated.title } : item))
+  }
+
+  async function deleteConversation(id: string) {
+    await api.deleteConversation(id)
+    setHistory(current => current.filter(item => item.id !== id))
+    if (id === conversationId) {
+      setInput('')
+      setError('')
+      setHistoryOpen(false)
+      const next = history.find(item => item.id !== id)
+      setConversationId(next?.id ?? '')
+      navigate(next ? `/chat/${next.id}` : '/chat', { replace: true })
     }
   }
 
@@ -471,5 +502,5 @@ export function useConversation() {
     }
   }
 
-  return { turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, workflowMode, workflowSelectionAvailable, switchingMode, clock, optimisticStartedAt, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill }
+  return { draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, workflowMode, workflowSelectionAvailable, switchingMode, clock, optimisticStartedAt, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill }
 }

@@ -170,7 +170,7 @@ describe('ChatPage 候选组件闭环', () => {
     cleanup()
   })
 
-  it('在 StrictMode 下进入 /chat 只创建一个对话', async () => {
+  it('空白页和重复新建不创建会话，首次发送才创建', async () => {
     getConversation.mockResolvedValue({
       id: 'conv-1',
       title: '新对话',
@@ -191,6 +191,21 @@ describe('ChatPage 候选组件闭环', () => {
       </StrictMode>,
     )
 
+    await waitFor(() => expect(listConversations).toHaveBeenCalled())
+    fireEvent.click(screen.getByRole('button', { name: '新建对话' }))
+    fireEvent.click(screen.getByRole('button', { name: '新建对话' }))
+    expect(createConversation).not.toHaveBeenCalled()
+    expect(getConversation).not.toHaveBeenCalled()
+    fireEvent.change(screen.getByRole('textbox', { name: '对话输入' }), { target: { value: '第一条消息' } })
+    expect(createConversation).not.toHaveBeenCalled()
+    sendMessage.mockRejectedValueOnce(new Error('发送失败，请重试'))
+      .mockResolvedValue({ assistant: { type: 'text', text: '收到' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith('conv-1', '第一条消息'))
+    expect(await screen.findByText('发送失败，请重试')).toBeInTheDocument()
+    expect(screen.getByRole('textbox', { name: '对话输入' })).toHaveValue('第一条消息')
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledTimes(2))
     await waitFor(() => expect(getConversation).toHaveBeenCalledWith('conv-1'))
     expect(createConversation).toHaveBeenCalledTimes(1)
   })
@@ -210,7 +225,7 @@ describe('ChatPage 候选组件闭环', () => {
 
     await waitFor(() =>
       expect(
-        screen.getByText('Agent 自动调用能力；需要你决策时会显示交互卡片'),
+        screen.getByRole('textbox', { name: '对话输入' }),
       ).toBeInTheDocument(),
     )
   })

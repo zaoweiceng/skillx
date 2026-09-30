@@ -11,7 +11,7 @@ from app.runtime.traex_models import list_traex_models, validate_traex_model
 async def test_cli_model_list_uses_config_id_and_deduplicates(tmp_path, monkeypatch):
     executable = tmp_path / "traex"
     executable.write_text(
-        f'#!{sys.executable}\nimport json, sys\n'
+        f"#!{sys.executable}\nimport json, sys\n"
         'assert sys.argv[1:] == ["models", "--json"]\n'
         'print(json.dumps([{"name":"Display", "config_name":"model-id"},'
         '{"name":"fallback"},{"name":"Display", "config_name":"model-id"}]))\n'
@@ -47,3 +47,41 @@ async def test_selection_rejects_unknown_model_without_changing_conversation(mon
     assert error.value.status_code == 422
     assert conversation.traex_model == "original"
     session.commit.assert_not_called()
+
+
+async def test_reasoning_selection_persists_and_is_frozen_per_task(monkeypatch):
+    from dataclasses import replace
+    from uuid import uuid4
+
+    from app.api.routes import create_message
+    from app.api.runtime_profiles import get_selection
+    from app.api.schemas import MessageCreate
+    from app.application.runtime_config import agent_runtime_config
+    from app.infrastructure.database import Conversation, SessionLocal
+    from app.infrastructure.models.tasks import Task
+
+    runtime = replace(agent_runtime_config(), type="traex_builtin", model=None)
+    monkeypatch.setattr("app.application.runtime_profiles.agent_runtime_config", lambda: runtime)
+    models = [{"id": "gpt-test", "reasoningEfforts": ["low", "medium", "high"]}]
+    monkeypatch.setattr(
+        "app.runtime.traex_models.list_traex_models", AsyncMock(return_value=models)
+    )
+    conversation_id = str(uuid4())
+    async with SessionLocal() as session, session.begin():
+        session.add(Conversation(id=conversation_id))
+    async with SessionLocal() as session:
+        await select_agent(
+            conversation_id, Selection(traexModel="gpt-test", reasoningEffort="high"), session
+        )
+        result = await create_message(conversation_id, MessageCreate(content="测试推理"), session)
+        await select_agent(
+            conversation_id, Selection(traexModel="gpt-test", reasoningEffort="low"), session
+        )
+    async with SessionLocal() as session:
+        assert (await get_selection(conversation_id, session))["reasoningEffort"] == "low"
+        task = await session.get(Task, result["taskId"])
+        assert task.runtime_json["reasoning_effort"] == "high"
+        with pytest.raises(HTTPException) as error:
+            await select_agent(conversation_id, Selection(reasoningEffort="high"), session)
+        assert error.value.status_code == 422
+        assert (await get_selection(conversation_id, session))["reasoningEffort"] == "low"

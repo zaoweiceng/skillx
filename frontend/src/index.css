@@ -8,6 +8,7 @@
   font-family: "Avenir Next", "Noto Sans SC", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  --graph-mask: rgba(33, 33, 33, .65);
   --bg: #212121;
   --sidebar: #171717;
   --panel: #262626;
@@ -42,6 +43,7 @@
 :root[data-theme="light"] {
   color: #171717;
   background: #ffffff;
+  --graph-mask: rgba(243, 243, 243, .65);
   --bg: #ffffff;
   --sidebar: #f9f9f9;
   --panel: #ffffff;
@@ -614,7 +616,7 @@ select:focus-visible {
 
 .workflow-graph {
   height: 490px;
-  background: #0b1419;
+  background: var(--sidebar);
 }
 
 .graph-node-label {
@@ -626,7 +628,7 @@ select:focus-visible {
 }
 
 .graph-node-label small {
-  color: #82959e;
+  color: var(--muted);
   font-family: "SFMono-Regular", monospace;
   font-size: 8px;
   letter-spacing: 0.1em;
@@ -639,14 +641,14 @@ select:focus-visible {
 }
 
 .react-flow__controls button {
-  border-bottom-color: #34444b !important;
-  background: #18262d !important;
-  fill: #d4ddda !important;
+  border-bottom-color: var(--line-soft) !important;
+  background: var(--panel) !important;
+  fill: var(--text) !important;
 }
 
 .react-flow__minimap {
   border: 1px solid var(--line);
-  background: #0c161b !important;
+  background: var(--panel) !important;
 }
 
 .run-form {
@@ -665,45 +667,6 @@ select:focus-visible {
 
 .run-form legend {
   display: none;
-}
-
-.form-group {
-  margin-bottom: 14px;
-}
-
-.control-label {
-  display: block;
-  margin-bottom: 6px;
-  color: #b7c3c6;
-  font-size: 10px;
-}
-
-.required {
-  color: var(--danger);
-}
-
-.form-control {
-  width: 100%;
-  min-height: 38px;
-  padding: 8px 10px;
-  border: 1px solid #34454d;
-  border-radius: 0;
-  outline: none;
-  background: var(--field);
-  color: var(--text);
-  font-size: 12px;
-}
-
-.form-control:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(140, 140, 140, 0.12);
-}
-
-.field-description,
-.help-block {
-  margin: 5px 0 0;
-  color: var(--muted);
-  font-size: 9px;
 }
 
 .run-notes {
@@ -1778,7 +1741,7 @@ select:focus-visible {
 :root[data-theme="light"] .workflow-graph,
 :root[data-theme="light"] .react-flow,
 :root[data-theme="light"] .react-flow__pane {
-  background: #eef1ef;
+  background: var(--sidebar);
 }
 
 :root[data-theme="light"] .react-flow__controls button {

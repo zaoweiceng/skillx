@@ -1,12 +1,14 @@
 import TaskPanel from '@/components/TaskPanel'
 import { useState } from 'react'
-import { Button, Input, Tag } from 'antd'
-import Form from '@rjsf/core'
+import { Button, Tag } from 'antd'
+import Form from '@/components/SchemaForm'
 import validator from '@rjsf/validator-ajv8'
 import {
   Bot,
-  CornerDownLeft,
   History,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRightClose,
   MessageSquareText,
   Plus,
   Workflow,
@@ -16,11 +18,16 @@ import { conversationRunUrl, taskCheckpointUrl, type TaskCheckpointSummary } fro
 import { useConversation, type Message } from '@/features/chat/useConversation'
 import { rjsfSchema } from '@/lib/utils'
 import styles from '@/features/chat/chat.module.css'
+import { ConversationHistoryItem } from '@/features/chat/ConversationHistoryItem'
+import { ChatComposer } from '@/features/chat/ChatComposer'
+import { useStoredBoolean } from '@/hooks/useStoredBoolean'
+import { ChatWorkspace } from '@/features/chat/ChatWorkspace'
 import { AgentSelector } from '@/features/runtime/AgentSelector'
 
 export default function ChatPage() {
+  const [historyCollapsed, setHistoryCollapsed] = useStoredBoolean('skillx-history-collapsed')
   const [runtimePending, setRuntimePending] = useState(false)
-  const { turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, clock, optimisticStartedAt, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill } = useConversation()
+  const { draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill } = useConversation()
 
   // 候选卡片绑定产生它的用户消息：取该助手消息之前最近的一条用户消息文本，
   // 而不是全局最近 prompt，避免继续 Agent 时误用无关的新输入。
@@ -394,6 +401,8 @@ export default function ChatPage() {
     <div className={`chat-page ${styles.page}`}>
       <header className="chat-header">
         <div>
+          {historyCollapsed && <Button type="text" aria-label="展开历史对话" aria-expanded={false}
+            onClick={() => { setHistoryCollapsed(false); setHistoryOpen(true) }} icon={<PanelLeftOpen size={17} />} />}
           <span className="eyebrow">工作空间 / 对话</span>
           <h1>通用对话</h1>
         </div>
@@ -403,7 +412,7 @@ export default function ChatPage() {
             htmlType="button"
             aria-label="打开历史对话"
             aria-expanded={historyOpen}
-            onClick={() => setHistoryOpen((current) => !current)}
+            onClick={() => { setHistoryCollapsed(false); setHistoryOpen((current) => !current) }}
           >
             <History size={14} />
           </Button>
@@ -411,42 +420,53 @@ export default function ChatPage() {
             className="mobile-history-toggle"
             htmlType="button"
             aria-label="打开执行轨迹"
+            title={traceOpen ? '收起执行轨迹' : '打开执行轨迹'}
+            aria-controls="execution-trace-sidebar"
             aria-expanded={traceOpen}
             onClick={() => setTraceOpen((current) => !current)}
           >
             <Bot size={14} />
           </Button>
-          <Tag variant="filled">Agent 工作空间</Tag>
         </div>
       </header>
-      <div className="chat-layout">
+      <ChatWorkspace collapsed={historyCollapsed} trace={
+        <aside id="execution-trace-sidebar" className="trace-sidebar" aria-label="执行轨迹" hidden={!traceOpen}>
+          <div className="panel-heading">
+            <div>
+              <span className="eyebrow">EXECUTION TRACE</span>
+              <h2>执行轨迹</h2>
+            </div>
+            <Button type="text" aria-label="收起执行轨迹" title="收起执行轨迹"
+              onClick={() => setTraceOpen(false)} icon={<PanelRightClose size={17} />} />
+            {runStatus && <span className={`status-badge ${runStatus}`}>{runStatus}</span>}
+            {(runStatus === 'queued' || runStatus === 'running') && (
+              <Button className="button ghost" htmlType="button" onClick={cancelActiveRun}>
+                取消运行
+              </Button>
+            )}
+          </div>
+          {renderTrace()}
+        </aside>
+      } sidebar={
         <aside
           className={`conversation-history ${historyOpen ? 'open' : ''}`}
           aria-label="历史对话"
         >
           <div className="history-heading">
             <span><History size={14} /> 历史对话</span>
+            <div className="history-heading-actions">
+            <Button type="text" aria-label="折叠历史对话" aria-expanded={true}
+              onClick={() => { setHistoryCollapsed(true); setHistoryOpen(false) }} icon={<PanelLeftClose size={16} />} />
             <Button htmlType="button" aria-label="新建对话" onClick={createNewConversation}>
               <Plus size={15} />
             </Button>
+            </div>
           </div>
           <nav>
             {history.map((item) => (
-              <Link
-                className={`history-item ${item.id === conversationId ? 'active' : ''}`}
-                aria-current={item.id === conversationId ? 'page' : undefined}
-                key={item.id}
-                to={`/chat/${item.id}`}
-                onClick={() => setHistoryOpen(false)}
-              >
-                <strong>{item.title}</strong>
-                <span>{item.preview || '暂无消息'}</span>
-                <small>
-                  {item.lastMessageAt
-                    ? new Date(item.lastMessageAt).toLocaleString()
-                    : '新对话'}
-                </small>
-              </Link>
+              <ConversationHistoryItem key={item.id} id={item.id} title={item.title}
+                active={item.id === conversationId} onNavigate={() => setHistoryOpen(false)}
+                onRename={renameConversation} onDelete={deleteConversation} />
             ))}
             {history.length === 0 && <span className="hint">暂无历史对话</span>}
           </nav>
@@ -455,7 +475,7 @@ export default function ChatPage() {
               加载更多
             </Button>
           )}
-        </aside>
+        </aside>}>
         <section className="message-column">
           <div className="message-stream">
           {messages.length === 0 && (
@@ -486,6 +506,9 @@ export default function ChatPage() {
               <div>
                 <small>{message.role === 'assistant' ? 'SkillX Agent' : '用户'}</small>
                 <p>{message.content.text}</p>
+                {!!message.content.referenceFiles?.length && <div className={styles.attachments}>
+                  {message.content.referenceFiles.map((file, index) => <Tag key={`${file.name}-${index}`}>{file.name}</Tag>)}
+                </div>}
                 {message.role === 'assistant' && turnFor(message) && (
                   <div className="turn-metrics">
                     <span className="metric-chip">
@@ -622,45 +645,12 @@ export default function ChatPage() {
             </article>
           ))}
           </div>
-          <form className="chat-composer" onSubmit={send}>
-            <span className="composer-mode-note">
-              Agent 自动调用能力；需要你决策时会显示交互卡片
-              {optimisticStartedAt !== null &&
-                ` · ${((clock - optimisticStartedAt) / 1000).toFixed(1)}s`}
-            </span>
-            <Input.TextArea variant="borderless"
-              aria-label="对话输入"
-              placeholder="描述一个需要探索或固化的任务..."
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              rows={2}
-            />
-            <Button type="primary" htmlType="submit" disabled={sending || runtimePending || !conversationId} aria-label={sending ? "处理中" : "发送"}>
-              <CornerDownLeft size={17} />
-              <span>{sending ? '处理中' : '发送'}</span>
-            </Button>
-            <div className={styles.composerControls}>
-              <AgentSelector key={conversationId} conversationId={conversationId} onBusyChange={setRuntimePending} />
-              {agentRuns[activeRunId]?.executor && <span>本次执行：{agentRuns[activeRunId].executor?.provider}{agentRuns[activeRunId].executor?.model ? ` · ${agentRuns[activeRunId].executor?.model}` : ""}</span>}
-            </div>
-          </form>
+          <ChatComposer key={conversationId} input={input} onInputChange={setInput}
+            sending={sending} disabled={sending || runtimePending} onSend={send}
+            controls={<AgentSelector key={conversationId} conversationId={conversationId} draftSelection={draftSelection} onDraftChange={setDraftSelection} onBusyChange={setRuntimePending} />} />
         </section>
-        <aside className={`trace-drawer ${traceOpen ? 'open' : ''}`}>
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">EXECUTION TRACE</span>
-              <h2>执行轨迹</h2>
-            </div>
-            {runStatus && <span className={`status-badge ${runStatus}`}>{runStatus}</span>}
-            {(runStatus === 'queued' || runStatus === 'running') && (
-              <Button className="button ghost" htmlType="button" onClick={cancelActiveRun}>
-                取消运行
-              </Button>
-            )}
-          </div>
-          {renderTrace()}
-        </aside>
-      </div>
+
+      </ChatWorkspace>
       {error && <div className="chat-error">{error}</div>}
     </div>
   )

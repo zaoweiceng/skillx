@@ -1,10 +1,12 @@
 import { Alert, Select } from 'antd'
 import { useEffect, useState } from 'react'
 import { type Profile, runtimeRequest } from './api'
+import { ReasoningSelect, type ReasoningEffort } from './ReasoningSelect'
+import styles from './picker.module.css'
 import { TraexModelSelect } from './TraexModelSelect'
 
-type Selection = { agentProfileId: string | null; traexModel: string | null }
-export function AgentSelector({ conversationId, onBusyChange }: { conversationId: string; onBusyChange?: (busy: boolean) => void }) {
+export type Selection = { agentProfileId: string | null; traexModel: string | null; reasoningEffort?: ReasoningEffort | null }
+export function AgentSelector({ conversationId, onBusyChange, draftSelection, onDraftChange }: { conversationId: string; draftSelection?: Selection; onDraftChange?: (selection: Selection) => void; onBusyChange?: (busy: boolean) => void }) {
   const [profiles, setProfiles] = useState<Profile[]>([])
   const [selection, setSelection] = useState<Selection>({ agentProfileId: null, traexModel: null })
   const [error, setError] = useState('')
@@ -13,18 +15,18 @@ export function AgentSelector({ conversationId, onBusyChange }: { conversationId
   useEffect(() => { onBusyChange?.(busy) }, [busy, onBusyChange])
   useEffect(() => () => onBusyChange?.(false), [onBusyChange])
   useEffect(() => {
-    if (!conversationId) return
     const controller = new AbortController()
     setLoaded(false)
     Promise.all([
       runtimeRequest<Profile[]>('', 'GET', undefined, controller.signal),
-      runtimeRequest<Selection>(`/conversations/${conversationId}`, 'GET', undefined, controller.signal),
+      conversationId ? runtimeRequest<Selection>(`/conversations/${conversationId}`, 'GET', undefined, controller.signal) : Promise.resolve({ agentProfileId: null, traexModel: null }),
     ]).then(([items, selected]) => {
       if (!controller.signal.aborted) { setProfiles(items); setSelection(selected); setError(''); setLoaded(true) }
     }).catch(() => { if (!controller.signal.aborted) setError('执行体配置加载失败') })
     return () => controller.abort()
   }, [conversationId])
   async function select(next: Selection) {
+    if (!conversationId) { onDraftChange?.(next); setSelection(next); return }
     setBusy(true)
     try {
       const saved = await runtimeRequest<Selection>(`/conversations/${conversationId}`, 'PUT', next)
@@ -32,14 +34,23 @@ export function AgentSelector({ conversationId, onBusyChange }: { conversationId
     } catch (reason) { setError(reason instanceof Error ? reason.message : '切换失败') }
     finally { setBusy(false) }
   }
-  const active = profiles.find(item => selection.agentProfileId ? item.id === selection.agentProfileId : item.kind === 'agent' && item.isDefault)
+  const currentSelection = !conversationId && draftSelection ? draftSelection : selection
+  const active = profiles.find(item => currentSelection.agentProfileId ? item.id === currentSelection.agentProfileId : item.kind === 'agent' && item.isDefault)
+  const piModel = profiles.find(item => item.id === active?.config.modelProfileId)?.config.model ?? ''
   return <div className="agent-picker">
-    <Select aria-label="Agent 执行体" value={selection.agentProfileId ?? ''} disabled={busy || !loaded}
-      style={{ minWidth: 140 }} options={[{ value: '', label: '默认 Agent' }, ...profiles.filter(item => item.kind === 'agent').map(item => ({ value: item.id, label: item.name, disabled: !item.active }))]}
-      onChange={value => void select({ agentProfileId: value || null, traexModel: null })} />
-    {active?.config.adapter === 'traex' && <TraexModelSelect value={selection.traexModel} disabled={busy || !loaded}
+    <Select size="small" variant="borderless" className={styles.trigger} classNames={{ popup: { root: styles.popup } }}
+      popupMatchSelectWidth={260} popupRender={menu => <><div className={styles.menuHeading}>选择执行体</div>{menu}</>} aria-label="Agent 执行体" value={currentSelection.agentProfileId ?? ''} disabled={busy || !loaded}
+      style={{ width: 128 }} options={[{ value: '', label: '默认 Agent', description: '使用工作空间默认配置' }, ...profiles.filter(item => item.kind === 'agent').map(item => ({ value: item.id, label: item.name, description: item.config.adapter === 'traex' ? 'TraeX · 本地 Agent' : 'Pi · 自定义模型服务', disabled: !item.active }))]}
+      optionRender={option => <div className={styles.option}><span>{option.label}</span><small>{option.data.description}</small></div>}
+      onChange={value => void select({ agentProfileId: value || null, traexModel: null, reasoningEffort: null })} />
+    {active?.config.adapter === 'traex' && <TraexModelSelect compact value={currentSelection.traexModel} disabled={busy || !loaded}
       defaultLabel={active.config.model ? `配置默认 · ${active.config.model}` : 'TraeX 默认模型'}
-      onChange={value => void select({ ...selection, traexModel: value })} />}
+      reasoningEffort={currentSelection.reasoningEffort}
+      onReasoningChange={value => void select({ ...currentSelection, reasoningEffort: value })}
+      onChange={value => void select({ ...currentSelection, traexModel: value, reasoningEffort: null })} />}
+    {active?.config.adapter === 'pi' && /^(gpt-[56]|o[34])/i.test(piModel) && <ReasoningSelect
+      value={currentSelection.reasoningEffort} disabled={busy || !loaded}
+      onChange={value => void select({ ...currentSelection, reasoningEffort: value })} />}
     <span className="selection-note">下次执行生效</span>
     {error && <Alert type="error" title={error} showIcon />}
   </div>

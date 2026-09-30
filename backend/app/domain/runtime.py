@@ -54,6 +54,7 @@ class AgentRuntimeConfig:
     adapter_version: str
     adapter_digest: str
     source: str = "split"
+    reasoning_effort: str | None = None
 
     @property
     def configured(self) -> bool:
@@ -77,6 +78,7 @@ class AgentRuntimeConfig:
                 "provider": self.provider,
                 "adapterVersion": self.adapter_version,
                 "adapterDigest": self.adapter_digest,
+                "reasoningEffort": self.reasoning_effort,
             }
         )
 

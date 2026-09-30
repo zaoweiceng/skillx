@@ -11,6 +11,27 @@ vi.mock('@/api/http', () => ({ request: (...args: unknown[]) => request(...args)
 afterEach(() => { cleanup(); vi.clearAllMocks() })
 
 describe('统一能力执行面板', () => {
+  it('开放对象可添加属性并作为对象提交', async () => {
+    request.mockImplementation(async (path: string) => {
+      if (path.endsWith('/versions')) return [{id: 'v', version: '1', interfaces: {execute: {
+        inputSchema: {type: 'object', properties: {formValues: {type: 'object', title: '表单值'}}},
+      }}}]
+      if (path.startsWith('/invocations?')) return []
+      return {id: 'call', status: 'queued'}
+    })
+    render(<MemoryRouter initialEntries={['/capabilities/example']}><Routes>
+      <Route path="/capabilities/:id" element={<CapabilityDetailPage />} />
+    </Routes></MemoryRouter>)
+    fireEvent.click(await screen.findByRole('button', {name: '添加一项'}))
+    const fields = screen.getAllByRole('textbox')
+    fireEvent.change(fields[0], {target: {value: 'purpose'}})
+    fireEvent.blur(fields[0])
+    fireEvent.change(screen.getAllByRole('textbox')[1], {target: {value: '差旅'}})
+    fireEvent.click(screen.getByRole('button', {name: '运行能力'}))
+    await waitFor(() => expect(request).toHaveBeenCalledWith('/capability-versions/v/invocations', expect.objectContaining({method: 'POST'})))
+    const call = request.mock.calls.find(([url]) => url === '/capability-versions/v/invocations')
+    expect(JSON.parse(call![1].body).input).toEqual({formValues: {purpose: '差旅'}})
+  })
   it.each(['capabilities', 'workflows'])('%s 入口使用相同契约和调用协议', async route => {
     request.mockImplementation(async (path: string) => {
       if (path === '/capabilities/example/versions') return [{

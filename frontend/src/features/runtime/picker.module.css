@@ -1,0 +1,9 @@
+.trigger { min-width: 112px; font-size: 12px; border-radius: 8px; }
+.trigger:hover { background: var(--panel-raised); }
+.popup { padding: 6px !important; border: 1px solid var(--line-soft); border-radius: 14px !important; box-shadow: 0 8px 28px #00000014 !important; background: var(--panel) !important; }
+.popup :global(.ant-select-item) { padding: 9px 10px; border-radius: 8px; font-size: 13px; color: var(--text); }
+.popup :global(.ant-select-item-option-selected:not(.ant-select-item-option-disabled)) { background: var(--panel-raised) !important; color: var(--text) !important; font-weight: 500; }
+.popup :global(.ant-select-item-option-active:not(.ant-select-item-option-disabled)) { background: var(--sidebar) !important; }
+.option { display: flex; flex-direction: column; gap: 3px; }
+.option small { color: var(--muted); font-size: 11px; font-weight: 400; }
+.menuHeading { padding: 7px 10px; color: var(--muted); font-size: 11px; }

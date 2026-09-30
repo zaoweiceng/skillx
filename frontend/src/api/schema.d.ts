@@ -966,6 +966,25 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/conversations/{conversation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Conversation */
+        get: operations["get_conversation_api_conversations__conversation_id__get"];
+        put?: never;
+        post?: never;
+        /** Delete Conversation */
+        delete: operations["delete_conversation_api_conversations__conversation_id__delete"];
+        options?: never;
+        head?: never;
+        /** Rename Conversation */
+        patch: operations["rename_conversation_api_conversations__conversation_id__patch"];
+        trace?: never;
+    };
     "/api/conversations/{conversation_id}/workflow-mode": {
         parameters: {
             query?: never;
@@ -981,23 +1000,6 @@ export interface paths {
         head?: never;
         /** Update Conversation Workflow Mode */
         patch: operations["update_conversation_workflow_mode_api_conversations__conversation_id__workflow_mode_patch"];
-        trace?: never;
-    };
-    "/api/conversations/{conversation_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Conversation */
-        get: operations["get_conversation_api_conversations__conversation_id__get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
         trace?: never;
     };
     "/api/conversations/{conversation_id}/messages": {
@@ -1771,6 +1773,13 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** ChatReferenceFile */
+        ChatReferenceFile: {
+            /** Name */
+            name: string;
+            /** Content */
+            content: string;
+        };
         /** ComponentConfirm */
         ComponentConfirm: {
             /** Componentid */
@@ -1837,6 +1846,11 @@ export interface components {
             trajectory: {
                 [key: string]: unknown;
             };
+        };
+        /** ConversationTitleUpdate */
+        ConversationTitleUpdate: {
+            /** Title */
+            title: string;
         };
         /** Decision */
         Decision: {
@@ -1958,6 +1972,8 @@ export interface components {
             inputs?: {
                 [key: string]: unknown;
             } | null;
+            /** Referencefiles */
+            referenceFiles?: components["schemas"]["ChatReferenceFile"][];
         };
         /** PlanCreate */
         PlanCreate: {
@@ -2071,6 +2087,8 @@ export interface components {
         Selection: {
             /** Agentprofileid */
             agentProfileId?: string | null;
+            /** Reasoningeffort */
+            reasoningEffort?: ("low" | "medium" | "high") | null;
             /** Traexmodel */
             traexModel?: string | null;
         };
@@ -4110,7 +4128,73 @@ export interface operations {
             };
         };
     };
-    update_conversation_workflow_mode_api_conversations__conversation_id__workflow_mode_patch: {
+    get_conversation_api_conversations__conversation_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_conversation_api_conversations__conversation_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    rename_conversation_api_conversations__conversation_id__patch: {
         parameters: {
             query?: never;
             header?: never;
@@ -4121,7 +4205,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ConversationModeUpdate"];
+                "application/json": components["schemas"]["ConversationTitleUpdate"];
             };
         };
         responses: {
@@ -4147,7 +4231,7 @@ export interface operations {
             };
         };
     };
-    get_conversation_api_conversations__conversation_id__get: {
+    update_conversation_workflow_mode_api_conversations__conversation_id__workflow_mode_patch: {
         parameters: {
             query?: never;
             header?: never;
@@ -4156,7 +4240,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationModeUpdate"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

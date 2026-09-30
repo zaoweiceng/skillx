@@ -1,7 +1,9 @@
 import { App as AntApp, Button, ConfigProvider, Divider, Tooltip, theme } from 'antd'
+import { useEffect } from 'react'
+import { useStoredBoolean } from '@/hooks/useStoredBoolean'
 import zhCN from 'antd/locale/zh_CN'
-import { Blocks, Bot, Boxes, Cable, CircleDot, Moon, Plus, Settings, Sun } from 'lucide-react'
-import { NavLink, Outlet, useNavigate } from 'react-router-dom'
+import { Blocks, Bot, Boxes, Cable, Moon, PanelLeftClose, PanelLeftOpen, Plus, Settings, Sun } from 'lucide-react'
+import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { useTheme } from '@/hooks/useTheme'
 import styles from './shell.module.css'
 
@@ -16,6 +18,12 @@ const navigation = [
 export default function AppShell() {
   const { isDark, toggleTheme } = useTheme()
   const navigate = useNavigate()
+  const { pathname } = useLocation()
+  const [collapsed, setCollapsed] = useStoredBoolean('skillx-navigation-collapsed')
+  useEffect(() => {
+    const page = navigation.find(item => pathname.startsWith(item.to))?.label
+    document.title = page ? `${page} · SkillX 智能工作空间` : 'SkillX · 智能工作空间'
+  }, [pathname])
   return <ConfigProvider locale={zhCN} button={{ autoInsertSpace: false }} theme={{
     algorithm: isDark ? theme.darkAlgorithm : theme.defaultAlgorithm,
     token: {
@@ -34,16 +42,21 @@ export default function AppShell() {
     },
   }}>
     <AntApp>
-      <div className={styles.shell}>
-        <aside className={styles.sidebar}>
+      <div className={`${styles.shell} ${collapsed ? styles.collapsed : ''}`}>
+        <aside className={styles.sidebar} aria-label="工作空间导航">
+          <Tooltip title={collapsed ? '展开主导航' : '折叠主导航'}>
+            <Button type="text" className={styles.collapseToggle} aria-label={collapsed ? '展开主导航' : '折叠主导航'}
+              aria-expanded={!collapsed} onClick={() => setCollapsed(!collapsed)}
+              icon={collapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />} />
+          </Tooltip>
           <NavLink to="/chat" className={styles.brand}>
-            <span className={styles.logo}><Blocks size={23} strokeWidth={1.8} /></span>
+            <img className={styles.logo} src="/favicon.svg" alt="SkillX" />
             <strong>SkillX<span>智能工作空间</span></strong>
           </NavLink>
-          <Button className={styles.newChat} icon={<Plus size={16} />} onClick={() => navigate('/chat')}>新对话</Button>
+          <Button className={styles.newChat} icon={<Plus size={16} />} onClick={() => navigate('/chat')} aria-label="新对话">{collapsed ? null : '新对话'}</Button>
           <div className={styles.navCaption}>工作空间</div>
           <nav className={styles.navigation} aria-label="主导航">
-            {navigation.map(({ to, label, description, icon: Icon }) => <NavLink key={to} to={to}
+            {navigation.map(({ to, label, description, icon: Icon }) => <NavLink key={to} to={to} aria-label={label} title={collapsed ? label : undefined}
               className={({ isActive }) => `${styles.navItem} ${isActive ? styles.active : ''}`}>
               <Icon size={19} strokeWidth={1.7} /><span>{label}<small>{description}</small></span>
             </NavLink>)}
@@ -52,12 +65,9 @@ export default function AppShell() {
           </nav>
           <div className={styles.footer}>
             <Divider />
-            <div className={styles.local}><CircleDot size={17} /><span>本地工作空间<small>运行状态与连接见系统设置</small></span></div>
             <Tooltip title={isDark ? '切换到亮色主题' : '切换到暗色主题'}>
               <Button block type="text" icon={isDark ? <Moon size={16} /> : <Sun size={16} />}
-                aria-label={isDark ? '切换到亮色主题' : '切换到暗色主题'} aria-pressed={isDark} onClick={toggleTheme}>
-                {isDark ? '深色外观' : '浅色外观'}
-              </Button>
+                aria-label={isDark ? '切换到亮色主题' : '切换到暗色主题'} aria-pressed={isDark} onClick={toggleTheme} />
             </Tooltip>
           </div>
         </aside>

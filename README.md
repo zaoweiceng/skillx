@@ -51,7 +51,7 @@ uv run python -m app.reset_database --confirm-reset
 
 ## 本地启动
 
-要求 Python 3.12–3.13、`uv`、Node.js 22.19+、`npm`。在项目根目录执行：
+要求 Python 3.12–3.13（提供 `python3` 命令）、`uv`、Node.js 22.19+、`npm`。在项目根目录执行：
 
 ```bash
 # 日常启动：安装缺失依赖、迁移、seed，并启动 API / Worker / 前端
@@ -64,6 +64,7 @@ uv run python -m app.reset_database --confirm-reset
 浏览器打开 `http://127.0.0.1:5173`，OpenAPI 位于 `http://127.0.0.1:8000/docs`。
 按 `Ctrl+C` 同时停止全部服务；任意服务异常退出时，脚本也会停止其余进程。
 日志保存在 `.dev/logs/{api,worker,frontend}.log`。后端代码修改后重新运行脚本；前端保留 Vite 热更新。
+启动锁由操作系统管理，异常退出后可直接重试，无需删除 `.dev/lock`。若仍有服务运行，请先停止服务；不要删除 `.dev/supervisor.lock`，它的存在不代表锁被占用。
 
 ```bash
 ./dev.sh --skip-install       # 依赖已安装时跳过安装检查

@@ -28,6 +28,58 @@ body { font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto 
 @media (max-width: 600px) { .page { padding: 22px 16px; }.page-header { gap: 16px; }.header-stat { display: none; }.workflow-list-item { padding: 16px; }.workflow-list-item .contract-label { display: none; } }
 .collection-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }.collection-toolbar .filter-strip { margin-bottom: 0; }
 .route-loading { min-height: 60vh; display: grid; place-items: center; }
-.capability-overview { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; margin-bottom: 32px; }.capability-overview .ant-card-body { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 24px; }.capability-overview strong { font-size: 20px; font-weight: 600; }.capability-overview span { display: block; width: 100%; color: var(--muted); font-size: 12px; }.table-secondary { font-size: 11px; color: var(--muted); margin-top: 5px; }.collection-toolbar h2 { font-size: 18px; font-weight: 600; }
-@media (max-width: 600px) { .capability-overview { grid-template-columns: 1fr; gap: 10px; }.capability-overview .ant-card-body { padding: 16px; } }
 .runtime-diagnostics { margin-bottom: 20px; }.runtime-diagnostics-content { color: var(--muted); font-size: 12px; line-height: 1.8; }.runtime-diagnostics-content > span { display: block; margin: 10px 0; }
+
+.table-secondary { font-size: 11px; color: var(--muted); margin-top: 5px; }
+.collection-toolbar h2 { font-size: 18px; font-weight: 600; }
+/* Schema fields and controls are rendered by the official Ant Design theme. */
+.schema-form { container-type: inline-size; min-width: 0; }
+.schema-form fieldset { min-width: 0; }
+.schema-form .ant-form-item { margin-bottom: 20px; }
+.schema-form .ant-input-number { width: 100%; }
+@container (max-width: 520px) {
+  .schema-form .ant-col-12 { flex: 0 0 100%; max-width: 100%; }
+  .schema-form .form-additional { flex: 0 0 100% !important; max-width: 100%; }
+  .schema-form .form-additional ~ .ant-col:not(.form-additional) { margin-top: 0 !important; margin-bottom: 16px; }
+}
+.capability-detail-page { max-width: 1120px; }
+.execution-card { margin-bottom: 20px; }
+.execution-card h2, .component-detail-page .ant-card-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.execution-options { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 16px; padding-bottom: 24px; border-bottom: 1px solid var(--line-soft); }
+.execution-options label { display: flex; flex-direction: column; gap: 8px; flex: 1 1 200px; }
+.execution-options label > span { font-size: 12px; color: var(--muted); }
+.execution-input { padding-top: 24px; }
+.execution-input > h2 { margin-bottom: 20px; }
+.json-input, .invocation-output { font-family: ui-monospace, monospace; }
+.invocation-id { overflow-wrap: anywhere; font-size: 12px; }
+.invocation-output { margin: 16px 0 0; padding: 16px; background: var(--sidebar); border-radius: 8px; overflow: auto; max-height: 320px; font-size: 12px; }
+.invocation-pending { margin: 12px 0 0 !important; }
+.component-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; margin-bottom: 20px; }
+.component-section { margin-bottom: 20px; }
+.component-detail-page .ant-card { min-width: 0; border-color: var(--line-soft); }
+.component-detail-page .ant-card-head { border-color: var(--line-soft); }
+.component-detail-page .ant-descriptions-item-label { color: var(--muted); }
+.component-detail-page .ant-descriptions-item-content { overflow-wrap: anywhere; }
+.component-detail-page .detail-grid { gap: 20px; align-items: start; }
+.component-graph-card { overflow: hidden; }
+.component-graph-card .workflow-graph { height: 400px; }
+.component-run-notes { color: var(--muted); font-size: 12px; border-top: 1px solid var(--line-soft); padding-top: 16px; margin-top: 20px; }
+.component-run-notes > span { display: flex; align-items: center; gap: 8px; }
+.manifest-tags { margin-bottom: 16px; }
+.manifest-fragments { margin-top: 20px; }
+.workflow-node-card.ant-card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; box-shadow: 0 2px 6px #00000006; }
+.workflow-node-kind { display: block; font-size: 11px; margin-bottom: 6px; }
+.workflow-node-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; font-size: 13px; line-height: 20px; }
+.workflow-node-card .ant-card-body { height: 96px; padding: 16px; }
+.workflow-graph .react-flow__handle { width: 7px; height: 7px; border: 2px solid var(--panel); background: var(--muted); }
+.workflow-graph .react-flow__node:focus-visible .workflow-node-card { outline: 2px solid var(--muted); outline-offset: 3px; }
+.workflow-graph .react-flow__controls { overflow: hidden; border: 1px solid var(--line-soft); border-radius: 8px; box-shadow: none; }
+@media (max-width: 900px) {
+  .component-detail-page .detail-grid { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 600px) {
+  .component-summary-grid { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .execution-options { gap: 12px; }
+  .execution-card > .ant-card-body, .component-detail-page .ant-card > .ant-card-body { padding: 16px; }
+  .component-detail-page .component-graph-card > .ant-card-body { padding: 0; }
+}

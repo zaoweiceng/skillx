@@ -58,8 +58,29 @@ async def save_profile(
     return item
 
 
+async def with_reasoning(runtime, effort):
+    if effort is None:
+        return replace(runtime, reasoning_effort=None)
+    if effort not in {"low", "medium", "high"}:
+        raise ValueError("不支持的推理强度")
+    if runtime.type == "traex_builtin":
+        from app.runtime.traex_models import list_traex_models
+
+        models = await list_traex_models()
+        selected = next((item for item in models if item["id"] == runtime.model), None)
+        if not selected or effort not in selected.get("reasoningEfforts", []):
+            raise ValueError("请先选择支持调节推理强度的模型")
+    elif runtime.type == "pi":
+        if not (runtime.model or "").lower().startswith(("gpt-5", "gpt-6", "o3", "o4")):
+            raise ValueError("当前 Pi 模型未声明支持推理强度")
+    else:
+        raise ValueError("当前执行体不支持推理强度")
+    return replace(runtime, reasoning_effort=effort)
+
+
 async def agent_snapshot(
-    session: AsyncSession, profile_id: str | None, traex_model: str | None = None
+    session: AsyncSession, profile_id: str | None, traex_model: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> dict[str, Any]:
     profile = (
         await session.get(RuntimeProfile, profile_id)
@@ -78,7 +99,7 @@ async def agent_snapshot(
             if runtime.type != "traex_builtin":
                 raise ValueError("仅 TraeX 支持会话模型选择")
             runtime = replace(runtime, model=traex_model)
-        return asdict(runtime)
+        return asdict(await with_reasoning(runtime, reasoning_effort))
     if not profile.active or profile.kind != "agent":
         raise ValueError("Agent 配置不可用")
     config = profile.config_json
@@ -131,7 +152,7 @@ async def agent_snapshot(
             source="profile",
             adapter_digest="sha256:" + hashlib.sha256(bridge.read_bytes()).hexdigest(),
         )
-    return asdict(runtime)
+    return asdict(await with_reasoning(runtime, reasoning_effort))
 
 
 def restore_agent_snapshot(snapshot: dict[str, Any] | None) -> AgentRuntimeConfig | None:

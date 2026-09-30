@@ -49,7 +49,7 @@ try {
   runtime.registerProvider('skillx', {
     baseUrl: endpoint.replace(/\/chat\/completions\/?$/, '').replace(/\/$/, ''),
     api: 'openai-completions',
-    models: [{ id: modelId, name: modelId, reasoning: false, input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 }],
+    models: [{ id: modelId, name: modelId, reasoning: Boolean(process.env.SKILLX_REASONING_EFFORT), input: ['text'], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128000, maxTokens: 8192 }],
   });
   await runtime.setRuntimeApiKey('skillx', key);
   const settings = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
@@ -68,7 +68,7 @@ try {
       return { content: [{ type: 'text', text: JSON.stringify(result.status === 'succeeded' ? result.output : { error: result.error }) }], details: {} };
     },
   }));
-  ({ session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model: runtime.getModel('skillx', modelId), thinkingLevel: 'off', tools: tools.map(tool => tool.name), customTools: tools, resourceLoader: loader, settingsManager: settings, sessionManager: SessionManager.inMemory(cwd) }));
+  ({ session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model: runtime.getModel('skillx', modelId), thinkingLevel: process.env.SKILLX_REASONING_EFFORT || 'off', tools: tools.map(tool => tool.name), customTools: tools, resourceLoader: loader, settingsManager: settings, sessionManager: SessionManager.inMemory(cwd) }));
   let steps = 0; let totalTokens = 0; let usageComplete = true;
   session.subscribe(event => {
     if (event.type === 'turn_start') emit('model.request.dispatched', { attempt: steps + 1 });

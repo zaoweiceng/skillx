@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class WorkflowCreate(BaseModel):
@@ -90,10 +90,27 @@ class ConversationModeUpdate(BaseModel):
     workflow_mode: str = Field(alias="workflowMode", pattern="^(enabled|disabled)$")
 
 
+class ChatReferenceFile(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    content: str = Field(max_length=128 * 1024)
+
+
 class MessageCreate(BaseModel):
     content: str
     component_id: str | None = Field(default=None, alias="componentId")
     inputs: dict[str, Any] | None = None
+    reference_files: list[ChatReferenceFile] = Field(
+        default_factory=list, alias="referenceFiles", max_length=8
+    )
+
+    @model_validator(mode="after")
+    def validate_reference_files(self):
+        sizes = [len(item.content.encode("utf-8")) for item in self.reference_files]
+        if any(size > 128 * 1024 for size in sizes) or sum(sizes) > 256 * 1024:
+            raise ValueError("参考文件单个不能超过 128 KB，总大小不能超过 256 KB")
+        if any("\0" in item.content for item in self.reference_files):
+            raise ValueError("参考文件必须为文本文件")
+        return self
 
 
 class ComponentConfirm(BaseModel):
@@ -176,3 +193,11 @@ class PlanRunCreate(BaseModel):
 class PlanSolidifyRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
 
+
+class ConversationTitleUpdate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def trim_title(cls, value):
+        return value.strip() if isinstance(value, str) else value

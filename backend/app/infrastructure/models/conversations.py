@@ -24,11 +24,13 @@ class Conversation(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     owner_id: Mapped[str] = mapped_column(String(120), default="local-user")
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     title: Mapped[str] = mapped_column(String(200), default="新对话")
     bound_component_id: Mapped[str | None] = mapped_column(
         ForeignKey("components.id"), nullable=True
     )
     agent_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
     traex_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     workflow_mode: Mapped[str] = mapped_column(String(16), default="enabled")
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

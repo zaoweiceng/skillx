@@ -42,6 +42,12 @@ async def list_traex_models() -> list[dict[str, Any]]:
                         "id": identifier,
                         "name": item.get("name") or identifier,
                         "contextWindow": item.get("context_window"),
+                        "reasoningEfforts": ["low", "medium", "high"]
+                        if (
+                            identifier.lower().startswith(("gpt-5", "gpt-6", "o3", "o4"))
+                            and "support reasoning" in (item.get("description") or "").lower()
+                        )
+                        else [],
                     }
                 )
             return result
