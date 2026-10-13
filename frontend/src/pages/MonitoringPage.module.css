@@ -1,0 +1,16 @@
+.page { padding: 28px; width: 100%; overflow: auto; }
+.header { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 24px; }
+.header h1 { font-size: 24px; margin: 0 0 8px; }
+.header p, .note { color: var(--text-secondary, #888); font-size: 12px; line-height: 1.7; }
+.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.range { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 20px; }
+.summary { display: flex; align-items: baseline; gap: 10px; margin: 8px 0; }
+.value { font-size: 26px; font-weight: 600; margin: 0; font-variant-numeric: tabular-nums; }
+.wide, .full { grid-column: 1 / -1; }
+.reason { overflow-wrap: anywhere; }
+.record { border-bottom: 1px solid #8883; padding: 12px 0; }
+.record summary { cursor: pointer; font-size: 12px; overflow-wrap: anywhere; }
+.record pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 65vh; overflow: auto; }
+.recordActions { display: flex; gap: 8px; margin-bottom: 16px; }
+@media (max-width: 1200px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 700px) { .grid { grid-template-columns: minmax(0, 1fr); } .page { padding: 16px; } }

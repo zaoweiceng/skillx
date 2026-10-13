@@ -8,7 +8,7 @@ import { learningRoleLabels } from './taskProgressEvents'
 
 type Invocation = { id: string; kind: string; status: string; runId?: string; output: unknown; error: unknown; request?: Record<string, unknown>; reason?: string; workingDirectory?: string }
 type Learning = { id: string; kind: string; status: string; result: unknown }
-const statusLabels: Record<string, string> = { succeeded: '已完成', failed: '失败', cancelled: '已取消', running: '执行中', queued: '等待执行', published: '已发布', blocked: '固化受阻', skipped: '已跳过' }
+const statusLabels: Record<string, string> = { succeeded: '已完成', failed: '失败', cancelled: '已取消', running: '执行中', queued: '等待执行', published: '已发布', partial: '部分已发布', blocked: '固化受阻', skipped: '已跳过' }
 const kindLabels: Record<string, string> = { code: '代码执行', workflow: '工作流', skillx: 'SkillX 能力', tool: '工具调用', install: '安装依赖', model: '模型推理' }
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
@@ -110,6 +110,8 @@ export default function TaskRecords({ id, invocations, learning }: { id: string;
         {typeof record(item.result).scope === 'string' && <div className={styles.reason}>复用边界：{String(record(item.result).scope)}</div>}
         {Object.keys(record(record(item.result).skills)).length > 0 && <p>Skill：{Object.keys(record(record(item.result).skills)).join('、')}</p>}
         {Object.keys(record(record(item.result).skillx)).length > 0 && <p>SkillX：{Object.keys(record(record(item.result).skillx)).join('、')}</p>}
+        {Object.keys(record(record(item.result).workflows)).length > 0 && <p>工作流：{Object.keys(record(record(item.result).workflows)).join('、')}</p>}
+        {Object.entries(record(record(item.result).failures)).map(([name, reason]) => <p className={styles.error} key={name}>{name}：{String(reason)}</p>)}
         <LearningStages value={record(item.result).agentStages} />
         <Collapse ghost size="small" items={[{key: 'raw', label: '原始数据', children: <pre className={styles.output}>{format(item.result)}</pre>}]} />
       </div>)}] : []),

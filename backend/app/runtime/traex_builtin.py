@@ -132,7 +132,12 @@ def _usage(event: dict[str, Any]) -> dict[str, int]:
     total_tokens = int(
         raw.get("total_tokens") or raw.get("totalTokens") or input_tokens + output_tokens
     )
+    cached = raw.get("cached_input_tokens", raw.get("cacheReadTokens"))
+    details = raw.get("input_tokens_details") or {}
+    if cached is None and isinstance(details, dict):
+        cached = details.get("cached_tokens")
     return {
+        **({"cached_tokens": int(cached)} if cached is not None else {}),
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
@@ -400,6 +405,9 @@ class TraeXBuiltinAdapter:
                         "AGENT_PROTOCOL_INCOMPATIBLE",
                         "TraeX JSONL 包含无法解析的事件",
                     ) from exc
+                from app.application.session_records import record
+
+                await record("native_event", event)
                 if not isinstance(event, dict):
                     raise TraeXBridgeError(
                         "AGENT_PROTOCOL_INCOMPATIBLE",
@@ -435,7 +443,9 @@ class TraeXBuiltinAdapter:
                     dispatched = True
                     yield {
                         "type": "model.request.dispatched",
-                        "payload": {"attempt": 1},
+                        "payload": {"attempt": 1, "requestId": f"traex:{run_id}",
+                                    "provider": "traex", "model": self.model,
+                                    "runtimeType": "traex_builtin"},
                     }
                 if event_type == "turn.completed":
                     turn_completed = True
@@ -461,6 +471,11 @@ class TraeXBuiltinAdapter:
                     "type": "agent.step.completed",
                     "payload": {
                         "step": 1,
+                        "requestId": f"traex:{run_id}",
+                        "provider": "traex", "model": self.model,
+                        "runtimeType": "traex_builtin", "usageComplete": True,
+                        **({"cacheReadTokens": usage["cached_tokens"]}
+                           if "cached_tokens" in usage else {}),
                         "inputTokens": input_tokens,
                         "outputTokens": output_tokens,
                     },

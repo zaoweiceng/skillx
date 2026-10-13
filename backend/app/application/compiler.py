@@ -20,7 +20,11 @@ REFERENCE_PATTERN = re.compile(rf"\$\{{(?P<root>input|[a-zA-Z][\w-]*)\.(?P<path>
 class WorkflowValidationError(ValueError):
     def __init__(self, diagnostics: list[Diagnostic]) -> None:
         self.diagnostics = diagnostics
-        super().__init__("workflow validation failed")
+        # The same exception crosses the API and Agent feedback boundary. Keep
+        # actionable compiler diagnostics instead of dropping them on str(exc).
+        super().__init__("workflow validation failed: " + "; ".join(
+            f"{item.code} at {item.path}: {item.message}" for item in diagnostics
+        ))
 
 
 class WorkflowCompiler:

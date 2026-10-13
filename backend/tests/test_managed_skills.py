@@ -263,3 +263,16 @@ async def test_http_crud_and_schema_errors():
         assert (await client.delete(f"/api/skills/{id}")).status_code == 204
         assert (await client.get("/api/skills")).json() == []
         assert (await client.get(f"/api/skills/{id}")).status_code == 404
+
+
+async def test_skill_discovery_only_loads_instructions_on_demand():
+    from pathlib import Path
+
+    async with SessionLocal() as session:
+        await save_skill(session, VALUES)
+        await session.commit()
+        context = await managed_skill_context(session, include_instructions=False)
+        entry = context['skills'][0]
+        assert entry['description'] == VALUES['description']
+        assert 'MARKER-RAW-SKILL' not in json.dumps(context)
+        assert 'MARKER-RAW-SKILL' in Path(entry['instructionsPath']).read_text()

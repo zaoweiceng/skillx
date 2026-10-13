@@ -125,7 +125,7 @@ PY
 pids+=("$!")
 (cd "$ROOT/backend" && exec "$PYTHON" -m app.worker --worker-id "worker-local-$$") > "$ROOT/.dev/logs/worker.log" 2>&1 &
 pids+=("$!")
-(cd "$ROOT/frontend" && export VITE_API_BASE="http://127.0.0.1:$API_PORT/api" && exec node node_modules/vite/bin/vite.js --host 127.0.0.1 --port "$FRONTEND_PORT" --strictPort) > "$ROOT/.dev/logs/frontend.log" 2>&1 &
+(cd "$ROOT/frontend" && export VITE_API_BASE="/api" API_PORT="$API_PORT" && exec node node_modules/vite/bin/vite.js --host 127.0.0.1 --port "$FRONTEND_PORT" --strictPort) > "$ROOT/.dev/logs/frontend.log" 2>&1 &
 pids+=("$!")
 for attempt in {1..60}; do
   for pid in "${pids[@]}"; do

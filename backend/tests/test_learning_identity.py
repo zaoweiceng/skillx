@@ -86,6 +86,10 @@ async def test_model_call_persists_real_output_and_enters_learning(monkeypatch):
         assert inv.status == "succeeded"
         assert inv.output_json == {"labels": ["other"]}
         task = await session.get(Task, tid)
+        task.state_json = {"learningCandidate": {
+            "kind": "new_method", "novelty": "新增语义分类规则",
+            "verification": "已验证分类结果", "sourceInvocationIds": [iid],
+        }}
         await finish_task(session, task, "succeeded", "完成")
     async with SessionLocal() as session:
         assert await session.scalar(select(LearningJob.id).where(LearningJob.task_id == tid))

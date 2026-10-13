@@ -1,6 +1,6 @@
 export type TaskEvent = { id: number; type: string; payload: Record<string, unknown>; createdAt: string }
 const labels: Record<string, string> = {
-  'learning.published': '已提取可复用能力', 'learning.blocked': '固化受阻', 'learning.queued': '等待提炼可复用能力', 'learning.skipped': '没有需要固化的可复用片段',
+  'learning.partial': '部分产物已发布', 'learning.published': '已提取可复用能力', 'learning.blocked': '固化受阻', 'learning.queued': '等待提炼可复用能力', 'learning.skipped': '没有需要固化的可复用片段',
   'task.decision_rejected': '模型返回格式不符合要求，正在重试',
   'task.requeued': '服务重启，任务已重新排队',
   'task.accepted': '任务已接受', 'task.succeeded': '任务完成', 'task.failed': '任务失败',

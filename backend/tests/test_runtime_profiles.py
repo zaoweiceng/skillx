@@ -59,6 +59,7 @@ async def test_queued_run_keeps_pi_config_after_profile_edit(monkeypatch):
         snapshot = run.config_json["agentRuntimeSnapshot"]
         assert snapshot["type"] == "pi"
         assert snapshot["model"] == "original"
+        assert snapshot["model_options"]["structuredMode"] == "json_schema"
         assert "local-test-value" not in str(snapshot)
         await save_profile(
             session,

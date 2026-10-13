@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import { runtimeRequest } from '@/features/runtime/api'
+import { request } from '@/api/http'
 import { readSelectionPreference } from '@/features/runtime/selectionPreference'
 import type { Selection } from '@/features/runtime/AgentSelector'
 
@@ -31,6 +32,7 @@ export type Message = {
 export function useConversation() {
   const { id: routeConversationId } = useParams()
   const navigate = useNavigate()
+  const location = useLocation()
   const sendingRef = useRef(false)
   const pendingConversationRef = useRef('')
   const [draftSelection, setDraftSelection] = useState<Selection>(readSelectionPreference)
@@ -51,6 +53,8 @@ export function useConversation() {
   const [optimisticStartedAt, setOptimisticStartedAt] = useState<number | null>(null)
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  const [stopping, setStopping] = useState(false)
+  const stoppingRef = useRef(false)
   const [error, setError] = useState('')
   const [copyFeedback, setCopyFeedback] = useState('')
   const [drafts, setDrafts] = useState<Record<string, string>>({})
@@ -84,10 +88,10 @@ export function useConversation() {
     setConversationId(routeConversationId ?? '')
     if (!routeConversationId) setDraftSelection(readSelectionPreference())
     pendingConversationRef.current = ''
-    setWorkingDirectory(undefined)
+    setWorkingDirectory(routeConversationId ? undefined : location.state?.workingDirectory)
     setInput('')
     setError('')
-  }, [routeConversationId])
+  }, [routeConversationId, location.key])
 
   useEffect(() => {
     api
@@ -215,6 +219,9 @@ export function useConversation() {
   const activeTaskTurns = turns.filter(turn => !turn.completedAt && messages.some(message =>
     message.turnId === turn.id && message.content.taskId,
   )).map(turn => turn.id).sort().join(',')
+  const activeTaskId = [...messages].reverse().find(message => message.content.taskId &&
+    turns.some(turn => turn.id === message.turnId && !turn.completedAt))?.content.taskId
+  const canStop = !!activeTaskId || (!!activeRunId && ['queued', 'running'].includes(runStatus))
   useEffect(() => {
     if (!activeTaskTurns) return
     let cancelled = false
@@ -335,7 +342,7 @@ export function useConversation() {
 
   async function send(event: FormEvent, referenceFiles: ChatReferenceFile[] = [], workingDirectory?: string, images: ChatImageInput[] = []) {
     event.preventDefault()
-    if ((!input.trim() && !images.length) || sendingRef.current) return false
+    if ((!input.trim() && !images.length) || sendingRef.current || canStop) return false
     sendingRef.current = true
     const text = input.trim() || '请分析这些图片。'
     setInput('')
@@ -388,19 +395,20 @@ export function useConversation() {
     try {
       if (conversationId) await api.updateConversationDirectory(conversationId, value ?? null)
       setWorkingDirectory(value)
+      if (conversationId) await refreshHistory()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '保存工作目录失败')
     }
   }
 
-  function createNewConversation() {
+  function createNewConversation(directory?: string) {
     pendingConversationRef.current = ''
     setWorkingDirectory(undefined)
     setInput('')
     setError('')
     setHistoryOpen(false)
     setDraftSelection(readSelectionPreference())
-    navigate('/chat')
+    navigate('/chat', { state: { workingDirectory: directory } })
   }
 
   async function renameConversation(id: string, title: string) {
@@ -511,11 +519,19 @@ export function useConversation() {
   }
 
   async function cancelActiveRun() {
-    if (!activeRunId) return
+    if (!canStop || stoppingRef.current) return
+    stoppingRef.current = true
+    setStopping(true)
+    setError('')
     try {
-      await api.cancelConversationRun(activeRunId)
+      if (activeTaskId) await request(`/tasks/${activeTaskId}/cancel`, { method: 'POST' })
+      else await api.cancelConversationRun(activeRunId)
+      await refresh()
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '取消失败')
+    } finally {
+      stoppingRef.current = false
+      setStopping(false)
     }
   }
 
@@ -540,5 +556,5 @@ export function useConversation() {
     }
   }
 
-  return { refresh, workingDirectory, changeWorkingDirectory, draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, workflowMode, workflowSelectionAvailable, switchingMode, clock, optimisticStartedAt, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill }
+  return { cacheUsage: turns.flatMap(turn => turn.usage.stages), canStop, stopping, refresh, workingDirectory, changeWorkingDirectory, draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, workflowMode, workflowSelectionAvailable, switchingMode, clock, optimisticStartedAt, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill }
 }

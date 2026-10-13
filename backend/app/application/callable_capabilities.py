@@ -82,6 +82,10 @@ async def resolve_callable(session, version_id: str) -> CallableCapability:
             contract.setdefault(
                 "description", source_interfaces.get(name, {}).get("description", owner.name)
             )
+            profile = skill.manifest_json["interfaces"][name].get("x-executionProfile") or source_interfaces.get(name, {}).get("x-executionProfile")
+            if profile:
+                contract["executionProfile"] = profile
+                contract["requiresLocalValidation"] = profile == "local-command"
             contract["permissions"] = merge_requirements(
                 skill.manifest_json.get("manifest", {}).get("spec", {}).get("permissions", {}),
                 contract.get("permissions", {}),
@@ -114,12 +118,15 @@ async def resolve_callable(session, version_id: str) -> CallableCapability:
     owner = await session.get(Workflow, workflow.workflow_id)
     effects, permissions = [], {}
     idempotent = True
+    requires_local_validation = False
     for node in spec["nodes"]:
         permissions = merge_requirements(permissions, {"required": node.get("permissions", [])})
         idempotent = idempotent and node.get("idempotent", True)
-        if node["type"] == "skillx":
-            dependency = await resolve_callable(session, node["config"]["capabilityVersionId"])
-            contract = dependency.contract["interfaces"][node["config"]["interface"]]
+        if node["type"] in {"skillx", "capability_call", "workflow_call"}:
+            config = node["config"]
+            dependency = await resolve_callable(session, config.get("capabilityVersionId") or config["workflowVersionId"])
+            contract = dependency.contract["interfaces"][config.get("interface", "execute")]
+            requires_local_validation = requires_local_validation or contract.get("requiresLocalValidation", False)
             effects.extend(
                 {**deepcopy(effect), "id": node["id"] + ":" + effect.get("id", "effect")}
                 for effect in contract.get("effects", [])
@@ -158,6 +165,7 @@ async def resolve_callable(session, version_id: str) -> CallableCapability:
                     },
                     "permissions": permissions,
                     "effects": effects,
+                    "requiresLocalValidation": requires_local_validation,
                 }
             },
             **{
@@ -179,6 +187,13 @@ async def callable_catalog(session) -> list[dict]:
             not skill.enabled or skill.deleted_at or not skill.skillx_version_id
             or skill.converted_source_digest != skill.source_digest
         )
+    }
+    # A deleted historical guide must not hide a newly generated, enabled
+    # replacement that binds the same capability identity.
+    hidden -= {
+        skill.skillx_capability_id for skill in managed
+        if skill.enabled and not skill.deleted_at and skill.skillx_version_id
+        and skill.converted_source_digest == skill.source_digest
     }
     version_ids = list(
         await session.scalars(

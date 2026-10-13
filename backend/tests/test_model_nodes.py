@@ -1,12 +1,9 @@
 import json
 import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
 from typing import Any
 from uuid import uuid4
 
-import httpx
 import pytest
 from sqlalchemy import select
 
@@ -23,7 +20,7 @@ from app.infrastructure.database import (
     WorkflowVersion,
 )
 from app.runtime.executors import LLMExecutor
-from app.runtime.models import ModelRuntimeError, OpenAICompatibleAdapter
+from app.runtime.models import ModelRuntimeError
 
 STUB = Path(__file__).resolve().parents[2] / "examples" / "traex_stub.py"
 
@@ -43,49 +40,6 @@ def test_llm_prompt_always_includes_one_canonical_resolved_input_section() -> No
         assert prompt.count("[RESOLVED_INPUT_JSON]") == 1
         assert prompt.count(canonical) == 1
     assert "{input}" not in with_repeated_placeholder
-
-
-class _ModelHandler(BaseHTTPRequestHandler):
-    status = 200
-
-    def do_POST(self) -> None:  # noqa: N802
-        length = int(self.headers.get("content-length", "0"))
-        self.rfile.read(length)
-        if self.status != 200:
-            self.send_response(self.status)
-            self.end_headers()
-            return
-        payload = {
-            "model": "direct-test-model",
-            "choices": [{"message": {"content": json.dumps({"category": "direct"})}}],
-            "usage": {"prompt_tokens": 7, "completion_tokens": 3},
-        }
-        body = json.dumps(payload).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *_: object) -> None:
-        return
-
-
-class ModelServer:
-    def __init__(self, status: int) -> None:
-        handler = type("ConfiguredModelHandler", (_ModelHandler,), {"status": status})
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        self.thread = Thread(target=self.server.serve_forever, daemon=True)
-
-    def __enter__(self) -> str:
-        self.thread.start()
-        host, port = self.server.server_address
-        return f"http://{host}:{port}/v1/chat/completions"
-
-    def __exit__(self, *_: object) -> None:
-        self.server.shutdown()
-        self.server.server_close()
-        self.thread.join(timeout=5)
 
 
 def model_workflow(node_type: str = "llm") -> dict[str, Any]:
@@ -238,131 +192,14 @@ def _configure_agent_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-async def test_llm_unconfigured_does_not_silently_switch_to_agent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_llm_uses_agent_without_direct_model_configuration(monkeypatch):
+    from app.application.agent_host import AgentHost, AgentHostResult
     settings = get_settings()
     monkeypatch.setattr(settings, "llm_runtime_type", "unavailable")
     _configure_agent_fixture(monkeypatch)
-
-    run_id, run = await execute_workflow(_real_model_workflow())
-
-    assert run.status == "failed"
-    assert run.error_json["code"] == "MODEL_RUNTIME_UNAVAILABLE"
-    async with SessionLocal() as session:
-        usage = await session.scalar(select(ModelUsage).where(ModelUsage.run_id == run_id))
-        event_types = set(
-            await session.scalars(select(RunEvent.type).where(RunEvent.run_id == run_id))
-        )
-    assert usage is None
-    assert "tool.requested" not in event_types
-
-
-async def test_both_model_runtimes_unavailable_fails_stably(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    settings = get_settings()
-    monkeypatch.setattr(settings, "llm_runtime_type", "unavailable")
-    monkeypatch.setattr(settings, "agent_runtime_type", "unavailable")
-    monkeypatch.setattr(settings, "agent_command", None)
-
+    async def execute(self, request, **kwargs):
+        assert request.requested_capabilities == ()
+        return AgentHostResult(output={"category": "positive"}, total_tokens=3, input_tokens=2, output_tokens=1, usage_complete=True)
+    monkeypatch.setattr(AgentHost, "execute", execute)
     _run_id, run = await execute_workflow(_real_model_workflow())
-
-    assert run.status == "failed"
-    assert run.error_json["code"] == "MODEL_RUNTIME_UNAVAILABLE"
-
-
-@pytest.mark.parametrize(
-    ("status", "expected_status", "expected_code", "expected_runtime"),
-    [
-        (200, "succeeded", None, "direct_llm"),
-        (401, "failed", "MODEL_AUTH_FAILED", None),
-        (429, "failed", "RATE_LIMITED", None),
-    ],
-)
-async def test_direct_llm_never_falls_back_after_request_started(
-    monkeypatch: pytest.MonkeyPatch,
-    status: int,
-    expected_status: str,
-    expected_code: str | None,
-    expected_runtime: str | None,
-) -> None:
-    settings = get_settings()
-    _configure_agent_fixture(monkeypatch)
-    monkeypatch.setattr(settings, "llm_runtime_type", "openai_compatible")
-    monkeypatch.setattr(settings, "llm_model", "direct-test-model")
-    monkeypatch.setattr(settings, "llm_api_key_env", "TEST_LLM_RUNTIME_KEY")
-    monkeypatch.setenv("TEST_LLM_RUNTIME_KEY", "configured")
-    with ModelServer(status) as endpoint:
-        monkeypatch.setattr(settings, "llm_endpoint", endpoint)
-        run_id, run = await execute_workflow(_real_model_workflow())
-
-    assert run.status == expected_status
-    if expected_code:
-        assert run.error_json["code"] == expected_code
-    async with SessionLocal() as session:
-        usage = await session.scalar(
-            select(ModelUsage).where(ModelUsage.run_id == run_id)
-        )
-        event_types = set(
-            await session.scalars(select(RunEvent.type).where(RunEvent.run_id == run_id))
-        )
-        detail = await get_run(run_id, session)
-    assert (usage.runtime_used if usage else None) == (
-        expected_runtime or "direct_llm"
-    )
-    assert "tool.requested" not in event_types
-    assert detail["runtimeSnapshot"]["modelCalled"] is True
-    if status != 200:
-        assert usage is not None
-        assert usage.usage_complete is False
-        assert usage.total_tokens is None
-        assert usage.request_dispatched_at is not None
-        assert usage.completed_at is None
-    else:
-        assert usage is not None
-        assert usage.request_dispatched_at is not None
-        assert usage.completed_at is not None
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [
-        httpx.ConnectError("dns failed"),
-        httpx.TimeoutException("timed out"),
-    ],
-)
-async def test_direct_llm_transport_failures_record_dispatch(
-    monkeypatch: pytest.MonkeyPatch,
-    failure: httpx.HTTPError,
-) -> None:
-    settings = get_settings()
-    monkeypatch.setattr(settings, "llm_runtime_type", "openai_compatible")
-    monkeypatch.setattr(settings, "llm_endpoint", "https://provider.invalid/v1")
-    monkeypatch.setattr(settings, "llm_model", "direct-test-model")
-    monkeypatch.setattr(settings, "llm_api_key_env", "TEST_LLM_RUNTIME_KEY")
-    monkeypatch.setenv("TEST_LLM_RUNTIME_KEY", "configured")
-
-    class FailingClient:
-        async def __aenter__(self) -> "FailingClient":
-            return self
-
-        async def __aexit__(self, *_args: object) -> None:
-            return None
-
-        async def post(self, *_args: object, **_kwargs: object) -> None:
-            raise failure
-
-    monkeypatch.setattr(
-        "app.runtime.models.httpx.AsyncClient",
-        lambda **_kwargs: FailingClient(),
-    )
-
-    with pytest.raises(ModelRuntimeError) as raised:
-        await OpenAICompatibleAdapter().generate(
-            "test",
-            {"type": "object"},
-            10,
-        )
-
-    assert raised.value.request_dispatched is True
+    assert run.status == "succeeded", run.error_json

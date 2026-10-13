@@ -57,7 +57,7 @@ _USER_ERRORS: dict[str, tuple[str, str]] = {
     "RATE_LIMITED": ("服务请求过于频繁，请稍后重试。", "retry_later"),
     "MODEL_NOT_CONFIGURED": ("真实模型尚未配置，请在系统设置中完成配置。", "configure"),
     "MODEL_RUNTIME_UNAVAILABLE": (
-        "LLM Runtime 与 Agent Runtime 均不可用，请在系统设置中完成配置。",
+        "Agent 不可用，请在系统设置中配置 Pi 或其他 Agent。",
         "configure",
     ),
     "MODEL_RUNTIME_CONFIG_DRIFT": (

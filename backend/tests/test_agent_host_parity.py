@@ -334,3 +334,10 @@ def test_normalize_action_ignores_failed_browser_contract() -> None:
     action = AgentHost._normalize_action("tool.result", started, completed)
     assert "pageContract" not in action["arguments"]
     assert "pageContract" not in (action.get("observations") or {})
+
+
+def test_runtime_owned_output_channel_has_no_competing_json_terminal_rule():
+    prompt = build_strict_terminal_prompt("分析文件", OUTPUT_SCHEMA, include_schema=False)
+    assert "工具的参数对象" in prompt
+    assert "最终消息必须且只能" not in prompt
+    assert "outputSchema=" not in prompt

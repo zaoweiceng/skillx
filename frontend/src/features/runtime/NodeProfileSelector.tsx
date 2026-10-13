@@ -14,9 +14,9 @@ export function NodeProfileSelector({ node, onPatch }: {
     return () => { active = false }
   }, [])
   if (!['llm', 'agent'].includes(node.type)) return null
-  const key = node.type === 'llm' ? 'modelProfileId' : 'agentProfileId'
+  const key = 'agentProfileId'
   return <label className="inspector-field">
-    <span>{node.type === 'llm' ? '模型服务' : 'Agent 执行体'}</span>
+    <span>Agent 执行体</span>
     <select value={String(node.config?.[key] ?? '')} onChange={event => {
       const config = { ...node.config }
       if (event.target.value) config[key] = event.target.value
@@ -24,7 +24,7 @@ export function NodeProfileSelector({ node, onPatch }: {
       onPatch({ config })
     }}>
       <option value="">发布时使用默认配置</option>
-      {profiles.filter(item => item.kind === (node.type === 'llm' ? 'model' : 'agent')).map(item =>
+      {profiles.filter(item => item.kind === 'agent').map(item =>
         <option key={item.id} value={item.id} disabled={!item.active}>{item.name}</option>)}
     </select>
     {error && <span role="status">{error}</span>}

@@ -73,6 +73,7 @@ async def execute_skillx(
                 invocation_id + "-" + alias,
                 runtime,
                 cancelled,
+                effect_approved=effect_approved,
                 depth=depth + 1,
             )
             if result.status != "succeeded":
@@ -114,8 +115,17 @@ async def execute_skillx(
 
     async def perform():
         if raw["kind"] == "direct":
+            working_directory = None
+            if raw.get("x-executionProfile") == "local-command":
+                from app.application.local_execution import validate_working_directory
+                if not get_settings().task_local_execution_enabled:
+                    raise PermissionError("本机命令执行尚未启用")
+                directory = (runtime or {}).get("workingDirectory")
+                if directory:
+                    working_directory = validate_working_directory(directory)
             return await execute_in_subprocess(
-                package, interface_name, invocation_id, inputs, secrets, dependency
+                package, interface_name, invocation_id, inputs, secrets, dependency,
+                working_directory=working_directory,
             )
         entry = raw.get("prompt", {}).get("entry")
         prompt_path = (package / str(entry)).resolve()

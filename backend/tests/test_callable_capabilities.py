@@ -411,3 +411,29 @@ async def test_ui_schema_is_snapshotted_and_cannot_escape_package(tmp_path, monk
     path.write_text(yaml.safe_dump(manifest))
     with pytest.raises(SkillXValidationError, match="包内路径"):
         load_manifest(package)
+
+async def test_catalog_propagates_local_validation_through_published_nested_workflows():
+    from types import SimpleNamespace
+    from app.infrastructure.database import Capability, CapabilityVersion, Workflow, WorkflowVersion
+    skill = SimpleNamespace(status='published', capability_id='skill-owner', id='local-skill',
+        version='1', digest='sha256:skill', manifest_json={
+            'interfaces': {'execute': {'inputSchema': {}, 'outputSchema': {},
+                'execution': {'idempotency': 'none'}}},
+            'manifest': {'spec': {'interfaces': {'execute': {'x-executionProfile': 'local-command'}}}}})
+    def flow(id, node):
+        return SimpleNamespace(id=id, workflow_id=id+'-owner', version=1, digest='sha256:'+id,
+            definition_json={'spec': {'inputSchema': {}, 'outputSchema': {}, 'nodes': [node]}})
+    child = flow('child', {'id': 'call', 'type': 'capability_call', 'config': {
+        'capabilityVersionId': 'local-skill', 'interface': 'execute'}})
+    parent = flow('parent', {'id': 'nested', 'type': 'workflow_call', 'config': {'workflowVersionId': 'child'}})
+    records = {(CapabilityVersion, 'local-skill'): skill, (Capability, 'skill-owner'): SimpleNamespace(name='local'),
+               (WorkflowVersion, 'child'): child, (WorkflowVersion, 'parent'): parent,
+               (Workflow, 'child-owner'): SimpleNamespace(name='child'),
+               (Workflow, 'parent-owner'): SimpleNamespace(name='parent')}
+    class Session:
+        async def get(self, model, key): return records.get((model, key))
+    session = Session()
+    local = (await resolve_callable(session, 'local-skill')).contract['interfaces']['execute']
+    assert local['executionProfile'] == 'local-command'
+    for id in ['local-skill', 'child', 'parent']:
+        assert (await resolve_callable(session, id)).contract['interfaces']['execute']['requiresLocalValidation']

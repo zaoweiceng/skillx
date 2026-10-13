@@ -4,7 +4,10 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import get_settings
 
 from app.application.runtime_profiles import agent_snapshot, list_profiles, save_profile
 from app.infrastructure.database import Conversation, RuntimeProfile, get_session
@@ -41,7 +44,7 @@ class ProfileConfig(BaseModel):
     model: str | None = Field(default=None, min_length=1, max_length=200)
     models: list[ModelConfig] | None = Field(default=None, min_length=1, max_length=100)
     apiKey: SecretStr | None = Field(default=None, json_schema_extra={"writeOnly": True})
-    timeoutSeconds: float = Field(default=60, ge=1, le=600)
+    timeoutSeconds: float = Field(default=300, ge=1, le=1800)
     apiKeyEnv: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     structuredMode: Literal["json_schema", "json_object", "prompt"] = "json_schema"
 
@@ -210,9 +213,8 @@ async def select_agent(
 async def probe(profile_id: str, session: AsyncSession = Depends(get_session)):
 
     from app.application.agent_provider import probe_provider
-    from app.application.runtime_config import LLMRuntimeConfig, agent_runtime_scope
+    from app.application.runtime_config import agent_runtime_scope
     from app.application.runtime_profiles import restore_agent_snapshot
-    from app.runtime.models import OpenAICompatibleAdapter
 
     item = await session.get(RuntimeProfile, profile_id)
     if item is None or not item.active:
@@ -239,20 +241,27 @@ async def probe(profile_id: str, session: AsyncSession = Depends(get_session)):
             }
 
         else:
+            from pathlib import Path
+            from uuid import uuid4
+            from app.application.agent_host import AgentHost, AgentHostRequest
             config = dict(item.config_json)
+            pi_profile = await session.scalar(select(RuntimeProfile).where(
+                RuntimeProfile.kind == "agent", RuntimeProfile.active.is_(True),
+                RuntimeProfile.config_json["adapter"].as_string() == "pi",
+            ))
+            if pi_profile is None:
+                raise ValueError("请先配置 Pi Agent，再探测模型服务")
+            runtime = restore_agent_snapshot(await agent_snapshot(session, pi_profile.id,
+                model_profile_id=profile_id, model_id=config["model"]))
             await session.rollback()
-            await OpenAICompatibleAdapter(
-                LLMRuntimeConfig(
-                    "openai_compatible",
-                    config["baseUrl"],
-                    config["model"],
-                    config["apiKeyEnv"],
-                    credential_configured=bool(resolve_runtime_key(config["apiKeyEnv"])),
-                ),
-                timeout_seconds=config.get("timeoutSeconds", 60),
-                structured_mode=config.get("structuredMode", "json_schema"),
-            ).generate('Return {"reply":"ok"}', schema, 128)
-            result = {"status": "available", "summary": "真实模型输出契约验证成功"}
+            await AgentHost(runtime=runtime).execute(AgentHostRequest(
+                run_id="model-probe-" + str(uuid4()), prompt='Return {"reply":"ok"}',
+                output_schema=schema, working_directory=Path(get_settings().artifact_root) / "model-probes" / str(uuid4()),
+                max_steps=1, max_output_tokens=128, include_managed_skills=False,
+                capability_catalog_included=True, requested_capabilities=(),
+            ))
+            result = {"status": "available", "summary": "Pi Agent 模型服务验证成功"}
+
     except Exception as exc:
         result = {
             "status": "failed",

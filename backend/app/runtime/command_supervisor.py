@@ -18,12 +18,20 @@ def atomic(path, payload):
     temporary.replace(path)
 
 
-def tail(path, limit):
-    if not path.exists():
-        return ""
-    with path.open("rb") as stream:
-        stream.seek(max(0, path.stat().st_size - limit))
-        return stream.read(limit).decode(errors="replace")
+def captured_stream(path, limit, *, keep_tail=False):
+    """Bound transport, not evidence: retain the complete file and label omissions."""
+    size = path.stat().st_size if path.exists() else 0
+    offset = max(0, size - limit) if keep_tail else 0
+    if path.exists():
+        with path.open("rb") as stream:
+            stream.seek(offset)
+            raw = stream.read(limit)
+    else:
+        raw = b""
+    return raw.decode(errors="replace"), {
+        "path": str(path.resolve()), "totalBytes": size,
+        "truncated": size > limit, "offsetBytes": offset, "retainedBytes": len(raw),
+    }
 
 
 def main():
@@ -94,6 +102,8 @@ def main():
                 error = f"命令退出码 {process.returncode}"
     except Exception as exc:
         error = str(exc)
+    stdout, stdout_info = captured_stream(out_path, 256 * 1024)
+    stderr, stderr_info = captured_stream(err_path, 16000, keep_tail=True)
     atomic(
         result_path,
         {
@@ -102,8 +112,9 @@ def main():
             "exitCode": process.returncode if process else None,
             "argv": request["argv"],
             "requestDigest": request["digest"],
-            "stdout": tail(out_path, 32000),
-            "stderr": tail(err_path, 16000),
+            "stdout": stdout,
+            "stderr": stderr,
+            "streams": {"stdout": stdout_info, "stderr": stderr_info},
         },
     )
 

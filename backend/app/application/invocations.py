@@ -385,6 +385,10 @@ class InvocationDriver:
                             item.request_json.get("input", {}),
                             automatic_recovery=True,
                         )
+                        owner_task = await session.get(Task, item.task_id) if item.task_id else None
+                        if owner_task and owner_task.state_json.get("workingDirectory"):
+                            run.runtime_snapshot_json = {**run.runtime_snapshot_json,
+                                "workingDirectory": owner_task.state_json["workingDirectory"]}
                 except Exception as exc:
                     item.status = "failed"
                     item.error_json = {
@@ -525,7 +529,7 @@ class InvocationDriver:
                         args["interface"],
                         args.get("input", {}),
                         invocation_id,
-                        runtime_json,
+                        {**runtime_json, "workingDirectory": working_directory},
                         cancelled,
                         effect_approved=effect_approved,
                     )

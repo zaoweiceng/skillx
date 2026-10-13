@@ -354,6 +354,7 @@ class SkillXExecutor:
                     .get(node.id, {})
                     .get("agentConfig"),
                     "modelSnapshot": context.runtime_snapshot.get("nodeProfiles", {}).get(node.id),
+                    "workingDirectory": context.runtime_snapshot.get("workingDirectory"),
                 },
                 cancelled,
                 effect_approved=approved,
@@ -483,7 +484,7 @@ class LLMExecutor:
         )
         request_dispatched = False
         try:
-            max_output_tokens = int(node.config.get("maxOutputTokens", 1000))
+            max_output_tokens = int(node.config.get("maxOutputTokens", get_settings().structured_agent_max_output_tokens))
             if node.config.get("modelProfile") == "fake":
                 fake = await FakeModelAdapter(node.config.get("fakeOutput", {})).generate(
                     prompt, output_schema, max_output_tokens
@@ -570,7 +571,7 @@ class LLMExecutor:
                 ],
             )
         except ModelRuntimeError as exc:
-            snapshot = context.runtime_snapshot
+            snapshot = context.runtime_snapshot.get("nodeProfiles", {}).get(node.id, context.runtime_snapshot)
             runtime_selection = snapshot.get(
                 "runtimeSelection",
                 snapshot.get("runtimeUsed"),
@@ -584,7 +585,7 @@ class LLMExecutor:
                     "usageComplete": False,
                     "requestDispatched": exc.request_dispatched,
                 }
-                if runtime_selection == "direct_llm"
+                if runtime_selection == "agent_structured"
                 else {}
             )
             return NodeResult(
@@ -593,7 +594,7 @@ class LLMExecutor:
                 metrics=metrics,
             )
         except Exception as exc:
-            snapshot = context.runtime_snapshot
+            snapshot = context.runtime_snapshot.get("nodeProfiles", {}).get(node.id, context.runtime_snapshot)
             runtime_selection = snapshot.get(
                 "runtimeSelection",
                 snapshot.get("runtimeUsed"),
@@ -610,7 +611,7 @@ class LLMExecutor:
                         "usageComplete": False,
                         "requestDispatched": request_dispatched,
                     }
-                    if runtime_selection == "direct_llm"
+                    if runtime_selection == "agent_structured"
                     else {}
                 ),
             )

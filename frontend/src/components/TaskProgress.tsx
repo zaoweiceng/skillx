@@ -1,11 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Alert, Collapse, Spin } from 'antd'
 import { request } from '@/api/http'
 import styles from './TaskProgress.module.css'
 
 import { progressLabel, summarizeProgress, kindLabels, type TaskEvent } from './taskProgressEvents'
 
-export default function TaskProgress({ id, finished, learningActive = false, invocations }: {
+export default function TaskProgress({ id, finished, learningActive = false, invocations, children }: {
+  children?: ReactNode
   id: string; finished: boolean; learningActive?: boolean; invocations: Array<{id: string; kind: string; status: string}>
 }) {
   const [events, setEvents] = useState<TaskEvent[]>([])
@@ -40,9 +41,13 @@ export default function TaskProgress({ id, finished, learningActive = false, inv
     const clock = finished ? undefined : setInterval(() => setNow(Date.now()), 1000)
     return () => { active = false; abort.abort(); clearTimeout(timer); clearInterval(clock) }
   }, [id, finished, learningActive])
-  const steps = summarizeProgress(events)
+  // Group in execution order, then present newest stages first without changing the polling cursor.
+  const steps = summarizeProgress(events).reverse()
   const latest = events.map(event => ({ ...event, label: progressLabel(event) })).filter(event => event.label).at(-1)
-  const waiting = latest ? Math.max(0, Math.floor((now - Date.parse(latest.createdAt)) / 1000)) : 0
+  const activity = events.filter(event => progressLabel(event) || (
+    ['agent.audit', 'learning.agent.audit'].includes(event.type) && event.payload.type === 'model.response.progress'
+  )).at(-1)
+  const waiting = activity ? Math.max(0, Math.floor((now - Date.parse(activity.createdAt)) / 1000)) : 0
   const running = invocations.filter(call => ['running', 'waiting_execution'].includes(call.status))
   const timeline = <ol className={styles.steps}>{steps.map(event => <li key={event.id}>
     <time>{new Date(event.createdAt).toLocaleTimeString()}</time><span>{event.label}{event.detail && <small className={styles.detail}>{event.detail}</small>}</span>
@@ -53,11 +58,15 @@ export default function TaskProgress({ id, finished, learningActive = false, inv
       <div className={styles.current} role="status"><Spin size="small" />
         <span>{running.length ? `正在执行：${[...new Set(running.map(call => kindLabels[call.kind] ?? call.kind))].join('、')}` : latest?.label ?? '正在读取执行进度…'}</span>
       </div>
-      {waiting >= 15 && <p className={styles.waiting}>距上次进展 {waiting} 秒，{running.length ? '调用尚未返回结果' : '尚未收到新的执行事件'}。</p>}
-      {steps.length > 0 && <div className={styles.recent}><ol className={styles.steps}>{steps.slice(-4).map(event => <li key={event.id}>
+      {steps.length > 0 && <div className={styles.recent}><ol className={styles.steps}>{steps.slice(0, 4).map(event => <li key={event.id}>
         <time>{new Date(event.createdAt).toLocaleTimeString()}</time><span>{event.label}{event.detail && <small className={styles.detail}>{event.detail}</small>}</span>
       </li>)}</ol></div>}
     </>}
-    {steps.length > 0 && <Collapse ghost size="small" items={[{ key: 'progress', label: finished ? `执行过程 · ${steps.length} 个阶段` : '查看完整执行过程', children: timeline }]} />}
+    {(steps.length > 0 || (finished && children)) && <Collapse key={`${id}-${finished}`} ghost size="small" items={[{
+      key: 'progress', label: finished ? `执行过程${steps.length ? ` · ${steps.length} 个阶段` : ''}` : '查看完整执行过程',
+      children: <>{timeline}{finished && children}</>,
+    }]} />}
+    {!finished && waiting >= 15 && <p className={styles.waiting}>距上次进展 {waiting} 秒，{running.length ? '调用尚未返回结果' : '尚未收到新的执行事件'}。</p>}
+    {!finished && children}
   </div>
 }

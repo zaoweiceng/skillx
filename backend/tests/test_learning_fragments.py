@@ -100,7 +100,8 @@ def mock_proposal(monkeypatch, value):
                 item for item in value["skillx"] if item["name"] == data["fragment"]["name"]
             )
             return AgentHostResult(
-                output={"decision": "ready", "reason": "可验证", "skillx": draft}
+                output={"decision": "ready", "reason": "可验证", "skillx": {
+                    "executionProfile": "pure-python", **draft}}
             )
         assert title == "WorkflowDraft"
         assert "工作流编排专家" in request.prompt
@@ -145,7 +146,10 @@ async def test_reusable_guide_is_saved_without_workflow(monkeypatch):
         guide = await session.get(ManagedSkill, job.result_json["skills"]["team-analysis"])
         assert guide.skillx_version_id is None
         assert "本次临时分析" not in guide.content
-        assert call_id in guide.content
+        assert call_id not in guide.content
+        assert job_id not in guide.content
+        assert "x-source-invocations" not in guide.content
+        assert job.result_json["artifactProvenance"][guide.id]["sourceInvocationIds"] == [call_id]
         assert (await managed_skill_context(session))["skills"][0]["name"] == "team-analysis"
 
 
@@ -225,7 +229,7 @@ async def test_only_fixed_fragment_is_saved_as_workflow(monkeypatch):
     async with SessionLocal() as session:
         job = await session.get(LearningJob, job_id)
         assert job.status == "published", job.result_json
-        version = await session.get(WorkflowVersion, job.result_json["workflowVersionId"])
+        version = await session.get(WorkflowVersion, job.result_json["workflows"]["fixed-workflow"])
         assert version.definition_json["metadata"]["reuseScope"].endswith("不包含团队分析")
         assert version.definition_json["metadata"]["sourceInvocationIds"] == [call_id]
         assert [node["type"] for node in version.definition_json["spec"]["nodes"]] == [
@@ -276,3 +280,25 @@ def test_candidate_requires_reuse_scope_and_real_evidence():
     )
     with pytest.raises(ValueError, match="成功执行证据"):
         validate_learning_scope(proposal, witness, "distill")
+
+
+async def test_failed_skillx_does_not_block_sibling_or_repeat_job(monkeypatch):
+    from copy import deepcopy
+    job_id, call_id = await learning_job({"value": 2})
+    schema = {"type": "object", "properties": {"value": {"type": "integer"}}, "required": ["value"]}
+    good = {"name": "double-value", "description": "数值翻倍", "kind": "direct",
+        "inputSchema": schema, "outputSchema": schema,
+        "source": 'def execute(request, context): return {"value": request.input["value"] * 2}',
+        "examples": [{"input": {"value": 1}, "expected": {"value": 2}, "sourceInvocationId": call_id},
+                     {"input": {"value": 3}, "expected": {"value": 6}}]}
+    broken = deepcopy(good)
+    broken.update(name="broken-value", source='def execute(request, context): return {"value": 99}')
+    mock_proposal(monkeypatch, {"decision": "candidate", "reason": "独立能力", "skillx": [broken, good]})
+    assert await LearningDriver().poll_once()
+    async with SessionLocal() as session:
+        job = await session.get(LearningJob, job_id)
+        assert job.status == "partial", job.result_json
+        assert set(job.result_json["skillx"]) == {"double-value"}
+        assert "skillx:broken-value" in job.result_json["failures"]
+        assert job.attempts == 1
+    assert await LearningDriver().poll_once() is False

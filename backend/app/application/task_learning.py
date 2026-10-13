@@ -55,15 +55,19 @@ async def save_learned_skills(
     from app.infrastructure.models import CapabilityVersion, ManagedSkill
 
     raw_ids, converted_ids = {}, {}
+    provenance = {}
+    job = await session.get(LearningJob, job_id)
+    fragment_sources = {item["name"]: item.get("sourceInvocationIds", []) for item in
+        ((job.result_json if job else {}).get("agentStages", {}).get("extractor", {}).get("output", {}).get("skillx", []))}
     for skill in proposal.skills:
         metadata, body = parse_skill(skill.content)
+        for key in ("x-learning-job-id", "x-source-invocations"):
+            metadata.pop(key, None)
         metadata.update(
             {
                 "name": skill.name,
                 "description": skill.description,
                 "useWhen": skill.useWhen,
-                "x-learning-job-id": job_id,
-                "x-source-invocations": skill.sourceInvocationIds,
             }
         )
         content = "---\n" + yaml.safe_dump(metadata, allow_unicode=True) + "---\n\n" + body
@@ -95,6 +99,7 @@ async def save_learned_skills(
             },
         )
         raw_ids[skill.name] = managed.id
+        provenance[managed.id] = {"sourceInvocationIds": skill.sourceInvocationIds}
     for skill in proposal.skillx:
         version = await session.get(CapabilityVersion, registered[skill.name])
         managed = await session.scalar(
@@ -104,7 +109,12 @@ async def save_learned_skills(
             )
         )
         if managed:
-            raise ValueError("该 SkillX 已有受管理的版本，请复用其契约，避免覆盖现有 Skill")
+            job = await session.get(LearningJob, job_id)
+            expected = (job.result_json.get("revisionBaseVersions", {}) if job else {}).get(skill.name)
+            if not expected or managed.skillx_version_id != expected:
+                raise ValueError("修订已有 SkillX 必须锁定被验证失败的基线版本，避免覆盖用户的新版本")
+            if managed.source_digest != managed.converted_source_digest:
+                raise ValueError("SkillX 已被用户编辑，不能以生成修订覆盖")
         root = roots[skill.name]
         managed = await save_skill(
             session,
@@ -115,12 +125,20 @@ async def save_learned_skills(
                 "content": (root / "SKILL.md").read_text(),
                 "enabled": True,
             },
+            skill=managed,
             imported=root,
         )
         managed.skillx_capability_id = version.capability_id
         managed.skillx_version_id = version.id
         managed.converted_source_digest = managed.source_digest
         converted_ids[skill.name] = managed.id
+        provenance[managed.id] = {"sourceInvocationIds": fragment_sources.get(skill.name) or sorted({
+            example.sourceInvocationId for example in skill.examples if example.sourceInvocationId
+        }), "capabilityVersionId": version.id}
+    job = await session.get(LearningJob, job_id)
+    if job is not None:
+        job.result_json = {**job.result_json, "artifactProvenance": {
+            **job.result_json.get("artifactProvenance", {}), **provenance}}
     return {"skills": raw_ids, "skillx": registered, "skillxSkills": converted_ids}
 
 
@@ -146,6 +164,9 @@ async def materialize_skill(proposal: SkillProposal, job_id: str, evidence: dict
 
         return await materialize_model_skill(proposal, job_id, evidence)
     import ast
+    local_command = proposal.executionProfile == "local-command"
+    if local_command and proposal.dependencies:
+        raise ValueError("命令脚本直接使用本机 CLI；不要混入未隔离的远程依赖")
 
     from app.application.dependency_fixtures import fixture_handler, observed_dependencies
 
@@ -154,24 +175,7 @@ async def materialize_skill(proposal: SkillProposal, job_id: str, evidence: dict
             session, proposal.dependencies, evidence
         )
     tree = ast.parse(proposal.source)
-    # Generated packages cannot silently gain network/filesystem/process dependencies.
-    allowed_imports = {
-        "math",
-        "statistics",
-        "decimal",
-        "fractions",
-        "re",
-        "json",
-        "datetime",
-        "collections",
-        "itertools",
-        "functools",
-        "operator",
-        "string",
-        "typing",
-    }
     forbidden = {
-        "open",
         "eval",
         "exec",
         "compile",
@@ -196,27 +200,12 @@ async def materialize_skill(proposal: SkillProposal, job_id: str, evidence: dict
                 or node.args[1].value.startswith("_")
             ):
                 raise ValueError("getattr 只允许静态公开属性名称")
-        if isinstance(node, ast.Import) and any(
-            x.name.split(".")[0] not in allowed_imports for x in node.names
-        ):
-            raise ValueError("生成能力需要额外依赖验证，保留候选")
-        if isinstance(node, ast.ImportFrom) and (
-            node.level or (node.module or "").split(".")[0] not in allowed_imports
-        ):
-            raise ValueError("生成能力需要额外依赖验证，保留候选")
         if isinstance(node, ast.Name) and (node.id in forbidden or node.id.startswith("__")):
             raise ValueError("生成能力包含需要人工授权的动态执行或 I/O")
-        if isinstance(node, ast.Attribute) and node.attr.startswith("_"):
-            raise ValueError("生成能力不允许访问内部属性")
-    verified = [
-        example
-        for example in proposal.examples
-        if example.sourceInvocationId in evidence
-        and evidence[example.sourceInvocationId].status == "succeeded"
-        and observed_output(evidence[example.sourceInvocationId]) == example.expected
-    ]
-    if not verified or len({digest_json(x.input) for x in proposal.examples}) < 2:
-        raise ValueError("缺少原任务结果证据或不同输入测试")
+        if isinstance(node, ast.Attribute) and node.attr.startswith("_") and node.attr != "__name__":
+            raise ValueError(f"source 第 {node.lineno} 行访问了不允许的内部属性 {node.attr}")
+    from app.application.learning_evidence import validate_examples
+    validate_examples(proposal.examples, evidence, local_command=local_command)
     root = get_settings().capability_root.resolve() / "generated" / job_id / proposal.name
     root.mkdir(parents=True, exist_ok=True)
     (root / "SKILL.md").write_text(
@@ -265,18 +254,31 @@ async def materialize_skill(proposal: SkillProposal, job_id: str, evidence: dict
                         "protocol": "skillx.python-callable/v1",
                         "entry": "execute.py:execute",
                     },
-                    "execution": {"timeoutSeconds": 30, "idempotency": "inherent"},
-                    "effects": [],
+                    "execution": {"timeoutSeconds": 30, "idempotency": "none" if any(
+                        lock.get("effect", "unknown") not in {"none", "read", "data.read"}
+                        for lock in dependency_locks.values()
+                    ) else "inherent"},
+                    "effects": [{"type": lock["effect"], "confirmation": "required"}
+                        for lock in dependency_locks.values()
+                        if lock.get("effect", "unknown") not in {"none", "read", "data.read"}],
                     "capabilities": list(proposal.dependencies),
                 }
             },
         },
     }
+    manifest["spec"]["interfaces"]["execute"]["x-executionProfile"] = proposal.executionProfile
+    if local_command:
+        interface = manifest["spec"]["interfaces"]["execute"]
+        interface["x-executionProfile"] = "local-command"
+        interface["execution"]["idempotency"] = "none"
+        interface["effects"] = [{"type": "local.command", "confirmation": "required"}]
     (root / "skillx.yaml").write_text(yaml.safe_dump(manifest, allow_unicode=True))
     load_manifest(root)
     import asyncio
 
     for index, example in enumerate(proposal.examples):
+        if local_command:
+            continue  # Validate resolved fixture values after setup, not placeholders.
         Draft202012Validator(proposal.inputSchema).validate(example.input)
         async with asyncio.timeout(30):
             result = await execute_in_subprocess(
@@ -292,7 +294,13 @@ async def materialize_skill(proposal: SkillProposal, job_id: str, evidence: dict
             )
     from app.application.clean_validation import validate_clean_package
 
-    await validate_clean_package(root, proposal.examples, proposal.outputSchema, fixtures=fixtures)
+    if local_command:
+        from app.application.local_validation import validate_local_package
+        await validate_local_package(root, proposal.examples, proposal.outputSchema)
+    else:
+        await validate_clean_package(root, proposal.examples, proposal.outputSchema, fixtures=fixtures)
+        from app.application.input_form_coverage import validate_input_form_coverage
+        validate_input_form_coverage(proposal.inputSchema, [example.input for example in proposal.examples])
     (root / "dependency-validation.json").write_text(
         json.dumps(
             {
@@ -301,7 +309,7 @@ async def materialize_skill(proposal: SkillProposal, job_id: str, evidence: dict
             }
         )
     )
-    (root / "tests.json").write_text(json.dumps([x.model_dump() for x in proposal.examples]))
+    (root / "tests.json").write_text(json.dumps([x.portable_dump() for x in proposal.examples]))
     return root
 
 
@@ -413,7 +421,7 @@ class LearningDriver:
                     == job.id
                 )
             )
-            if published:
+            if published and job.kind == "repair":
                 job.status = "published"
                 job.result_json = {
                     "workflowVersionId": published.id,
@@ -444,8 +452,14 @@ class LearningDriver:
                 return False
             task = await session.get(Task, job.task_id)
             calls = list(
-                await session.scalars(select(Invocation).where(Invocation.task_id == task.id))
+                await session.scalars(select(Invocation).where(
+                    Invocation.id.in_(task.state_json["extractionSource"]["invocationIds"])
+                    if task.state_json.get("extractionSource") else Invocation.task_id == task.id
+                ))
             )
+            if job.result_json.get("automatic"):
+                nominated_ids = set(job.result_json["nomination"]["sourceInvocationIds"])
+                calls = [call for call in calls if call.id in nominated_ids]
             evidence = {x.id: x for x in calls}
             job_id, task_id, kind = job.id, task.id, job.kind
             attempts = job.attempts
@@ -478,6 +492,7 @@ class LearningDriver:
                         "status": x.status,
                         "input": x.request_json,
                         "output": x.output_json,
+                        "observedOutput": observed_output(x),
                         "error": x.error_json,
                     }
                     for x in calls
@@ -517,6 +532,18 @@ class LearningDriver:
                     .order_by(TaskEvent.id)
                 )
             ]
+            if task.state_json.get("extractionSource"):
+                source = task.state_json["extractionSource"]
+                context["requirements"] = task.state_json.get("extractionRequirements", {})
+                for key in ("sessionMessages", "humanAnswers", "decisions", "outcome"):
+                    context[key] = source[key]
+            if job.result_json.get("automatic"):
+                context["learningNomination"] = job.result_json["nomination"]
+                # Automatic learning evaluates the nominated delta, not the
+                # conversation again. Explicit user extraction keeps its snapshot.
+                context.pop("sessionMessages", None)
+                context.pop("decisions", None)
+                context.pop("finalState", None)
             if observation_id:
                 from app.infrastructure.database import FailureObservation, NodeRun
 
@@ -594,17 +621,23 @@ class LearningDriver:
             from app.application.learning_agents import LearningAgentPipeline
 
             pipeline = LearningAgentPipeline(job_id, task_id, token, runtime)
+            from app.application.learning_publishing import publish_artifacts
             proposal = await pipeline.generate(
                 context,
                 materializer=lambda skill, source_ids: materialize_skill(
                     skill, job_id, {id: evidence[id] for id in source_ids}
                 ),
+                publish=(lambda item: publish_artifacts(pipeline, item, evidence)) if kind != "repair" else None,
             )
             if any(skill.kind not in available_kinds for skill in proposal.skillx):
                 raise ValueError("候选使用了当前未配置的模型接口")
-            validate_learning_scope(proposal, evidence, kind)
+            if kind == "repair":
+                validate_learning_scope(proposal, evidence, kind)
             if proposal.decision == "skip":
                 status, output = "skipped", {"reason": proposal.reason}
+            elif kind != "repair":
+                from app.application.learning_publishing import publish_artifacts
+                status, output = await publish_artifacts(pipeline, proposal, evidence)
             else:
                 roots = pipeline.materialized_roots
                 async with SessionLocal() as session:
@@ -645,6 +678,8 @@ class LearningDriver:
                         await session.commit()
                         return True
                     definition = deepcopy(proposal.workflow)
+                    from app.domain.capability_metadata import validate_publication_metadata
+                    validate_publication_metadata(definition.get("metadata", {}))
                     definition.setdefault("metadata", {}).update(
                         {
                             "learningJobId": job_id,
@@ -769,8 +804,13 @@ class LearningDriver:
                     await pipeline.invalidate("workflow", pipeline.workflow_name, reason)
                 except LearningLeaseLost:
                     pass
+            # Deterministic contract/programming failures cannot improve by replaying
+            # the whole job. Only known transient transport failures may resume.
+            from app.application.error_policy import error_policy
+            policy = error_policy(getattr(exc, "code", "EXECUTOR_INTERNAL_ERROR"))
             status, output = (
-                "queued" if attempts < 3 else "blocked",
+                "queued" if policy.retryable and policy.evidence_kind == "transport_error"
+                and attempts < policy.max_attempts else "blocked",
                 {"reason": reason, "proposal": proposal.model_dump() if proposal else None},
             )
         async with SessionLocal() as session, session.begin():
@@ -778,8 +818,17 @@ class LearningDriver:
             if current.lease_token == token:
                 if observation_id:
                     output["observationId"] = observation_id
+                output["artifacts"] = output.get("artifacts", current.result_json.get("artifacts", {}))
                 output["agentStages"] = current.result_json.get("agentStages", {})
-                current.status, current.result_json = status, output
+                from app.application.conversation_extraction import finish_extraction
+                await finish_extraction(session, task_id, status, output)
+                current.status, current.result_json = status, {
+                    **output,
+                    "artifactProvenance": current.result_json.get("artifactProvenance", {}),
+                    "maintenanceResumes": current.result_json.get("maintenanceResumes", []),
+                    **{key: value for key, value in current.result_json.items()
+                       if key.startswith("revision") or key in {"budget", "usageByRequest", "validationUsageIncomplete"}},
+                }
                 current.lease_token, current.lease_expires_at = None, None
                 emit(
                     session,

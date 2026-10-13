@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
 
 from app.application.compiler import digest_json
-from app.application.runtime_config import LLMRuntimeConfig, llm_runtime_config
-from app.runtime.models import ModelRuntimeError, OpenAICompatibleAdapter
+from app.application.runtime_config import agent_runtime_config
+from app.runtime.models import ModelRuntimeError
 
-RuntimeUsed = Literal["direct_llm"]
+RuntimeUsed = Literal["agent_structured"]
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class StructuredGenerationRequest:
 @dataclass(frozen=True)
 class StructuredGenerationRuntime:
     runtime_used: RuntimeUsed
-    runtime_kind: Literal["llm_runtime"]
+    runtime_kind: Literal["agent_runtime"]
     provider: str
     identity: str | None
     protocol: str
@@ -34,6 +34,7 @@ class StructuredGenerationRuntime:
     adapter_digest: str | None
     digest: str
     policy_digest: str
+    fallback_reason: str | None = None
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -65,36 +66,25 @@ class StructuredGenerationResult:
 def normalize_model_runtime_policy(
     policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    raw = policy or {}
-    order = raw.get("order", ["llm_runtime"])
-    if order not in (["llm_runtime"], ["llm_runtime", "agent_runtime"]):
-        raise ValueError("modelRuntimePolicy.order 必须以 llm_runtime 开始")
-    return {"order": ["llm_runtime"]}
+    # Legacy policy fields remain readable, but cannot enable a second runtime.
+    return {"order": ["agent_runtime"]}
 
 
-def resolve_structured_generation_runtime(
-    policy: dict[str, Any] | None = None,
-) -> StructuredGenerationRuntime:
-    normalized = normalize_model_runtime_policy(policy)
-    policy_digest = digest_json(normalized)
-    llm = llm_runtime_config()
-    if llm.configured:
-        return StructuredGenerationRuntime(
-            runtime_used="direct_llm",
-            runtime_kind="llm_runtime",
-            provider="openai-compatible",
-            identity=llm.model,
-            protocol="openai-compatible-http",
-            runtime_type=llm.type,
-            adapter_version=None,
-            adapter_digest=None,
-            digest=llm.digest,
-            policy_digest=policy_digest,
-        )
-    raise ModelRuntimeError(
-        "MODEL_RUNTIME_UNAVAILABLE",
-        "LLM Runtime 未配置",
-    )
+def resolve_structured_generation_runtime(policy=None) -> StructuredGenerationRuntime:
+    agent = agent_runtime_config()
+    if not agent.configured:
+        raise ModelRuntimeError("MODEL_RUNTIME_UNAVAILABLE", "请配置 Pi 或其他 Agent")
+    return frozen_runtime_from_snapshot(agent_structured_snapshot(asdict(agent)))
+
+
+def agent_structured_snapshot(agent):
+    return {
+        "runtimeSelection": "agent_structured", "agentConfig": agent,
+        "runtimeKind": "agent_runtime", "provider": agent.get("provider", "agent"),
+        "identity": agent.get("model"), "protocol": "agent-host",
+        "runtimeType": agent["type"], "runtimeDigest": digest_json(agent),
+        "policyDigest": digest_json({"order": ["agent_runtime"], "tools": False}),
+    }
 
 
 def frozen_runtime_from_snapshot(
@@ -102,7 +92,7 @@ def frozen_runtime_from_snapshot(
 ) -> StructuredGenerationRuntime:
     selection = snapshot.get("runtimeSelection", snapshot.get("runtimeUsed")) if snapshot else None
     if not snapshot or selection not in {
-        "direct_llm",
+        "agent_structured",
     }:
         raise ModelRuntimeError(
             "MODEL_RUNTIME_UNAVAILABLE",
@@ -129,52 +119,30 @@ class StructuredGenerationResolver:
         runtime_snapshot: dict[str, Any] | None,
     ) -> StructuredGenerationResult:
         runtime = frozen_runtime_from_snapshot(runtime_snapshot)
-        config = (runtime_snapshot or {}).get("modelConfig")
-        selected = LLMRuntimeConfig(**config) if config else llm_runtime_config()
-        if selected.digest != runtime.digest:
-            raise ModelRuntimeError(
-                "MODEL_RUNTIME_CONFIG_DRIFT",
-                "LLM Runtime 配置在 Run 启动后发生变化",
-            )
-        result = await OpenAICompatibleAdapter(
-            selected,
-            structured_mode=(runtime_snapshot or {}).get("structuredMode") or "json_schema",
-            timeout_seconds=(runtime_snapshot or {}).get("timeoutSeconds", 60),
-        ).generate(
-            request.prompt,
-            request.output_schema,
-            request.max_output_tokens,
-        )
-        Draft202012Validator(request.output_schema).validate(result.output)
-        return StructuredGenerationResult(
-            output=result.output,
-            runtime=runtime,
-            input_tokens=result.input_tokens,
-            output_tokens=result.output_tokens,
-            total_tokens=result.input_tokens + result.output_tokens,
-            usage_complete=result.usage_complete,
-        )
+        if runtime.runtime_used == "agent_structured":
+            from app.application.agent_host import AgentHost, AgentHostRequest, AgentHostError
+            from app.application.runtime_profiles import restore_agent_snapshot
+            agent = (runtime_snapshot or {}).get("agentConfig")
+            if not agent or digest_json(agent) != runtime.digest:
+                raise ModelRuntimeError("MODEL_RUNTIME_CONFIG_DRIFT", "Agent 结构化生成配置已变化")
+            selected = restore_agent_snapshot(agent)
+            if not selected.configured:
+                raise ModelRuntimeError("MODEL_RUNTIME_UNAVAILABLE", "请配置 Pi 或其他 Agent")
+            try:
+                result = await AgentHost(runtime=selected).execute(AgentHostRequest(
+                run_id=request.call_id, prompt=request.prompt, output_schema=request.output_schema,
+                working_directory=request.working_directory, max_steps=1,
+                max_output_tokens=request.max_output_tokens, include_managed_skills=False,
+                capability_catalog_included=True, requested_capabilities=(),
+                ))
+            except AgentHostError as exc:
+                raise ModelRuntimeError(exc.code, str(exc), request_dispatched=exc.request_dispatched) from exc
+            Draft202012Validator(request.output_schema).validate(result.output)
+            return StructuredGenerationResult(output=result.output, runtime=runtime,
+                input_tokens=result.input_tokens, output_tokens=result.output_tokens,
+                total_tokens=result.total_tokens, usage_complete=result.usage_complete)
 
 
 def runtime_snapshot_for_definition(definition: Any) -> dict[str, Any]:
-    policy = getattr(definition.spec, "model_runtime_policy", None)
-    raw_policy = policy.model_dump(by_alias=True, mode="json") if policy is not None else None
-    normalized = normalize_model_runtime_policy(raw_policy)
-    try:
-        runtime = resolve_structured_generation_runtime(normalized)
-        return {"policy": normalized, **runtime.snapshot()}
-    except ModelRuntimeError as exc:
-        return {
-            "policy": normalized,
-            "runtimeSelection": "unavailable",
-            "runtimeKind": None,
-            "provider": None,
-            "identity": None,
-            "runtimeDigest": digest_json(
-                {
-                    "llm": llm_runtime_config().digest,
-                }
-            ),
-            "policyDigest": digest_json(normalized),
-            "fallbackReason": exc.code,
-        }
+    return {"policy": {"order": ["agent_runtime"]},
+            **agent_structured_snapshot(asdict(agent_runtime_config()))}

@@ -1,6 +1,6 @@
 .progress { margin: 12px 0; color: var(--muted); font-size: 12px; }
 .current { display: flex; align-items: center; gap: 10px; color: var(--ink); font-size: 13px; line-height: 1.7; }
-.waiting { margin: 6px 0 0 24px; }
+.progress .waiting { margin: 6px 0 0 28px; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .steps { list-style: none; padding: 0 0 0 14px; margin: 12px 0 12px 4px; max-height: 260px; overflow: auto; border-left: 1px solid var(--line, #e5e5e5); }
 .steps li { position: relative; display: flex; gap: 12px; padding: 0 0 14px 4px; line-height: 1.6; overflow-wrap: anywhere; }
 .steps li:last-child { padding-bottom: 0; }

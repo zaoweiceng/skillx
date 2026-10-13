@@ -30,3 +30,9 @@ async def clean_database() -> AsyncIterator[None]:
         for table in reversed(Base.metadata.sorted_tables):
             await connection.execute(table.delete())
     yield
+
+
+@pytest.fixture(autouse=True)
+def isolated_session_records(tmp_path, monkeypatch):
+    # Runtime transcript tests must never write into the developer's live records.
+    monkeypatch.setattr('app.application.session_records.root', lambda: tmp_path / 'sessions')

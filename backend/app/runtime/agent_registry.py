@@ -52,11 +52,14 @@ class PiAdapter(TraeXSubprocessAdapter):
     """Pi SDK bridge; all custom tools are executed by the Host broker."""
 
     supports_tool_descriptors = True
+    provides_output_schema = True
 
     def extra_arguments(self, request: AgentRunRequest) -> list[str]:
         import json
 
         return [
+            "--max-output-tokens",
+            str(request.max_output_tokens),
             "--tool-descriptors",
             json.dumps(request.tool_descriptors),
             "--images",

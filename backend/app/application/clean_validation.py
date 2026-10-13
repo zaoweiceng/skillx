@@ -14,22 +14,27 @@ from app.config import get_settings
 
 _RUNNER = """import asyncio, importlib.util, inspect, json, sys
 from types import SimpleNamespace
-spec = importlib.util.spec_from_file_location("candidate", "execute.py")
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+from pure_guard import install_guard
 inputs = json.loads(sys.stdin.read())
+fixtures = json.load(open("fixtures.json"))
 class Capabilities:
     async def call(self, alias, arguments):
-        fixtures = json.load(open("fixtures.json"))
         matches = [f for f in fixtures if f["alias"] == alias and f["input"] == arguments]
         if not matches or any(f["output"] != matches[0]["output"] for f in matches):
             raise ValueError("No exact observed dependency fixture")
         return matches[0]["output"]
-request = SimpleNamespace(input=inputs, invocation_id="clean-validation")
-result = module.execute(request, SimpleNamespace(secrets={}, capabilities=Capabilities()))
-if inspect.isawaitable(result):
-    result = asyncio.run(result)
-print(json.dumps(result))
+async def main():
+    install_guard()
+    spec = importlib.util.spec_from_file_location("candidate", "execute.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    request = SimpleNamespace(input=inputs, invocation_id="clean-validation")
+    result = module.execute(request, SimpleNamespace(secrets={}, capabilities=Capabilities()))
+    if inspect.isawaitable(result): result = await result
+    print(json.dumps(result))
+asyncio.run(main())
 """
 
 
@@ -38,6 +43,8 @@ async def validate_clean_package(package, examples, output_schema, *, fixtures=(
     root.mkdir(parents=True)
     shutil.copyfile(package / "execute.py", root / "execute.py")
     (root / "runner.py").write_text(_RUNNER)
+    from app.runtime import pure_python
+    shutil.copyfile(pure_python.__file__, root / "pure_guard.py")
     (root / "fixtures.json").write_text(json.dumps(fixtures))
     lock = "# Pure Python profile: standard library only; no third-party distributions.\n"
     (package / "requirements.lock").write_text(lock)
@@ -65,16 +72,18 @@ async def validate_clean_package(package, examples, output_schema, *, fixtures=(
                 await process.wait()
 
     await run([sys.executable, "-m", "venv", "--without-pip", str(root / ".venv")])
+    from app.runtime.pure_python import sandbox_command
     for example in examples:
-        out = await run(
-            [str(root / ".venv/bin/python"), "-I", "runner.py"], json.dumps(example.input).encode()
-        )
+        out = await run(sandbox_command(
+            [str(root / ".venv/bin/python"), "-I", "runner.py"], code_roots=(root,)),
+            json.dumps(example.input).encode())
         result = json.loads(out)
         Draft202012Validator(output_schema).validate(result)
         if result != example.expected:
             raise ValueError("干净环境输出与业务断言不一致")
     proof = {
         "profile": "pure-python",
+        "isolation": "os-runtime-readonly-no-network-with-effect-audit",
         "python": sys.version,
         "examples": len(examples),
         "fixtureDigest": hashlib.sha256(json.dumps(fixtures).encode()).hexdigest(),

@@ -1,6 +1,6 @@
 import MarkdownContent from './MarkdownContent'
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button } from 'antd'
+import { Alert } from 'antd'
 import { request } from '@/api/http'
 import TaskRecords from './TaskRecords'
 import TaskProgress from './TaskProgress'
@@ -27,16 +27,15 @@ export default function TaskPanel({ id, onFinished }: { id: string; onFinished?:
       void onFinished?.().catch(reason => setError(String(reason)))
     }
   }, [task, id, onFinished])
-  async function cancel() { try { await request(`/tasks/${id}/cancel`, {method: 'POST'}); setRevision(x => x + 1) } catch (e) { setError(String(e)) } }
   const finished = !!task && ['succeeded', 'failed', 'cancelled', 'blocked'].includes(task.status)
   return <section className="task-panel" aria-label="任务执行">
     {error && <Alert type="error" title={error} />}
-    <span className="task-state">{({succeeded: '已完成', failed: '执行失败', cancelled: '已取消', blocked: '等待处理', running: '正在处理', deciding: '正在分析任务', waiting_execution: '正在执行调用', waiting_user: '等待你的回复', queued: '等待执行'} as Record<string, string>)[task?.status ?? 'queued'] ?? task?.status}</span>
+    <span className="task-state">{({succeeded: '已完成', failed: '执行失败', cancelled: '已取消', blocked: '等待处理', running: '正在处理', deciding: '正在分析任务', waiting_execution: '正在执行调用', waiting_user: '等待你的回复', queued: '等待执行', learning: '正在提取能力与工作流'} as Record<string, string>)[task?.status ?? 'queued'] ?? task?.status}</span>
+    <TaskProgress id={id} finished={finished} learningActive={task?.learning.some(job => ['running', 'queued'].includes(job.status))} invocations={task?.invocations ?? []}>
+      {task?.interactions.map(item => <HumanInteractionCard key={item.id} item={item} onAnswered={() => setRevision(x => x + 1)} />)}
+      <TaskRecords id={id} invocations={task?.invocations ?? []} learning={task?.learning ?? []} />
+    </TaskProgress>
     {task?.output.text && <MarkdownContent>{task.output.text}</MarkdownContent>}
-    <TaskProgress id={id} finished={finished} learningActive={task?.learning.some(job => ['running', 'queued'].includes(job.status))} invocations={task?.invocations ?? []} />
     {task?.error && <Alert type="error" title={task.error.message ?? '任务执行失败'} />}
-    {task?.interactions.map(item => <HumanInteractionCard key={item.id} item={item} onAnswered={() => setRevision(x => x + 1)} />)}
-    {task && !['succeeded', 'failed', 'cancelled', 'blocked'].includes(task.status) && <Button onClick={cancel}>取消任务</Button>}
-    <TaskRecords id={id} invocations={task?.invocations ?? []} learning={task?.learning ?? []} />
   </section>
 }

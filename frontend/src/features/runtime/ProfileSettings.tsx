@@ -8,7 +8,7 @@ import styles from './runtime.module.css'
 type Model = { id: string; reasoning: boolean; images: boolean; contextWindow: number; maxOutputTokens: number }
 const newModel = (): Model => ({ id: '', reasoning: false, images: false, contextWindow: 128000, maxOutputTokens: 8192 })
 const empty = { name: '', kind: 'model' as Profile['kind'], active: true, isDefault: false,
-  config: { adapter: 'pi' as 'traex' | 'pi', modelProfileId: '', baseUrl: '', model: '', apiKey: '', apiKeyEnv: '', models: [newModel()], structuredMode: 'json_schema', timeoutSeconds: 60 } }
+  config: { adapter: 'pi' as 'traex' | 'pi', modelProfileId: '', baseUrl: '', model: '', apiKey: '', apiKeyEnv: '', models: [newModel()], structuredMode: 'json_schema', timeoutSeconds: 300 } }
 export function ProfileSettings() {
   const [items, setItems] = useState<Profile[]>([])
   const [draft, setDraft] = useState(empty)
@@ -92,7 +92,7 @@ export function ProfileSettings() {
             <Button aria-label={`删除模型 ${index + 1}`} icon={<Trash2 size={14} />} disabled={draft.config.models.length === 1} onClick={() => setDraft({ ...draft, config: { ...draft.config, models: draft.config.models.filter((_, position) => position !== index), model: draft.config.model === model.id ? '' : draft.config.model } })} />
           </div>)}<Button icon={<Plus size={14} />} onClick={() => setDraft({ ...draft, config: { ...draft.config, models: [...draft.config.models, newModel()] } })}>添加模型</Button></div>
           <label>默认模型<Select aria-label="服务默认模型" value={draft.config.model || draft.config.models[0]?.id || undefined} onChange={model => setDraft({ ...draft, config: { ...draft.config, model } })} options={draft.config.models.filter(model => model.id).map(model => ({ value: model.id, label: model.id }))} /></label>
-          <label>超时（秒）<InputNumber min={1} max={600} value={draft.config.timeoutSeconds} style={{ width: '100%' }} onChange={value => setDraft({ ...draft, config: { ...draft.config, timeoutSeconds: value ?? 60 } })} /></label>
+          <label>超时（秒）<InputNumber min={1} max={1800} value={draft.config.timeoutSeconds} style={{ width: '100%' }} onChange={value => setDraft({ ...draft, config: { ...draft.config, timeoutSeconds: value ?? 300 } })} /></label>
           <label>LLM 节点结构化输出<Select value={draft.config.structuredMode} onChange={structuredMode => setDraft({ ...draft, config: { ...draft.config, structuredMode } })} options={[{ value: 'json_schema', label: 'JSON Schema' }, { value: 'json_object', label: 'JSON Object' }, { value: 'prompt', label: '提示词约束' }]} /></label>
         </>}
         <Space className={styles.full}><Checkbox checked={draft.isDefault} onChange={event => setDraft({ ...draft, isDefault: event.target.checked })}>设为默认</Checkbox>

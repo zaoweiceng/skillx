@@ -19,9 +19,10 @@ import {
 import { Link } from 'react-router-dom'
 import { conversationRunUrl, taskCheckpointUrl, type TaskCheckpointSummary } from '@/api/client'
 import { useConversation, type Message } from '@/features/chat/useConversation'
+import { tokenSpeedLabel } from '@/features/chat/tokenSpeed'
 import { rjsfSchema } from '@/lib/utils'
 import styles from '@/features/chat/chat.module.css'
-import { ConversationHistoryItem } from '@/features/chat/ConversationHistoryItem'
+import { ConversationGroups } from '@/features/chat/ConversationGroups'
 import { ChatComposer } from '@/features/chat/ChatComposer'
 import { ChatImageAttachments } from '@/features/chat/ChatImageAttachments'
 import { useStoredBoolean } from '@/hooks/useStoredBoolean'
@@ -31,7 +32,7 @@ import { AgentSelector } from '@/features/runtime/AgentSelector'
 export default function ChatPage() {
   const [historyCollapsed, setHistoryCollapsed] = useStoredBoolean('skillx-history-collapsed')
   const [runtimePending, setRuntimePending] = useState(false)
-  const { refresh, workingDirectory, changeWorkingDirectory, draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill } = useConversation()
+  const { cacheUsage, canStop, stopping, refresh, workingDirectory, changeWorkingDirectory, draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill } = useConversation()
 
   // 候选卡片绑定产生它的用户消息：取该助手消息之前最近的一条用户消息文本，
   // 而不是全局最近 prompt，避免继续 Agent 时误用无关的新输入。
@@ -420,7 +421,7 @@ export default function ChatPage() {
             aria-expanded={historyOpen}
             onClick={() => { setHistoryCollapsed(false); setHistoryOpen((current) => !current) }}
           >
-            <History size={14} />
+            <History size={16} strokeWidth={1.7} />
           </Button>
           <Button
             className="mobile-history-toggle"
@@ -445,11 +446,6 @@ export default function ChatPage() {
             <Button type="text" aria-label="收起执行轨迹" title="收起执行轨迹"
               onClick={() => setTraceOpen(false)} icon={<PanelRightClose size={17} />} />
             {runStatus && <span className={`status-badge ${runStatus}`}>{runStatus}</span>}
-            {(runStatus === 'queued' || runStatus === 'running') && (
-              <Button className="button ghost" htmlType="button" onClick={cancelActiveRun}>
-                取消运行
-              </Button>
-            )}
           </div>
           {renderTrace()}
         </aside>
@@ -459,28 +455,18 @@ export default function ChatPage() {
           aria-label="历史对话"
         >
           <div className="history-heading">
-            <span><History size={14} /> 历史对话</span>
+            <span><History size={16} strokeWidth={1.7} /> 历史对话</span>
             <div className="history-heading-actions">
             <Button type="text" aria-label="折叠历史对话" aria-expanded={true}
               onClick={() => { setHistoryCollapsed(true); setHistoryOpen(false) }} icon={<PanelLeftClose size={16} />} />
-            <Button htmlType="button" aria-label="新建对话" onClick={createNewConversation}>
-              <Plus size={15} />
+            <Button type="text" htmlType="button" aria-label="新建对话" onClick={() => createNewConversation()}>
+              <Plus size={16} strokeWidth={1.7} />
             </Button>
             </div>
           </div>
-          <nav>
-            {history.map((item) => (
-              <ConversationHistoryItem key={item.id} id={item.id} title={item.title}
-                active={item.id === conversationId} onNavigate={() => setHistoryOpen(false)}
-                onRename={renameConversation} onDelete={deleteConversation} />
-            ))}
-            {history.length === 0 && <span className="hint">暂无历史对话</span>}
-          </nav>
-          {historyCursor && (
-            <Button className="button ghost" htmlType="button" onClick={loadMoreHistory}>
-              加载更多
-            </Button>
-          )}
+          <ConversationGroups history={history} conversationId={conversationId}
+            onNavigate={() => setHistoryOpen(false)} onNew={createNewConversation}
+            onRename={renameConversation} onDelete={deleteConversation} />
         </aside>}>
         <section className="message-column">
           <div className="message-stream">
@@ -492,7 +478,7 @@ export default function ChatPage() {
               <span className={styles.welcomeLabel}>想法，从这里开始</span>
               <h2>今天，一起完成什么？</h2>
               <p>
-                描述你的目标，一起完成任务，并将重复步骤保存为工作流。
+                描述你的目标或问题，一起找到解决办法。
               </p>
               <div className="prompt-suggestions">
                 <Button onClick={() => setInput('帮我梳理一个重复任务的执行步骤')}>
@@ -525,6 +511,10 @@ export default function ChatPage() {
                     </span>
                     <span className="metric-chip">{elapsedLabel(turnFor(message))}</span>
                     <span className="metric-chip">{tokenLabel(turnFor(message))}</span>
+                    {tokenSpeedLabel(turnFor(message)) && <span className="metric-chip"
+                      title="平均输出速度：输出 Token 总数 ÷ 模型调用总耗时（含响应等待，不含工具执行时间）">
+                      {tokenSpeedLabel(turnFor(message))}
+                    </span>}
                   </div>
                 )}
                 {message.content.code && (
@@ -653,9 +643,10 @@ export default function ChatPage() {
           ))}
           </div>
           <ChatComposer key={conversationId} input={input} onInputChange={setInput}
-            sending={sending} disabled={sending || runtimePending} onSend={send}
+            sending={sending} disabled={sending || runtimePending || canStop} onSend={send}
+            onStop={canStop ? cancelActiveRun : undefined} stopping={stopping}
             workingDirectory={workingDirectory} onWorkingDirectoryChange={changeWorkingDirectory}
-            controls={<AgentSelector key={conversationId} conversationId={conversationId} draftSelection={draftSelection} onDraftChange={setDraftSelection} onBusyChange={setRuntimePending} />} />
+            controls={<AgentSelector cacheUsage={cacheUsage} key={conversationId} conversationId={conversationId} draftSelection={draftSelection} onDraftChange={setDraftSelection} onBusyChange={setRuntimePending} />} />
         </section>
 
       </ChatWorkspace>

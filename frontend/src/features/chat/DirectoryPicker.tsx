@@ -3,8 +3,8 @@ import { ArrowUp, FolderOpen } from 'lucide-react'
 import { useState } from 'react'
 import { api } from '@/api/client'
 
-export function DirectoryPicker({ value, onChange, disabled }: {
-  value?: string; onChange: (path: string | undefined) => void; disabled: boolean
+export function DirectoryPicker({ value, onChange, disabled, label = '选择工作目录' }: {
+  value?: string; onChange: (path: string | undefined) => void; disabled: boolean; label?: string
 }) {
   const [open, setOpen] = useState(false)
   const [path, setPath] = useState('')
@@ -24,8 +24,8 @@ export function DirectoryPicker({ value, onChange, disabled }: {
     } finally { setLoading(false) }
   }
   return <>
-    <Tooltip title={value ? `工作目录：${value}` : '选择工作目录'}>
-      <Button type="text" aria-label="选择工作目录" icon={<FolderOpen size={19} />} disabled={disabled}
+    <Tooltip title={value ? `工作目录：${value}` : label}>
+      <Button type="text" aria-label={label} icon={<FolderOpen size={19} />} disabled={disabled}
         onClick={() => { setOpen(true); void browse(value) }} />
     </Tooltip>
     <Modal title="选择工作目录" open={open} onCancel={() => setOpen(false)}

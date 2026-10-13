@@ -1,0 +1,9 @@
+.chart { width: 100%; min-width: 0; outline-offset: 3px; color: #687585; }
+.chart svg { width: 100%; height: auto; display: block; overflow: visible; }
+.axis { fill: currentColor; font-size: 11px; font-variant-numeric: tabular-nums; }
+.gridLine { stroke: currentColor; stroke-opacity: .16; stroke-dasharray: 3 4; }
+.line { fill: none; stroke: #4c8be8; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+.dot { fill: #4c8be8; }
+.cursor { stroke: #4c8be8; stroke-opacity: .5; stroke-dasharray: 4 3; }
+.tooltip { min-height: 42px; display: flex; flex-wrap: wrap; align-content: center; align-items: center; gap: 4px 10px; font-size: 11px; font-variant-numeric: tabular-nums; }
+.tooltip strong { color: #4c8be8; }

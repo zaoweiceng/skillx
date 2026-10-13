@@ -7,7 +7,11 @@ from uuid import uuid4
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.application.runtime_config import AgentRuntimeConfig, agent_runtime_config
+from app.application.runtime_config import (
+    AgentRuntimeConfig,
+    adapter_source_digest,
+    agent_runtime_config,
+)
 from app.infrastructure.database import RuntimeProfile
 from app.infrastructure.runtime_credentials import resolve_runtime_key
 
@@ -113,7 +117,6 @@ async def agent_snapshot(
     current = agent_runtime_config()
     adapter = config["adapter"]
     if adapter == "traex":
-        import hashlib
         import shutil
         from pathlib import Path
 
@@ -130,14 +133,13 @@ async def agent_snapshot(
             protocol="traex-cli-jsonl+mcp",
             endpoint=None,
             model=traex_model or config.get("model") or None,
-            adapter_digest="sha256:" + hashlib.sha256(bridge.read_bytes()).hexdigest(),
+            adapter_digest=adapter_source_digest(bridge),
             adapter_version="traex-builtin/v1",
             source="profile",
         )
     else:
         if traex_model:
             raise ValueError("Pi 模型请在模型服务配置中选择")
-        import hashlib
         import shutil
         from pathlib import Path
 
@@ -168,7 +170,7 @@ async def agent_snapshot(
                     model=current.model if current.type == "pi" else None,
                     reasoning_effort=None,
                     adapter_version="pi-sdk-bridge/v1",
-                    adapter_digest="sha256:" + hashlib.sha256(bridge.read_bytes()).hexdigest(),
+                    adapter_digest=adapter_source_digest(bridge),
                 )
             )
         if model is None or model.kind != "model" or not model.active:
@@ -185,7 +187,11 @@ async def agent_snapshot(
         if options is None and model.config_json.get("models"):
             raise ValueError("所选模型不属于此服务")
         options = options or {"id": selected_model}
-        options = {**options, "timeoutSeconds": model.config_json.get("timeoutSeconds", 60)}
+        options = {
+            **options,
+            "timeoutSeconds": model.config_json.get("timeoutSeconds", 300),
+            "structuredMode": model.config_json.get("structuredMode", "json_schema"),
+        }
         bridge = Path(__file__).resolve().parents[3] / "bridges/pi/bridge.mjs"
         runtime = replace(
             current,
@@ -201,7 +207,7 @@ async def agent_snapshot(
             credential_configured=bool(resolve_runtime_key(model.config_json["apiKeyEnv"])),
             adapter_version="pi-sdk-bridge/v1",
             source="profile",
-            adapter_digest="sha256:" + hashlib.sha256(bridge.read_bytes()).hexdigest(),
+            adapter_digest=adapter_source_digest(bridge),
         )
     return asdict(await with_reasoning(runtime, reasoning_effort))
 
@@ -221,14 +227,8 @@ def restore_agent_snapshot(snapshot: dict[str, Any] | None) -> AgentRuntimeConfi
 
 async def workflow_profiles(session: AsyncSession, definition: Any) -> dict[str, Any]:
     from app.application.compiler import digest_json
-    from app.application.runtime_config import LLMRuntimeConfig
 
     result = {}
-    default_model = await session.scalar(
-        select(RuntimeProfile).where(
-            RuntimeProfile.kind == "model", RuntimeProfile.is_default.is_(True)
-        )
-    )
     for node in definition.spec.nodes:
         if node.type == "skillx":
             from app.infrastructure.database import CapabilityVersion
@@ -248,35 +248,11 @@ async def workflow_profiles(session: AsyncSession, definition: Any) -> dict[str,
                 "agentConfig": await agent_snapshot(session, node.config.get("agentProfileId"))
             }
         elif node.type == "llm" and node.config.get("modelProfile") != "fake":
-            profile_id = node.config.get("modelProfileId")
-            profile = await session.get(RuntimeProfile, profile_id) if profile_id else default_model
-            if profile is None:
-                if profile_id:
-                    raise ValueError("模型配置不存在")
-                continue
-            if not profile.active or profile.kind != "model":
-                raise ValueError("模型配置不可用")
-            config = profile.config_json
-            runtime = LLMRuntimeConfig(
-                "openai_compatible",
-                config["baseUrl"],
-                config["model"],
-                config["apiKeyEnv"],
-                credential_configured=bool(resolve_runtime_key(config["apiKeyEnv"])),
-            )
-            result[node.id] = {
-                "modelConfig": asdict(runtime),
-                "structuredMode": config.get("structuredMode"),
-                "timeoutSeconds": config.get("timeoutSeconds", 60),
-                "runtimeSelection": "direct_llm",
-                "runtimeKind": "llm_runtime",
-                "provider": "openai-compatible",
-                "identity": runtime.model,
-                "protocol": "openai-compatible",
-                "runtimeType": runtime.type,
-                "runtimeDigest": runtime.digest,
-                "policyDigest": digest_json({"profileId": profile.id}),
-            }
+            from app.application.structured_generation import agent_structured_snapshot
+            result[node.id] = agent_structured_snapshot(await agent_snapshot(
+                session, node.config.get("agentProfileId"),
+                model_profile_id=node.config.get("modelProfileId"),
+            ))
     return result
 
 

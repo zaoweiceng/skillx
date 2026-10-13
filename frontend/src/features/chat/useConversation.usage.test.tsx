@@ -6,6 +6,8 @@ import type { ConversationTurn } from '@/api/client'
 
 const getConversation = vi.fn()
 const sendMessage = vi.fn()
+const cancelRequest = vi.fn()
+vi.mock('@/api/http', () => ({ request: (...args: unknown[]) => cancelRequest(...args) }))
 vi.mock('@/api/client', () => ({ api: {
   getConversation: (...args: unknown[]) => getConversation(...args),
   sendMessage: (...args: unknown[]) => sendMessage(...args),
@@ -53,4 +55,25 @@ it('updates known token counts during execution and stops polling after completi
   const calls = getConversation.mock.calls.length
   await act(async () => { await vi.advanceTimersByTimeAsync(3000) })
   expect(getConversation).toHaveBeenCalledTimes(calls)
+})
+
+function StopProbe() {
+  const { canStop, stopping, cancelActiveRun, error } = useConversation()
+  return <><button disabled={!canStop || stopping} onClick={() => void cancelActiveRun()}>终止</button><p>{error}</p></>
+}
+it('取消活动任务，失败后允许重试，成功刷新为终态', async () => {
+  getConversation.mockResolvedValue(snapshot(null))
+  cancelRequest.mockRejectedValueOnce(new Error('取消失败')).mockImplementationOnce(async () => {
+    getConversation.mockResolvedValue(snapshot(100, true))
+  })
+  render(<MemoryRouter initialEntries={['/chat/conversation']}><Routes><Route path="/chat/:id" element={<StopProbe />} /></Routes></MemoryRouter>)
+  const stop = screen.getByRole('button', { name: '终止' })
+  await waitFor(() => expect(stop).toBeEnabled())
+  fireEvent.click(stop)
+  expect(await screen.findByText('取消失败')).toBeInTheDocument()
+  await waitFor(() => expect(stop).toBeEnabled())
+  fireEvent.click(stop)
+  await waitFor(() => expect(cancelRequest).toHaveBeenCalledTimes(2))
+  expect(cancelRequest).toHaveBeenLastCalledWith('/tasks/task/cancel', { method: 'POST' })
+  await waitFor(() => expect(stop).toBeDisabled())
 })

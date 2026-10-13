@@ -126,7 +126,7 @@ export type Run = {
     runtimeType?: string | null
     adapterVersion?: string | null
     adapterDigest?: string | null
-    runtimeUsed: 'direct_llm' | 'agent_fallback' | 'agent_runtime' | 'fake_structured' | null
+    runtimeUsed: 'agent_structured' | 'direct_llm' | 'agent_fallback' | 'agent_runtime' | 'fake_structured' | null
     runtimeDigest: string | null
     fallbackReason: string | null
     errorCode: string | null
@@ -142,7 +142,7 @@ export type Run = {
     completedAt: string | null
   }>
   runtimeSnapshot?: {
-    runtimeSelection?: 'direct_llm' | 'agent_fallback' | 'unavailable'
+    runtimeSelection?: 'agent_structured' | 'direct_llm' | 'agent_fallback' | 'unavailable'
     runtimeUsed?:
       | 'direct_llm'
       | 'agent_fallback'
@@ -247,6 +247,10 @@ export type TokenSummary = {
   state: 'pending' | 'zero' | 'complete' | 'partial' | 'unavailable'
   totalTokens: number | null
   stages: Array<{
+    inputTokens?: number | null
+    outputTokens?: number | null
+    durationMs?: number | null
+    cacheReadTokens?: number | null
     stage: string
     provider: string | null
     model: string | null
@@ -277,6 +281,7 @@ export type ConversationSummary = {
   lastMessageAt: string | null
   status: string
   workflowMode: 'enabled' | 'disabled'
+  workingDirectory?: string | null
 }
 
 export type Workflow = {
@@ -581,15 +586,6 @@ export const api = {
           maxBillableTokens: number
         }
       }
-      llmRuntime?: {
-        type: 'openai_compatible' | 'unavailable'
-        configured: boolean
-        protocol: string
-        model: string | null
-        digest: string
-        source: string
-        probe: { kind: string; ok: boolean; summary: string }
-      }
       modelRuntimeFallbackPolicy?: {
         order: string[]
         trigger: string
@@ -824,16 +820,23 @@ export const api = {
       body: JSON.stringify({ title }),
       },
     ),
+  extractConversationWorkflows: (id: string, budget?: { maxDurationSeconds: number; maxTokens: number; requireWorkflowComposition: boolean }) =>
+    request<{ conversationId: string; taskId: string }>(`/conversations/${id}/extract-workflows`, { method: 'POST', body: budget ? JSON.stringify(budget) : undefined }),
   renameConversation: (id: string, title: string) =>
     request<{ id: string; title: string }>(`/conversations/${id}`, {
       method: 'PATCH', body: JSON.stringify({ title }),
     }),
   deleteConversation: (id: string) =>
     request<{ id: string; deleted: boolean }>(`/conversations/${id}`, { method: 'DELETE' }),
-  listConversations: (cursor?: string, query?: string) => {
+  listChatWorkspaces: () => request<{ items: string[] }>('/chat-workspaces'),
+  addChatWorkspace: (workingDirectory: string) => request<{ path: string }>('/chat-workspaces', {
+    method: 'POST', body: JSON.stringify({ workingDirectory }),
+  }),
+  listConversations: (cursor?: string, query?: string, workingDirectory?: string) => {
     const params = new URLSearchParams({ limit: '30' })
     if (cursor) params.set('cursor', cursor)
     if (query) params.set('query', query)
+    if (workingDirectory !== undefined) params.set('workingDirectory', workingDirectory)
     return request<{ items: ConversationSummary[]; nextCursor: string | null }>(
       `/conversations?${params}`,
     )

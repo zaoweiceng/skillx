@@ -6,13 +6,14 @@ import hashlib
 import json
 import re
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Annotated, Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from jsonschema import Draft202012Validator, FormatChecker
 from pydantic import ValidationError
+from app.application.conversation_extraction import ExtractionBudget
 from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -56,7 +57,6 @@ from app.application.agent_host import (
     resolve_local_demo_capabilities,
 )
 from app.application.agent_provider import (
-    llm_runtime_readiness,
     probe_provider,
     provider_readiness,
 )
@@ -471,7 +471,6 @@ async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str
             detail={"code": "NOT_READY", "message": str(exc)},
         ) from exc
     provider = await provider_readiness()
-    llm_runtime = await llm_runtime_readiness()
     browser_runtime = await browser_runtime_readiness(session)
     worker_available = bool(
         browser_runtime.get("workerId") and not browser_runtime.get("stale")
@@ -488,9 +487,8 @@ async def health_ready(session: AsyncSession = Depends(get_session)) -> dict[str
         ),
         "selectionProvider": provider,
         "agentRuntime": provider,
-        "llmRuntime": llm_runtime,
         "modelRuntimeFallbackPolicy": {
-            "order": ["llm_runtime"],
+            "order": ["agent_runtime"],
             "trigger": "explicit_recovery_policy",
             "executionErrorsFallback": False,
         },
@@ -555,7 +553,7 @@ async def run_provider_probe(
 @router.get("/workflows")
 async def list_workflows(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
     rows = (await session.scalars(select(Workflow).order_by(Workflow.updated_at.desc()))).all()
-    return [workflow_view(item) for item in rows]
+    return [workflow_view(item) for item in rows if not item.draft_metadata_json.get("archived")]
 
 
 @router.post("/workflows", status_code=201)
@@ -1676,7 +1674,7 @@ async def apply_plan_snapshot_patch(
 
 @router.get("/components")
 async def list_components(session: AsyncSession = Depends(get_session)) -> list[dict[str, Any]]:
-    rows = (await session.scalars(select(Component).order_by(Component.updated_at.desc()))).all()
+    rows = (await session.scalars(select(Component).where(Component.visibility != "archived").order_by(Component.updated_at.desc()))).all()
     return [
         {
             "id": item.id,
@@ -3025,7 +3023,7 @@ async def download_artifact(
 async def list_capabilities(
     session: AsyncSession = Depends(get_session),
 ) -> list[dict[str, Any]]:
-    rows = (await session.scalars(select(Capability).order_by(Capability.name))).all()
+    rows = (await session.scalars(select(Capability).where(Capability.current_version_id.is_not(None)).order_by(Capability.name))).all()
     return [
         {
             "id": item.id,
@@ -3091,6 +3089,8 @@ async def prompt_catalog(
     seen_workflows: set[str] = set()
     for version, workflow in workflow_rows:
         if workflow.id in seen_workflows:
+            continue
+        if workflow.draft_metadata_json.get("archived"):
             continue
         try:
             definition = WorkflowDefinition.model_validate(version.definition_json)
@@ -3472,14 +3472,75 @@ def _decode_run_cursor(cursor: str) -> tuple[datetime, str]:
     return created_at, run_id
 
 
+@router.post("/learning-jobs/{job_id}/revise")
+async def revise_learning_artifacts(job_id: str, feedback: dict[str, str],
+    session: AsyncSession = Depends(get_session)):
+    from app.application.learning_revisions import create_revision_job
+    from app.infrastructure.models.tasks import LearningJob
+    source = await session.get(LearningJob, job_id)
+    if source is None:
+        raise HTTPException(404, "提取任务不存在")
+    if source.status in {"queued", "running"}:
+        raise HTTPException(409, "请等待当前提取结束后提交验证反馈")
+    try:
+        job = await create_revision_job(session, source, feedback)
+        await session.commit()
+        return {"jobId": job.id, "status": job.status}
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post("/conversations/{conversation_id}/extract-workflows")
+async def extract_conversation_workflows(conversation_id: str, budget: ExtractionBudget | None = None,
+                                         session: AsyncSession = Depends(get_session)):
+    from app.application.conversation_extraction import start_extraction
+    return await start_extraction(session, conversation_id, budget)
+
+
+@router.get("/chat-workspaces")
+async def list_chat_workspaces(session: AsyncSession = Depends(get_session)):
+    from app.infrastructure.models.conversations import ChatWorkspace
+
+    saved = await session.scalars(select(ChatWorkspace.path))
+    existing = await session.scalars(select(Conversation.working_directory).where(
+        Conversation.deleted_at.is_(None), Conversation.working_directory.is_not(None)
+    ).distinct())
+    return {"items": sorted(set(saved.all()) | set(existing.all()))}
+
+
+@router.post("/chat-workspaces")
+async def add_chat_workspace(body: ConversationDirectoryUpdate, session: AsyncSession = Depends(get_session)):
+    from app.application.local_execution import validate_working_directory
+    from app.infrastructure.models.conversations import ChatWorkspace
+
+    if not body.working_directory:
+        raise HTTPException(400, "请选择工作目录")
+    try:
+        path = str(validate_working_directory(body.working_directory))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, "无法使用工作目录：" + str(exc)) from exc
+    if await session.get(ChatWorkspace, path) is None:
+        session.add(ChatWorkspace(path=path))
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            if await session.get(ChatWorkspace, path) is None:
+                raise
+    return {"path": path}
+
+
 @router.get("/conversations")
 async def list_conversations(
+    working_directory: Annotated[str | None, Query(alias="workingDirectory")] = None,
     cursor: str | None = None,
     limit: int = Query(default=30, ge=1, le=100),
     query: str | None = Query(default=None, max_length=200),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     statement = select(Conversation).where(Conversation.deleted_at.is_(None))
+    if working_directory is not None:
+        statement = statement.where(Conversation.working_directory == (working_directory or None))
     if query:
         statement = statement.where(Conversation.title.contains(query.strip()))
     if cursor:
@@ -3535,6 +3596,7 @@ async def list_conversations(
                 ),
                 "status": "active" if active_turn else "idle",
                 "workflowMode": item.workflow_mode,
+                "workingDirectory": item.working_directory,
             }
         )
     return {

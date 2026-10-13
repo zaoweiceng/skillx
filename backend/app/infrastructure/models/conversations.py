@@ -18,6 +18,12 @@ from app.infrastructure.payloads import ArtifactJSON
 from .base import Base, TimestampMixin, utcnow
 
 
+class ChatWorkspace(Base, TimestampMixin):
+    __tablename__ = "chat_workspaces"
+
+    path: Mapped[str] = mapped_column(String(4096), primary_key=True)
+
+
 class Conversation(Base, TimestampMixin):
     __tablename__ = "conversations"
     __table_args__ = (Index("ix_conversations_activity", "last_message_at", "id"),)

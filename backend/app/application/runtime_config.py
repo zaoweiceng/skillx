@@ -17,6 +17,14 @@ logger = logging.getLogger(__name__)
 _legacy_logged = False
 
 
+def adapter_source_digest(path: Path) -> str:
+    content = hashlib.sha256(path.read_bytes())
+    if path.name == "bridge.mjs" and path.parent.name == "pi":
+        content.update(path.with_name("result-tools.mjs").read_bytes())
+        content.update(path.with_name("openai-usage.mjs").read_bytes())
+    return "sha256:" + content.hexdigest()
+
+
 _agent_override: ContextVar[AgentRuntimeConfig | None] = ContextVar("agent_runtime", default=None)
 
 
@@ -68,6 +76,9 @@ def agent_runtime_config() -> AgentRuntimeConfig:
                 content = hashlib.sha256()
                 for path in paths:
                     content.update(path.read_bytes())
+                    if path.name == "bridge.mjs" and path.parent.name == "pi":
+                        content.update(path.with_name("result-tools.mjs").read_bytes())
+                        content.update(path.with_name("openai-usage.mjs").read_bytes())
                 adapter_digest = f"sha256:{content.hexdigest()}"
         return AgentRuntimeConfig(
             type=runtime_type,
@@ -144,7 +155,7 @@ def agent_runtime_config() -> AgentRuntimeConfig:
             allowed_executables=("node",), endpoint=settings.agent_endpoint,
             model=settings.agent_model, api_key_env=settings.agent_api_key_env,
             protocol="host-ndjson", provider="pi", adapter_version="pi-sdk-bridge/v1",
-            adapter_digest="sha256:" + hashlib.sha256(bridge.read_bytes()).hexdigest(),
+            adapter_digest=adapter_source_digest(bridge),
             source="builtin_default",
         )
 
@@ -168,14 +179,8 @@ def agent_runtime_config() -> AgentRuntimeConfig:
 
 
 def runtime_config_facts() -> dict[str, object]:
-    llm = llm_runtime_config()
     agent = agent_runtime_config()
     return {
-        "llmRuntime": {
-            **asdict(llm),
-            "configured": llm.configured,
-            "digest": llm.digest,
-        },
         "agentRuntime": {
             **asdict(agent),
             "command": list(agent.command),

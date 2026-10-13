@@ -1,0 +1,2 @@
+你正在继续同一次工作流修订。此前你根据真实执行反馈请求修订依赖；repairedDependencies 现在给出对应独立 Agent 已修订、测试并发布的新版本。使用这些确切版本 ID、interface、digest 更新工作流引用和 reusedDependencies。保持原业务目标和失败用例，不降低断言，不更改无关步骤。只返回本阶段 WorkflowRepair 中需要变化的 workflow/workflowExamples/reusedDependencies；workflow 是完整图，workflowExamples 与其顶层并列。不要再次返回 dependencyRepairs；这不是新的重试轮次。
+requiredCounterexamples 必须继续保留同一 input/setup 与已有 expected 业务事实，更新锁后仍执行这些失败场景，不能靠替换为另一种输入形式消除失败。

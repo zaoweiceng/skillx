@@ -20,6 +20,7 @@ const getHealth = vi.fn()
 
 vi.mock('@/api/client', () => ({
   api: {
+    listChatWorkspaces: async () => ({ items: [] }),
     createConversation: (...args: unknown[]) => createConversation(...args),
     listConversations: (...args: unknown[]) => listConversations(...args),
     updateConversationWorkflowMode: (...args: unknown[]) =>

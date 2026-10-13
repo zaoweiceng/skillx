@@ -29,17 +29,10 @@ async def model_runtime(session, kind):
 
 
 async def materialize_model_skill(proposal, job_id, evidence):
-    from app.application.task_learning import observed_output
-
     if not proposal.prompt.strip() or proposal.source or proposal.dependencies:
         raise ValueError("模型 SkillX 必须提供独立 prompt，不能混入未验证代码")
-    if len({digest_json(x.input) for x in proposal.examples}) < 2 or not any(
-        x.sourceInvocationId in evidence
-        and evidence[x.sourceInvocationId].status == "succeeded"
-        and observed_output(evidence[x.sourceInvocationId]) == x.expected
-        for x in proposal.examples
-    ):
-        raise ValueError("模型能力缺少原任务证据或不同输入业务断言")
+    from app.application.learning_evidence import validate_examples
+    validate_examples(proposal.examples, evidence)
     settings = get_settings()
     root = settings.capability_root.resolve() / "generated" / job_id / proposal.name
     root.mkdir(parents=True, exist_ok=True)
@@ -56,7 +49,9 @@ async def materialize_model_skill(proposal, job_id, evidence):
             major, minor, patch = previous.version.split(".")
             number = f"{major}.{minor}.{int(patch) + 1}"
         runtime = await model_runtime(session, proposal.kind)
-    if proposal.kind == "agent" and runtime["agentConfig"].get("provider") == "fixture":
+    selected_agent = (runtime.get("modelSnapshot", {}).get("agentConfig", {})
+                      if proposal.kind == "llm" else runtime["agentConfig"])
+    if selected_agent.get("type") in {"fixture", "unavailable"} or selected_agent.get("provider") == "fixture":
         raise ValueError("模型能力发布必须使用真实模型，fixture 不能作为发布证据")
     (root / "SKILL.md").write_text(
         "---\n"
@@ -135,5 +130,5 @@ async def materialize_model_skill(proposal, job_id, evidence):
         "promptDigest": digest_json(proposal.prompt),
     }
     (root / "validation.json").write_text(json.dumps(proof))
-    (root / "tests.json").write_text(json.dumps([x.model_dump() for x in proposal.examples]))
+    (root / "tests.json").write_text(json.dumps([x.portable_dump() for x in proposal.examples]))
     return root

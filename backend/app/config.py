@@ -2,12 +2,21 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ExtractionBudget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    maxDurationSeconds: int = Field(gt=0)
+    maxTokens: int = Field(gt=0)
+    requireWorkflowComposition: bool = False
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SKILLX_", env_file=".env")
 
+    structured_agent_max_output_tokens: int = 8192
     database_url: str = "sqlite+aiosqlite:///./skillx.db"
     artifact_root: Path = Path("./artifacts")
     runtime_credentials_path: Path = Path("./.runtime-credentials")
@@ -19,6 +28,9 @@ class Settings(BaseSettings):
     auto_create_schema: bool = False
     deterministic_workflows: bool = False
     task_max_decisions: int = 20
+    # Keep a few ordinary reference documents intact before compressing history.
+    # This bounds business evidence, excluding the catalog and system contract.
+    task_context_max_characters: int = 64000
     task_max_active_seconds: int = 1800
     task_local_execution_enabled: bool = True
     mcp_allowed_executables: list[str] = [
@@ -83,7 +95,18 @@ class Settings(BaseSettings):
     provider_probe_max_output_tokens: int = 250000
     provider_probe_max_billable_tokens: int = 1250000
     provider_probe_estimated_input_tokens: int = 32000
-    agent_max_duration_seconds: int = 120
+    agent_max_duration_seconds: int = 600
+    automatic_learning_max_tokens: int = 60000
+    automatic_learning_max_seconds: int = 120
+    learning_agent_idle_seconds: int = 300
+    learning_agent_max_duration_seconds: int = 1800
+    learning_agent_max_output_tokens: int = 32768
+    # Independent builders solve narrow schema-bound steps, not the source task.
+    # None preserves the conversation's reasoning setting.
+    learning_agent_reasoning_effort: Literal["low", "medium", "high"] | None = "low"
+    # Optional per-source policies for one-click extraction. Each new job gets
+    # its own start time and usage ledger; unrelated conversations are unchanged.
+    extraction_source_budgets: dict[str, ExtractionBudget] = Field(default_factory=dict)
     agent_max_event_payload_bytes: int = 65536
     agent_lease_seconds: int = 30
     agent_max_continuation_generations: int = 3

@@ -59,3 +59,17 @@ it('selects a Pi model from another service and persists its exact service/model
     agentProfileId: null, traexModel: null, modelProfileId: 'service', model: 'second', reasoningEffort: null,
   }))
 })
+
+it('only shows a two-decimal cache hit rate for a saved conversation with measurements', async () => {
+  request.mockResolvedValue([])
+  const usage = [{ inputTokens: 100, cacheReadTokens: 90 }, { inputTokens: 900, cacheReadTokens: 0 }, {}]
+  const { rerender } = render(<AgentSelector conversationId="" cacheUsage={usage} />)
+  expect(screen.queryByText(/缓存命中/)).not.toBeInTheDocument()
+  rerender(<AgentSelector conversationId="saved" cacheUsage={usage} />)
+  expect(screen.getByText('缓存命中9.00%')).toHaveAttribute('title', expect.stringContaining('部分调用未报告缓存数据'))
+  rerender(<AgentSelector conversationId="saved" cacheUsage={[{ inputTokens: 100 }]} />)
+  expect(screen.queryByText(/缓存命中/)).not.toBeInTheDocument()
+  rerender(<AgentSelector conversationId="saved" cacheUsage={[{ inputTokens: 100, cacheReadTokens: 0 }]} />)
+  expect(screen.getByText('缓存命中0.00%')).toBeInTheDocument()
+  await waitFor(() => expect(request).toHaveBeenCalled())
+})

@@ -372,7 +372,9 @@ async def convert_skill(session, skill: ManagedSkill, options: dict) -> ManagedS
         shutil.rmtree(stage, ignore_errors=True)
 
 
-async def managed_skill_context(session, *, include_contracts: bool = True) -> dict:
+async def managed_skill_context(
+    session, *, include_contracts: bool = True, include_instructions: bool = True,
+) -> dict:
     skills = list(
         await session.scalars(
             select(ManagedSkill)
@@ -392,7 +394,9 @@ async def managed_skill_context(session, *, include_contracts: bool = True) -> d
                 {
                     "name": skill.name,
                     "description": skill.description,
-                    "instructions": skill.content,
+                    **({"instructions": skill.content} if include_instructions else {
+                        "instructionsPath": str(source_path(skill) / "SKILL.md"),
+                    }),
                     "resourceRoot": str(source_path(skill)),
                 }
             )

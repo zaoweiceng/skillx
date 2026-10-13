@@ -48,7 +48,6 @@ export default function SettingsPage() {
 
   const provider = health?.selectionProvider
   const agentRuntime = health?.agentRuntime ?? provider
-  const llmRuntime = health?.llmRuntime
   const activeProbeAuthenticated =
     provider?.capabilityStates?.activeProbeAuthenticated === true
   const credentialPresent = provider?.capabilityStates?.credentialPresent === true
@@ -84,18 +83,10 @@ export default function SettingsPage() {
             : '未检测',
         },
         {
-          icon: ServerCog,
-          name: 'LLM Runtime',
-          status: llmRuntime?.configured ? 'available' : 'unconfigured',
-          detail:
-            llmRuntime?.probe.summary ??
-            'Direct LLM Runtime 未配置；符合策略时使用无 Tool 的 Agent fallback。',
-        },
-        {
           icon: PanelsTopLeft,
           name: '浏览器运行时',
           ...health.runtimes.browser,
-          detail: `${health.runtimes.browser.detail}${
+          detail: `用于网页读取与浏览器操作，仅访问允许的站点。${health.runtimes.browser.detail}${
             health.runtimes.browser.chromiumVersion
               ? ` · Chromium ${health.runtimes.browser.chromiumVersion}`
               : ''
@@ -136,9 +127,7 @@ export default function SettingsPage() {
           <span>
             当前结构化生成路径：
             <strong>
-              {llmRuntime?.configured
-                ? ' LLM Runtime'
-                : agentRuntime?.protocolTestOnly
+              {agentRuntime?.protocolTestOnly
                   ? ' 协议测试 Agent fallback'
                   : agentRuntime?.modelAvailable
                     ? ' 已验证可用 Agent Runtime'

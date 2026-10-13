@@ -39,6 +39,9 @@ async def invoke(request: dict[str, Any]) -> NodeResult:
             Path(request["packageRoot"]),
             request["interface"],
         )
+        from app.runtime.pure_python import execution_profile, install_guard
+        if execution_profile(loaded.package_root, loaded.interface) == "pure-python":
+            install_guard()
         return await execute_direct(
             loaded,
             request["invocationId"],

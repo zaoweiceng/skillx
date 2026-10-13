@@ -84,7 +84,7 @@ class WorkflowPolicies(BaseModel):
 
 class ModelRuntimePolicy(BaseModel):
     order: list[Literal["llm_runtime", "agent_runtime"]] = Field(
-        default_factory=lambda: ["llm_runtime", "agent_runtime"]
+        default_factory=lambda: ["agent_runtime"]
     )
     fallback: Literal["startup_unavailable_only"] | None = None
 
@@ -93,10 +93,11 @@ class ModelRuntimePolicy(BaseModel):
     @model_validator(mode="after")
     def fixed_order(self) -> ModelRuntimePolicy:
         if self.order not in (
+            ["agent_runtime"],
             ["llm_runtime"],
             ["llm_runtime", "agent_runtime"],
         ):
-            raise ValueError("modelRuntimePolicy.order 必须以 llm_runtime 开始")
+            raise ValueError("modelRuntimePolicy.order 只支持 Agent 或旧版本兼容策略")
         return self
 
 

@@ -47,3 +47,32 @@ def test_title_validation():
     for title in ["", "   ", "字" * 201]:
         with pytest.raises(ValidationError):
             ConversationTitleUpdate(title=title)
+
+
+async def test_workspace_persistence_and_history_filter(tmp_path):
+    from app.api.routes import add_chat_workspace, list_chat_workspaces
+    from app.api.schemas import ConversationDirectoryUpdate
+
+    directory = str(tmp_path)
+    async with SessionLocal() as session:
+        for path in [directory, directory + "/."]:
+            assert (await add_chat_workspace(
+                ConversationDirectoryUpdate(workingDirectory=path), session
+            ))["path"] == directory
+    async with SessionLocal() as session:
+        assert (await list_chat_workspaces(session))["items"] == [directory]
+        session.add_all([
+            Conversation(id="ordinary", title="普通"),
+            Conversation(id="work-a", title="工作一", working_directory=directory),
+            Conversation(id="work-b", title="工作二", working_directory=directory),
+            Conversation(id="legacy", title="旧工作区", working_directory="/legacy"),
+        ])
+        await session.commit()
+        assert (await list_chat_workspaces(session))["items"] == sorted([directory, "/legacy"])
+        normal = await list_conversations(working_directory="", limit=30, query=None, session=session)
+        assert [item["id"] for item in normal["items"]] == ["ordinary"]
+        first = await list_conversations(working_directory=directory, limit=1, query=None, session=session)
+        second = await list_conversations(working_directory=directory, cursor=first["nextCursor"], limit=1, query=None, session=session)
+        assert {first["items"][0]["id"], second["items"][0]["id"]} == {"work-a", "work-b"}
+        assert first["items"][0]["workingDirectory"] == directory
+        assert second["nextCursor"] is None

@@ -2,8 +2,8 @@ import { App as AntApp, Button, ConfigProvider, Divider, Tooltip, theme } from '
 import { useEffect } from 'react'
 import { useStoredBoolean } from '@/hooks/useStoredBoolean'
 import zhCN from 'antd/locale/zh_CN'
-import { Blocks, BookOpen, Bot, Cable, Moon, PanelLeftClose, PanelLeftOpen, Plus, Settings, Sun } from 'lucide-react'
-import { NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom'
+import { Activity, Blocks, BookOpen, Bot, Cable, Moon, PanelLeftClose, Settings, Sun } from 'lucide-react'
+import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { useTheme } from '@/hooks/useTheme'
 import styles from './shell.module.css'
 
@@ -12,6 +12,7 @@ const navigation = [
   { to: '/workflows', label: '工作流', description: '编排、运行与复用', icon: Cable },
   { to: '/skills', label: 'Skills', description: '管理指令与可复用能力', icon: BookOpen },
   { to: '/capabilities', label: 'SkillX', description: '工具与连接', icon: Blocks },
+  { to: '/monitoring', label: '监控', description: '用量、质量与 Session 记录', icon: Activity },
 ]
 
 export default function AppShell() {
@@ -19,7 +20,6 @@ export default function AppShell() {
   const controls = isDark
     ? { hover: '#30343b', selected: '#343d49', selectedHover: '#414d5c', border: '#8b98a7', ring: 'rgba(139, 152, 167, .18)', text: '#ececec' }
     : { hover: '#f4f6f8', selected: '#edf1f5', selectedHover: '#e3eaf2', border: '#8695a7', ring: 'rgba(134, 149, 167, .16)', text: '#171717' }
-  const navigate = useNavigate()
   const { pathname } = useLocation()
   const navigationPath = pathname.startsWith('/components') ? '/workflows' : pathname
   const [collapsed, setCollapsed] = useStoredBoolean('skillx-navigation-collapsed')
@@ -66,16 +66,28 @@ export default function AppShell() {
     <AntApp>
       <div className={`${styles.shell} ${collapsed ? styles.collapsed : ''}`}>
         <aside className={styles.sidebar} aria-label="工作空间导航">
-          <Tooltip title={collapsed ? '展开主导航' : '折叠主导航'}>
-            <Button type="text" className={styles.collapseToggle} aria-label={collapsed ? '展开主导航' : '折叠主导航'}
-              aria-expanded={!collapsed} onClick={() => setCollapsed(!collapsed)}
-              icon={collapsed ? <PanelLeftOpen size={17} /> : <PanelLeftClose size={17} />} />
-          </Tooltip>
-          <NavLink to="/chat" className={styles.brand}>
-            <img className={styles.logo} src="/favicon.svg" alt="SkillX" />
-            <strong>SkillX<span>智能工作空间</span></strong>
-          </NavLink>
-          <Button className={styles.newChat} icon={<Plus size={16} />} onClick={() => navigate('/chat')} aria-label="新对话">{collapsed ? null : '新对话'}</Button>
+          <div className={styles.sidebarHeader}>
+            {collapsed ? (
+              <Tooltip title="展开主导航">
+                <button type="button" className={styles.expandBrand} aria-label="展开主导航"
+                  aria-expanded={false} onClick={() => setCollapsed(false)}>
+                  <img className={styles.logo} src="/favicon.svg" alt="SkillX" />
+                </button>
+              </Tooltip>
+            ) : (
+              <>
+                <NavLink to="/chat" className={styles.brand}>
+                  <img className={styles.logo} src="/favicon.svg" alt="SkillX" />
+                  <strong>SkillX<span>智能工作空间</span></strong>
+                </NavLink>
+                <Tooltip title="折叠主导航">
+                  <Button type="text" className={styles.collapseToggle} aria-label="折叠主导航"
+                    aria-expanded={true} onClick={() => setCollapsed(true)}
+                    icon={<PanelLeftClose size={18} strokeWidth={1.7} />} />
+                </Tooltip>
+              </>
+            )}
+          </div>
           <div className={styles.navCaption}>工作空间</div>
           <nav className={styles.navigation} aria-label="主导航">
             {navigation.map(({ to, label, description, icon: Icon }) => <NavLink key={to} to={to} aria-label={label} title={collapsed ? label : undefined}

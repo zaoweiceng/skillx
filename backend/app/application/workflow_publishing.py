@@ -171,6 +171,7 @@ async def publish_workflow(
     workflow_id: str,
     body: PublishInput,
     session: AsyncSession,
+    *, commit: bool = True,
 ) -> dict[str, Any]:
     item = await session.get(Workflow, workflow_id)
     if item is None:
@@ -185,7 +186,7 @@ async def publish_workflow(
                 422,
                 detail={
                     "code": "CAPABILITY_METADATA_REQUIRED",
-                    "message": "目录公开前必须补充完整语义元数据",
+                    "message": "metadata.name 必须是非空字符串；目录元数据 summary 必须是非空字符串；useWhen/doNotUseWhen/examples/tags 必须是非空字符串数组，examples 不是 input/output 对象；可执行样例放在顶层 workflowExamples",
                     "fields": metadata_issues,
                 },
             )
@@ -462,7 +463,10 @@ async def publish_workflow(
                 "message": "发布领取已失效",
             },
         )
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
     await session.refresh(version)
     return await published_response(version)
 

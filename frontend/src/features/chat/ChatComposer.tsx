@@ -1,5 +1,5 @@
 import { Alert, Button, Flex, Input, Tag, Tooltip } from 'antd'
-import { ArrowUp, FileText, FolderOpen, Paperclip } from 'lucide-react'
+import { ArrowUp, FileText, FolderOpen, Paperclip, Square } from 'lucide-react'
 import { useRef, useState, type FormEvent, type ReactNode } from 'react'
 import type { ChatImageInput, ChatReferenceFile } from '@/api/client'
 import styles from './chat.module.css'
@@ -23,7 +23,9 @@ function readImage(file: File): Promise<string> {
   })
 }
 
-export function ChatComposer({ input, onInputChange, disabled, sending, controls, onSend, directoryControl, workingDirectory, onWorkingDirectoryChange }: {
+export function ChatComposer({ input, onInputChange, disabled, sending, controls, onSend, onStop, stopping = false, directoryControl, workingDirectory, onWorkingDirectoryChange }: {
+  onStop?: () => Promise<void>
+  stopping?: boolean
   workingDirectory?: string
   onWorkingDirectoryChange: (path: string | undefined) => void
   input: string
@@ -34,6 +36,7 @@ export function ChatComposer({ input, onInputChange, disabled, sending, controls
   directoryControl?: ReactNode
   onSend: (event: FormEvent, files: ChatReferenceFile[], workingDirectory?: string, images?: ChatImageInput[]) => Promise<boolean>
 }) {
+  const submitting = useRef(false)
   const fileInput = useRef<HTMLInputElement>(null)
   const [files, setFiles] = useState<ChatReferenceFile[]>([])
   const [images, setImages] = useState<DraftImage[]>([])
@@ -95,12 +98,15 @@ export function ChatComposer({ input, onInputChange, disabled, sending, controls
 
   async function submit(event: FormEvent) {
     event.preventDefault()
-    if (disabled || reading || (!input.trim() && !images.length)) return
+    if (submitting.current || onStop || sending || disabled || reading || (!input.trim() && !images.length)) return
     setError('')
-    const sent = images.length
-      ? await onSend(event, files, workingDirectory, images.map(({ name, mimeType, data }) => ({ name, mimeType, data })))
-      : await onSend(event, files, workingDirectory)
-    if (sent) { filesRef.current = []; imagesRef.current = []; setFiles([]); setImages([]) }
+    submitting.current = true
+    try {
+      const sent = images.length
+        ? await onSend(event, files, workingDirectory, images.map(({ name, mimeType, data }) => ({ name, mimeType, data })))
+        : await onSend(event, files, workingDirectory)
+      if (sent) { filesRef.current = []; imagesRef.current = []; setFiles([]); setImages([]) }
+    } finally { submitting.current = false }
   }
 
   return <form className={styles.composer} onSubmit={submit} onPaste={event => {
@@ -121,7 +127,13 @@ export function ChatComposer({ input, onInputChange, disabled, sending, controls
         {file.name}
       </Tag>)}
     </Flex>}
-    <Input.TextArea variant="borderless" aria-label="对话输入" placeholder="描述一个需要探索或固化的任务..."
+    <Input.TextArea variant="borderless" aria-label="对话输入" placeholder="描述你的需求...（Enter 发送，Shift+Enter 换行）"
+      onKeyDown={event => {
+        if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) {
+          event.preventDefault()
+          if (!event.repeat) void submit(event)
+        }
+      }}
       value={input} onChange={event => onInputChange(event.target.value)} autoSize={{minRows: 2, maxRows: 8}} />
     <div className={styles.composerToolbar}>
       <div className={styles.composerOptions}>{controls}</div>
@@ -131,8 +143,12 @@ export function ChatComposer({ input, onInputChange, disabled, sending, controls
           <Button type="text" aria-label="添加参考文件" icon={<Paperclip size={20} />} disabled={sending || reading}
             loading={reading} onClick={() => fileInput.current?.click()} />
         </Tooltip>
-        <Button type="primary" shape="circle" htmlType="submit" aria-label={sending ? '处理中' : '发送'}
-          disabled={disabled || reading || (!input.trim() && !images.length)} loading={sending} icon={<ArrowUp size={21} />} />
+        {onStop ? <Tooltip title={stopping ? '正在终止任务' : '终止任务'}>
+          <Button type="primary" shape="circle" htmlType="button" aria-label="终止任务"
+            disabled={stopping} loading={stopping} onClick={() => void onStop()}
+            icon={<Square size={15} fill="currentColor" />} />
+        </Tooltip> : <Button type="primary" shape="circle" htmlType="submit" aria-label={sending ? '处理中' : '发送'}
+          disabled={disabled || reading || (!input.trim() && !images.length)} loading={sending} icon={<ArrowUp size={21} />} />}
       </Flex>
     </div>
     <input ref={fileInput} type="file" multiple hidden aria-label="参考文件"

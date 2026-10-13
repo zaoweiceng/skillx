@@ -101,6 +101,8 @@ class Orchestrator:
     ) -> Run:
         definition = WorkflowDefinition.model_validate(workflow_version.definition_json)
         await validate_workflow_capabilities(session, definition)
+        from app.application.schema_defaults import apply_input_defaults
+        inputs = apply_input_defaults(inputs, definition.spec.input_schema)
         errors = list(Draft202012Validator(definition.spec.input_schema).iter_errors(inputs))
         if errors:
             raise ValueError(errors[0].message)
@@ -119,7 +121,10 @@ class Orchestrator:
                 }} if automatic_recovery else {}),
                 "nodeProfiles": (
                     workflow_version.validation_json["nodeProfiles"]
-                    if "nodeProfiles" in (workflow_version.validation_json or {})
+                    if "nodeProfiles" in (workflow_version.validation_json or {}) and not any(
+                        profile.get("runtimeSelection") == "direct_llm"
+                        for profile in workflow_version.validation_json["nodeProfiles"].values()
+                    )
                     else await workflow_profiles(session, definition)
                 ),
             },
@@ -148,6 +153,8 @@ class Orchestrator:
 
         verify_plan_snapshot(snapshot)
         definition = WorkflowDefinition.model_validate(snapshot.definition_json)
+        from app.application.schema_defaults import apply_input_defaults
+        inputs = apply_input_defaults(inputs, definition.spec.input_schema)
         errors = list(Draft202012Validator(definition.spec.input_schema).iter_errors(inputs))
         if errors:
             raise ValueError(errors[0].message)

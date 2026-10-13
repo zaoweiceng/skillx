@@ -27,3 +27,19 @@ describe('conversation history actions', () => {
     await waitFor(() => expect(remove).toHaveBeenCalledTimes(2))
   })
 })
+
+it('opens extraction from the context menu in a new conversation', async () => {
+  const { api } = await import('@/api/client')
+  const extract = vi.spyOn(api, 'extractConversationWorkflows').mockResolvedValue({ conversationId: 'extracted', taskId: 'task' })
+  const { Routes, Route } = await import('react-router-dom')
+  render(<MemoryRouter initialEntries={['/chat/source']}><Routes>
+    <Route path="/chat/source" element={<ConversationHistoryItem id="source" title="来源" active onNavigate={() => {}} onRename={vi.fn()} onDelete={vi.fn()} />} />
+    <Route path="/chat/extracted" element={<p>提取对话</p>} />
+  </Routes></MemoryRouter>)
+  fireEvent.contextMenu(screen.getByRole('link', { name: '来源' }))
+  fireEvent.click(await screen.findByText('提取工作流'))
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  expect(await screen.findByText('提取对话')).toBeInTheDocument()
+  expect(extract).toHaveBeenCalledWith('source')
+  extract.mockRestore()
+})

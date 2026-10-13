@@ -1,71 +1,27 @@
-import httpx
+from dataclasses import asdict
+from pathlib import Path
+
 import pytest
-
-from app.domain.runtime import LLMRuntimeConfig
-from app.runtime.models import ModelRuntimeError, OpenAICompatibleAdapter
-
-
-@pytest.mark.parametrize("mode", ["json_schema", "json_object", "prompt"])
-async def test_structured_modes_validate_output_and_keep_usage_unknown(monkeypatch, mode):
-    seen = []
-
-    async def reply(request):
-        import json
-
-        seen.append(json.loads(request.content))
-        assert str(request.url) == "https://provider.invalid/v1/chat/completions"
-        return httpx.Response(200, json={"choices": [{"message": {"content": '{"value":3}'}}]})
-
-    original = httpx.AsyncClient
-    monkeypatch.setattr(
-        httpx,
-        "AsyncClient",
-        lambda **kwargs: original(transport=httpx.MockTransport(reply), **kwargs),
-    )
-    monkeypatch.setenv("TEST_MODEL_KEY", "test")
-    adapter = OpenAICompatibleAdapter(
-        LLMRuntimeConfig(
-            "openai_compatible", "https://provider.invalid/v1", "test-model", "TEST_MODEL_KEY"
-        ),
-        structured_mode=mode,
-    )
-    schema = {"type": "object", "properties": {"value": {"type": "integer"}}, "required": ["value"]}
-    result = await adapter.generate("extract", schema, 100)
-    assert result.output == {"value": 3}
-    assert result.usage_complete is False
-    if mode == "prompt":
-        assert "response_format" not in seen[0]
-    else:
-        assert seen[0]["response_format"]["type"] == mode
-    with pytest.raises(ModelRuntimeError, match="输出契约"):
-        await adapter.generate("extract", {"type": "object", "required": ["missing"]}, 100)
+from app.application.agent_host import AgentHost, AgentHostError, AgentHostResult
+from app.application.runtime_config import agent_runtime_config
+from app.application.structured_generation import (
+    StructuredGenerationResolver, StructuredGenerationRequest, agent_structured_snapshot,
+)
+from app.runtime.models import ModelRuntimeError
 
 
-async def test_text_stream_has_deltas_and_usage_without_agent(monkeypatch):
-    async def reply(request):
-        return httpx.Response(
-            200,
-            text=(
-                'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n'
-                'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\n'
-                "data: [DONE]\n\n"
-            ),
-            headers={"content-type": "text/event-stream"},
-        )
-
-    original = httpx.AsyncClient
-    monkeypatch.setattr(
-        httpx,
-        "AsyncClient",
-        lambda **kwargs: original(transport=httpx.MockTransport(reply), **kwargs),
-    )
-    monkeypatch.setenv("TEST_MODEL_KEY", "test")
-    adapter = OpenAICompatibleAdapter(
-        LLMRuntimeConfig(
-            "openai_compatible", "https://provider.invalid/v1", "test-model", "TEST_MODEL_KEY"
-        )
-    )
-    events = [event async for event in adapter.stream_text([{"role": "user", "content": "hello"}])]
-    assert "".join(event.delta for event in events) == "Hello"
-    assert events[-1].input_tokens == 3
-    assert events[-1].output_tokens == 1
+@pytest.mark.parametrize("code", ["MODEL_AUTH_FAILED", "RATE_LIMITED", "AGENT_TIMEOUT"])
+async def test_structured_agent_errors_preserve_dispatch_without_switching(monkeypatch, code):
+    snapshot = asdict(agent_runtime_config())
+    snapshot.update(type="fixture", provider="fixture", command=["fixture"])
+    calls = []
+    async def fail(self, request, **kwargs):
+        calls.append(request)
+        raise AgentHostError(code, "failure", request_dispatched=True)
+    monkeypatch.setattr(AgentHost, "execute", fail)
+    with pytest.raises(ModelRuntimeError) as error:
+        await StructuredGenerationResolver().generate(StructuredGenerationRequest(
+            "isolated", "prompt", {"type": "object"}, 100, Path("/tmp/test-agent")),
+            agent_structured_snapshot(snapshot))
+    assert error.value.code == code and error.value.request_dispatched
+    assert len(calls) == 1 and calls[0].requested_capabilities == ()

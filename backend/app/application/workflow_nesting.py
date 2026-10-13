@@ -62,7 +62,9 @@ async def expand_workflow(session, raw, ancestors=()):
         if len(ancestors) + depth > 8:
             raise ValueError("工作流嵌套超过 8 层")
         required = child["spec"]["inputSchema"].get("required", [])
-        if set(required) - call.get("input", {}).keys():
+        from app.application.schema_defaults import apply_input_defaults
+        child_inputs = apply_input_defaults(call.get("input", {}), child["spec"]["inputSchema"])
+        if set(required) - child_inputs.keys():
             raise ValueError("子工作流缺少必填输入映射")
         child_nodes = child["spec"]["nodes"]
         input_node = next(n for n in child_nodes if n["type"] == "input")
@@ -77,7 +79,7 @@ async def expand_workflow(session, raw, ancestors=()):
             if node["type"] == "input":
                 item.update(
                     type="transform",
-                    input=call.get("input", {}),
+                    input=child_inputs,
                     config={
                         "operation": "passthrough",
                         "outputSchema": child["spec"]["inputSchema"],

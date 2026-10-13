@@ -1,19 +1,19 @@
-.page:global(.chat-page) { padding: 12px 28px 16px; }
+.page:global(.chat-page) { padding: 12px 28px 16px 12px; }
 .page :global(.chat-layout) { display: flex; border: 0; background: var(--bg); gap: 0; }
-.page :global(.chat-header) { padding-block: 4px 12px; border-bottom: 1px solid var(--line-soft); margin-bottom: 12px; }
-.page :global(.chat-header h1) { font-size: 18px; font-weight: 600; letter-spacing: -.4px; margin: 0; }
-.page :global(.chat-header > div:first-child) { display: flex; align-items: center; gap: 12px; }
-.page :global(.chat-header .eyebrow) { font-size: 11px; letter-spacing: 0; }
+.page :global(.chat-header) { align-items: center; min-height: 44px; padding-block: 4px 10px; border-bottom: 1px solid var(--line-soft); margin-bottom: 12px; }
+.page :global(.chat-header h1) { font-size: 16px; line-height: 24px; font-weight: 600; letter-spacing: -.2px; margin: 0; }
+.page :global(.chat-header > div:first-child) { display: flex; align-items: center; gap: 10px; }
+.page :global(.chat-header .eyebrow) { font-size: 12px; line-height: 20px; font-weight: 400; letter-spacing: 0; }
 .page :global(.conversation-history) { background: transparent; border: 0; border-radius: 12px; }
-.page :global(.history-heading) { background: var(--bg); border: 0; padding: 8px 10px 12px; color: var(--muted); }
-.page :global(.history-row) { display: flex; align-items: center; min-width: 0; border-radius: 10px; margin: 2px 0; padding-right: 4px; transition: background-color .15s ease; }
+.page :global(.history-heading) { background: var(--bg); border: 0; padding: 6px 8px 10px 12px; min-height: 44px; font-size: 12px; line-height: 20px; color: var(--muted); }
+.page :global(.history-row) { display: flex; align-items: center; min-width: 0; border-radius: 10px; margin: 2px 0; position: relative; transition: background-color .15s ease; }
 .page :global(.history-row.active), .page :global(.history-row:hover), .page :global(.history-row:focus-within) { background: var(--panel-raised); }
 .page :global(.history-item) { display: flex; align-items: center; flex: 1; min-width: 0; min-height: 42px; border: 0; padding: 9px 12px; border-radius: 10px; color: color-mix(in srgb, var(--text) 87%, var(--bg)); background: transparent; }
 .page :global(.history-item:focus-visible) { outline: 2px solid var(--muted); outline-offset: -2px; }
 .page :global(.history-item strong) { display: block; min-width: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif; font-size: 13px; font-weight: 400; line-height: 22px; letter-spacing: 0; }
-.page :global(.history-menu) { flex: none; width: 28px; height: 28px; padding: 0; opacity: 0; color: var(--muted); }
-.page :global(.history-row:hover .history-menu), .page :global(.history-row:focus-within .history-menu), .page :global(.history-menu[aria-expanded="true"]) { opacity: 1; }
-@media (hover: none) { .page :global(.history-menu) { opacity: 1; } }
+.page :global(.history-menu) { position: absolute; right: 4px; top: 7px; background: var(--panel-raised); box-shadow: -8px 0 8px var(--panel-raised); pointer-events: none; width: 28px; height: 28px; padding: 0; opacity: 0; color: var(--muted); }
+.page :global(.history-row:hover .history-menu), .page :global(.history-row:focus-within .history-menu), .page :global(.history-menu[aria-expanded="true"]) { opacity: 1; pointer-events: auto; }
+@media (hover: none) { .page :global(.history-menu) { opacity: 1; pointer-events: auto; } }
 .page :global(.mobile-history-toggle[aria-label="打开执行轨迹"]) { display: inline-flex; }
 .page :global(.message-stream) { padding: 20px 12px; }
 .page :global(.chat-empty) { padding-bottom: 32px; }
@@ -33,7 +33,7 @@
 @media (max-width: 600px) {
   .page:global(.chat-page) { height: calc(100dvh - 64px); padding: 10px 16px; }
   .page :global(.chat-header) { align-items: center; gap: 8px; margin-bottom: 8px; padding-bottom: 8px; }
-  .page :global(.chat-header h1) { font-size: 17px; }.page :global(.chat-header .eyebrow) { display: none; }.page :global(.chat-header-actions > .ant-tag) { display: none; }.page :global(.chat-header-actions) { flex-wrap: wrap; }
+  .page :global(.chat-header h1) { font-size: 16px; }.page :global(.chat-header .eyebrow) { display: none; }.page :global(.chat-header-actions > .ant-tag) { display: none; }.page :global(.chat-header-actions) { flex-wrap: wrap; }
   .page :global(.chat-empty) { padding: 24px 0; }
   .page :global(.prompt-suggestions) { margin-top: 20px; gap: 8px; }.page :global(.prompt-suggestions button) { padding: 14px; }
   .page :global(.prompt-suggestions button span) { display: none; }.page :global(.chat-empty h2) { font-size: 23px; }
@@ -81,8 +81,9 @@
 }
 
 .page :global(.chat-layout > .message-column) { flex: 1; min-width: 0; }
-.page :global(.history-heading-actions) { display: flex; align-items: center; gap: 2px; }
-.page :global(.history-heading-actions button) { width: 28px; height: 28px; padding: 0; }
+.page :global(.history-heading-actions) { display: flex; align-items: center; gap: 4px; }
+.page :global(.history-heading-actions button) { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 8px; box-shadow: none; color: var(--muted); }
+.page :global(.history-heading-actions button:hover) { color: var(--text); background: var(--panel-raised); }
 
 .workspaceSplitter .historyCollapsed { padding: 0; visibility: hidden; }
 .workspaceSplitter .historyCollapsed > * { display: none; }
@@ -137,3 +138,13 @@
 .attachments .directoryTag { display: inline-flex; min-width: 0; max-width: 100%; margin-inline-end: 0; white-space: nowrap; }
 .directoryTag > svg, .directoryTag > :global(.ant-tag-close-icon) { flex-shrink: 0; }
 .directoryPath { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.page :global(.conversation-group-heading) { display: flex; align-items: center; min-width: 0; padding: 4px 8px; color: var(--muted); font-size: 12px; }
+.page :global(.conversation-group-toggle) { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; border: 0; background: transparent; color: inherit; cursor: pointer; padding: 4px 0; text-align: left; }
+.page :global(.conversation-group-toggle span) { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.page :global(.conversation-group-toggle svg) { flex: none; }
+.page :global(.workspace-heading) { justify-content: space-between; margin-top: 16px; padding-left: 12px; }
+.page :global(.group-empty) { display: block; padding: 6px 12px; font-size: 12px; }
+.page :global(.history-item strong) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.page :global(.workspace-group > nav) { margin-left: 24px; }

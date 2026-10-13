@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import OperationalError
 
 from app.api.handoffs import router as handoffs_router
+from app.api.monitoring import router as monitoring_router
 from app.api.routes import router
 from app.api.runtime_profiles import router as profiles_router
 from app.api.skills import router as skills_router
@@ -51,6 +52,7 @@ app.add_middleware(
 )
 app.include_router(router, prefix="/api")
 app.include_router(tasks_router, prefix="/api")
+app.include_router(monitoring_router, prefix="/api")
 app.include_router(profiles_router, prefix="/api")
 app.include_router(handoffs_router, prefix="/api")
 app.include_router(skills_router, prefix="/api")

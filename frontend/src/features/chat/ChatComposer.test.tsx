@@ -77,3 +77,50 @@ describe('对话参考文件', () => {
     expect(screen.queryByText('data.bin')).not.toBeInTheDocument()
   })
 })
+
+it('执行时用终止按钮替换发送，保留草稿并在结束后恢复发送', async () => {
+  const onStop = vi.fn().mockResolvedValue(undefined)
+  const onSend = vi.fn().mockResolvedValue(true)
+  const props = { input: '下一条草稿', onInputChange: vi.fn(), disabled: true, sending: false,
+    controls: null, onSend, onWorkingDirectoryChange: vi.fn() }
+  const { rerender } = render(<ChatComposer {...props} onStop={onStop} />)
+  expect(screen.queryByRole('button', { name: '发送' })).not.toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: '终止任务' }))
+  expect(onStop).toHaveBeenCalledTimes(1)
+  expect(onSend).not.toHaveBeenCalled()
+  expect(screen.getByLabelText('对话输入')).toHaveValue('下一条草稿')
+  rerender(<ChatComposer {...props} onStop={onStop} stopping />)
+  expect(screen.getByRole('button', { name: '终止任务' })).toBeDisabled()
+  rerender(<ChatComposer {...props} disabled={false} />)
+  fireEvent.click(screen.getByRole('button', { name: '发送' }))
+  await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1))
+})
+
+it('输入为空也可终止，表单提交不会发送或意外终止任务', () => {
+  const onStop = vi.fn().mockResolvedValue(undefined)
+  const onSend = vi.fn().mockResolvedValue(true)
+  render(<ChatComposer input="" onInputChange={vi.fn()} disabled sending={false}
+    controls={null} onSend={onSend} onStop={onStop} onWorkingDirectoryChange={vi.fn()} />)
+  const stop = screen.getByRole('button', { name: '终止任务' })
+  expect(stop).toBeEnabled()
+  fireEvent.submit(stop.closest('form')!)
+  expect(onStop).not.toHaveBeenCalled()
+  expect(onSend).not.toHaveBeenCalled()
+  fireEvent.click(stop)
+  expect(onStop).toHaveBeenCalledTimes(1)
+})
+
+it('Enter sends once; Shift+Enter and IME confirmation preserve the draft', async () => {
+  let resolve!: (value: boolean) => void
+  const send = composer(vi.fn(() => new Promise<boolean>(done => { resolve = done })))
+  const input = screen.getByLabelText('对话输入')
+  fireEvent.keyDown(input, { key: 'Enter', shiftKey: true })
+  fireEvent.keyDown(input, { key: 'Enter', isComposing: true })
+  fireEvent.keyDown(input, { key: 'Enter', keyCode: 229 })
+  expect(send).not.toHaveBeenCalled()
+  fireEvent.keyDown(input, { key: 'Enter' })
+  fireEvent.keyDown(input, { key: 'Enter' })
+  expect(send).toHaveBeenCalledTimes(1)
+  resolve(true)
+  await waitFor(() => expect(send).toHaveBeenCalledTimes(1))
+})

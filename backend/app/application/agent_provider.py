@@ -12,7 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
-from app.application.runtime_config import agent_runtime_config, llm_runtime_config
+from app.application.runtime_config import agent_runtime_config
 from app.application.tool_broker import ToolAdapterRegistry, ToolExecutionContext
 from app.config import get_settings
 from app.infrastructure.runtime_credentials import resolve_runtime_key
@@ -490,25 +490,3 @@ def reset_provider_probe_cache() -> None:
     """Test helper; production cache is process-local and intentionally bounded."""
 
     _probe_cache.clear()
-
-
-async def llm_runtime_readiness() -> dict[str, Any]:
-    runtime = llm_runtime_config()
-    configured = runtime.configured
-    return {
-        "type": runtime.type,
-        "configured": configured,
-        "protocol": ("openai-compatible-http" if runtime.type == "openai_compatible" else "none"),
-        "model": runtime.model,
-        "probe": {
-            "kind": "configuration_only",
-            "ok": configured,
-            "summary": (
-                "Direct LLM Runtime 已配置；执行中 401/429/timeout 不会切换 Runtime"
-                if configured
-                else "Direct LLM Runtime 未配置，请配置模型服务或显式选择 Agent 节点"
-            ),
-        },
-        "digest": runtime.digest,
-        "source": runtime.source,
-    }

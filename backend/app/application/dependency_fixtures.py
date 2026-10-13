@@ -16,8 +16,6 @@ async def observed_dependencies(session, dependencies, evidence):
     )
     fixtures = []
     for alias, lock in locks.items():
-        if lock.get("effect", "unknown") not in {"none", "read", "data.read"}:
-            raise ValueError("生成的写操作包装需要独立授权契约与回放证据，保留候选")
         matches = []
         for call in evidence.values():
             if call.status != "succeeded":

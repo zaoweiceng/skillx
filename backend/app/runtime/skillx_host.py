@@ -21,6 +21,7 @@ async def execute_in_subprocess(
     inputs: dict[str, Any],
     secrets: dict[str, str] | None = None,
     dependency_handler=None,
+    working_directory: Path | None = None,
 ) -> NodeResult:
     workdir = get_settings().artifact_root.resolve() / "skillx-execution" / invocation_id
     workdir.mkdir(parents=True, exist_ok=True)
@@ -31,15 +32,21 @@ async def execute_in_subprocess(
         "PYTHONNOUSERSITE": "1",
         "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
     }
+    argv = [sys.executable, "-m", "app.runtime.skillx_runner"]
+    from app.runtime.skillx import load_manifest
+    interface = load_manifest(package_root)["spec"]["interfaces"][interface_name]
+    from app.runtime.pure_python import execution_profile, sandbox_command
+    if execution_profile(package_root, interface) == "pure-python":
+        argv = sandbox_command(argv, code_roots=(
+            Path(__file__).resolve().parents[1], package_root, workdir))
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
     process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "app.runtime.skillx_runner",
+        *argv,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=1024 * 1024,
-        cwd=workdir,
+        cwd=working_directory or workdir,
         env=environment,
         start_new_session=True,
     )

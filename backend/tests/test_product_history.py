@@ -204,7 +204,7 @@ async def test_template_presentation_is_persisted_without_changing_run_output() 
     assert not await PresentationDriver().poll_once()
 
 
-async def test_llm_presentation_unavailable_does_not_switch_agent(
+async def test_presentation_uses_selected_agent_without_direct_llm(
     monkeypatch,
 ) -> None:
     settings = get_settings()
@@ -263,9 +263,9 @@ async def test_llm_presentation_unavailable_does_not_switch_agent(
             select(ModelUsage).where(ModelUsage.presentation_id == presentation.id)
         )
     assert presentation is not None
-    assert presentation.status == "failed"
-    assert presentation.error_json["code"] == "MODEL_RUNTIME_UNAVAILABLE"
-    assert usage is None
+    assert presentation.status == "completed"
+    assert usage is not None
+    assert usage.runtime_used == "agent_structured"
 
 
 async def test_run_history_filters_on_server() -> None:
@@ -336,3 +336,46 @@ async def test_run_history_filters_on_server() -> None:
     assert len(page["items"]) == 1
     assert page["items"][0]["componentId"] == first.id
     assert page["items"][0]["status"] == "failed"
+
+
+async def test_extraction_usage_includes_learning_calls_without_double_counting() -> None:
+    from app.infrastructure.models.tasks import Task, TaskEvent
+
+    async with SessionLocal() as session, session.begin():
+        conversation = Conversation(id=str(uuid4()), title="提取统计")
+        turn = ConversationTurn(
+            id=str(uuid4()), conversation_id=conversation.id,
+            workflow_mode_snapshot="enabled", status="completed", accepted_at=utcnow(),
+        )
+        task = Task(
+            id=str(uuid4()), conversation_id=conversation.id, turn_id=turn.id,
+            goal="提取工作流", status="succeeded", total_tokens=100,
+        )
+        session.add_all([conversation, turn, task])
+        await session.flush()
+        for event_type, request_id, input_tokens, output_tokens in [
+            ("agent.audit", "decision", 80, 20),
+            ("learning.agent.audit", "extractor", 70609, 6597),
+        ]:
+            for kind, payload in [
+                ("model.request.dispatched", {"requestId": request_id}),
+                ("agent.step.completed", {
+                    "requestId": request_id, "inputTokens": input_tokens,
+                    "outputTokens": output_tokens, "usageComplete": True,
+                }),
+            ]:
+                session.add(TaskEvent(task_id=task.id, type=event_type,
+                    payload_json={"type": kind, "stage": "extractor", "payload": payload}))
+        await session.flush()
+        summary = await usage_summary(session, turn.id)
+        assert summary["state"] == "complete"
+        assert summary["totalTokens"] == 77306
+        assert len(summary["stages"]) == 2
+        session.add(TaskEvent(task_id=task.id, type="learning.agent.audit", payload_json={
+            "type": "model.request.dispatched", "stage": "skillx",
+            "payload": {"requestId": "unfinished"},
+        }))
+        await session.flush()
+        summary = await usage_summary(session, turn.id)
+        assert summary["state"] == "partial"
+        assert summary["totalTokens"] == 77306

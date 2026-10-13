@@ -180,6 +180,17 @@ class ModelResponseEvent(BaseModel):
     payload: ModelResponsePayload
 
 
+class ModelProgressPayload(_PayloadBase):
+    requestId: str = Field(min_length=1)
+    receivedCharacters: StrictInt = Field(ge=1)
+    elapsedMs: StrictInt = Field(ge=0)
+
+
+class ModelProgressEvent(BaseModel):
+    type: Literal["model.response.progress"]
+    payload: ModelProgressPayload
+
+
 class AgentPlanEvent(BaseModel):
     type: Literal["agent.plan"]
     payload: PlanPayload
@@ -260,7 +271,8 @@ AgentEvent = Annotated[
     | LogEvent
     | ModelRequestDispatchedEvent
     | ModelTraceEvent
-    | ModelResponseEvent,
+    | ModelResponseEvent
+    | ModelProgressEvent,
     Field(discriminator="type"),
 ]
 
@@ -409,11 +421,11 @@ class AgentEventValidator:
                     "outputTokens": payload.get("outputTokens", 0),
                     **{key: payload[key] for key in (
                         "requestId", "model", "provider", "durationMs", "cacheReadTokens",
-                        "cacheWriteTokens", "usageComplete",
+                        "cacheWriteTokens", "usageComplete", "runtimeType",
                     ) if key in payload},
                 },
             }
-        if event_type in {"model.request.dispatched", "model.response.started", "model.trace"}:
+        if event_type in {"model.request.dispatched", "model.response.started", "model.response.progress", "model.trace"}:
             return {
                 "type": event_type,
                 "payload": redact(payload),

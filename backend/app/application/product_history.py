@@ -75,7 +75,7 @@ async def record_model_usage(
 ) -> None:
     now = utcnow()
     if total_tokens is None and input_tokens is not None and output_tokens is not None:
-        total_tokens = input_tokens + output_tokens + (cached_tokens or 0) + (reasoning_tokens or 0)
+        total_tokens = input_tokens + output_tokens
     await session.execute(
         sqlite_insert(ModelUsage)
         .values(
@@ -154,7 +154,13 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
         audit_events = (
             await session.scalars(
                 select(TaskEvent)
-                .where(TaskEvent.task_id == task.id, TaskEvent.type == "agent.audit")
+                .where(
+                    TaskEvent.task_id == task.id,
+                    TaskEvent.type.in_(["agent.audit", "learning.agent.audit"]),
+                    TaskEvent.payload_json["type"].as_string().in_(
+                        ["model.request.dispatched", "agent.step.completed"]
+                    ),
+                )
                 .order_by(TaskEvent.id)
             )
         ).all()
@@ -167,10 +173,11 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
                 continue
             if envelope.get("type") == "model.request.dispatched":
                 stages[request_id] = {
-                    "stage": "task_decision",
+                    "stage": envelope.get("stage", "learning") if event.type == "learning.agent.audit" else "task_decision",
+                    "learning": event.type == "learning.agent.audit",
                     "provider": payload.get("provider"),
                     "model": payload.get("model"),
-                    "runtimeType": "pi",
+                    "runtimeType": payload.get("runtimeType", "pi"),
                     "totalTokens": None,
                     "complete": False,
                     "attempted": True,
@@ -178,12 +185,17 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
                     "completed": False,
                 }
             elif envelope.get("type") == "agent.step.completed":
-                stages.setdefault(request_id, {})
+                stages.setdefault(request_id, {
+                    "stage": envelope.get("stage", "learning") if event.type == "learning.agent.audit" else "task_decision",
+                    "learning": event.type == "learning.agent.audit",
+                    "provider": payload.get("provider"), "model": payload.get("model"),
+                    "runtimeType": payload.get("runtimeType"),
+                })
                 stages[request_id].update(
                     {
                         "inputTokens": payload.get("inputTokens", 0),
                         "outputTokens": payload.get("outputTokens", 0),
-                        "cacheReadTokens": payload.get("cacheReadTokens", 0),
+                        "cacheReadTokens": payload.get("cacheReadTokens"),
                         "cacheWriteTokens": payload.get("cacheWriteTokens", 0),
                         "durationMs": payload.get("durationMs"),
                         "totalTokens": payload.get("inputTokens", 0)
@@ -202,11 +214,14 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
                     "model": row.model,
                     "runtimeType": row.runtime_type,
                     "totalTokens": row.total_tokens,
+                    "inputTokens": row.input_tokens,
+                    "cacheReadTokens": row.cached_tokens,
                     "complete": row.usage_complete,
                     "attempted": True,
                     "dispatched": row.request_dispatched_at is not None,
                     "completed": row.completed_at is not None,
                 }
+        total += sum(stage.get("totalTokens") or 0 for stage in stages.values() if stage.get("learning"))
         measured = sum(stage.get("totalTokens") or 0 for stage in stages.values())
         # Step events commit before a decision/run finishes and updates the task
         # counter. Expose those measurements immediately without adding them twice.
@@ -287,6 +302,8 @@ async def usage_summary(session: AsyncSession, turn_id: str) -> dict[str, Any]:
                 "fallbackReason": item.fallback_reason,
                 "errorCode": item.error_code,
                 "totalTokens": item.total_tokens,
+                "inputTokens": item.input_tokens,
+                "cacheReadTokens": item.cached_tokens,
                 "complete": item.usage_complete,
                 "attempted": True,
                 "dispatched": item.request_dispatched_at is not None,
