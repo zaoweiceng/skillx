@@ -36,10 +36,12 @@ def project(output, mapping, *, context=""):
 
 def validate_examples(examples, evidence, *, local_command=False):
     from app.application.task_learning import observed_output
-    # For local commands repository/file state is part of the effective input.
+    # For local commands repository/file/HTTP state is part of the effective input.
     # The same repoPath in two independently initialized repositories is not a
     # duplicate case (e.g. clean vs dirty tree). Pure transformations use JSON only.
-    inputs = [{"input": item.input, "setup": item.setup.strip()} if local_command else item.input
+    inputs = [{"input": item.input, "setup": item.setup.strip(),
+               "httpFixtures": [fixture.model_dump() for fixture in item.httpFixtures]}
+              if local_command else item.input
               for item in examples]
     if len({digest_json(value) for value in inputs}) < 2:
         raise ValueError("必须提供至少两个不同输入或独立环境状态的业务断言")

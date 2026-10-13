@@ -21,6 +21,8 @@ it('shows purpose and compact results while keeping source and full output avail
   render(<TaskRecords id="t" learning={[]} invocations={[{id: 'call', kind: 'code', status: 'succeeded', reason: '列出 agents 目录，定位入口文件', workingDirectory: '/project', request: {language: 'python', source: 'print("secret source")'}, output: {exitCode: 0, stdout: JSON.stringify({'/project/agents': ['F\ta.md', 'D\tskills']})}, error: null}]} />)
   fireEvent.click(screen.getByText('调用记录'))
   expect(screen.getByText('列出 agents 目录，定位入口文件')).toBeTruthy()
+  expect(screen.queryByText('目录清单 · 2 项')).not.toBeInTheDocument()
+  fireEvent.click(screen.getByText('列出 agents 目录，定位入口文件'))
   expect(screen.getByText('目录清单 · 2 项')).toBeTruthy()
   expect(screen.queryByText('print("secret source")')).toBeNull()
   fireEvent.click(screen.getByText('查看执行代码'))

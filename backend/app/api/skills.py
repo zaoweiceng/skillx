@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.application.managed_skills import (
     convert_skill,
+    import_target,
     parse_skill,
     save_skill,
     skill_view,
@@ -112,7 +113,11 @@ async def import_skill(body: SkillImport, session: AsyncSession = Depends(get_se
             description=metadata.get("description", ""),
             content=content,
         )
-        skill = await save_skill(session, values.model_dump(), imported=path)
+        existing = await import_target(session, values.name, path)
+        imported_values = values.model_dump()
+        if existing:
+            imported_values["enabled"] = existing.enabled
+        skill = await save_skill(session, imported_values, existing, imported=path)
         result = await skill_view(session, skill, detail=True)
         await session.commit()
         return result

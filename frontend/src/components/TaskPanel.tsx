@@ -5,6 +5,7 @@ import { request } from '@/api/http'
 import TaskRecords from './TaskRecords'
 import TaskProgress from './TaskProgress'
 import HumanInteractionCard, { type HumanInteraction } from './HumanInteractionCard'
+import styles from './TaskPanel.module.css'
 
 type Task = { id: string; status: string; output: {text?: string}; state: {summary?: string; remaining?: string[]};
   error?: {message?: string}; invocations: Array<{id: string; kind: string; status: string; runId?: string; output: unknown; error: unknown}>;
@@ -35,7 +36,7 @@ export default function TaskPanel({ id, onFinished }: { id: string; onFinished?:
       {task?.interactions.map(item => <HumanInteractionCard key={item.id} item={item} onAnswered={() => setRevision(x => x + 1)} />)}
       <TaskRecords id={id} invocations={task?.invocations ?? []} learning={task?.learning ?? []} />
     </TaskProgress>
-    {task?.output.text && <MarkdownContent>{task.output.text}</MarkdownContent>}
+    {task?.output.text && <section className={styles.result} aria-label="任务结果"><MarkdownContent>{task.output.text}</MarkdownContent></section>}
     {task?.error && <Alert type="error" title={task.error.message ?? '任务执行失败'} />}
   </section>
 }

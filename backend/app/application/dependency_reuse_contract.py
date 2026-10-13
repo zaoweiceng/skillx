@@ -12,6 +12,20 @@ class ReusedDependency(BaseModel):
 
 
 def dependency_reuse_contract(data):
+    declared = set(data.get('fragment', {}).get('dependsOn', []))
+    generated_rules = []
+    for group, key, node_type in (
+        ('suppliedSkillXContracts', 'generatedSkill', 'skillx'),
+        ('suppliedWorkflowContracts', 'generatedWorkflow', 'workflow_call'),
+    ):
+        for item in data.get(group, []):
+            if item['name'] not in declared:
+                continue
+            generated_rules.append({'contains': {
+                'required': ['type', 'config'],
+                'properties': {'type': {'const': node_type}, 'config': {
+                    'required': [key], 'properties': {key: {'const': item['name']}}}},
+            }})
     skipped = {item['name'] for item in data.get('skippedDependencies', [])}
     pinned = {item['name']: item['versionId'] for item in data.get('skippedDependencies', []) if item.get('versionId')}
     choices, node_rules = [], []
@@ -46,6 +60,10 @@ def dependency_reuse_contract(data):
         'required': sorted(skipped), 'properties': {name: {'anyOf': choices_by_name[name] or [False]} for name in skipped}}}}
     if skipped:
         required['required'] = ['reusedDependencies']
+    if generated_rules:
+        required.setdefault('required', []).append('workflow')
+        required['properties']['workflow'] = {'required': ['spec'], 'properties': {
+            'spec': {'required': ['nodes'], 'properties': {'nodes': {'allOf': generated_rules}}}}}
     return {'allOf': [{'if': {'required': ['decision'], 'properties': {'decision': {'const': 'ready'}}},
                      'then': required}, *node_rules]}
 
@@ -53,5 +71,5 @@ def dependency_reuse_contract(data):
 def validate_dependency_reuse(value, data):
     errors = list(Draft202012Validator(dependency_reuse_contract(data)).iter_errors(value.model_dump()))
     if errors:
-        raise ValueError('跳过依赖的复用选择不符合契约：' + '; '.join(
+        raise ValueError('工作流依赖未实际调用或复用选择不符合契约：' + '; '.join(
             '.'.join(map(str, error.absolute_path)) + ': ' + error.message for error in errors[:4]))

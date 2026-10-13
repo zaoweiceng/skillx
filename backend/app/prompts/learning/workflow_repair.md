@@ -19,3 +19,7 @@ verify 的公共变量：result 为实际输出，inputs 为默认值应用及 f
 
 requiredCounterexamples 是已实际执行失败的业务输入场景。修订后的 workflowExamples 必须保留这些 input/setup 和结构化 expected 事实，在修订后的图上重新执行；不能把失败的输入形式换成已经通过的另一种形式。verify 程序错误可以修复，但不得用 assert True、删除有效业务断言或改业务预期掩盖实现缺陷。若实际节点观察显示依赖实现违反契约，按 dependencyRepairs 将反馈交回其独立 Agent。
 MR/PR 验证只使用模拟服务或返回值，不得访问真实托管平台或来源仓库。样例业务地址使用合成 .invalid 域名；用隔离配置将需要 Git I/O 的地址映射到临时 bare 仓库。不得复制来源地址作为会访问网络的测试输入。
+
+
+HTTP 外部动作与隔离验证：HTTP GET/POST/PUT/PATCH/DELETE 等真实读写也属于 local-command，可用 Python 标准库 urllib.request.Request/urlopen，生产执行沿用明确审批。无网络是验证环境限制，不是业务能力限制；不能将“创建/查询/回读”降成返回 method/url/body 或让用户提供 records。每个样例用 httpFixtures 顺序声明精确请求，例如 {"method":"POST","url":"https://fixture.invalid/notes","requestJson":{"title":"A"},"responseJson":{"id":"n1"},"status":201}。GET 的 requestJson=null。Host 拦截 urlopen（含 from urllib.request import urlopen），匹配 method/完整 URL/JSON 请求体后返回该响应，所有 fixture 必须实际消费；未声明、顺序错误、多调、漏调或 body 不符都失败，真实网络仍禁止。setup 可用 pass，verify 要断言有业务意义的实际 result。动态值可用 ${fixture.key}。组合 Workflow 的 httpFixtures 是所有节点按执行顺序共用的一条队列，并非每节点重新重放；例子仍需覆盖不同业务输入/状态。fixture 只存在验证器，禁止生产 source 内置 mock 或测试分支。
+fragment.requiredEffects 是来源成功调用证据中确定的外部 HTTP 义务，必须由实现完成；http.read 需要真实读取请求，http.write 需要真实变更请求。纯参数生成只有在片段明确限于格式化时才合法，不能假称完成外部动作。Workflow 的外部输入仅包含业务任务本身需要的参数，站点记录和回读响应必须由节点获得，不能要求用户补传以替代执行。

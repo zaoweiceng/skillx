@@ -80,17 +80,24 @@ export default function TaskRecords({ id, invocations, learning }: { id: string;
     </div>
     {error && <div role="alert" className={styles.error}>{error}</div>}
     <Collapse ghost size="small" items={[
-      {key: 'calls', label: '调用记录', children: invocations.length ? invocations.map(item => {
+      {key: 'calls', label: '调用记录', children: invocations.length ? <Collapse className={styles.calls} ghost size="small" items={invocations.map(item => {
         const output = record(item.output)
         const args = item.request ?? {}
         const input = record(args.input)
         const result = item.error ? record(item.error).message ?? item.error : output.stdout ?? item.output
-        return <div className={styles.call} key={item.id}>
-          <div className={styles.heading}>
-            {item.kind === 'code' ? <Terminal size={15} /> : item.kind === 'workflow' ? <Workflow size={15} /> : <Wrench size={15} />}
-            <strong>{item.kind === 'code' ? `${args.language === 'javascript' ? 'JavaScript' : 'Python'} 脚本` : item.kind === 'tool' ? String(args.capabilityRef ?? '工具调用') : kindLabels[item.kind] ?? item.kind}</strong>
-            <span className={item.status === 'failed' ? styles.error : styles.status}>{statusLabels[item.status] ?? item.status}</span>
-          </div>
+        const kind = item.kind === 'code' ? `${args.language === 'javascript' ? 'JavaScript' : 'Python'} 脚本` : item.kind === 'tool' ? String(args.capabilityRef ?? '工具调用') : kindLabels[item.kind] ?? item.kind
+        const description = item.reason?.replace(/\s+/g, ' ').trim() || kind
+        const characters = Array.from(description)
+        const preview = characters.length > 24 ? `${characters.slice(0, 24).join('')}…` : description
+        return {
+          key: item.id,
+          label: <div className={styles.callHeading}>
+            {item.kind === 'code' ? <Terminal size={14} /> : item.kind === 'workflow' ? <Workflow size={14} /> : <Wrench size={14} />}
+            <span className={styles.callTitle} title={description}>{preview}</span>
+            {description !== kind && <span className={styles.callKind} title={kind}>{kind}</span>}
+          </div>,
+          extra: <span className={item.status === 'failed' ? styles.error : styles.status}>{statusLabels[item.status] ?? item.status}</span>,
+          children: <div className={styles.callDetails}>
           {item.reason && <div className={styles.purpose}>{item.reason}</div>}
           {item.workingDirectory && <div className={styles.reason}>工作目录：{item.workingDirectory}</div>}
           {typeof input.path === 'string' && <div className={styles.reason}>目标路径：{input.path}</div>}
@@ -102,8 +109,9 @@ export default function TaskRecords({ id, invocations, learning }: { id: string;
           ]} />
           {item.runId && <Link to={`/runs/${item.runId}`}>查看工作流</Link>}
           <Collapse ghost size="small" items={[{key: 'raw', label: '原始数据', children: <pre className={styles.output}>{format({request: item.request, output: item.output, error: item.error})}</pre>}]} />
-        </div>
-      }) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无调用记录" />},
+          </div>,
+        }
+      })} /> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无调用记录" />},
       ...(learning.length ? [{key: 'learning', label: '能力提炼与固化', children: learning.map(item => <div className={styles.call} key={item.id}>
         <div className={styles.heading}><Workflow size={15} /><strong>{item.kind === 'repair' ? '工作流修复' : '可复用能力提炼'}</strong><span className={styles.status}>{statusLabels[item.status] ?? item.status}</span></div>
         {typeof record(item.result).reason === 'string' && <div className={styles.reason}>{String(record(item.result).reason)}</div>}

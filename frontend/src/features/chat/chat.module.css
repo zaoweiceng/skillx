@@ -8,10 +8,10 @@
 .page :global(.history-heading) { background: var(--bg); border: 0; padding: 6px 8px 10px 12px; min-height: 44px; font-size: 12px; line-height: 20px; color: var(--muted); }
 .page :global(.history-row) { display: flex; align-items: center; min-width: 0; border-radius: 10px; margin: 2px 0; position: relative; transition: background-color .15s ease; }
 .page :global(.history-row.active), .page :global(.history-row:hover), .page :global(.history-row:focus-within) { background: var(--panel-raised); }
-.page :global(.history-item) { display: flex; align-items: center; flex: 1; min-width: 0; min-height: 42px; border: 0; padding: 9px 12px; border-radius: 10px; color: color-mix(in srgb, var(--text) 87%, var(--bg)); background: transparent; }
+.page :global(.history-item) { display: flex; align-items: center; flex: 1; min-width: 0; min-height: 36px; border: 0; padding: 6px 12px; border-radius: 10px; color: color-mix(in srgb, var(--text) 87%, var(--bg)); background: transparent; }
 .page :global(.history-item:focus-visible) { outline: 2px solid var(--muted); outline-offset: -2px; }
 .page :global(.history-item strong) { display: block; min-width: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif; font-size: 13px; font-weight: 400; line-height: 22px; letter-spacing: 0; }
-.page :global(.history-menu) { position: absolute; right: 4px; top: 7px; background: var(--panel-raised); box-shadow: -8px 0 8px var(--panel-raised); pointer-events: none; width: 28px; height: 28px; padding: 0; opacity: 0; color: var(--muted); }
+.page :global(.history-menu) { position: absolute; right: 4px; top: 4px; background: var(--panel-raised); box-shadow: -8px 0 8px var(--panel-raised); pointer-events: none; width: 28px; height: 28px; padding: 0; opacity: 0; color: var(--muted); }
 .page :global(.history-row:hover .history-menu), .page :global(.history-row:focus-within .history-menu), .page :global(.history-menu[aria-expanded="true"]) { opacity: 1; pointer-events: auto; }
 @media (hover: none) { .page :global(.history-menu) { opacity: 1; pointer-events: auto; } }
 .page :global(.mobile-history-toggle[aria-label="打开执行轨迹"]) { display: inline-flex; }
@@ -27,8 +27,8 @@
 .page :global(.prompt-suggestions button span) { font-size: 11px; color: var(--muted); }
 .page :global(.message) { margin: 0 auto 28px; }
 .page :global(.message-avatar) { border-radius: 10px; background: var(--sidebar); border: 0; }
-.page :global(.message small) { font-size: 11px; }.page :global(.message p) { border: 0; border-radius: 12px; font-size: 14px; line-height: 1.85; }
-.page :global(.message.assistant p) { background: transparent; padding-left: 0; }
+.page :global(.message small) { font-size: 11px; }.page :global(.message > div > p) { border: 0; border-radius: 12px; font-size: 14px; line-height: 1.85; }
+.page :global(.message.assistant > div > p) { background: transparent; padding-left: 0; }
 @media (max-width: 1200px) { .page :global(.chat-layout > .message-column) { flex: 1; }.page :global(.conversation-history.open) { background: var(--panel); border: 1px solid var(--line-soft); } }
 @media (max-width: 600px) {
   .page:global(.chat-page) { height: calc(100dvh - 64px); padding: 10px 16px; }
@@ -116,7 +116,7 @@
 .page :global(.message-avatar), .page :global(.message > div > small) { display: none; }
 .page :global(.message.user > div) { display: flex; flex-direction: column; align-items: flex-end; }
 .page :global(.message.user p) { max-width: 88%; padding: 12px 18px; border-radius: 22px; background: var(--panel-raised); font-size: 14px; line-height: 1.75; }
-.page :global(.message.assistant p) { padding: 8px 0; font-size: 14px; line-height: 1.9; }
+.page :global(.message.assistant > div > p) { padding: 8px 0; font-size: 14px; line-height: 1.9; }
 .page :global(.turn-metrics) { gap: 10px; margin: 0 0 4px; opacity: .75; }
 .page :global(.turn-metrics .metric-chip) { border: 0; background: transparent; padding: 0; font-size: 11px; color: var(--muted); }
 .page :global(.task-state) { display: inline-block; font-size: 11px; color: var(--muted); }
@@ -139,7 +139,7 @@
 .directoryTag > svg, .directoryTag > :global(.ant-tag-close-icon) { flex-shrink: 0; }
 .directoryPath { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.page :global(.conversation-group-heading) { display: flex; align-items: center; min-width: 0; padding: 4px 8px; color: var(--muted); font-size: 12px; }
+.page :global(.conversation-group-heading) { display: flex; align-items: center; min-width: 0; padding: 2px 8px; color: var(--muted); font-size: 12px; }
 .page :global(.conversation-group-toggle) { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; border: 0; background: transparent; color: inherit; cursor: pointer; padding: 4px 0; text-align: left; }
 .page :global(.conversation-group-toggle span) { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .page :global(.conversation-group-toggle svg) { flex: none; }
@@ -147,4 +147,4 @@
 .page :global(.group-empty) { display: block; padding: 6px 12px; font-size: 12px; }
 .page :global(.history-item strong) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.page :global(.workspace-group > nav) { margin-left: 24px; }
+.page :global(.workspace-group > nav) { margin-left: 16px; }

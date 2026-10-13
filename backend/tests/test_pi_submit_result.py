@@ -35,7 +35,7 @@ def test_extra_field_feedback_names_only_invalid_keys():
     ({"reply": {"nested": "private value"}}, 'reply: type "string"'),
 ])
 async def test_invalid_submission_has_actionable_feedback_and_usage(
-    monkeypatch, tmp_path, candidate, feedback, copies, task_mode,
+    monkeypatch, tmp_path, candidate, feedback, copies, task_mode, malformed=None,
 ):
     from app.application.task_contracts import task_decision_schema
 
@@ -56,7 +56,7 @@ async def test_invalid_submission_has_actionable_feedback_and_usage(
             {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{
                 "index": i, "id": f"submit-{i}", "type": "function", "function": {
                     "name": "task_complete" if task_mode else "submit_result",
-                    "arguments": json.dumps(
+                    "arguments": malformed if malformed is not None and i == copies - 1 else json.dumps(
                         {"reply": "conflicting"} if copies == 3 and i == 2 else candidate),
                 },
             } for i in range(copies)]}, "finish_reason": None}]},
@@ -87,7 +87,18 @@ async def test_invalid_submission_has_actionable_feedback_and_usage(
                            "type": "object", "properties": {"reply": {"type": "string"}},
                            "required": ["reply"], "additionalProperties": False},
         )
-        if copies == 3:
+        if malformed is not None:
+            with pytest.raises(AgentHostError, match="工具参数不是合法 JSON") as raised:
+                await AgentHost(runtime=runtime).execute(request)
+            assert raised.value.code == "MODEL_MALFORMED_OUTPUT"
+            assert raised.value.total_tokens == 15
+            assert raised.value.request_dispatched
+            diagnostic = raised.value.reported_error["outputParseError"]
+            assert diagnostic["rawArguments"] == malformed
+            assert diagnostic["kind"] == "invalid_json"
+            assert diagnostic["truncated"] is False
+            assert diagnostic["stopReason"] == "toolUse"
+        elif copies == 3:
             with pytest.raises(AgentHostError, match="结果提交冲突"):
                 await AgentHost(runtime=runtime).execute(request)
         elif feedback is None:
@@ -114,3 +125,18 @@ async def test_invalid_submission_has_actionable_feedback_and_usage(
     finally:
         server.close()
         await server.wait_closed()
+
+
+@pytest.mark.parametrize("copies", [1, 2])
+@pytest.mark.parametrize("task_mode", [False, True])
+@pytest.mark.parametrize("malformed", [
+    '{"reply">"ok"}</invoke></function_calls>',
+    '{"reply":"ok"',  # SDK partial JSON recovery must not accept truncated data.
+])
+async def test_malformed_submission_rejected_before_schema_or_conflict(
+    monkeypatch, tmp_path, copies, task_mode, malformed,
+):
+    await test_invalid_submission_has_actionable_feedback_and_usage(
+        monkeypatch, tmp_path, {"reply": "ok"}, None, copies, task_mode,
+        malformed=malformed,
+    )

@@ -72,7 +72,9 @@ class TaskCall(BaseModel):
         "tool 调用：{capabilityRef: 字符串, input: 对象}。"
         "code 的 language 和 source 必须直接放在 arguments 中，不能包在 input 中。"
     )
-    reason: str = Field(min_length=1)
+    # Display metadata only; absence must not force regeneration of executable
+    # arguments or invent a rationale. HumanRequest.reason remains mandatory.
+    reason: str = ""
 
     @model_validator(mode="after")
     def valid_code_arguments(self):

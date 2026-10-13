@@ -51,3 +51,38 @@ def test_existing_catalog_inputs_are_required_in_model_and_backend_contract():
 
 def test_general_designer_node_model_still_accepts_agent_nodes():
     assert WorkflowNode(id="run", type="agent", displayName="Run", config={}).type == "agent"
+
+
+@pytest.mark.parametrize('node', [
+    {'type': 'condition', 'config': {'operation': 'equals', 'value': '${input.success}', 'expected': True}},
+    {'type': 'condition', 'config': {'operation': 'equals'}, 'input': {'expected': True}},
+    {'type': 'condition', 'config': {'operation': 'filter'}, 'input': {'value': []}},
+    {'type': 'skillx', 'config': {'generatedSkill': 'create', 'interface': 'execute'},
+     'input': {'id': {'$optional': '${input.nested.id}'}}},
+])
+def test_ignored_condition_config_and_unsafe_optional_mapping_rejected(node):
+    assert not Draft202012Validator(extraction_node_contract({})).is_valid(node)
+    with pytest.raises(ValueError):
+        validate_extraction_nodes({'spec': {'nodes': [node]}}, {})
+
+
+def test_condition_value_and_optional_passthrough_supported():
+    nodes = [
+        {'type': 'condition', 'config': {'operation': 'equals', 'expected': True}, 'input': {'value': '${read.output.success}'}},
+        {'type': 'skillx', 'config': {'generatedSkill': 'create', 'interface': 'execute'}, 'input': {'id': {'$optional': '${input.id}'}}},
+    ]
+    validate_extraction_nodes({'spec': {'nodes': nodes}}, {})
+    for node in nodes:
+        Draft202012Validator(extraction_node_contract({})).validate(node)
+
+
+@pytest.mark.parametrize('mapping', [
+    {'$optional': '${input.id}'},
+    {'nested': {'id': {'$optional': '${input.id}'}}},
+    {'items': [{'$optional': '${input.id}'}]},
+])
+def test_optional_invalid_positions_rejected_by_model_and_backend(mapping):
+    node = {'type': 'transform', 'input': mapping}
+    assert not Draft202012Validator(extraction_node_contract({})).is_valid(node)
+    with pytest.raises(ValueError):
+        validate_extraction_nodes({'spec': {'nodes': [node]}}, {})

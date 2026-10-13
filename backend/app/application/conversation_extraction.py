@@ -43,7 +43,8 @@ async def start_extraction(session, source_id, budget: ExtractionBudget | None =
     session.add(turn)
     await session.flush()
     task = Task(id=str(uuid4()), conversation_id=conversation.id, turn_id=turn.id, status="learning",
-        goal="从来源对话提取独立、简单、可执行的 SkillX，并用 SkillX、LLM 和子工作流组合多个可复用工作流。仅提炼，不重新执行来源任务。",
+        goal=("先比较已有 Skill、SkillX 和工作流，功能已覆盖则直接复用；"
+              "仅提取缺失能力，部分覆盖时依赖已有能力实现增量。仅提炼，不重新执行来源任务。"),
         runtime_json=await agent_snapshot(session, source.agent_profile_id, source.traex_model,
             source.reasoning_effort, source.model_profile_id, source.agent_model),
         state_json={"workingDirectory": source.working_directory,
@@ -78,11 +79,24 @@ async def finish_extraction(session, task_id, status, output):
         return
     if status in {"queued", "running"}:
         return
-    lines = ["提取部分完成，仍有产物未发布。" if status == "partial" else "提取已完成。" if status == "published" else "本次提取未发布新产物。"]
+    if status == "partial":
+        summary = "提取部分完成，仍有产物未发布。"
+    elif status == "published":
+        summary = "提取已完成。"
+    elif output.get("reusedArtifacts"):
+        summary = "已复用现有能力，无需重复创建。"
+    else:
+        summary = "本次提取未发布新产物。"
+    lines = [summary]
     for key, label in [("skills", "操作指南"), ("skillx", "独立能力"), ("workflows", "工作流")]:
-        names = list(output.get(key, {}))
+        names = [name for name in output.get(key, {})
+                 if name not in output.get("reusedArtifacts", {}).get(key, {})]
         if names:
             lines.append(f"\n{label}：" + "、".join(names))
+    for key, label in [("skills", "操作指南"), ("skillx", "独立能力"), ("workflows", "工作流")]:
+        names = list(output.get("reusedArtifacts", {}).get(key, {}))
+        if names:
+            lines.append(f"\n已复用{label}（未重复创建）：" + "、".join(names))
     failures = output.get("failures", {})
     if failures:
         lines.append("\n以下产物未发布，已发布的产物可独立使用：")

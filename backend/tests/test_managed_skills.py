@@ -276,3 +276,83 @@ async def test_skill_discovery_only_loads_instructions_on_demand():
         assert entry['description'] == VALUES['description']
         assert 'MARKER-RAW-SKILL' not in json.dumps(context)
         assert 'MARKER-RAW-SKILL' in Path(entry['instructionsPath']).read_text()
+
+
+async def test_reimport_extracted_skill_converts_same_capability_without_mutating_old_version(tmp_path):
+    from pathlib import Path
+    from sqlalchemy import func, select
+    from app.api.skills import SkillImport, import_skill
+    from app.application.capabilities import register_skillx, resolve_package_path
+    from app.infrastructure.models import Capability, CapabilityVersion, ManagedSkill
+    from app.runtime.skillx import load_manifest
+
+    original = Path(__file__).resolve().parents[2] / 'capabilities' / 'skillx' / 'text-stats'
+    package = get_settings().capability_root / 'extracted'
+    copy_source(original, package)
+    async with SessionLocal() as session:
+        cap, old = await register_skillx(session, 'extracted')
+        skill = await save_skill(session, {**VALUES, 'name': cap.name}, imported=package)
+        skill.skillx_capability_id, skill.skillx_version_id = cap.id, old.id
+        skill.converted_source_digest = skill.source_digest
+        await session.commit()
+        old_path = resolve_package_path(old.package_path)
+        frozen = {str(p.relative_to(old_path)): p.read_bytes() for p in old_path.rglob('*') if p.is_file()}
+        imported = tmp_path / 'revision'
+        copy_source(package, imported)
+        with (imported / 'SKILL.md').open('a') as stream:
+            stream.write('\nUpdated guidance\n')
+        view = await import_skill(SkillImport(path=str(imported)), session)
+        assert view['id'] == skill.id
+        assert skill.skillx_capability_id == cap.id
+        assert skill.skillx_version_id is None
+        await convert_skill(session, skill, {'kind': 'existing'})
+        await session.commit()
+        assert skill.skillx_capability_id == cap.id
+        assert skill.skillx_version_id != old.id
+        latest = await session.get(CapabilityVersion, skill.skillx_version_id)
+        assert latest.capability_id == cap.id
+        assert load_manifest(resolve_package_path(latest.package_path))['metadata']['name'] == cap.name
+        assert await session.scalar(select(func.count()).select_from(Capability)) == 1
+        assert await session.scalar(select(func.count()).select_from(ManagedSkill)) == 1
+        assert await session.scalar(select(func.count()).select_from(CapabilityVersion)) == 2
+        assert {str(p.relative_to(old_path)): p.read_bytes() for p in old_path.rglob('*') if p.is_file()} == frozen
+        assert (await session.get(CapabilityVersion, old.id)).digest == old.digest
+
+
+async def test_import_rejects_ambiguous_skill_identity_without_updating_either(tmp_path):
+    from app.api.skills import SkillImport, import_skill
+    imported = tmp_path / 'import'
+    imported.mkdir()
+    (imported / 'SKILL.md').write_text('---\nname: report-helper\ndescription: new\n---\nChanged')
+    async with SessionLocal() as session:
+        first = await save_skill(session, VALUES)
+        second = await save_skill(session, VALUES)
+        await session.commit()
+        with pytest.raises(HTTPException, match='多个 Skill'):
+            await import_skill(SkillImport(path=str(imported)), session)
+        await session.refresh(first)
+        await session.refresh(second)
+        assert first.revision == second.revision == 1
+
+
+async def test_existing_conversion_rejects_foreign_manifest_identity(tmp_path):
+    from pathlib import Path
+    from app.api.skills import SkillImport, import_skill
+    from app.application.capabilities import register_skillx
+    original = Path(__file__).resolve().parents[2] / 'capabilities' / 'skillx' / 'text-stats'
+    package = get_settings().capability_root / 'other'
+    copy_source(original, package)
+    async with SessionLocal() as session:
+        foreign, _ = await register_skillx(session, 'other')
+        skill = await save_skill(session, VALUES)
+        await convert_skill(session, skill, options())
+        cap_id = skill.skillx_capability_id
+        # A different registered package cannot be relabeled as this capability.
+        await save_skill(session, {**VALUES, 'name': foreign.name}, skill, imported=package)
+        await session.commit()
+        with pytest.raises(HTTPException, match='另一个 SkillX'):
+            await import_skill(SkillImport(path=str(package)), session)
+        await session.refresh(skill)
+        with pytest.raises(ValueError, match='身份不一致'):
+            await convert_skill(session, skill, {'kind': 'existing'})
+        assert skill.skillx_capability_id == cap_id

@@ -39,6 +39,8 @@ async def validate_candidate(session, definition, examples, evidence, *, generat
             raw = version.manifest_json["manifest"]["spec"]["interfaces"][node["config"]["interface"]]
             if raw.get("x-executionProfile") == "local-command":
                 local_versions.add(version.id)
+    if not local_versions and any(example.httpFixtures for example in examples):
+        raise ValueError("HTTP fixtures require actual local-command execution nodes")
     validate_examples(examples, evidence, local_command=bool(local_versions))
     compiled = WorkflowCompiler().compile(definition)
     from app.application.runtime_profiles import workflow_profiles
@@ -62,6 +64,7 @@ async def validate_candidate(session, definition, examples, evidence, *, generat
                 cleanup.callback(workspace.close)
                 await workspace.setup(example.setup)
                 inputs = await workspace.resolve_inputs(inputs)
+                await workspace.configure_http(example)
             Draft202012Validator(compiled.definition.spec.input_schema).validate(inputs)
             outputs, states, observations = {}, {}, []
             context = RunContext(

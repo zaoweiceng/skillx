@@ -17,7 +17,7 @@ from sqlalchemy import select
 from app.application.callable_capabilities import resolve_callable
 from app.application.capabilities import register_skillx, resolve_package_path
 from app.config import get_settings
-from app.infrastructure.models import CapabilityVersion, ManagedSkill
+from app.infrastructure.models import Capability, CapabilityVersion, ManagedSkill
 from app.infrastructure.models.base import rfc3339
 from app.runtime.skillx import NAME_PATTERN, load_manifest, package_digest
 from app.runtime.skillx_host import execute_in_subprocess
@@ -39,19 +39,19 @@ DEFAULT_OUTPUT = {
 
 
 def parse_skill(content: str) -> tuple[dict, str]:
+    from app.runtime.skill_document import split_frontmatter
+
     if len(content.encode()) > MAX_CONTENT:
         raise ValueError("SKILL.md 不能超过 128 KB")
-    if content.startswith("---\n") or content.startswith("---\r\n"):
-        parts = content.split("---", 2)
-        if len(parts) != 3:
-            raise ValueError("SKILL.md 的 YAML 元信息未闭合")
+    frontmatter, body = split_frontmatter(content)
+    if frontmatter is not None:
         try:
-            metadata = yaml.safe_load(parts[1])
+            metadata = yaml.safe_load(frontmatter)
         except yaml.YAMLError as exc:
             raise ValueError("SKILL.md 的 YAML 元信息无效") from exc
         if not isinstance(metadata, dict):
             raise ValueError("SKILL.md 的元信息必须为对象")
-        return metadata, parts[2].strip()
+        return metadata, body.strip()
     return {}, content.strip()
 
 
@@ -237,6 +237,29 @@ async def save_skill(
     return skill
 
 
+async def import_target(session, name: str, path: Path) -> ManagedSkill | None:
+    """Resolve an import by existing identity; never choose among duplicates."""
+    matches = list(await session.scalars(select(ManagedSkill).where(
+        ManagedSkill.name == name, ManagedSkill.deleted_at.is_(None))))
+    manifest_capability = None
+    if (path / "skillx.yaml").is_file():
+        manifest = load_manifest(path)
+        manifest_capability = await session.scalar(select(Capability).where(
+            Capability.name == manifest["metadata"]["name"]))
+        if manifest_capability:
+            linked = list(await session.scalars(select(ManagedSkill).where(
+                ManagedSkill.skillx_capability_id == manifest_capability.id,
+                ManagedSkill.deleted_at.is_(None))))
+            matches = list({skill.id: skill for skill in [*matches, *linked]}.values())
+    if len(matches) > 1:
+        raise ValueError("导入名称或 SkillX 身份对应多个 Skill，无法安全确定更新目标")
+    skill = matches[0] if matches else None
+    if (skill and skill.skillx_capability_id and manifest_capability
+            and skill.skillx_capability_id != manifest_capability.id):
+        raise ValueError("导入 Manifest 属于另一个 SkillX，不能替换当前 Skill 的能力身份")
+    return skill
+
+
 async def convert_skill(session, skill: ManagedSkill, options: dict) -> ManagedSkill:
     path = source_path(skill)
     if package_digest(path) != skill.source_digest:
@@ -250,8 +273,12 @@ async def convert_skill(session, skill: ManagedSkill, options: dict) -> ManagedS
         base = resolve_package_path(published.package_path)
     copy_source(base, stage)
     try:
-        # Keep generated capabilities separate from third-party registrations.
-        name = "managed-skill-" + skill.id.replace("-", "")
+        # A linked Skill is another editor for the same capability, including
+        # extracted capabilities. Only first-time conversion creates an identity.
+        capability = await session.get(Capability, skill.skillx_capability_id) if skill.skillx_capability_id else None
+        if skill.skillx_capability_id and capability is None:
+            raise ValueError("Skill 关联的 SkillX 不存在，不能创建替代身份")
+        name = capability.name if capability else "managed-skill-" + skill.id.replace("-", "")
         versions = (
             list(
                 await session.scalars(
@@ -263,9 +290,20 @@ async def convert_skill(session, skill: ManagedSkill, options: dict) -> ManagedS
             if skill.skillx_capability_id
             else []
         )
-        version = f"1.0.{len(versions)}"
+        if versions:
+            major, minor, patch = max(tuple(map(int, item.version.split("-", 1)[0].split("+", 1)[0].split(".")))
+                                      for item in versions)
+            version = f"{major}.{minor}.{patch + 1}"
+        else:
+            version = "1.0.0"
         if kind == "existing":
             manifest = load_manifest(stage)
+            if capability:
+                source_name = manifest["metadata"]["name"]
+                source_capability = await session.scalar(select(Capability).where(Capability.name == source_name))
+                if (source_name not in {name, skill.name}
+                        or source_capability and source_capability.id != capability.id):
+                    raise ValueError("导入 Manifest 与当前 SkillX 身份不一致")
             manifest["metadata"].update(name=name, version=version, displayName=skill.display_name)
         else:
             for field in ("inputSchema", "outputSchema"):

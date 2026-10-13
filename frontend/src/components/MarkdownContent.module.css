@@ -1,22 +1,25 @@
-.markdown { color: var(--text); font-size: 14px; line-height: 1.85; overflow-wrap: anywhere; min-width: 0; }
-.markdown.markdown p { margin: 10px 0; padding: 0; background: none; border: 0; border-radius: 0; line-height: inherit; }
-.markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 { line-height: 1.5; font-weight: 600; margin: 24px 0 10px; letter-spacing: normal; }
-.markdown h1 { font-size: 23px; } .markdown h2 { font-size: 20px; } .markdown h3 { font-size: 17px; }
+.markdown { color: color-mix(in srgb, var(--text) 68%, var(--muted)); font-size: 14px; line-height: 2; overflow-wrap: anywhere; min-width: 0; }
+.markdown.markdown p { margin: 16px 0; padding: 0; background: none; border: 0; border-radius: 0; font-size: inherit; line-height: inherit; }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 { line-height: 1.5; font-weight: 600; margin: 24px 0 10px; letter-spacing: normal; color: var(--text); }
+.markdown h1 { font-size: 24px; } .markdown h2 { font-size: 19px; margin: 30px 0 14px; } .markdown h3 { font-size: 16px; margin: 24px 0 12px; }
 .markdown h4, .markdown h5, .markdown h6 { font-size: 15px; }
-.markdown > :first-child { margin-top: 12px; }
-.markdown ul, .markdown ol { padding-left: 24px; margin: 10px 0; }
-.markdown li { margin: 5px 0; } .markdown li > p { margin: 4px 0; }
-.markdown blockquote { border-left: 3px solid var(--line-soft); margin: 16px 0; padding: 2px 16px; color: var(--muted); }
+.markdown.markdown > :first-child { margin-top: 0; }
+.markdown.markdown > :last-child { margin-bottom: 0; }
+.markdown strong { color: var(--text); font-weight: 600; }
+.markdown ul, .markdown ol { padding-left: 24px; margin: 16px 0; }
+.markdown li { margin: 5px 0; padding-left: 4px; } .markdown.markdown li > p { margin: 4px 0; }
+.markdown blockquote { border-left: 3px solid var(--line); margin: 20px 0; padding: 1px 20px; background: var(--panel-raised); border-radius: 0 8px 8px 0; color: var(--muted); }
 .markdown code { font: .9em/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; padding: 2px 5px; background: var(--panel-raised); border-radius: 4px; }
-.markdown pre { overflow: auto; padding: 14px 16px; background: var(--panel-raised); border-radius: 10px; margin: 14px 0; white-space: pre; }
+.markdown pre { overflow: auto; padding: 18px 20px; background: var(--panel-raised); border: 1px solid var(--line-soft); border-radius: 8px; margin: 20px 0; white-space: pre; }
 .markdown pre code { background: none; padding: 0; border: 0; }
 .markdown a { color: var(--text); text-decoration: underline; text-underline-offset: 3px; }
-.markdown img { max-width: 100%; }
-.markdown hr { border: 0; border-top: 1px solid var(--line-soft); margin: 22px 0; }
-.tableScroll { overflow-x: auto; margin: 14px 0; }
-.markdown table { border-collapse: collapse; width: 100%; font-size: 13px; }
-.markdown th, .markdown td { padding: 9px 12px; border: 1px solid var(--line-soft); text-align: left; vertical-align: top; min-width: 90px; }
-.markdown th { background: var(--panel-raised); font-weight: 600; }
+.markdown img { max-width: 100%; border-radius: 8px; }
+.markdown hr { border: 0; border-top: 1px solid var(--line-soft); margin: 28px 0; }
+.tableScroll { max-width: 100%; overflow-x: auto; margin: 24px 0; }
+.markdown table { border-collapse: collapse; width: 100%; font-size: inherit; line-height: 1.7; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.markdown th, .markdown td { padding: 12px 18px; border: 0; border-bottom: 1px solid var(--line-soft); text-align: left; vertical-align: top; min-width: 90px; }
+.markdown th { background: transparent; color: var(--text); font-weight: 600; border-bottom-color: var(--line); }
+.markdown tr:last-child td { border-bottom: 0; }
 .markdown :global(.katex-display) { overflow-x: auto; overflow-y: hidden; padding: 8px 0; }
 .diagram { margin: 18px 0; padding: 16px; border: 1px solid var(--line-soft); border-radius: 12px; background: var(--bg); }
 .diagramImage { overflow-x: auto; text-align: center; }

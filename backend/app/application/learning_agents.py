@@ -22,6 +22,11 @@ from app.application.agent_host import (
     AgentOutputValidationError,
 )
 from app.application.compiler import digest_json
+from app.application.extraction_reuse import (
+    ReuseReview,
+    validate_reuse_implementation,
+    validate_reuse_plan,
+)
 from app.application.learning_contracts import (
     ContractExample,
     SkillXExample,
@@ -58,11 +63,15 @@ class ReusableFragment(BaseModel):
     scope: str = Field(min_length=1, max_length=4000)
     useWhen: list[str] = Field(min_length=1, max_length=8)
     sourceInvocationIds: list[str] = Field(min_length=1, max_length=32)
+    reuseVersionId: str | None = Field(
+        default=None, description="直接复用已发布的可执行能力版本，不派发构建")
+    reuseSkillId: str | None = Field(default=None, description="直接复用已有操作指南，不派发构建")
+    reuseReview: ReuseReview | None = None
+    requiredEffects: list[Literal["http.read", "http.write"]] = Field(default_factory=list, description="该片段必须实际完成的外部 HTTP 读/写；只格式化参数不算完成。纯计算填 []。")
 
 
 class WorkflowFragment(ReusableFragment):
     dependsOn: list[str] = Field(default_factory=list, max_length=8)
-    reuseVersionId: str | None = Field(default=None, description="复用目录中已发布工作流的精确版本 ID；已有等价阶段必须复用，不重新生成。复用阶段仍可被 dependsOn 引用。")
 
 
 class ExtractionPlan(BaseModel):
@@ -79,14 +88,22 @@ class ComposedExtractionPlan(ExtractionPlan):
     """Only for requests explicitly requiring independent and composed workflows."""
     model_config = ConfigDict(extra="forbid", json_schema_extra={"allOf": [{
         "if": {"properties": {"decision": {"const": "candidate"}}},
-        "then": {"properties": {"workflows": {"minItems": 3}}},
+        "then": {"anyOf": [
+            {"properties": {"workflows": {"minItems": 3}}},
+            {"properties": {"workflows": {"minItems": 1, "maxItems": 1, "items": {
+                "required": ["reuseVersionId"],
+                "properties": {"reuseVersionId": {"type": "string", "minLength": 1}}}}}},
+        ]},
     }]})
     workflows: list[WorkflowFragment] = Field(default_factory=list, max_length=16,
-        description="至少两个可独立调用的子工作流（已有阶段用 reuseVersionId 复用），以及通过 dependsOn 引用它们的上层组合工作流。不是要求新建三个工作流。")
+        description=("优先复用一个已覆盖完整目标的组合工作流；否则规划至少两个独立阶段及上层流程。"
+                     "已有阶段用 reuseVersionId，不要求新建三个工作流。"))
 
     @model_validator(mode="after")
     def composition(self):
         if self.decision == "skip":
+            return self
+        if len(self.workflows) == 1 and self.workflows[0].reuseVersionId:
             return self
         names = {item.name for item in self.workflows}
         if len(self.workflows) < 3 or not any(len(set(item.dependsOn) & (names - {item.name})) >= 2 for item in self.workflows):
@@ -163,6 +180,50 @@ class WorkflowExamples(BaseModel):
     workflowExamples: list[ContractExample] = Field(min_length=2, max_length=8)
 
 
+class MissingWorkflowCapability(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    inputSchema: dict
+    outputSchema: dict
+    reason: str = Field(min_length=1)
+
+
+class WorkflowGraphDraft(BaseModel):
+    """Freeze the graph before reasoning about exact external-protocol fixtures."""
+    model_config = ConfigDict(extra="forbid", json_schema_extra={"allOf": [{
+        "if": {"properties": {"decision": {"const": "ready"}}},
+        "then": {"required": ["workflow"], "properties": {"workflow": {"type": "object"}}},
+    }, {
+        "if": {"properties": {"decision": {"const": "needs_dependencies"}}},
+        "then": {"required": ["missingCapabilities"], "properties": {
+            "missingCapabilities": {"minItems": 1}, "workflow": {"type": "null"}}},
+        "else": {"properties": {"missingCapabilities": {"maxItems": 0}}},
+    }]})
+    decision: Literal["skip", "ready", "needs_dependencies"]
+    reason: str = Field(min_length=1)
+    workflow: Annotated[WorkflowDefinition,
+        AfterValidator(lambda value: value.model_dump(mode="json", by_alias=True, exclude_unset=True)),
+        PlainSerializer(lambda value: value)] | None = None
+    reusedDependencies: dict[str, ReusedDependency] = Field(default_factory=dict)
+    baseVersionId: str | None = None
+    missingCapabilities: list[MissingWorkflowCapability] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode="after")
+    def ready_artifact(self):
+        if self.decision == "needs_dependencies":
+            if not self.missingCapabilities or self.workflow is not None:
+                raise ValueError("缺失依赖必须提供结构化缺口且不能提交缩小范围的工作流")
+        elif self.missingCapabilities:
+            raise ValueError("仅 needs_dependencies 可以声明缺失能力")
+        if self.decision == "ready":
+            if not self.workflow:
+                raise ValueError("ready 工作流必须提供完整定义")
+            from app.domain.capability_metadata import validate_publication_metadata
+            validate_publication_metadata(self.workflow.get("metadata", {}))
+        return self
+
+
 class DependencyRepairRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     nodeId: str = Field(min_length=1)
@@ -223,6 +284,7 @@ def validate_extraction(plan: ExtractionPlan, context: dict, *, check_dependenci
             for id in fragment.sourceInvocationIds
         ):
             raise ValueError("片段引用了不存在或不符合状态要求的执行证据")
+    validate_reuse_plan(plan, context, required=context.get("requireReuseReview", False))
     known = {fragment.name for fragment in [*plan.skillx, *workflows]}
     for workflow in workflows:
         if check_dependencies and not set(workflow.dependsOn).issubset(known):
@@ -285,7 +347,8 @@ def compact_builder_context(data: dict) -> dict:
     previous = result.get("previousDraft") or {}
     if isinstance(previous, dict) and isinstance(previous.get("workflow"), dict):
         local = local or workflow_uses_local_validation(previous["workflow"], result)
-    if local:
+    from app.application.learning_context import requires_external_request_evidence
+    if local and not requires_external_request_evidence(result):
         result["calls"] = [{"id": c["id"], "status": c["status"],
             "input": observation(c.get("input", {}), 400),
             "output": observation(c.get("output", {}), 700)} for c in result.get("calls", [])]
@@ -334,7 +397,9 @@ def bind_workflow_schema(schema, data):
         "minContains": 1, "maxContains": 1} for kind in ("input", "output")]
     constraints = definitions["WorkflowNode"].setdefault("allOf", [])
     from app.application.extraction_graph_contract import extraction_node_contract
-    constraints.append(extraction_node_contract(data))
+    node_contract = extraction_node_contract(data)
+    definitions.update(node_contract.pop("$defs", {}))
+    constraints.append(node_contract)
     constraints.append({"if": {"required": ["sideEffect", "idempotent"],
         "properties": {"sideEffect": {"const": True}, "idempotent": {"const": False}}},
         "then": {"properties": {"retry": {"properties": {"maxAttempts": {"const": 1}}}}}})
@@ -541,8 +606,14 @@ class LearningAgentPipeline:
         key = self.stage_key(role, name) + (":" + phase if phase else "")
         instructions = (PROMPT_ROOT / f"{role}{'_' + phase if phase else ''}.md").read_text(encoding="utf-8")
         schema = schema_model.model_json_schema()
+        if role == "extractor" and not phase:
+            from app.application.extraction_reuse import bind_reuse_schema
+            schema = bind_reuse_schema(schema, data)
         if role == "workflow":
             schema = bind_workflow_schema(schema, data)
+        if role == "skillx" and phase == "repair":
+            from app.application.learning_profile_contract import bind_skillx_repair_profile, bind_examples_only_repair
+            schema = bind_examples_only_repair(bind_skillx_repair_profile(schema, data), data)
         if role == "skillx" and not phase:
             model_kinds = [kind for kind in data["availableSkillKinds"] if kind != "direct"]
             if model_kinds:
@@ -570,6 +641,8 @@ class LearningAgentPipeline:
             inputs["validationFeedback"] = {
                 "error": cached["error"],
                 "previousDraft": cached.get("output"),
+                **({"invalidJsonSubmission": cached["formatRepairCandidate"]}
+                   if cached.get("formatRepairCandidate") else {}),
             }
             previous_skill = (cached.get("output") or {}).get("skillx") or {}
             if not isinstance(previous_skill, dict):
@@ -579,7 +652,9 @@ class LearningAgentPipeline:
                 and implementation.get("source") and implementation.get("examples")):
                 # Structural repair needs the rejected draft and exact schema,
                 # not another copy of all original tool output.
-                inputs.pop("calls", None)
+                from app.application.learning_context import requires_external_request_evidence
+                if not requires_external_request_evidence(data):
+                    inputs.pop("calls", None)
         if cached.get("error") and cached.get("output"):
             inputs.pop("catalog", None)
             inputs.pop("workflowExample", None)
@@ -725,15 +800,28 @@ class LearningAgentPipeline:
         except Exception as exc:
             if isinstance(exc, AgentOutputValidationError):
                 raw_output = exc.candidate
+            transport = (getattr(exc, "reported_error", None) or {}).get("outputParseError")
+            graph_json_error = (role == "workflow" and phase == "graph"
+                and isinstance(exc, AgentHostError) and exc.code == "MODEL_MALFORMED_OUTPUT"
+                and isinstance(transport, dict) and transport.get("kind") == "invalid_json"
+                and transport.get("stopReason") == "toolUse" and transport.get("truncated") is False
+                and isinstance(transport.get("rawArguments"), str))
+            from app.application.learning_profile_contract import profile_validation_feedback
+            feedback = profile_validation_feedback(exc, raw_output, data) if role == "skillx" else str(exc)
             await self._record(
                 key,
-                {"status": "failed", "error": str(exc), "finishedAt": rfc3339(utcnow()),
+                {"status": "failed", "error": feedback, "finishedAt": rfc3339(utcnow()),
+                 **({"formatRepairCandidate": transport, "output": None} if graph_json_error else {}),
                  **({"output": raw_output} if raw_output is not None else {})},
                 "learning.agent.failed",
             )
             # A malformed output is not an execution failure. Repair once with
             # exact Host feedback; the same durable job budget covers both calls.
-            if isinstance(exc, AgentOutputValidationError) and not cached.get("formatRepairCount"):
+            from app.application.learning_profile_contract import examples_only_error
+            examples_only = (role == "skillx" and not phase and isinstance(raw_output, dict)
+                             and isinstance(raw_output.get("skillx"), dict)
+                             and raw_output["skillx"].get("source") and examples_only_error(exc))
+            if (isinstance(exc, AgentOutputValidationError) or graph_json_error) and not cached.get("formatRepairCount") and not examples_only:
                 await self._record(key, {"formatRepairCount": 1})
                 return await self.call(
                     role, schema_model, data, name=name, validate=validate, phase=phase)
@@ -809,6 +897,8 @@ class LearningAgentPipeline:
             changes = patch.model_dump(exclude_none=True)
             if not changes:
                 raise ValueError("修订没有针对失败反馈提供任何变更")
+            from app.application.learning_profile_contract import validate_examples_only_patch
+            validate_examples_only_patch(changes, original_skill, stage.get("error", ""))
             result = SkillXDraft.model_validate({**original,
                 "skillx": {**original_skill, **changes}})
             validate(result)
@@ -830,7 +920,8 @@ class LearningAgentPipeline:
         data = {**inputs, "contract": contract}
         stage = await self._stage(self.stage_key("skillx", fragment.name))
         data["validationFeedback"] = {"error": stage.get("error"), "previousDraft": stage.get("output")}
-        if contract.get("executionProfile") == "local-command":
+        from app.application.learning_context import requires_external_request_evidence
+        if contract.get("executionProfile") == "local-command" and not requires_external_request_evidence(inputs):
             from app.application.task_context import observation
             data["calls"] = [{"id": call["id"], "status": call["status"],
                 "input": observation(call.get("input", {}), 400),
@@ -960,6 +1051,7 @@ class LearningAgentPipeline:
 
         patch = await self.call("workflow", WorkflowRepair,
             {"fragment": inputs["fragment"], "previousDraft": original,
+             "originalAcceptance": inputs.get("originalAcceptance", {}),
              "skippedDependencies": inputs.get("skippedDependencies", []),
              "suppliedSkillXContracts": inputs.get("suppliedSkillXContracts", []),
              "suppliedWorkflowContracts": inputs.get("suppliedWorkflowContracts", []),
@@ -975,6 +1067,28 @@ class LearningAgentPipeline:
         key = self.stage_key("workflow", fragment.name)
         stage = await self._stage(key)
         draft = stage.get("output") or {}
+        if not draft.get("workflow") and any(effect.startswith("http.") for effect in fragment.requiredEffects):
+            from copy import deepcopy
+            graph_inputs = {key: deepcopy(value) for key, value in inputs.items()
+                            if key not in {"calls", "workflowExample", "validationFeedback"}}
+            # Exact transport examples are deliberately deferred. The graph
+            # builder must wire contracts, not reverse engineer serialized bodies.
+            for group in ("suppliedSkillXContracts", "suppliedWorkflowContracts"):
+                for contract in graph_inputs.get(group, []):
+                    contract.pop("examples", None)
+            for contract in graph_inputs.get("catalog", {}).get("capabilities", []):
+                contract.pop("examples", None)
+            graph = await self.call("workflow", WorkflowGraphDraft, graph_inputs,
+                                    name=fragment.name, phase="graph")
+            if graph.decision == "needs_dependencies":
+                raise ValueError("工作流缺少必要依赖：" + "；".join(
+                    item.name + "：" + item.reason for item in graph.missingCapabilities))
+            if graph.decision == "skip":
+                return WorkflowDraft.model_validate(graph.model_dump(exclude={"missingCapabilities"}))
+            draft = graph.model_dump(exclude={"missingCapabilities"})
+            await self._record(key, {"role": "workflow", "roleLabel": ROLE_LABELS["workflow"],
+                                     "name": fragment.name, "status": "needs_examples", "output": draft,
+                                     "buildInputs": inputs, "error": None})
         if draft.get("workflow"):
             try:
                 WorkflowDefinition.model_validate(draft["workflow"])
@@ -1040,20 +1154,44 @@ class LearningAgentPipeline:
                     return await self.repair_workflow_draft(fragment, inputs, str(exc), validate)
         from app.application.task_context import observation
         data = {"fragment": inputs["fragment"], "workflow": draft["workflow"],
+            "originalAcceptance": inputs.get("originalAcceptance", {}),
+            "catalog": inputs.get("catalog", {}),
             "suppliedSkillXContracts": inputs.get("suppliedSkillXContracts", []),
             "suppliedWorkflowContracts": inputs.get("suppliedWorkflowContracts", []),
             "calls": [{"id": call["id"], "status": call["status"],
                 "input": observation(call.get("input", {}), 400),
                 "output": observation(call.get("output", {}), 700)} for call in inputs["calls"]]}
         if not (any(item.get("executionProfile") == "local-command" for item in data["suppliedSkillXContracts"])
-                or any(item.get("requiresLocalValidation") for item in data["suppliedWorkflowContracts"])):
+                or any(item.get("requiresLocalValidation") for item in data["suppliedWorkflowContracts"])
+                or workflow_uses_local_validation(draft["workflow"], inputs)):
             data["calls"] = inputs["calls"]
+        if any(effect.startswith("http.") for effect in fragment.requiredEffects):
+            from app.application.dependency_validation_context import load_dependency_validation_context
+            async with SessionLocal() as session:
+                data["dependencyValidation"] = await load_dependency_validation_context(
+                    session, draft["workflow"], supplied_contracts=[
+                        *inputs.get("suppliedSkillXContracts", []),
+                        *inputs.get("suppliedWorkflowContracts", []),
+                    ])
         examples = await self.call("workflow", WorkflowExamples, data, name=fragment.name, phase="examples")
         result = WorkflowDraft.model_validate({**draft, "workflowExamples": examples.model_dump()["workflowExamples"]})
         validate(result)
         await self._record(key, {"status": "completed", "output": result.model_dump(), "error": None,
             "buildInputs": inputs}, "learning.agent.completed")
         return result
+
+    @staticmethod
+    def original_acceptance(context: dict) -> dict:
+        """Source objectives survive fragment planning without carrying private outputs."""
+        outcome = context.get("outcome") or {}
+        goals = [item["goal"] for item in outcome.get("tasks", [])
+                 if isinstance(item, dict) and isinstance(item.get("goal"), str)]
+        if not goals and isinstance(context.get("goal"), str):
+            goals = [context["goal"]]
+        criteria = [item for decision in context.get("decisions", [])
+                    for item in decision.get("completionCriteria", []) if isinstance(item, str)]
+        return {"goals": list(dict.fromkeys(goals)),
+                "completionCriteria": list(dict.fromkeys(criteria))}
 
     @staticmethod
     def fragment_context(context: dict, fragment: ReusableFragment) -> dict:
@@ -1066,7 +1204,8 @@ class LearningAgentPipeline:
             ],
         }
 
-    async def generate(self, context: dict, *, materializer, publish=None) -> LearningProposal:
+    async def generate(self, context: dict, *, materializer, publish=None,
+                       frozen_proposal=None, frozen_names=()) -> LearningProposal:
         extraction_context = {
             key: context[key]
             for key in (
@@ -1088,29 +1227,20 @@ class LearningAgentPipeline:
         from app.application.task_context import observation
         # Extraction selects boundaries; specialists receive the exact assigned evidence.
         # Never repeat source code and tool outputs inside decisions and conversation state.
-        extraction_context["calls"] = [
-            {"id": call["id"], "kind": call.get("kind"), "status": call["status"],
-             "input": observation(call.get("input", {}), 500),
-             "output": observation(call.get("output", {}), 700),
-             "error": observation(call.get("error"), 300)}
-            for call in context["calls"]
-        ]
+        from app.application.learning_context import extraction_call_preview
+        extraction_context["calls"] = [extraction_call_preview(call) for call in context["calls"]]
+        extraction_context["callEvidenceNote"] = (
+            "calls 是规划预览；truncated=true 表示不完整，不能当作全部证据或缺失协议。"
+            "完整原始调用及 observedOutput 仍按 id 保存并交给后续构建/验证阶段。")
+        extraction_context["originalAcceptance"] = self.original_acceptance(context)
         extraction_context["decisions"] = [
             {key: observation(value, 300) for key, value in decision.items() if key in {"summary", "reason", "status"}}
             for decision in context.get("decisions", [])
         ]
-        # Boundary selection needs names and interface descriptions, not every
-        # nested workflow schema. Builders still receive the complete catalog.
-        extraction_context["catalog"] = {
-            "capabilities": [
-                {"id": item.get("id"), "name": item.get("name"),
-                 "description": observation(item.get("description", ""), 300),
-                 "interfaces": list(item.get("interfaces", {}))}
-                for item in context.get("catalog", {}).get("capabilities", [])
-            ],
-            "tools": [{"capabilityRef": item["capabilityRef"], "effect": item.get("effect")}
-                for item in context.get("catalog", {}).get("tools", [])],
-        }
+        # Reuse is a contract comparison: retain schemas, effects and boundaries.
+        # Names and truncated descriptions alone caused repeated extraction.
+        extraction_context["catalog"] = context.get("catalog", {})
+        extraction_context["requireReuseReview"] = True
         for key in ("sessionMessages", "humanAnswers", "outcome"):
             if key in extraction_context:
                 extraction_context[key] = observation(extraction_context[key], 1500)
@@ -1124,14 +1254,16 @@ class LearningAgentPipeline:
         else:
             try:
                 plan = await self.call("extractor", plan_model, extraction_context,
-                    validate=lambda value: validate_extraction(value, context, check_dependencies=False))
+                    validate=lambda value: validate_extraction(
+                        value, {**context, "requireReuseReview": True}, check_dependencies=False))
             except ValueError:
                 stage = await self._stage("extractor")
                 if not stage.get("output") or stage.get("revisionCount", 0) >= 1:
                     raise
                 await self._record("extractor", {"revisionCount": 1})
                 plan = await self.call("extractor", plan_model, extraction_context,
-                    validate=lambda value: validate_extraction(value, context, check_dependencies=False))
+                    validate=lambda value: validate_extraction(
+                        value, {**context, "requireReuseReview": True}, check_dependencies=False))
         if plan.decision == "skip":
             return LearningProposal(decision="skip", reason=plan.reason)
         workflows = [*plan.workflows, *([plan.workflow] if plan.workflow else [])]
@@ -1166,7 +1298,8 @@ class LearningAgentPipeline:
             except Exception:
                 pass  # Per-workflow dependency failures are recorded below.
         self.workflow_name = plan.workflow.name if plan.workflow else ""
-        proposal = LearningProposal(decision="candidate", reason=plan.reason)
+        proposal = (frozen_proposal.model_copy(deep=True) if frozen_proposal is not None
+                    else LearningProposal(decision="candidate", reason=plan.reason))
         async def publish_one(group, artifact):
             if publish is None:
                 return artifact
@@ -1187,9 +1320,31 @@ class LearningAgentPipeline:
             return artifact
         async with SessionLocal() as session:
             published = (await self._owned_job(session)).result_json.get("artifacts", {})
+        async def record_reuse(role, group, fragment):
+            target = fragment.reuseSkillId if group == "skills" else fragment.reuseVersionId
+            if not target:
+                return False
+            await self._record(self.stage_key(role, fragment.name), {
+                "role": role, "name": fragment.name, "status": "completed",
+                "output": {"decision": "skip", "reason": "直接复用已有能力 " + target},
+                "reusedVersionId": target,
+            }, "learning.agent.completed")
+            async with SessionLocal() as session:
+                job = await self._owned_job(session)
+                from copy import deepcopy
+                reused = deepcopy(job.result_json.get("reusedArtifacts", {}))
+                reused.setdefault(group, {})[fragment.name] = target
+                job.result_json = {**job.result_json, "reusedArtifacts": reused}
+                await session.commit()
+            return True
+
         skipped = []
         for fragment in plan.skills:
+            if fragment.name in frozen_names:
+                continue
             try:
+                if await record_reuse("skill", "skills", fragment):
+                    continue
                 saved = await self._stage(self.stage_key("skill", fragment.name))
                 if fragment.name in published.get("skills", {}) and saved.get("status") == "completed":
                     proposal.skills.append(SkillDraft.model_validate(saved["output"]).skill)
@@ -1197,6 +1352,7 @@ class LearningAgentPipeline:
                 inputs = {
                     **self.fragment_context(context, fragment),
                     "existingSkills": context.get("existingSkills", []),
+                    "catalog": context["catalog"],
                 }
 
                 def validate_skill(value, fragment=fragment):
@@ -1207,6 +1363,7 @@ class LearningAgentPipeline:
                     if value.skill is None or value.skill.name != fragment.name:
                         raise ValueError("Skill 名称必须与分配片段一致")
                     check_evidence_ids(value.skill.sourceInvocationIds, fragment)
+                    validate_reuse_implementation(fragment, value.skill, "skills", context)
 
                 draft = await self.call(
                     "skill", SkillDraft, inputs, name=fragment.name, validate=validate_skill
@@ -1222,7 +1379,11 @@ class LearningAgentPipeline:
             except Exception as exc:
                 proposal.failures["skill:" + fragment.name] = str(exc)
         for fragment in plan.skillx:
+            if fragment.name in frozen_names:
+                continue
             try:
+                if await record_reuse("skillx", "skillx", fragment):
+                    continue
                 inputs = {
                     **self.fragment_context(context, fragment),
                     "catalog": context["catalog"],
@@ -1236,6 +1397,9 @@ class LearningAgentPipeline:
                         return
                     if value.skillx is None or value.skillx.name != fragment.name:
                         raise ValueError("SkillX 名称必须与分配片段一致")
+                    validate_reuse_implementation(fragment, value.skillx, "skillx", context)
+                    from app.application.extraction_effects import validate_required_effects
+                    validate_required_effects(fragment.requiredEffects, value.skillx)
                     if value.skillx.kind not in context["availableSkillKinds"]:
                         raise ValueError("SkillX 使用了未配置的模型接口")
                     example_ids = [example.sourceInvocationId for example in value.skillx.examples
@@ -1259,20 +1423,9 @@ class LearningAgentPipeline:
             {fragment.name for fragment in plan.skillx})
         proposal.failures.update(dependency_failures)
         for fragment in ordered:
-            if fragment.reuseVersionId:
-                from app.infrastructure.database import WorkflowVersion
-                async with SessionLocal() as reuse_session:
-                    version = await reuse_session.get(WorkflowVersion, fragment.reuseVersionId)
-                available = {item.get("id") for item in context.get("catalog", {}).get("capabilities", [])}
-                if not version or fragment.reuseVersionId not in available:
-                    proposal.failures["workflow:" + fragment.name] = "复用目标必须是目录中已发布的工作流版本"
-                    continue
-                await self._record(self.stage_key("workflow", fragment.name), {
-                    "role": "workflow", "name": fragment.name,
-                    "status": "completed", "output": {"decision": "skip",
-                        "reason": "提炼 Agent 已选择复用工作流版本 " + fragment.reuseVersionId},
-                    "reusedVersionId": fragment.reuseVersionId,
-                }, "learning.agent.completed")
+            if fragment.name in frozen_names:
+                continue
+            if await record_reuse("workflow", "workflows", fragment):
                 continue
             saved = await self._stage(self.stage_key("workflow", fragment.name))
             if fragment.name in published.get("workflows", {}) and saved.get("status") == "completed":
@@ -1304,6 +1457,7 @@ class LearningAgentPipeline:
                     **self.fragment_context(context, fragment),
                     "catalog": context["catalog"],
                     "skippedDependencies": skipped_dependencies,
+                    "originalAcceptance": self.original_acceptance(context),
                     "workflowExample": context["workflowExample"],
                     "suppliedWorkflowContracts": [
                         {"name": item.name, "inputSchema": item.definition.get("spec", {}).get("inputSchema", {}),
@@ -1334,10 +1488,12 @@ class LearningAgentPipeline:
                 # A composition with explicitly bound children does not need
                 # unrelated atomic implementations or every historical workflow.
                 if fragment.dependsOn and all(item.get("versionId") for item in skipped_dependencies):
-                    generated_names = {item.name for item in proposal.workflows}
+                    generated_names = {item.name for item in [*proposal.workflows, *proposal.skillx]}
                     reused_names = {item["name"] for item in skipped_dependencies}
                     if set(fragment.dependsOn) <= generated_names | reused_names:
                         pinned_versions = {item["versionId"] for item in skipped_dependencies}
+                        if fragment.reuseReview:
+                            pinned_versions.update(fragment.reuseReview.dependencyIds)
                         inputs["catalog"] = {**context["catalog"], "capabilities": [
                             item for item in context["catalog"].get("capabilities", [])
                             if item.get("id") in pinned_versions]}
@@ -1347,7 +1503,7 @@ class LearningAgentPipeline:
                         "input": observation(call.get("input", {}), 400),
                         "output": observation(call.get("output", {}), 700)} for call in inputs["calls"]]
 
-                def validate_workflow(value):
+                def validate_workflow(value, fragment=fragment):
                     if value.decision == "skip":
                         if value.workflow is not None:
                             raise ValueError("skip 不能同时生成工作流")
@@ -1358,6 +1514,9 @@ class LearningAgentPipeline:
                     validate_dependency_reuse(value, inputs)
                     from app.application.extraction_graph_contract import validate_extraction_nodes
                     validate_extraction_nodes(value.workflow, inputs)
+                    validate_reuse_implementation(fragment, value.workflow, "workflows", context)
+                    from app.application.extraction_effects import validate_http_examples
+                    validate_http_examples(fragment.requiredEffects, value.workflowExamples, across_examples=True)
                     example_ids = [example.sourceInvocationId for example in value.workflowExamples
                                    if example.sourceInvocationId]
                     local = workflow_uses_local_validation(value.workflow, inputs)

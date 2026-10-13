@@ -147,7 +147,7 @@ export default function SkillsPage() {
       </Form>
     </Modal>
     <Modal title="导入 Skill 目录" open={importing} onCancel={() => {if (!busy) setImporting(false)}} onOk={() => void importDirectory()} confirmLoading={busy} okText="导入" cancelText="取消" okButtonProps={{disabled: !path.trim()}}>
-      <Typography.Paragraph type="secondary">选择服务所在电脑上包含 SKILL.md 的目录，脚本与参考文件会一并保存为资源快照。</Typography.Paragraph>
+      <Typography.Paragraph type="secondary">选择服务所在电脑上包含 SKILL.md 的目录，脚本与参考文件会一并保存为资源快照。同名 Skill 或已关联的 SkillX 将更新原 Skill；转换后发布为同一能力的新版本。</Typography.Paragraph>
       <Flex gap={8}><Input aria-label="Skill 目录路径" placeholder="/path/to/skill" value={path} onChange={event => setPath(event.target.value)} /><DirectoryPicker value={path || undefined} disabled={busy} onChange={value => setPath(value || '')} /></Flex>
       {modalError && <Alert style={{marginTop: 16}} type="error" title={modalError} showIcon />}
     </Modal>

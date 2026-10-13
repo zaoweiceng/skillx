@@ -350,6 +350,7 @@ class TaskDriver:
             if settings.task_local_execution_enabled:
                 observed_calls, call_history = call_context(
                     call_records, context_directory, limit=settings.task_context_max_characters,
+                    fresh_keys={call["key"] for call in task.state_json.get("calls", [])},
                 )
             else:
                 # Do not require local file reads when code execution is disabled.
@@ -436,7 +437,8 @@ class TaskDriver:
                         "运行时补齐的字段无需重新生成。"
                         "action=dispatch 时 calls 必须非空；"
                         "completionCriteria 必须是字符串数组，不能是字符串化 JSON。"
-                        "calls 每项必须含 key、kind、arguments 对象和 reason 字符串；"
+                        "calls 每项必须含 key、kind 和 arguments 对象；"
+                        "reason 是可选调用说明，省略时为空，不补造理由；"
                         "code 的 language/source 放在 arguments 内。"
                         '结构示例（占位文字需替换为当前任务内容）：'
                         '{"action":"dispatch","summary":"本轮目的",'
@@ -522,7 +524,8 @@ class TaskDriver:
                         "catalogPath 保存完整目录和工具契约，仅在需要对应能力时定向读取相关条目；"
                         "简单的文件读取和检索可直接使用 code，无需先加载无关目录或 Skill。"
                         "调用相关能力前用 code 读取该路径的完整契约；"
-                        "不要读取无关能力。calls 是有限预览，recordPath 保存单次完整记录，"
+                        "不要读取无关能力。calls 优先展示上批新结果；先前已读结果只保留有限预览，"
+                        "这不表示原执行结果丢失。recordPath 保存单次完整记录，"
                         "callHistory.path 保存全部历史；需要省略内容时"
                         "用 code 定向读取对应 JSON 字段，"
                         "不要因预览截断而重新执行原操作。"
@@ -545,6 +548,9 @@ class TaskDriver:
                     working_directory=settings.artifact_root / "tasks" / task_id,
                     max_steps=1,
                     max_total_tokens=settings.agent_max_total_tokens - task.total_tokens,
+                    # Only the decision stream is watched here; dispatched
+                    # invocations run separately under their execution limits.
+                    max_idle_seconds=120,
                     max_duration_seconds=min(
                         settings.agent_max_duration_seconds,
                         max(1, settings.task_max_active_seconds - task.active_ms // 1000),

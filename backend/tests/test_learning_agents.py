@@ -202,6 +202,57 @@ def test_workflow_builder_schema_matches_executable_node_contract():
         WorkflowDraft.model_validate(value)
 
 
+def test_workflow_graph_schema_cannot_include_examples_or_fixture_contracts():
+    from jsonschema import Draft202012Validator
+    from app.application.learning_agents import WorkflowGraphDraft, bind_workflow_schema
+    value = responses()["WorkflowDraft"]
+    graph = {key: item for key, item in value.items() if key != "workflowExamples"}
+    schema = bind_workflow_schema(WorkflowGraphDraft.model_json_schema(), {
+        "suppliedSkillXContracts": [{"name": "calculate", "executionProfile": "local-command"}]})
+    assert Draft202012Validator(schema).is_valid(graph)
+    assert not Draft202012Validator(schema).is_valid(value)
+    assert "ContractExample" not in schema.get("$defs", {})
+    assert WorkflowGraphDraft.model_validate(graph).workflow
+
+
+async def test_http_workflow_freezes_graph_before_independent_examples(monkeypatch):
+    from copy import deepcopy
+    from app.application.learning_agents import WorkflowFragment, WorkflowGraphDraft, WorkflowExamples
+    worker = await pipeline()
+    full = responses()["WorkflowDraft"]
+    graph = {key: item for key, item in full.items() if key != "workflowExamples"}
+    part = WorkflowFragment(**fragment("fixed-flow", "flow-call", dependsOn=["calculate"],
+                                      requiredEffects=["http.write"]))
+    seen = []
+    async def call(role, model, payload, **kwargs):
+        seen.append((model.__name__, deepcopy(payload)))
+        if model is WorkflowGraphDraft:
+            assert payload["originalAcceptance"] == inputs["originalAcceptance"]
+            assert "calls" not in payload
+            assert "dependencyValidation" not in payload
+            assert "examples" not in payload["suppliedSkillXContracts"][0]
+            return model.model_validate(graph)
+        assert model is WorkflowExamples
+        assert payload["originalAcceptance"] == inputs["originalAcceptance"]
+        assert payload["workflow"] == full["workflow"]
+        assert payload["dependencyValidation"]["dependencies"][0]["examples"]
+        assert "workflow" not in model.model_json_schema()["properties"]
+        return model(workflowExamples=full["workflowExamples"])
+    monkeypatch.setattr(worker, "call", call)
+    inputs = {"fragment": part.model_dump(), "calls": [], "catalog": {"capabilities": []},
+              "originalAcceptance": {"goals": ["Search all candidates"], "completionCriteria": ["Reuse only equal content"]},
+              "suppliedSkillXContracts": [{"name": "calculate", "examples": full["workflowExamples"]}]}
+    validated = []
+    result = await worker.build_workflow(part, inputs, lambda value: validated.append(value))
+    assert [name for name, _ in seen] == ["WorkflowGraphDraft", "WorkflowExamples"]
+    assert len(validated) == 1 and validated[0] == result
+    assert len(result.workflowExamples) == 2
+    assert inputs["suppliedSkillXContracts"][0]["examples"]  # Do not mutate source evidence.
+    # Resume reuses the frozen complete draft rather than rebuilding either stage.
+    await worker.build_workflow(part, inputs, lambda value: None)
+    assert len(seen) == 2
+
+
 async def test_professional_roles_have_separate_sessions_schemas_and_scoped_evidence(monkeypatch):
     worker = await pipeline()
     requests, order = [], []
@@ -223,7 +274,7 @@ async def test_professional_roles_have_separate_sessions_schemas_and_scoped_evid
     assert "WHOLE-TASK" in requests[0].prompt
     for request, id in zip(requests[1:], ["guide-call", "script-call", "flow-call"], strict=True):
         assert [call["id"] for call in data(request)["calls"]] == [id]
-        assert "WHOLE-TASK" not in request.prompt
+        assert ("WHOLE-TASK" in request.prompt) == (id == "flow-call")
         assert "unrelated-call" not in request.prompt
     assert "PRIVATE-SOURCE" not in requests[-1].prompt
     assert "PRIVATE-GUIDE" not in requests[-1].prompt
@@ -245,6 +296,24 @@ async def test_professional_roles_have_separate_sessions_schemas_and_scoped_evid
         )
         assert len([event for event in events if event.type == "learning.agent.audit"]) == 4
         assert not any(event.type == "agent.audit" for event in events)
+
+
+async def test_workflow_with_all_atomic_dependencies_omits_unrelated_catalog(monkeypatch):
+    worker = await pipeline()
+    requests, order = [], []
+    values = responses()
+    plan = values["ExtractionPlan"]
+    for item in [*plan["skills"], *plan["skillx"], plan["workflow"]]:
+        item["reuseReview"] = {"comparedIds": ["unrelated"], "gap": "No matching contract"}
+    mock_agents(monkeypatch, values, requests, order)
+    ctx = context()
+    ctx["catalog"]["capabilities"] = [{"id": "unrelated", "name": "unrelated"}]
+    proposal = await worker.generate(ctx, materializer=materializer(order))
+    assert proposal.workflows
+    assert data(requests[0])["catalog"]["capabilities"]  # Discovery still compares all.
+    builder = data(requests[-1])
+    assert builder["suppliedSkillXContracts"][0]["name"] == "calculate"
+    assert not builder.get("catalog", {}).get("capabilities")
 
 
 async def test_completed_stages_survive_worker_restart_and_only_invalidated_stage_repeats(
@@ -810,7 +879,11 @@ async def test_nested_workflow_examples_are_repaired_by_agent_once(monkeypatch, 
             payload = data(request)
             assert payload['previousDraft']['workflow']['workflowExamples'] == valid['workflowExamples']
             assert 'workflowExamples' in payload['validationFeedback']['error']
-            assert payload['catalog']['capabilities'] == [{'id': 'existing', 'name': 'published'}]
+            assert not payload.get('catalog', {}).get('capabilities')
+            dependency = payload['suppliedSkillXContracts'][0]
+            assert dependency['name'] == 'calculate'
+            assert dependency['inputSchema'] == values['SkillXDraft']['skillx']['inputSchema']
+            assert dependency['outputSchema'] == values['SkillXDraft']['skillx']['outputSchema']
         result = await execute(self, request, **kwargs)
         if role == 'WorkflowDraft' and host_rejection:
             await kwargs['event_sink']({'type': 'agent.completed', 'payload': {'output': result.output}}, {})
@@ -820,6 +893,10 @@ async def test_nested_workflow_examples_are_repaired_by_agent_once(monkeypatch, 
     monkeypatch.setattr(AgentHost, 'execute', run)
     ctx = context()
     ctx['catalog']['capabilities'] = [{'id': 'existing', 'name': 'published'}]
+    plan = values['ExtractionPlan']
+    for item in [*plan['skills'], *plan['skillx'], plan['workflow']]:
+        item['reuseReview'] = {'comparedIds': ['existing'],
+                               'gap': 'Existing fixture has no matching executable contract'}
     result = await worker.generate(ctx, materializer=materializer(order))
     assert not result.failures
     assert result.workflows[0].definition == valid['workflow']
@@ -1005,6 +1082,9 @@ async def test_parent_agent_can_explicitly_reuse_published_skipped_dependency_on
     ctx = context()
     ctx['catalog']['capabilities'] = [{'id': 'published', 'name': 'existing', 'digest': 'sha256:published',
         'interfaces': {'execute': {'inputSchema': {'required': ['value']}, 'outputSchema': {}}}}]
+    for item in values['ExtractionPlan']['workflows']:
+        item['reuseReview'] = {'comparedIds': ['published'],
+                               'gap': 'Builder must verify the candidate scope'}
     requests, order = [], []
     mock_agents(monkeypatch, values, requests, order)
     execute = AgentHost.execute
@@ -1096,3 +1176,95 @@ async def test_output_contract_repair_is_bounded_and_accounts_both_calls(
     async with SessionLocal() as session:
         job = await session.get(LearningJob, worker.job_id)
         assert sum(job.result_json["usageByRequest"].values()) == 30
+
+
+@pytest.mark.parametrize('repair_succeeds', [True, False])
+async def test_pure_profile_semantic_repair_has_actionable_feedback_and_stays_bounded(monkeypatch, repair_succeeds):
+    from copy import deepcopy
+    worker = await pipeline()
+    values = responses()
+    values['ExtractionPlan']['skills'] = []
+    values['ExtractionPlan']['workflow'] = None
+    original = values['SkillXDraft']['skillx']
+    for example in original['examples']:
+        example['verify'] = 'assert result == expected'
+    repaired = deepcopy(original['examples'])
+    if repair_succeeds:
+        for example in repaired:
+            example['verify'] = ''
+    values['SkillXRepair'] = {'examples':repaired}
+    requests, order = [], []
+    mock_agents(monkeypatch, values, requests, order)
+    result = await worker.generate(context(), materializer=materializer(order))
+    repair_request = next(request for request in requests if request.output_schema['title'] == 'SkillXRepair')
+    feedback = data(repair_request)['validationFeedback']
+    assert '必须为空' in feedback
+    assert '不是要求缩短' in feedback
+    assert data(repair_request)['previousDraft']['executionProfile'] == 'pure-python'
+    assert data(repair_request)['previousDraft']['examples'][0]['verify']  # Original rejected evidence retained.
+    assert order.count('SkillXDraft') == order.count('SkillXRepair') == 1
+    if repair_succeeds:
+        assert not result.failures
+        assert result.skillx[0].executionProfile == 'pure-python'
+        assert all(not item.verify for item in result.skillx[0].examples)
+    else:
+        assert 'skillx:calculate' in result.failures
+        assert 'validate:calculate' not in order
+
+
+async def test_examples_format_error_uses_delta_repair_without_regenerating_source(monkeypatch):
+    from copy import deepcopy
+    from app.application.agent_host import AgentOutputValidationError
+    worker = await pipeline()
+    values = responses()
+    values['ExtractionPlan']['skills'] = []
+    values['ExtractionPlan']['workflow'] = None
+    original = deepcopy(values['SkillXDraft'])
+    examples = deepcopy(original['skillx']['examples'])
+    values['SkillXRepair'] = {'examples':examples}
+    requests, order = [], []
+    mock_agents(monkeypatch, values, requests, order)
+    execute = AgentHost.execute
+    async def run(self, request, **kwargs):
+        result = await execute(self, request, **kwargs)
+        if request.output_schema['title'] == 'SkillXDraft':
+            malformed = deepcopy(original)
+            malformed['skillx']['examples'] = examples[:1]
+            raise AgentOutputValidationError('CONTRACT_VIOLATION', 'Agent 输出不符合 outputSchema: skillx.examples: minItems 2', candidate=malformed)
+        return result
+    monkeypatch.setattr(AgentHost, 'execute', run)
+    result = await worker.generate(context(), materializer=materializer(order))
+    assert not result.failures
+    assert order == ['ExtractionPlan','SkillXDraft','SkillXRepair','validate:calculate']
+    assert result.skillx[0].source == original['skillx']['source']
+    repair = next(request for request in requests if request.output_schema['title'] == 'SkillXRepair')
+    assert repair.output_schema['properties']['source']['type'] == 'null'  # Source retained server-side, never regenerated.
+
+
+def test_original_acceptance_uses_source_goals_not_extraction_instruction():
+    source = {"goal": "Extract", "outcome": {"tasks": [{"goal": "Preserve content", "output": "PRIVATE"}]},
+              "decisions": [{"completionCriteria": ["Inspect all candidates", "Inspect all candidates"]}]}
+    assert LearningAgentPipeline.original_acceptance(source) == {
+        "goals": ["Preserve content"], "completionCriteria": ["Inspect all candidates"]}
+
+
+async def test_graph_missing_dependency_stops_before_examples(monkeypatch):
+    from app.application.learning_agents import WorkflowGraphDraft, WorkflowFragment
+    from jsonschema import Draft202012Validator
+    worker = await pipeline()
+    gap = {"decision": "needs_dependencies", "reason": "No collection selection primitive",
+           "missingCapabilities": [{"name": "select-record", "description": "Select across all candidates",
+               "inputSchema": {"type": "object"}, "outputSchema": {"type": "object"},
+               "reason": "Existing lookup returns candidates but does not compare content"}]}
+    Draft202012Validator(WorkflowGraphDraft.model_json_schema()).validate(gap)
+    invalid = {**gap, "missingCapabilities": []}
+    assert not Draft202012Validator(WorkflowGraphDraft.model_json_schema()).is_valid(invalid)
+    seen = []
+    async def call(role, model, payload, **kwargs):
+        seen.append(model)
+        return model.model_validate(gap)
+    monkeypatch.setattr(worker, 'call', call)
+    part = WorkflowFragment(**fragment('compose', 'source', requiredEffects=['http.read']))
+    with pytest.raises(ValueError, match='工作流缺少必要依赖'):
+        await worker.build_workflow(part, {'fragment': part.model_dump()}, lambda value: pytest.fail('must not publish'))
+    assert seen == [WorkflowGraphDraft]

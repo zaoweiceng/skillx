@@ -143,11 +143,16 @@ def _reject_unknown(value: dict[str, Any], allowed: set[str], path: str) -> None
 
 
 def _skill_name(skill_file: Path) -> str | None:
+    from app.runtime.skill_document import split_frontmatter
+
     content = skill_file.read_text(encoding="utf-8")
-    if not content.startswith("---"):
-        return None
-    _, frontmatter, _ = content.split("---", 2)
-    parsed = yaml.safe_load(frontmatter)
+    try:
+        frontmatter, _ = split_frontmatter(content)
+        if frontmatter is None:
+            return None
+        parsed = yaml.safe_load(frontmatter)
+    except (ValueError, yaml.YAMLError) as exc:
+        raise SkillXValidationError("SKILL.md 的 YAML 元信息无效或未闭合") from exc
     return parsed.get("name") if isinstance(parsed, dict) else None
 
 

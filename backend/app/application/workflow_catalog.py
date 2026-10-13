@@ -662,9 +662,11 @@ async def search_manifests(
     limit = max(1, min(limit, MAX_SEARCH_LIMIT))
     constraints = constraints or {}
     normalized_query = query.strip().lower()[:200]
-    prefilter = select(WorkflowCapabilityManifest).where(
-        WorkflowCapabilityManifest.status == "published"
+    visible = select(WorkflowCapabilityManifest).join(WorkflowVersion).join(Workflow).where(
+        WorkflowCapabilityManifest.status == "published",
+        func.coalesce(Workflow.draft_metadata_json["archived"].as_boolean(), False).is_(False),
     )
+    prefilter = visible
     terms = [term for term in re.split(r"\s+", normalized_query) if term]
     if terms:
         prefilter = prefilter.where(
@@ -678,9 +680,7 @@ async def search_manifests(
     if not rows and terms:
         rows = (
             await session.scalars(
-                select(WorkflowCapabilityManifest)
-                .where(WorkflowCapabilityManifest.status == "published")
-                .order_by(WorkflowCapabilityManifest.updated_at.desc())
+                visible.order_by(WorkflowCapabilityManifest.updated_at.desc())
                 .limit(256)
             )
         ).all()

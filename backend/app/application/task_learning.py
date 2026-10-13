@@ -571,7 +571,9 @@ class LearningDriver:
             from app.infrastructure.models import ManagedSkill
 
             context["existingSkills"] = [
-                {"id": skill.id, "name": skill.name, "description": skill.description}
+                {"id": skill.id, "name": skill.name, "description": skill.description,
+                 "revision": skill.revision, "digest": skill.source_digest,
+                 "content": skill.content}
                 for skill in await session.scalars(
                     select(ManagedSkill).where(
                         ManagedSkill.enabled.is_(True), ManagedSkill.deleted_at.is_(None)
@@ -622,7 +624,9 @@ class LearningDriver:
 
             pipeline = LearningAgentPipeline(job_id, task_id, token, runtime)
             from app.application.learning_publishing import publish_artifacts
-            proposal = await pipeline.generate(
+            from app.application.learning_gap_feedback import generate_with_gap_feedback
+            proposal = await generate_with_gap_feedback(
+                pipeline,
                 context,
                 materializer=lambda skill, source_ids: materialize_skill(
                     skill, job_id, {id: evidence[id] for id in source_ids}
@@ -820,6 +824,7 @@ class LearningDriver:
                     output["observationId"] = observation_id
                 output["artifacts"] = output.get("artifacts", current.result_json.get("artifacts", {}))
                 output["agentStages"] = current.result_json.get("agentStages", {})
+                output["reusedArtifacts"] = current.result_json.get("reusedArtifacts", {})
                 from app.application.conversation_extraction import finish_extraction
                 await finish_extraction(session, task_id, status, output)
                 current.status, current.result_json = status, {

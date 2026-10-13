@@ -82,6 +82,15 @@ EvidencePointer = Annotated[str, Field(pattern=r"^(?:|/(?:[^~]|~[01])*)$",
     description="JSON Pointer 相对于 calls[].observedOutput：空字符串表示整个结果，/field 表示字段；不是字段的字面值。")]
 
 
+class HttpFixture(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    method: Literal["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
+    url: str = Field(pattern=r"^https?://", description="完整合成 URL，必须与候选实际请求精确匹配")
+    requestJson: Any = Field(default=None, description="JSON 请求体；null 表示无请求体，按 JSON 值精确匹配")
+    responseJson: Any
+    status: int = Field(default=200, ge=100, le=599)
+
+
 class ContractExample(BaseModel):
     model_config = ConfigDict(extra="forbid")
     input: dict
@@ -93,6 +102,7 @@ class ContractExample(BaseModel):
     sourceOutput: dict[str, EvidencePointer] | None = None
     setup: str = Field(default="", max_length=20000, description="临时环境准备 Python；动态值可通过 stdout 输出一个完整 JSON 对象，或写 .skillx-fixture.json。通过 ${fixture.key} 引用，两通道同名值必须一致。")
     verify: str = Field(default="", max_length=20000)
+    httpFixtures: list[HttpFixture] = Field(default_factory=list, max_length=64, description="隔离验证专用：顺序匹配 urllib.request.urlopen 的 method/URL/JSON body；所有 fixture 必须被实际调用消费，禁止真实网络")
 
     def portable_dump(self):
         return self.model_dump(exclude={"sourceInvocationId", "sourceInput", "sourceOutput", "evidenceMode"})
@@ -105,6 +115,7 @@ class ExpectedExecutionError(BaseModel):
 
 
 class SkillXExample(ContractExample):
+    failureOutput: dict | None = Field(default=None, description="HTTP 失败但按契约返回结构化结果时，声明业务失败输出子集（如成功标志=false或非空错误原因），不能仅提供HTTP状态码；Host独立核验。使用expectedError时省略。")
     expectedError: ExpectedExecutionError | None = Field(default=None,
         description="仅 local-command 的预期拒绝用例：匹配执行异常类型与消息，verify 用 error 检查异常并断言仓库未被误改。正常样例省略。")
 
@@ -139,13 +150,13 @@ class SkillXProposal(BaseModel):
     def executable_contract(self):
         if self.kind == "direct":
             validate_python_source(self.source)
-            if self.executionProfile == "pure-python" and any(e.setup or e.verify for e in self.examples):
-                raise ValueError("临时仓库/文件 setup 和 verify 属于 local-command，请显式选择正确 executionProfile")
+            if self.executionProfile == "pure-python" and any(e.setup or e.verify or e.httpFixtures for e in self.examples):
+                raise ValueError("pure-python 的 setup/verify/httpFixtures 必须为空；使用 expected 声明输出断言，不是缩短 verify，也不能为纯断言改成 local-command")
         elif not self.prompt.strip():
             raise ValueError("模型能力必须提供非空 prompt")
         if any(e.expectedError for e in self.examples) and (self.kind != "direct" or self.executionProfile != "local-command"):
             raise ValueError("预期执行错误样例仅支持 local-command")
-        if not any(e.expectedError is None for e in self.examples):
+        if not any(e.expectedError is None and not e.failureOutput for e in self.examples):
             raise ValueError("至少一个样例必须验证成功执行，不能仅靠拒绝输入发布能力")
         from jsonschema import Draft202012Validator
         from jsonschema.exceptions import ValidationError
@@ -169,7 +180,7 @@ class SkillXProposal(BaseModel):
 
 class DirectSkillXProposal(SkillXProposal):
     model_config = ConfigDict(extra="forbid", json_schema_extra={
-        "allOf": [{"properties": {"examples": {"contains": {"properties": {"expectedError": {"type": "null"}}}}}}, {
+        "allOf": [{"properties": {"examples": {"contains": {"properties": {"expectedError": {"type": "null"}, "failureOutput": {"type": "null"}}}}}}, {
         "if": {"properties": {"executionProfile": {"const": "local-command"}}},
         "then": {"properties": {"examples": {"items": {
             "required": ["setup", "verify"],

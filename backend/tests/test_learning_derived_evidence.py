@@ -41,3 +41,37 @@ def test_evidence_mode_schema_and_backend_agree_and_default_to_replay():
     assert list(Draft202012Validator(ContractExample.model_json_schema()).iter_errors(value))
     with pytest.raises(ValueError): ContractExample.model_validate(value)
     assert 'evidenceMode' not in example().portable_dump()
+
+
+def http_example(response, status=200, **changes):
+    return ContractExample.model_validate({
+        'input': {'title': 'same'}, 'setup': 'pass',
+        'expected': {'found': bool(response)}, 'verify': 'assert result == expected',
+        'httpFixtures': [{'method': 'GET', 'url': 'https://fixture.invalid/items',
+                          'responseJson': response, 'status': status}], **changes,
+    })
+
+
+def test_http_response_states_are_distinct_effective_inputs():
+    # The user request stays fixed while remote state changes.
+    cases = [http_example([{'id': 'match'}]), http_example([]),
+             http_example({'error': 'unavailable'}, status=500)]
+    validate_examples(cases, evidence(), local_command=True)
+    validate_examples([http_example({}, 200), http_example({}, 500)], evidence(), local_command=True)
+
+
+@pytest.mark.parametrize('changes', [
+    {'expected': {'found': 'different'}},
+    {'verify': 'assert result.get("found") is not None'},
+    {'httpFixtures': [{'url': 'https://fixture.invalid/items', 'method': 'GET',
+                       'status': 200, 'requestJson': None, 'responseJson': [{'id': 'match'}]}]},
+])
+def test_same_http_state_cannot_be_distinguished_by_assertions_or_serialization(changes):
+    with pytest.raises(ValueError, match='至少两个不同'):
+        validate_examples([http_example([{'id': 'match'}]), http_example([{'id': 'match'}], **changes)],
+                          evidence(), local_command=True)
+
+
+def test_pure_examples_still_require_distinct_inputs_even_if_fixtures_differ():
+    with pytest.raises(ValueError, match='至少两个不同'):
+        validate_examples([http_example([]), http_example([{'id': 'match'}])], evidence())

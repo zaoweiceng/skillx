@@ -138,7 +138,7 @@ def evidence_output(record):
     return output
 
 
-def call_context(records, directory, limit=24000):
+def call_context(records, directory, limit=24000, *, fresh_keys=None):
     """Share a bounded evidence budget across retained calls, without a top-three cliff."""
     history_path = context_record(directory, records) if records else None
     selected, outputs = [], []
@@ -161,7 +161,20 @@ def call_context(records, directory, limit=24000):
         selected.append(item)
         outputs.append(evidence_output(record))
         used += size
-    allowances = share_budget([encoded_size(output) for output in outputs], limit - used)
+    sizes = []
+    for item, output in zip(selected, outputs, strict=True):
+        size = encoded_size(output)
+        # Already-consumed evidence remains addressable, but should not be sent in
+        # full on every decision. Keep the last dispatched batch fresh, including
+        # during schema retries; the model has not successfully consumed it yet.
+        if fresh_keys is not None and item["key"] not in fresh_keys:
+            size = min(size, 2000)
+        # A single output larger than the entire context cannot be shown whole.
+        # Give it a preview rather than letting it absorb all unused capacity.
+        elif size > limit:
+            size = limit // 4
+        sizes.append(size)
+    allowances = share_budget(sizes, limit - used)
     for item, output, allowance in zip(selected, outputs, allowances, strict=True):
         item["output"] = bounded_evidence(output, allowance)
     return list(reversed(selected)), {

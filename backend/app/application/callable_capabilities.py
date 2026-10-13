@@ -83,6 +83,7 @@ async def resolve_callable(session, version_id: str) -> CallableCapability:
                 "description", source_interfaces.get(name, {}).get("description", owner.name)
             )
             profile = skill.manifest_json["interfaces"][name].get("x-executionProfile") or source_interfaces.get(name, {}).get("x-executionProfile")
+            contract["hasDependencies"] = bool(skill.manifest_json.get("dependencyLocks"))
             if profile:
                 contract["executionProfile"] = profile
                 contract["requiresLocalValidation"] = profile == "local-command"
@@ -209,9 +210,12 @@ async def callable_catalog(session) -> list[dict]:
             )
         )
     )
+    archived = set(await session.scalars(select(WorkflowVersion.id).join(Workflow).where(
+        Workflow.draft_metadata_json["archived"].as_boolean().is_(True))))
     result = []
     for version_id in dict.fromkeys(version_ids):
-        result.append((await resolve_callable(session, version_id)).contract)
+        if version_id not in archived:
+            result.append((await resolve_callable(session, version_id)).contract)
     return result
 
 

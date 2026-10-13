@@ -1000,6 +1000,8 @@ class AgentHost:
                             "message": payload["message"],
                             "retryable": payload["retryable"],
                             "callId": payload.get("callId"),
+                            **({"outputParseError": payload["outputParseError"]}
+                               if isinstance(payload.get("outputParseError"), dict) else {}),
                         }
                         if failed_tool_result is not None:
                             call_id = payload.get("callId")

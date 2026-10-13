@@ -112,6 +112,19 @@ async def publish_artifacts(pipeline, proposal, evidence):
                     await validate_candidate(session, definition, flow.examples,
                         {id: evidence[id] for id in flow.sourceInvocationIds},
                         generated_ids=set(artifacts["skillx"].values()))
+                if not base_id:
+                    from app.application.workflow_equivalence import find_equivalent_workflow
+                    from app.application.workflow_nesting import expand_workflow
+
+                    equivalent = await find_equivalent_workflow(
+                        session, await expand_workflow(session, definition))
+                    if equivalent:
+                        artifacts["workflows"][flow.name] = equivalent.id
+                        reused = deepcopy(job.result_json.get("reusedArtifacts", {}))
+                        reused.setdefault("workflows", {})[flow.name] = equivalent.id
+                        job.result_json = {**job.result_json, "reusedArtifacts": reused}
+                        await save(session)
+                        continue
                 if base_id:
                     workflow.draft_revision += 1
                     workflow.draft_json, workflow.draft_digest = definition, compiled.digest
@@ -159,7 +172,11 @@ async def publish_artifacts(pipeline, proposal, evidence):
             except Exception as revision_error:
                 failures[failure_key] = str(revision_error)
     async with SessionLocal() as session:
-        artifacts = deepcopy((await pipeline._owned_job(session)).result_json.get("artifacts", artifacts))
-    count = sum(len(artifacts[key]) for key in ("skills", "skillx", "workflows"))
+        job = await pipeline._owned_job(session)
+        artifacts = deepcopy(job.result_json.get("artifacts", artifacts))
+        reused = deepcopy(job.result_json.get("reusedArtifacts", {}))
+    count = sum(len(artifacts[key]) + len(reused.get(key, {}))
+                for key in ("skills", "skillx", "workflows"))
     status = "partial" if count and failures else "published" if count else "blocked" if failures else "skipped"
-    return status, {**artifacts, "artifacts": artifacts, "failures": failures, "reason": proposal.reason}
+    return status, {**artifacts, "artifacts": artifacts, "failures": failures,
+                    "reason": proposal.reason, "reusedArtifacts": reused}

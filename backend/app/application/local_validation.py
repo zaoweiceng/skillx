@@ -23,6 +23,8 @@ class LocalValidation:
         self.temp = TemporaryDirectory(prefix="skillx-command-validation-")
         self.root = Path(self.temp.name).resolve()
         self.fixture_output = {}
+        self.http_fixtures = []
+        self.http_requests = []
         self.env = {"PATH": os.defpath, "HOME": str(self.root), "TMPDIR": str(self.root),
             "PYTHONNOUSERSITE": "1", "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
         # Keep policy in the Host, outside the candidate's writable workspace.
@@ -89,6 +91,10 @@ class LocalValidation:
             return value
         return resolve(inputs)
 
+    async def configure_http(self, example):
+        self.http_fixtures = await self.resolve_inputs([item.model_dump() for item in example.httpFixtures])
+        self.http_requests = []
+
     async def execute(self, source, inputs, schema, expected_error=None):
         module = self.root / (str(uuid4()) + ".py")
         module.write_text(source)
@@ -96,20 +102,32 @@ class LocalValidation:
 sys.path.insert(0, BACKEND)
 from app.runtime.skillx import SkillXRequest, SkillXContext, SkillXResult
 from contextlib import redirect_stdout
+from app.runtime.http_validation import HttpFixtures
+import urllib.request
+payload = json.load(sys.stdin)
+http = HttpFixtures(payload["httpFixtures"])
+urllib.request.urlopen = http.urlopen
 spec = importlib.util.spec_from_file_location("candidate", MODULE)
 module = importlib.util.module_from_spec(spec)
 with redirect_stdout(sys.stderr):
     spec.loader.exec_module(module)
     try:
-        result = module.execute(SkillXRequest(input=json.load(sys.stdin), invocation_id="validation", interface="execute"), SkillXContext())
+        result = module.execute(SkillXRequest(input=payload["inputs"], invocation_id="validation", interface="execute"), SkillXContext())
         if inspect.isawaitable(result): result = asyncio.run(result)
         if isinstance(result, SkillXResult): result = result.output
         outcome = {"output": result}
     except Exception as exc:
         outcome = {"error": {"type": type(exc).__name__, "message": str(exc)}}
+outcome["httpConsumed"] = http.consumed
+outcome["httpViolations"] = http.violations
+outcome["httpRequests"] = http.requests
 print(json.dumps(outcome))
 '''.replace("MODULE", repr(str(module))).replace("BACKEND", repr(str(Path(__file__).resolve().parents[2])))
-        outcome = json.loads(await self.python(runner, inputs))
+        outcome = json.loads(await self.python(runner, {"inputs": inputs, "httpFixtures": self.http_fixtures}))
+        self.http_fixtures = self.http_fixtures[outcome["httpConsumed"]:]
+        self.http_requests.extend(outcome["httpRequests"])
+        if outcome["httpViolations"]:
+            raise ValueError("HTTP fixture violation: " + "; ".join(outcome["httpViolations"]))
         error = outcome.get("error")
         if expected_error:
             if not error or error["type"] != expected_error.type or expected_error.messageContains not in error["message"]:
@@ -122,6 +140,8 @@ print(json.dumps(outcome))
         return result
 
     async def verify(self, example, result, inputs=None):
+        if self.http_fixtures:
+            raise ValueError("HTTP fixtures not consumed; candidate must execute every declared request")
         if not example.verify.strip() or "assert" not in example.verify:
             raise ValueError("命令能力必须提供独立的仓库/文件后置条件 assert")
         negative = getattr(example, "expectedError", None)
@@ -131,18 +151,22 @@ print(json.dumps(outcome))
         if not negative:
             from app.application.workflow_assertions import check_expected
             check_expected(expected, result, partial=True)
+            if getattr(example, "failureOutput", None):
+                check_expected(example.failureOutput, result, partial=True)
         payload = {"result": None if negative else result, "inputs": inputs, "expected": expected,
-                   "error": result["validationError"] if negative else None}
-        await self.python("import json, sys\n_payload = json.load(sys.stdin)\nresult = _payload['result']\nerror = _payload['error']\ninputs = _payload['inputs']\nexpected = _payload['expected']\n" + example.verify, payload)
+                   "error": result["validationError"] if negative else None, "httpRequests": self.http_requests}
+        await self.python("import json, sys\n_payload = json.load(sys.stdin)\nresult = _payload['result']\nerror = _payload['error']\ninputs = _payload['inputs']\nexpected = _payload['expected']\nhttpRequests = _payload['httpRequests']\n" + example.verify, payload)
 
 
 async def validate_local_package(package, examples, output_schema):
     observations = []
+    successful_inputs = []
     for example in examples:
         workspace = LocalValidation()
         try:
             await workspace.setup(example.setup)
             inputs = await workspace.resolve_inputs(example.input)
+            await workspace.configure_http(example)
             input_file = package / "input.json"
             if input_file.exists():
                 Draft202012Validator(json.loads(input_file.read_text())).validate(inputs)
@@ -150,12 +174,14 @@ async def validate_local_package(package, examples, output_schema):
                 getattr(example, "expectedError", None))
             await workspace.verify(example, result, inputs)
             observations.append({"input": inputs, "output": result})
+            if not getattr(example, "expectedError", None) and not getattr(example, "failureOutput", None):
+                successful_inputs.append(inputs)
         finally:
             workspace.close()
     if (package / "input.json").exists():
         from app.application.input_form_coverage import validate_input_form_coverage
         validate_input_form_coverage(json.loads((package / "input.json").read_text()),
-                                    [item["input"] for item in observations if "validationError" not in item["output"]])
+                                    successful_inputs)
     proof = {"profile": "local-command", "status": "passed", "examples": len(examples),
         "isolation": "os-write-confined-no-network", "observations": observations}
     (package / "validation.json").write_text(json.dumps(proof))

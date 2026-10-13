@@ -177,6 +177,43 @@ async def test_task_dispatch_and_question_persist_together(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_decision_idle_limit_does_not_wrap_dispatched_code(tmp_path, monkeypatch):
+    from app.application.invocations import InvocationDriver
+    from app.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "artifact_root", tmp_path)
+    monkeypatch.setattr(settings, "agent_max_duration_seconds", 600)
+    monkeypatch.setattr(settings, "task_max_active_seconds", 1800)
+    task_id = await make_task()
+    requests = []
+
+    async def decide(self, request, **kwargs):
+        requests.append(request)
+        assert request.max_idle_seconds == 120
+        assert request.max_duration_seconds == 600
+        return AgentHostResult(output={
+            "action": "dispatch", "summary": "计算", "completionCriteria": ["取得结果"],
+            "calls": [{"key": "calculate", "kind": "code",
+                       "arguments": {"language": "python", "source": "print(6 * 7)"}}],
+        })
+
+    monkeypatch.setattr(AgentHost, "execute", decide)
+    assert await TaskDriver().poll_once()
+    async with SessionLocal() as session:
+        assert (await session.get(Task, task_id)).status == "waiting_execution"
+        item = await session.scalar(select(Invocation).where(Invocation.task_id == task_id))
+        invocation_id = item.id
+    # A separate worker executes the actual code without entering decision Host.
+    assert await InvocationDriver().poll_once()
+    assert len(requests) == 1
+    async with SessionLocal() as session:
+        item = await session.get(Invocation, invocation_id)
+        assert item.status == "succeeded", item.error_json
+        assert item.output_json["stdout"].strip() == "42"
+
+
+@pytest.mark.asyncio
 async def test_local_code_invocation_executes_and_exports_evidence(tmp_path, monkeypatch):
     from app.application.invocations import InvocationDriver, enqueue_invocation
     from app.config import get_settings

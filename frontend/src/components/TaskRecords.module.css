@@ -23,3 +23,14 @@
 .stage .heading { flex-wrap: wrap; margin-bottom: 6px; }
 .stage .heading .error { margin-left: auto; }
 .stageMeta { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 11px; overflow-wrap: anywhere; }
+
+.calls > :global(.ant-collapse-item) { border-bottom: 1px solid var(--line-soft); }
+.calls > :global(.ant-collapse-item:last-child) { border-bottom: 0; }
+.records .calls > :global(.ant-collapse-item) > :global(.ant-collapse-header) { padding: 10px 0 !important; gap: 8px; }
+.calls :global(.ant-collapse-header-text) { min-width: 0; }
+.calls :global(.ant-collapse-extra) { flex-shrink: 0; white-space: nowrap; }
+.callHeading { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.callHeading > svg { flex-shrink: 0; }
+.callTitle { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); font-weight: 500; }
+.callKind { flex-shrink: 1; min-width: 0; max-width: 30%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.callDetails { padding: 2px 0 4px 22px; }

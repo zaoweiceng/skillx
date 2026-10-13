@@ -117,3 +117,47 @@ def test_multiple_reference_documents_do_not_erase_each_other(tmp_path):
     assert history['omittedCalls'] == 0
     assert [x['output']['stdout'] for x in calls] == [r['output']['stdout'] for r in records]
     assert len(json.dumps(calls, ensure_ascii=False, separators=(',', ':'))) <= limit
+
+
+def test_consumed_giant_output_does_not_fill_every_followup_context(tmp_path):
+    # Reproduces a probe that printed a whole collection (566 KB), followed by
+    # small discovery and write responses. The execution stream itself is clipped.
+    old = record(0)
+    old['output'] = {
+        'stdout': '{"notes": [' + '"正文\\n"' * 30000,
+        'exitCode': 0,
+        'streams': {'stdout': {'path': '/execution/stdout', 'truncated': True,
+                               'totalBytes': 566505, 'retainedBytes': 262144}},
+    }
+    recent = record(1)
+    recent['output'] = {'stdout': json.dumps({'created': True, 'verified': True}), 'exitCode': 0}
+    records = [old, recent]
+    calls, _ = call_context(records, tmp_path, limit=64000, fresh_keys={'call-1'})
+    assert len(json.dumps(calls, ensure_ascii=False, separators=(',', ':'))) < 5000
+    assert calls[0]['output']['stdout']['truncated'] is True
+    assert calls[0]['output']['streams'] == old['output']['streams']
+    assert calls[1]['output'] == recent['output']
+    assert [call['id'] for call in calls] == ['id-0', 'id-1']
+    assert json.loads(Path(calls[0]['recordPath']).read_text()) == old
+
+
+def test_latest_parallel_batch_stays_fresh_and_format_retry_does_not_consume_it(tmp_path):
+    records = [record(i) for i in range(3)]
+    for item in records:
+        item['output']['stdout'] = 'facts\\n' * 1300
+    fresh = {'call-1', 'call-2'}
+    calls, _ = call_context(records, tmp_path, limit=64000, fresh_keys=fresh)
+    assert calls[0]['output']['stdout']['truncated'] is True
+    assert [c['output'] for c in calls[1:]] == [r['output'] for r in records[1:]]
+    retried, _ = call_context(records, tmp_path, limit=64000, fresh_keys=fresh)
+    assert retried == calls
+
+
+def test_single_oversized_fresh_result_leaves_room_for_small_parallel_result(tmp_path):
+    records = [record(0), record(1)]
+    records[0]['output']['stdout'] = '"\\\n' * 100000
+    records[1]['output']['stdout'] = 'all required fields: title, id, created_at'
+    calls, _ = call_context(records, tmp_path, limit=24000, fresh_keys={'call-0', 'call-1'})
+    assert len(json.dumps(calls, ensure_ascii=False, separators=(',', ':'))) < 10000
+    assert calls[0]['output']['stdout']['truncated'] is True
+    assert calls[1]['output'] == records[1]['output']

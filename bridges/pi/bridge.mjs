@@ -43,6 +43,7 @@ process.stdin.on('data', chunk => {
 let session;
 let apiKey;
 let failureCode = 'MODEL_PROVIDER_ERROR';
+let outputParseError;
 const scrub = value => {
   if (typeof value === 'string' && /^data:image\/[\w.+-]+;base64,/.test(value)) {
     return value.slice(0, value.indexOf(',')) + ',[图片数据已省略]';
@@ -207,6 +208,22 @@ try {
   // may reject its arguments before execute() (e.g. an extra property), leaving
   // no text to parse. Preserve that candidate for the Host's authoritative
   // outputSchema validation and actionable, bounded decision repair.
+  // The SDK tolerantly parses incomplete/invalid JSON as an object (sometimes
+  // {}). Check the captured transport first so a malformed second submission
+  // cannot be mistaken for a conflicting valid result or silently ignored.
+  if (submitResultMode) {
+    for (const [index, item] of message.content.entries()) {
+      if (item.type !== 'toolCall' || !submissionsTools.some(tool => tool.name === item.name)) continue;
+      const raw = rawArguments.get(index);
+      if (raw === undefined) continue;
+      try { JSON.parse(raw); } catch (error) {
+        outputParseError = { kind: 'invalid_json', parseError: scrub(String(error.message)).slice(0, 1000),
+          rawArguments: scrub(raw).slice(0, 65536), truncated: raw.length > 65536,
+          stopReason: message.stopReason };
+        throw new Error('结果提交工具参数不是合法 JSON；请只调用一次提交工具，参数使用完整 JSON，不混入 XML/DSML 文本。');
+      }
+    }
+  }
   const submissions = submitResultMode
     ? message.content.filter(item => item.type === 'toolCall' && submissionsTools.some(tool => tool.name === item.name))
       .map(item => ({ ...item, arguments: submissionsTools.find(tool => tool.name === item.name).normalize(item.arguments) }))
@@ -226,7 +243,8 @@ try {
   const outputProvenance = Object.fromEntries(Object.keys(output).map(field => [field, { mode: 'generative', sourceCallIds: evidence.map(item => item.callId), evidenceDigests: evidence.map(item => item.evidenceDigest), promptVersion: 'pi-sdk-bridge-v1' }]));
   emit('agent.completed', { steps, totalTokens, usageComplete, model: modelId, provider: 'pi', output, outputProvenance });
 } catch (error) {
-  emit('agent.failed', { code: failureCode, message: scrub(String(error?.message ?? 'Pi execution failed')).slice(0, 2000), retryable: false });
+  emit('agent.failed', { code: failureCode, message: scrub(String(error?.message ?? 'Pi execution failed')).slice(0, 2000), retryable: false,
+    ...(outputParseError ? { outputParseError } : {}) });
 } finally {
   session?.dispose();
   process.stdin.destroy();

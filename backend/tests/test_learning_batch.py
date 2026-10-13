@@ -88,7 +88,8 @@ async def test_independent_publication_nested_workflow_and_restart(monkeypatch, 
     _, again = await publish_artifacts(worker, proposal, evidence)
     assert again["workflows"] == output["workflows"]
     async with SessionLocal() as session:
-        assert await session.scalar(select(func.count()).select_from(WorkflowVersion)) == 3
+        assert output["workflows"]["first"] == output["workflows"]["sibling"]
+        assert await session.scalar(select(func.count()).select_from(WorkflowVersion)) == 2
 
 
 @pytest.mark.parametrize("failure", ["assertion", "compiler"])

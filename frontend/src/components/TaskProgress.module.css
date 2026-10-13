@@ -1,4 +1,10 @@
 .progress { margin: 12px 0; color: var(--muted); font-size: 12px; }
+.processCard { border: 1px solid var(--line-soft); border-radius: 12px; background: color-mix(in srgb, var(--panel-raised) 45%, var(--bg)); overflow: hidden; }
+.processCard > :global(.ant-collapse-item) > :global(.ant-collapse-header) { padding: 13px 16px; align-items: center; color: var(--text); font-size: 13px; font-weight: 500; line-height: 1.6; transition: background .15s ease; }
+.processCard > :global(.ant-collapse-item) > :global(.ant-collapse-header):hover { background: var(--panel-raised); }
+.processCard > :global(.ant-collapse-item-active) > :global(.ant-collapse-header) { border-bottom: 1px solid var(--line-soft); }
+.processCard > :global(.ant-collapse-item) > :global(.ant-collapse-panel) > :global(.ant-collapse-body) { padding: 4px 16px 16px; }
+.recent + .processCard { margin-top: 12px; }
 .current { display: flex; align-items: center; gap: 10px; color: var(--ink); font-size: 13px; line-height: 1.7; }
 .progress .waiting { margin: 6px 0 0 28px; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .steps { list-style: none; padding: 0 0 0 14px; margin: 12px 0 12px 4px; max-height: 260px; overflow: auto; border-left: 1px solid var(--line, #e5e5e5); }

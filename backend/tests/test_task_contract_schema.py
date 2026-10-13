@@ -42,6 +42,9 @@ console.log(JSON.stringify(tools.map(tool => ({...tool,
     base = {"summary": "read", "completionCriteria": ["deliver"], "evidenceGap": "missing fact"}
     for call, valid in [
         (CALL, True),
+        ({key: value for key, value in CALL.items() if key != "reason"}, True),
+        ({**CALL, "reason": ""}, True),
+        ({**CALL, "reason": None}, False),
         ({**CALL, "arguments": {"input": CALL["arguments"]}}, False),
         ({**CALL, "arguments": {"language": "shell", "source": "pwd"}}, False),
         ({**CALL, "arguments": {"language": "python", "source": " "}}, False),
@@ -180,7 +183,7 @@ def test_provider_can_compile_each_branch_without_inheriting_parent_constraints(
             assert not validator.is_valid({"action": action, "summary": "next",
                                            "completionCriteria": ["done"]})
     for branch in schema["$defs"]["TaskCall"]["anyOf"]:
-        assert set(branch["required"]) == {"key", "kind", "arguments", "reason"}
+        assert set(branch["required"]) == {"key", "kind", "arguments"}
 
 
 @pytest.mark.parametrize("source", ["print(123)", "import json\nprint(json.dumps({'ok': True}))\n"])
@@ -214,3 +217,25 @@ def test_runtime_evidence_enum_and_followup_gap():
     assert not validator.is_valid(dispatch)
     assert validator.is_valid({**dispatch, "evidenceGap": "用户问执行结果，现有证据只有规范"})
     assert Draft202012Validator(task_decision_schema([])).is_valid(dispatch)
+
+
+def test_missing_call_reason_defaults_without_changing_execution_or_evidence_gate():
+    from app.application.task_contracts import task_decision_schema
+
+    call = {key: value for key, value in CALL.items() if key != "reason"}
+    decision = {"action": "dispatch", "summary": "read", "completionCriteria": ["answer"],
+                "calls": [call]}
+    parsed = TaskDecision.model_validate(decision)
+    assert parsed.calls[0].reason == ""
+    assert parsed.calls[0].arguments == CALL["arguments"]
+    assert parsed.calls[0].key == CALL["key"]
+    assert parsed.calls[0].kind == CALL["kind"]
+    validator = Draft202012Validator(task_decision_schema([{"id": "id", "status": "succeeded"}]))
+    assert not validator.is_valid(decision)
+    assert not validator.is_valid({**decision, "evidenceGap": ""})
+    assert validator.is_valid({**decision, "evidenceGap": "缺少目标文件内容，需执行读取"})
+    # User-facing questions still require a real reason, unlike execution labels.
+    with pytest.raises(ValidationError):
+        TaskDecision.model_validate({"action": "human.request", "summary": "ask",
+                                     "completionCriteria": ["answer"], "questions": [
+                                         {k: v for k, v in QUESTION.items() if k != "reason"}]})

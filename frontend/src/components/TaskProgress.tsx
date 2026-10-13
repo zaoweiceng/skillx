@@ -62,9 +62,9 @@ export default function TaskProgress({ id, finished, learningActive = false, inv
         <time>{new Date(event.createdAt).toLocaleTimeString()}</time><span>{event.label}{event.detail && <small className={styles.detail}>{event.detail}</small>}</span>
       </li>)}</ol></div>}
     </>}
-    {(steps.length > 0 || (finished && children)) && <Collapse key={`${id}-${finished}`} ghost size="small" items={[{
-      key: 'progress', label: finished ? `执行过程${steps.length ? ` · ${steps.length} 个阶段` : ''}` : '查看完整执行过程',
-      children: <>{timeline}{finished && children}</>,
+    {finished && (steps.length > 0 || children) && <Collapse className={styles.processCard} key={`${id}-${finished}`} ghost size="small" items={[{
+      key: 'progress', label: `执行过程${steps.length ? ` · ${steps.length} 个阶段` : ''}`,
+      children: <>{timeline}{children}</>,
     }]} />}
     {!finished && waiting >= 15 && <p className={styles.waiting}>距上次进展 {waiting} 秒，{running.length ? '调用尚未返回结果' : '尚未收到新的执行事件'}。</p>}
     {!finished && children}

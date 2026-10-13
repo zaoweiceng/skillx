@@ -54,12 +54,27 @@ def extraction_node_contract(data):
         "anyOf": [{"required": ["workflowVersionId", "digest"]}, {"required": ["generatedWorkflow"]}]})
     config_for("llm", {"type": "object", "required": ["outputSchema"],
                        "properties": {"outputSchema": {"type": "object"}}})
+    config_for("condition", {"type": "object", "additionalProperties": False,
+        "properties": {"operation": {"enum": ["equals", "exists", "truthy"]}, "expected": {}}})
+    conditions.append({"if": {"required": ["type"], "properties": {"type": {"const": "condition"}}},
+        "then": {"required": ["input"], "properties": {"input": {"required": ["value"]}}}})
     for selector, required in input_binding_contracts(data):
         if required:
             conditions.append({"if": {"required": ["config"], "properties": {"config": {
                 "required": list(selector), "properties": {key: {"const": value} for key, value in selector.items()}}}},
                 "then": {"required": ["input"], "properties": {"input": {"required": required}}}})
-    return {"properties": {"type": {"enum": EXTRACTION_NODE_TYPES}}, "allOf": conditions}
+    plain_ref = {"$ref": "#/$defs/ExtractionMappingValue"}
+    plain_value = {"anyOf": [
+        {"type": ["string", "number", "boolean", "null"]},
+        {"type": "array", "items": plain_ref},
+        {"type": "object", "propertyNames": {"not": {"const": "$optional"}}, "additionalProperties": plain_ref},
+    ]}
+    optional_mapping = {"type": "object", "additionalProperties": False, "required": ["$optional"],
+        "properties": {"$optional": {"type": "string", "pattern": r"^\$\{(?:input\.|[a-zA-Z][\w-]*\.output\.)[a-zA-Z0-9_-]+\}$"}}}
+    return {"$defs": {"ExtractionMappingValue": plain_value},
+            "properties": {"type": {"enum": EXTRACTION_NODE_TYPES},
+                "input": {"propertyNames": {"not": {"const": "$optional"}},
+                          "additionalProperties": {"anyOf": [plain_ref, optional_mapping]}}}, "allOf": conditions}
 
 
 def validate_extraction_nodes(definition, data):

@@ -67,6 +67,18 @@ def _resolve_reference(
 
 def resolve_value(value: Any, run_input: dict[str, Any], outputs: dict[str, Any]) -> Any:
     if isinstance(value, dict):
+        if "$optional" in value:
+            raise ExpressionError("$optional 只能用作节点 input 的直接字段值")
+        if "$if" in value:
+            branch = value["$if"]
+            if set(value) != {"$if"} or not isinstance(branch, dict) or set(branch) != {"condition", "then", "else"}:
+                raise ExpressionError("$if 必须只包含 condition、then、else")
+            condition = resolve_value(branch["condition"], run_input, outputs)
+            if not isinstance(condition, bool):
+                raise ExpressionError("$if condition 必须解析为布尔值")
+            # A skipped branch has no output. Resolve only the explicitly selected
+            # value; missing data or errors in that branch still fail normally.
+            return resolve_value(branch["then" if condition else "else"], run_input, outputs)
         return {key: resolve_value(item, run_input, outputs) for key, item in value.items()}
     if isinstance(value, list):
         return [resolve_value(item, run_input, outputs) for item in value]
@@ -92,4 +104,28 @@ def resolve_value(value: Any, run_input: dict[str, Any], outputs: dict[str, Any]
 def resolve_mapping(
     mapping: dict[str, Any], run_input: dict[str, Any], outputs: dict[str, Any]
 ) -> dict[str, Any]:
-    return resolve_value(mapping, run_input, outputs)
+    if "$optional" in mapping:
+        raise ExpressionError("$optional 不能作为 input 映射的根键")
+    result = {}
+    for key, value in mapping.items():
+        if isinstance(value, dict) and "$optional" in value:
+            reference = value["$optional"]
+            match = EXACT_REFERENCE.match(reference) if isinstance(reference, str) else None
+            field = match.group("path") if match else ""
+            if match and match.group("root") != "input" and field.startswith("output."):
+                field = field.removeprefix("output.")
+            if (set(value) != {"$optional"} or not match
+                    or not re.fullmatch(r"[a-zA-Z0-9_-]+", field)
+                    or (match.group("root") != "input" and not match.group("path").startswith("output."))):
+                raise ExpressionError("$optional 必须引用顶层 input 字段或已执行节点的 output 字段")
+            source = run_input if match.group("root") == "input" else _resolve_reference(
+                match.group("root"), "output", run_input, outputs)
+            if not isinstance(source, dict):
+                raise ExpressionError("$optional 引用的容器必须为对象")
+            # Absence preserves the callee's own default; explicit null remains
+            # a value and is still checked against the callee input schema.
+            if field in source:
+                result[key] = deepcopy(source[field])
+        else:
+            result[key] = resolve_value(value, run_input, outputs)
+    return result

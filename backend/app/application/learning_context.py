@@ -3,6 +3,26 @@ from copy import deepcopy
 import json
 
 
+def extraction_call_preview(call):
+    """Spend the planner's evidence budget on results, not process transport metadata."""
+    from app.application.task_context import observation
+
+    def preview(value, limit):
+        result = observation(value, limit)
+        if isinstance(result, dict) and result.get("truncated") is True and "preview" in result:
+            result.pop("instruction", None)  # Shared once for the entire call index.
+        return result
+
+    observed = call.get("observedOutput", call.get("output", {}))
+    if (call.get("kind") == "code" and isinstance(observed, dict)
+            and "stdout" in observed and "exitCode" in observed
+            and ("argv" in observed or "requestDigest" in observed)):
+        observed = {key: observed[key] for key in ("stdout", "stderr", "exitCode", "error") if key in observed}
+    return {"id": call["id"], "kind": call.get("kind"), "status": call["status"],
+            "input": preview(call.get("input", {}), 500),
+            "observedOutput": preview(observed, 700), "error": preview(call.get("error"), 300)}
+
+
 def _compact_workflow_process_output(call):
     """Preview oversized process envelopes, never relabel previews as evidence."""
     observed = call.get("observedOutput")
@@ -37,7 +57,7 @@ def _compact_workflow_process_output(call):
 
 def compact_catalog_context(data: dict) -> dict:
     result = deepcopy(data)
-    if "suppliedWorkflowContracts" in result or "suppliedSkillXContracts" in result:
+    if ("suppliedWorkflowContracts" in result or "suppliedSkillXContracts" in result) and not requires_external_request_evidence(result):
         for call in result.get("calls", []):
             _compact_workflow_process_output(call)
     if isinstance(result.get("fragment"), dict):
@@ -89,3 +109,9 @@ def compact_catalog_context(data: dict) -> dict:
                 interface.pop("uiSchema", None)
     catalog["capabilities"] = capabilities
     return result
+
+
+def requires_external_request_evidence(data):
+    """Keep successful protocol evidence across formatting/implementation repairs."""
+    fragment = data.get("fragment") or {}
+    return isinstance(fragment, dict) and bool(fragment.get("requiredEffects"))
