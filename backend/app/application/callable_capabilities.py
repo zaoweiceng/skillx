@@ -178,7 +178,7 @@ async def resolve_callable(session, version_id: str) -> CallableCapability:
     )
 
 
-async def callable_catalog(session) -> list[dict]:
+async def callable_catalog(session, *, include_disabled=False) -> list[dict]:
     from app.infrastructure.models import ManagedSkill
 
     managed = list(await session.scalars(select(ManagedSkill)))
@@ -212,10 +212,15 @@ async def callable_catalog(session) -> list[dict]:
     )
     archived = set(await session.scalars(select(WorkflowVersion.id).join(Workflow).where(
         Workflow.draft_metadata_json["archived"].as_boolean().is_(True))))
+    from app.infrastructure.models import CapabilityAvailability
+    disabled = set(await session.scalars(select(CapabilityAvailability.capability_id).where(CapabilityAvailability.enabled.is_(False))))
     result = []
     for version_id in dict.fromkeys(version_ids):
         if version_id not in archived:
-            result.append((await resolve_callable(session, version_id)).contract)
+            contract = (await resolve_callable(session, version_id)).contract
+            enabled = contract["capabilityId"] not in disabled
+            if include_disabled or enabled:
+                result.append({**contract, "enabled": enabled})
     return result
 
 

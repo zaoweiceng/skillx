@@ -172,8 +172,14 @@ class TaskDecision(BaseModel):
         return self
 
 
-def task_decision_schema(calls: list[dict], state: dict | None = None) -> dict:
-    """Bind evidence at generation time instead of asking the model to copy UUID prose."""
+def task_decision_schema(
+    calls: list[dict], state: dict | None = None, *, current_call_ids: set[str] | None = None,
+) -> dict:
+    """Bind runtime evidence to the authoritative Host validation contract.
+
+    Pi projects this into stable provider tools; state-dependent membership and
+    follow-up requirements are still enforced here after generation.
+    """
     schema = TaskDecision.model_json_schema()
     # Transport metadata, not a relaxation of the canonical decision contract.
     # Pi presents one small tool per action; stable control fields need not be
@@ -185,16 +191,19 @@ def task_decision_schema(calls: list[dict], state: dict | None = None) -> dict:
         },
     }
     ids = [call["id"] for call in calls if call["status"] == "succeeded"]
+    # Historical evidence is legal to cite, but an unrelated follow-up must not
+    # be forced to cite it. Existing callers retain their task-local semantics.
+    requires_evidence = bool(ids if current_call_ids is None else set(ids) & current_call_ids)
     evidence = {"type": "array", "uniqueItems": True, "maxItems": len(ids),
                 "items": {"type": "string", "enum": ids} if ids else {"type": "string"}}
     schema["properties"]["evidence"] = evidence
     for branch in schema["anyOf"]:
         branch["properties"]["evidence"] = deepcopy(evidence)
         action = branch["properties"]["action"]["const"]
-        if action == "complete" and ids:
+        if action == "complete" and requires_evidence:
             branch["required"].append("evidence")
             branch["properties"]["evidence"]["minItems"] = 1
-        if action == "dispatch" and ids:
+        if action == "dispatch" and requires_evidence:
             branch["required"].append("evidenceGap")
             branch["properties"]["evidenceGap"]["minLength"] = 1
     return schema

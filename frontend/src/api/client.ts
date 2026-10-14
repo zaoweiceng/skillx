@@ -1,5 +1,7 @@
 import { API_BASE, request } from './http'
 
+export type ChatWorkspaceSummary = { path: string; name: string }
+
 export type NodeDefinition = {
   id: string
   type: string
@@ -812,12 +814,12 @@ export const api = {
         currentVersionId: string | null
       }>
     >('/capabilities'),
-  createConversation: (title: string) =>
+  createConversation: (title: string, workspacePath?: string) =>
     request<{ id: string; title: string; workflowMode: 'enabled' | 'disabled' }>(
       '/conversations',
       {
       method: 'POST',
-      body: JSON.stringify({ title }),
+      body: JSON.stringify({ title, workspacePath }),
       },
     ),
   extractConversationWorkflows: (id: string, budget?: { maxDurationSeconds: number; maxTokens: number; requireWorkflowComposition: boolean }) =>
@@ -828,15 +830,19 @@ export const api = {
     }),
   deleteConversation: (id: string) =>
     request<{ id: string; deleted: boolean }>(`/conversations/${id}`, { method: 'DELETE' }),
-  listChatWorkspaces: () => request<{ items: string[] }>('/chat-workspaces'),
-  addChatWorkspace: (workingDirectory: string) => request<{ path: string }>('/chat-workspaces', {
+  listChatWorkspaces: () => request<{ items: ChatWorkspaceSummary[] }>('/chat-workspaces'),
+  addChatWorkspace: (workingDirectory: string) => request<ChatWorkspaceSummary>('/chat-workspaces', {
     method: 'POST', body: JSON.stringify({ workingDirectory }),
   }),
-  listConversations: (cursor?: string, query?: string, workingDirectory?: string) => {
+  updateChatWorkspace: (path: string, changes: { name?: string; workingDirectory?: string }) =>
+    request<ChatWorkspaceSummary>('/chat-workspaces', { method: 'PATCH', body: JSON.stringify({ path, ...changes }) }),
+  deleteChatWorkspace: (path: string, deleteConversations: boolean) =>
+    request<{ deleted: boolean; conversationIds: string[] }>(`/chat-workspaces?${new URLSearchParams({ path, delete_conversations: String(deleteConversations) })}`, { method: 'DELETE' }),
+  listConversations: (cursor?: string, query?: string, workspacePath?: string) => {
     const params = new URLSearchParams({ limit: '30' })
     if (cursor) params.set('cursor', cursor)
     if (query) params.set('query', query)
-    if (workingDirectory !== undefined) params.set('workingDirectory', workingDirectory)
+    if (workspacePath !== undefined) params.set('workspacePath', workspacePath)
     return request<{ items: ConversationSummary[]; nextCursor: string | null }>(
       `/conversations?${params}`,
     )

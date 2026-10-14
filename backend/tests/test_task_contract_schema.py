@@ -53,11 +53,58 @@ console.log(JSON.stringify(tools.map(tool => ({...tool,
     ]:
         assert validator.is_valid({**base, "calls": [call]}) is valid
     assert not validator.is_valid({**base, "calls": []})
-    assert not validator.is_valid({"summary": "read", "completionCriteria": ["deliver"],
-                                   "calls": [CALL]})
+    assert validator.is_valid({"summary": "read", "completionCriteria": ["deliver"],
+                              "calls": [CALL]})
     validator = Draft202012Validator(complete["parameters"])
-    assert not validator.is_valid({"answer": "ok", "evidence": ["unknown-id"]})
+    assert validator.is_valid({"answer": "ok", "evidence": ["unknown-id"]})
+    assert not Draft202012Validator(schema).is_valid({
+        **complete["sample"], "evidence": ["unknown-id"],
+    })
     assert not validator.is_valid({"answer": "ok", "evidence": ["evidence-1"], "calls": [CALL]})
+
+
+def test_action_tool_schemas_are_stable_across_execution_state():
+    from app.application.task_contracts import task_decision_schema
+
+    states = [
+        ([], {}),
+        ([{"id": "one", "status": "succeeded"}], {"completionCriteria": ["first"]}),
+        ([{"id": "other", "status": "succeeded"},
+          {"id": "two", "status": "succeeded"},
+          {"id": "failed", "status": "failed"}], {"completionCriteria": ["different", "criteria"]}),
+    ]
+    schemas = [task_decision_schema(calls, state) for calls, state in states]
+    script = """
+import { resultTools } from './bridges/pi/result-tools.mjs';
+import { readFileSync } from 'node:fs';
+const schemas = JSON.parse(readFileSync(0, 'utf8'));
+const original = JSON.stringify(schemas);
+const projections = schemas.map(schema => resultTools(schema).map(tool => ({
+  name: tool.name, description: tool.description, parameters: tool.parameters,
+})));
+if (JSON.stringify(schemas) !== original) throw new Error('Canonical schema mutated');
+console.log(JSON.stringify(projections));
+"""
+    projections = json.loads(subprocess.run(
+        ["node", "--input-type=module", "-e", script], input=json.dumps(schemas),
+        text=True, capture_output=True, check=True, cwd=Path(__file__).parents[2],
+    ).stdout)
+    assert projections[0] == projections[1] == projections[2]
+    tools = {tool["name"]: tool for tool in projections[0]}
+    complete = {"answer": "done", "evidence": ["invented"]}
+    assert Draft202012Validator(tools["task_complete"]["parameters"]).is_valid(complete)
+    dispatch = {"summary": "read", "completionCriteria": ["deliver"], "calls": [CALL]}
+    provider = Draft202012Validator(tools["task_dispatch"]["parameters"])
+    assert provider.is_valid(dispatch)
+    assert provider.is_valid({**dispatch, "evidenceGap": ""})
+    for schema in schemas:
+        host = Draft202012Validator(schema)
+        assert not host.is_valid({**complete, "action": "complete", "summary": "done",
+                                  "completionCriteria": ["deliver"]})
+    for schema in schemas[1:]:
+        host = Draft202012Validator(schema)
+        assert not host.is_valid({**dispatch, "action": "dispatch"})
+        assert not host.is_valid({**dispatch, "action": "dispatch", "evidenceGap": ""})
 
 
 @pytest.mark.parametrize(("fields", "valid"), [
@@ -239,3 +286,18 @@ def test_missing_call_reason_defaults_without_changing_execution_or_evidence_gat
         TaskDecision.model_validate({"action": "human.request", "summary": "ask",
                                      "completionCriteria": ["answer"], "questions": [
                                          {k: v for k, v in QUESTION.items() if k != "reason"}]})
+
+
+def test_historical_evidence_is_optional_for_an_unrelated_new_goal():
+    from app.application.task_contracts import task_decision_schema
+
+    calls = [{"id": "old-read", "status": "succeeded"}]
+    validator = Draft202012Validator(task_decision_schema(calls, current_call_ids=set()))
+    answer = {"action": "complete", "summary": "回答", "completionCriteria": ["回答"],
+              "answer": "你好"}
+    assert validator.is_valid(answer)
+    assert validator.is_valid({**answer, "evidence": ["old-read"]})
+    assert not validator.is_valid({**answer, "evidence": ["invented"]})
+    required = Draft202012Validator(task_decision_schema(calls, current_call_ids={"old-read"}))
+    assert not required.is_valid(answer)
+    assert required.is_valid({**answer, "evidence": ["old-read"]})

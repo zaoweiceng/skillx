@@ -47,6 +47,8 @@ async def approve(
     approval_id: str,
     body: Decision,
     session: AsyncSession,
+    *,
+    provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     approval = await session.get(Approval, approval_id)
     if approval is None:
@@ -71,8 +73,27 @@ async def approve(
     node_run = await session.get(NodeRun, approval.node_run_id)
     if node_run is None or node_run.status != "waiting_user":
         raise HTTPException(409, "关联节点不在等待状态")
+    run = await session.get(Run, approval.run_id)
+    if not run or run.cancellation_requested_at or run.status in {"failed", "cancelled", "succeeded"}:
+        raise HTTPException(409, "运行已结束或取消")
+    if effect == "workflow.run":
+        from app.application.run_authorization import approval_plan, covers
+        plan = approval.snapshot_json.get("plan")
+        if (
+            not isinstance(plan, dict)
+            or plan != await approval_plan(session, run.id)
+            or not covers(plan, node_run.node_id, approval.snapshot_json.get("operation"),
+                          approval.snapshot_json.get("versionDigest"))
+        ):
+            raise HTTPException(409, "工作流执行计划已变化")
+    if effect == "skillx.invoke" and "operationContext" in approval.snapshot_json:
+        from app.application.run_authorization import operation_context
+        if approval.snapshot_json["operationContext"] != await operation_context(
+            session, run.id, node_run.id, approval.snapshot_json.get("operation", {})
+        ):
+            raise HTTPException(409, "当前操作输入或上游执行证据已变化")
     approval.status = "approved"
-    approval.decided_by = "local-user"
+    approval.decided_by = "dsh-host-policy" if provenance else "local-user"
     approval.decided_at = utcnow()
     if node_run.node_type == "browser" and effect == "form.submit":
         authorization_digest_value = approval.snapshot_json.get("authorizationDigest")
@@ -86,7 +107,7 @@ async def approve(
         node_run.output_json = None
         node_run.error_json = None
         node_run.available_at = utcnow()
-    elif node_run.node_type == "skillx" and effect == "skillx.invoke":
+    elif node_run.node_type == "skillx" and effect in {"skillx.invoke", "workflow.run"}:
         node_run.status = "ready"
         node_run.output_json = None
         node_run.error_json = None
@@ -120,7 +141,8 @@ async def approve(
         session,
         approval.run_id,
         "approval.resolved",
-        {"approvalId": approval.id, "nodeId": approval.node_id, "status": "approved"},
+        {"approvalId": approval.id, "nodeId": approval.node_id, "status": "approved",
+         **({"authorization": provenance} if provenance else {})},
         node_run.id,
     )
     await orchestrator.advance_run(session, approval.run_id)

@@ -66,7 +66,8 @@ async def test_pi_sdk_returns_validated_output(
             },
         ]
         if not with_tool and structured_mode == 'json_schema':
-            chunks[0]['choices'][0]['delta'] = {'role': 'assistant', 'content': '0', 'tool_calls': [{
+            chunks[0]['choices'][0]['delta'] = {
+                'role': 'assistant', 'content': '0', 'tool_calls': [{
                 'index': 0, 'id': 'submit-1', 'type': 'function',
                 'function': {'name': 'submit_result', 'arguments': '{"reply":"ok"}'},
             }]}
@@ -168,19 +169,16 @@ async def test_pi_sdk_returns_validated_output(
                 assert image_parts[0]["image_url"]["url"] == f"data:image/png;base64,{image_data}"
         assert requests == expected_requests
         # Pi supplies the contract once: via response_format for json_schema,
-        # otherwise via the system prompt. Host task data must not repeat it.
+        # otherwise via the current user message, never a changing system prefix.
         for request in received:
             assert request.get("max_tokens", request.get("max_completion_tokens")) == 37
             user_text = json.dumps([
                 message for message in request["messages"] if message["role"] == "user"
             ])
-            assert "outputSchema=" not in user_text
+            assert ("outputSchema=" in user_text) == (structured_mode != 'json_schema')
             system_text = next(message["content"] for message in request["messages"]
                                if message["role"] in {"system", "developer"})
-            if not with_tool and structured_mode == 'json_schema':
-                assert '"required"' not in system_text
-            else:
-                assert '"required"' in system_text
+            assert '"required"' not in system_text
 
         responses = [
             json.loads(event["payload"]["data"])
@@ -189,9 +187,15 @@ async def test_pi_sdk_returns_validated_output(
         ]
         assert responses[0]["usage"]["cacheRead"] == cache_tokens
         assert responses[0]["rawUsage"]["prompt_tokens"] == 10
-        assert responses[0]["rawUsage"].get("prompt_tokens_details", {}).get("cached_tokens") == cache_tokens
+        assert (
+            responses[0]["rawUsage"].get("prompt_tokens_details", {}).get("cached_tokens")
+            == cache_tokens
+        )
         if not with_tool and structured_mode == 'json_schema':
-            assert any(item.get('name') == 'submit_result' and item['arguments'] == {'reply': 'ok'} for item in responses[-1]['content'])
+            assert any(
+                item.get('name') == 'submit_result' and item['arguments'] == {'reply': 'ok'}
+                for item in responses[-1]['content']
+            )
         else:
             assert responses[-1]["content"][0]["text"] == '{"reply":"ok"}'
         assert "test-local-key" not in json.dumps(result.audit_events)
@@ -201,13 +205,16 @@ async def test_pi_sdk_returns_validated_output(
             if event["type"] == "agent.step.completed"
         ]
         assert all(
-            event["cacheReadTokens"] == cache_tokens and event["durationMs"] >= 0 for event in completed
+            event["cacheReadTokens"] == cache_tokens and event["durationMs"] >= 0
+            for event in completed
         )
         assert len(received) == (2 if with_tool else 1)
         assert received[0]["model"] == "test-model"
         for request in received:
             if not with_tool and structured_mode == 'json_schema':
-                assert request['tool_choice'] == {'type': 'function', 'function': {'name': 'submit_result'}}
+                assert request['tool_choice'] == {
+                    'type': 'function', 'function': {'name': 'submit_result'}
+                }
                 assert request['tools'][0]['function']['parameters']['required'] == ['reply']
                 assert 'response_format' not in request
             elif structured_mode == "prompt":

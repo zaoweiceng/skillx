@@ -50,3 +50,5 @@ fragment.requiredEffects 是来源成功调用证据中确定的外部 HTTP 义�
 
 带条件分支的工作流由成功样例集合共同覆盖 requiredEffects，而非要求每个分支均产生所有副作用。例如已有同内容记录的复用分支只提供 GET fixture；缺失记录的新建分支提供 GET、POST、回读 fixture。每个样例自己的请求队列仍必须全部实际消费，不可为了覆盖 write 让只读复用分支进行写入。
 有查重分支时，样例必须实际覆盖复用与新建两路，不能只跑新建来隐藏跳过节点的映射错误；标题相同不等于内容相同，复用前仍按业务要求核对简介、分类、标签、正文等字段。无法覆盖原目标就明确报告缺口，不以修改样例绕过。
+
+执行期间才产生的动态标识不能在 setup 中预测。HTTP fixture 可带 prepare Python 脚本：每次对应 HTTP 请求前在同一隔离目录的独立进程运行，变量 requestJson/responseJson 初始为 fixture 的静态值；脚本可从当前独立持久状态读取标识并更新这两个变量。不给实际请求体或候选模块；Host 仍全量精确比较 method、URL 和最终 requestJson，不允许额外字段，顺序/消费要求不变。例如前置节点真实创建了状态文件 runtime-id.txt，可写 prepare="from pathlib import Path\nid = Path('runtime-id.txt').read_text().strip()\nrequestJson['resourceId'] = id\nresponseJson['resourceId'] = id"，并在 verify 独立断言实际文件/业务状态与 httpRequests、result 的关联。prepare 不得导入、复制或调用候选实现来生成预期，不得从实际请求捕获值再自证；必须从业务独立可观测状态推导。脚本最多 5 秒、输出最多 1 MiB，网络仍被 OS 沙箱禁止。${fixture.key} 仅用于 setup 后已知值；prepare 用于执行期间新增值。不要通过固定时间、预测哈希或安装测试 hook 绕过动态状态。

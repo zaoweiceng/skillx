@@ -11,6 +11,7 @@ from jsonschema import ValidationError
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select, update
 
+from app.application.compiler import digest_json
 from app.application.invocations import enqueue_invocation
 from app.application.tasks import TERMINAL, answer_human, cancel_task
 from app.infrastructure.database import (
@@ -61,6 +62,17 @@ def invocation_view(item):
     }
 
 
+async def invocation_result_view(session, item):
+    """Attach runtime evidence only for a completed, individually requested call."""
+    from app.application.execution_receipts import build_execution_receipt
+
+    result = invocation_view(item)
+    receipt = await build_execution_receipt(session, item)
+    if receipt is not None:
+        result["executionReceipt"] = receipt
+    return result
+
+
 async def task_view(session, task):
     calls = list(
         await session.scalars(
@@ -83,6 +95,12 @@ async def task_view(session, task):
                     "runId": a.run_id,
                     "snapshotDigest": a.snapshot_digest,
                     "snapshot": a.snapshot_json,
+                    "authorizationDigest": digest_json(a.snapshot_json["plan"])
+                    if isinstance(a.snapshot_json.get("plan"), dict)
+                    else digest_json(a.snapshot_json["operationContext"])
+                    if isinstance(a.snapshot_json.get("operationContext"), dict) else None,
+                    "planDigest": digest_json(a.snapshot_json["plan"])
+                    if isinstance(a.snapshot_json.get("plan"), dict) else None,
                     "status": a.status,
                 }
                 for a in await session.scalars(
@@ -273,10 +291,29 @@ class InvocationCreate(BaseModel):
 
 
 @router.get("/capability-catalog")
-async def capability_catalog(session=Depends(get_session)):
+async def capability_catalog(session=Depends(get_session), include_disabled: bool = False):
     from app.application.callable_capabilities import callable_catalog
 
-    return await callable_catalog(session)
+    return await callable_catalog(session, include_disabled=include_disabled)
+
+
+class CapabilityAvailabilityUpdate(BaseModel):
+    enabled: bool = Field(strict=True)
+
+
+@router.patch("/capabilities/{capability_id}/availability")
+async def update_capability_availability(capability_id: str, body: CapabilityAvailabilityUpdate, session=Depends(get_session)):
+    from app.infrastructure.models import Capability, Workflow, CapabilityAvailability
+    if await session.get(Capability, capability_id) is None and await session.get(Workflow, capability_id) is None:
+        raise HTTPException(404, "能力不存在")
+    state = await session.get(CapabilityAvailability, capability_id)
+    if state is None:
+        state = CapabilityAvailability(capability_id=capability_id, enabled=body.enabled)
+        session.add(state)
+    else:
+        state.enabled = body.enabled
+    await session.commit()
+    return {"capabilityId": capability_id, "enabled": state.enabled}
 
 
 @router.get("/capability-versions/{version_id}/contract")
@@ -303,7 +340,7 @@ async def create_invocation(version_id: str, body: InvocationCreate, session=Dep
             key=body.idempotencyKey,
         )
         await session.commit()
-        return invocation_view(item)
+        return await invocation_result_view(session, item)
     except (ValueError, ValidationError) as exc:
         raise HTTPException(422, str(exc)) from exc
 
@@ -344,7 +381,7 @@ async def invocation(invocation_id: str, session=Depends(get_session)):
     item = await session.get(Invocation, invocation_id)
     if item is None:
         raise HTTPException(404, "Invocation 不存在")
-    return invocation_view(item)
+    return await invocation_result_view(session, item)
 
 
 @router.post("/invocations/{invocation_id}/cancel")

@@ -296,6 +296,7 @@ class SkillXExecutor:
             from sqlalchemy import select
 
             from app.infrastructure.database import Approval, CapabilityVersion, SessionLocal
+            from app.application.run_authorization import approval_plan, covers, operation_context
 
             operation = {
                 "versionId": node.config["capabilityVersionId"],
@@ -312,14 +313,26 @@ class SkillXExecutor:
                 if required:
                     approvals = await session.scalars(
                         select(Approval).where(
-                            Approval.node_run_id == context.node_run_id,
+                            Approval.run_id == context.run_id,
                             Approval.status == "approved",
                         )
                     )
+                    plan = await approval_plan(session, context.run_id)
+                    exact_context = await operation_context(
+                        session, context.run_id, context.node_run_id, operation
+                    )
                     approved = any(
-                        a.snapshot_json.get("operation") == operation
+                        (a.node_run_id == context.node_run_id
+                        and a.snapshot_json.get("effect") == "skillx.invoke"
+                        and a.snapshot_json.get("operation") == operation
                         and a.snapshot_json.get("versionDigest") == version.digest
-                        and a.snapshot_digest == digest_json(a.snapshot_json)
+                        and (not a.snapshot_json.get("operationContext")
+                             or a.snapshot_json["operationContext"] == exact_context)
+                        and a.snapshot_digest == digest_json(a.snapshot_json))
+                        or (a.snapshot_json.get("effect") == "workflow.run"
+                            and a.snapshot_digest == digest_json(a.snapshot_json)
+                            and a.snapshot_json.get("plan") == plan
+                            and covers(plan, node.id, operation, version.digest))
                         for a in approvals
                     )
                     if not approved:
@@ -333,6 +346,14 @@ class SkillXExecutor:
                             "payload": inputs,
                             "versionDigest": version.digest,
                         }
+                        if exact_context:
+                            snapshot["operationContext"] = exact_context
+                        if covers(plan, node.id, operation, version.digest):
+                            snapshot.update(
+                                effect="workflow.run", title="批准本次工作流执行计划",
+                                description="仅授权本次运行列出的具体操作、输入和锁定版本；动态操作另行审批。",
+                                plan=plan,
+                            )
                         return NodeResult(
                             status="waiting_user",
                             output={

@@ -33,3 +33,5 @@ text = "---\n" + json.dumps(meta, ensure_ascii=False) + "\n---\n\nBody"
 Path(".skillx-fixture.json").write_text(json.dumps({"expectedRequest": {"text": text, "expected_hash": ""}}, ensure_ascii=False))
 ```
 这是 fixture 准备模式示例，字段和输入须按业务契约补全。setup 独立使用业务输入与标准序列化，不导入或调用候选实现生成预期。verify 仍从 httpRequests 取实际请求体，独立解析文本并与 inputs 逐字段比较，确保数组、引号、换行等保持类型与值；不能比较候选与其自身输出。method/url/status/responseJson 保持普通字段，不能把整个 httpFixtures 项替换成字符串。
+
+执行期间才产生的动态标识不能在 setup 中预测。HTTP fixture 可带 prepare Python 脚本：每次对应 HTTP 请求前在同一隔离目录的独立进程运行，变量 requestJson/responseJson 初始为 fixture 的静态值；脚本可从当前独立持久状态读取标识并更新这两个变量。不给实际请求体或候选模块；Host 仍全量精确比较 method、URL 和最终 requestJson，不允许额外字段，顺序/消费要求不变。例如前置节点真实创建了状态文件 runtime-id.txt，可写 prepare="from pathlib import Path\nid = Path('runtime-id.txt').read_text().strip()\nrequestJson['resourceId'] = id\nresponseJson['resourceId'] = id"，并在 verify 独立断言实际文件/业务状态与 httpRequests、result 的关联。prepare 不得导入、复制或调用候选实现来生成预期，不得从实际请求捕获值再自证；必须从业务独立可观测状态推导。脚本最多 5 秒、输出最多 1 MiB，网络仍被 OS 沙箱禁止。${fixture.key} 仅用于 setup 后已知值；prepare 用于执行期间新增值。不要通过固定时间、预测哈希或安装测试 hook 绕过动态状态。

@@ -136,3 +136,10 @@ class BrowserRuntimeHeartbeat(Base, TimestampMixin):
     playwright_version: Mapped[str | None] = mapped_column(String(80), nullable=True)
     launch_succeeded: Mapped[bool] = mapped_column(Boolean, default=False)
     evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+
+
+class CapabilityAvailability(Base):
+    """Mutable availability shared by all immutable versions of a capability."""
+    __tablename__ = "capability_availability"
+    capability_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

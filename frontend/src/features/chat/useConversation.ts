@@ -357,7 +357,7 @@ export function useConversation() {
     try {
       let targetId = conversationId || pendingConversationRef.current
       if (!targetId) {
-        const created = await api.createConversation('新对话')
+        const created = await api.createConversation('新对话', location.state?.workspacePath)
         targetId = created.id
         pendingConversationRef.current = targetId
       }
@@ -401,14 +401,25 @@ export function useConversation() {
     }
   }
 
-  function createNewConversation(directory?: string) {
+  function createNewConversation(directory?: string, workspacePath?: string) {
     pendingConversationRef.current = ''
     setWorkingDirectory(undefined)
     setInput('')
     setError('')
     setHistoryOpen(false)
     setDraftSelection(readSelectionPreference())
-    navigate('/chat', { state: { workingDirectory: directory } })
+    navigate('/chat', { state: { workingDirectory: directory, workspacePath } })
+  }
+
+  async function workspaceChanged(path: string, nextPath?: string, deletedIds: string[] = []) {
+    setHistory(current => current.filter(item => !deletedIds.includes(item.id)))
+    if (deletedIds.includes(conversationId)) {
+      createNewConversation()
+    } else if (conversationId) {
+      await refresh()
+    } else if (location.state?.workspacePath === path) {
+      navigate('/chat', { replace: true, state: { workingDirectory: nextPath ?? workingDirectory, workspacePath: nextPath } })
+    }
   }
 
   async function renameConversation(id: string, title: string) {
@@ -556,5 +567,5 @@ export function useConversation() {
     }
   }
 
-  return { cacheUsage: turns.flatMap(turn => turn.usage.stages), canStop, stopping, refresh, workingDirectory, changeWorkingDirectory, draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, workflowMode, workflowSelectionAvailable, switchingMode, clock, optimisticStartedAt, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill }
+  return { workspaceChanged, cacheUsage: turns.flatMap(turn => turn.usage.stages), canStop, stopping, refresh, workingDirectory, changeWorkingDirectory, draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyCursor, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, workflowMode, workflowSelectionAvailable, switchingMode, clock, optimisticStartedAt, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, loadMoreHistory, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill }
 }

@@ -59,3 +59,7 @@
   .footerActions button { width: 30px; padding: 0; }
   .navItem { padding: 7px 5px; }
 }
+
+/* Embedded views use the host navigation, including at mobile widths. */
+.shell.embedded { display: block; padding-bottom: 0; }
+.embedded .workspace { width: 100%; }

@@ -966,6 +966,60 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/learning-jobs/{job_id}/revise": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Revise Learning Artifacts */
+        post: operations["revise_learning_artifacts_api_learning_jobs__job_id__revise_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/conversations/{conversation_id}/extract-workflows": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Extract Conversation Workflows */
+        post: operations["extract_conversation_workflows_api_conversations__conversation_id__extract_workflows_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/chat-workspaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Chat Workspaces */
+        get: operations["list_chat_workspaces_api_chat_workspaces_get"];
+        put?: never;
+        /** Add Chat Workspace */
+        post: operations["add_chat_workspace_api_chat_workspaces_post"];
+        /** Delete Chat Workspace */
+        delete: operations["delete_chat_workspace_api_chat_workspaces_delete"];
+        options?: never;
+        head?: never;
+        /** Update Chat Workspace */
+        patch: operations["update_chat_workspace_api_chat_workspaces_patch"];
+        trace?: never;
+    };
     "/api/conversations/{conversation_id}": {
         parameters: {
             query?: never;
@@ -1647,6 +1701,57 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/monitoring/metrics/{metric}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Metric Value */
+        get: operations["metric_value_api_monitoring_metrics__metric__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/monitoring/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Sessions */
+        get: operations["sessions_api_monitoring_sessions_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/monitoring/sessions/{session_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Session Records */
+        get: operations["session_records_api_monitoring_sessions__session_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/runtime-profiles": {
         parameters: {
             query?: never;
@@ -1931,6 +2036,15 @@ export interface components {
             /** Content */
             content: string;
         };
+        /** ChatWorkspaceUpdate */
+        ChatWorkspaceUpdate: {
+            /** Path */
+            path: string;
+            /** Name */
+            name?: string | null;
+            /** Workingdirectory */
+            workingDirectory?: string | null;
+        };
         /** ComponentConfirm */
         ComponentConfirm: {
             /** Componentid */
@@ -1970,6 +2084,8 @@ export interface components {
         };
         /** ConversationCreate */
         ConversationCreate: {
+            /** Workspacepath */
+            workspacePath?: string | null;
             /**
              * Title
              * @default 新对话
@@ -2062,6 +2178,18 @@ export interface components {
             sessionId: string;
             /** Actions */
             actions: components["schemas"]["DshTaskAction"][];
+        };
+        /** ExtractionBudget */
+        ExtractionBudget: {
+            /** Maxdurationseconds */
+            maxDurationSeconds: number;
+            /** Maxtokens */
+            maxTokens: number;
+            /**
+             * Requireworkflowcomposition
+             * @default false
+             */
+            requireWorkflowComposition: boolean;
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -2215,7 +2343,7 @@ export interface components {
             apiKey?: string | null;
             /**
              * Timeoutseconds
-             * @default 60
+             * @default 300
              */
             timeoutSeconds: number;
             /** Apikeyenv */
@@ -4316,6 +4444,8 @@ export interface operations {
     list_conversations_api_conversations_get: {
         parameters: {
             query?: {
+                workingDirectory?: string | null;
+                workspacePath?: string | null;
                 cursor?: string | null;
                 limit?: number;
                 query?: string | null;
@@ -4370,6 +4500,196 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    revise_learning_artifacts_api_learning_jobs__job_id__revise_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                job_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    [key: string]: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    extract_conversation_workflows_api_conversations__conversation_id__extract_workflows_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                conversation_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ExtractionBudget"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_chat_workspaces_api_chat_workspaces_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    add_chat_workspace_api_chat_workspaces_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ConversationDirectoryUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_chat_workspace_api_chat_workspaces_delete: {
+        parameters: {
+            query: {
+                path: string;
+                delete_conversations?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_chat_workspace_api_chat_workspaces_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatWorkspaceUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
             /** @description Validation Error */
@@ -5673,6 +5993,109 @@ export interface operations {
             header?: never;
             path: {
                 run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    metric_value_api_monitoring_metrics__metric__get: {
+        parameters: {
+            query?: {
+                start?: string | null;
+                end?: string | null;
+                timezone_offset?: number;
+            };
+            header?: never;
+            path: {
+                metric: "tokens" | "duration" | "success" | "skillx" | "workflow" | "failure" | "reasons";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    sessions_api_monitoring_sessions_get: {
+        parameters: {
+            query?: {
+                start?: string | null;
+                end?: string | null;
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    session_records_api_monitoring_sessions__session_id__get: {
+        parameters: {
+            query?: {
+                offset?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                session_id: string;
             };
             cookie?: never;
         };

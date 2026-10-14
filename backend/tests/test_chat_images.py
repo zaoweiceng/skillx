@@ -69,7 +69,8 @@ async def test_images_survive_reload_reach_agent_and_follow_up(monkeypatch, tmp_
     async with SessionLocal() as session:
         await create_message(conversation_id, MessageCreate(content="继续分析刚才的图"), session)
     assert await TaskDriver().poll_once()
-    assert requests[1].images == requests[0].images
+    assert requests[1].images == []
+    assert requests[1].messages[0]["images"] == requests[0].images
 
 
 async def test_text_only_model_rejects_images_before_acceptance(monkeypatch):

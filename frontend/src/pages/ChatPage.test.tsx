@@ -211,6 +211,19 @@ describe('ChatPage 候选组件闭环', () => {
     expect(createConversation).toHaveBeenCalledTimes(1)
   })
 
+  it.each([undefined, '/code/project'])('执行目录与工作区归属独立：%s', async workspacePath => {
+    getConversation.mockResolvedValue({ id: 'conv-1', title: '新对话', messages: [], turns: [] })
+    sendMessage.mockResolvedValue({ assistant: { type: 'text', text: '收到' } })
+    render(<MemoryRouter initialEntries={[{ pathname: '/chat', state: { workingDirectory: '/code/project', workspacePath } }]}>
+      <Routes><Route path="/chat" element={<ChatPage />} /><Route path="/chat/:id" element={<ChatPage />} /></Routes>
+    </MemoryRouter>)
+    await waitFor(() => expect(listConversations).toHaveBeenCalled())
+    fireEvent.change(screen.getByRole('textbox', { name: '对话输入' }), { target: { value: '读取目录' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    await waitFor(() => expect(createConversation).toHaveBeenCalledWith('新对话', workspacePath))
+    await waitFor(() => expect(sendMessage).toHaveBeenCalledWith('conv-1', '读取目录', [], '/code/project'))
+  })
+
   it('入口不要求用户切换工作流模式', async () => {
     getHealth.mockResolvedValue({ workflowSelectionMode: 'unavailable' })
     getConversation.mockResolvedValue({

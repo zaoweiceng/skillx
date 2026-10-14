@@ -12,7 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from app.application.agent_host import AgentHost, AgentHostError, AgentHostRequest
-from app.application.runtime_config import agent_runtime_config
+from app.application.runtime_config import adapter_source_digest, agent_runtime_config
 from app.application.tool_broker import ToolAdapterRegistry, ToolExecutionContext
 from app.config import get_settings
 from app.infrastructure.runtime_credentials import resolve_runtime_key
@@ -64,7 +64,7 @@ def _adapter_trust(sidecar_digest: str) -> tuple[bool, str]:
         return True, runtime.adapter_version
     if runtime.type == "pi":
         bridge = Path(__file__).resolve().parents[3] / "bridges/pi/bridge.mjs"
-        expected = "sha256:" + hashlib.sha256(bridge.read_bytes()).hexdigest()
+        expected = adapter_source_digest(bridge)
         if sidecar_digest == expected:
             return True, "pi-sdk-bridge/v1"
     configured = set(get_settings().agent_trusted_adapter_digests)

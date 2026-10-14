@@ -269,6 +269,8 @@ def validate_extraction(plan: ExtractionPlan, context: dict, *, check_dependenci
         if fragments:
             raise ValueError("skip 不能同时派发片段")
         return
+    if context.get("requirements", {}).get("requireWorkflow") and not workflows:
+        raise ValueError("本次要求总结可执行工作流，不能仅生成 Skill 或 SkillX")
     if not fragments:
         raise ValueError("candidate 必须包含可复用片段")
     names = [fragment.name for fragment in fragments]
@@ -609,6 +611,14 @@ class LearningAgentPipeline:
         if role == "extractor" and not phase:
             from app.application.extraction_reuse import bind_reuse_schema
             schema = bind_reuse_schema(schema, data)
+            if data.get("requirements", {}).get("requireWorkflow"):
+                schema.setdefault("allOf", []).append({
+                    "if": {"properties": {"decision": {"const": "candidate"}}},
+                    "then": {"anyOf": [
+                        {"required": ["workflows"], "properties": {"workflows": {"minItems": 1}}},
+                        {"required": ["workflow"], "properties": {"workflow": {"type": "object"}}},
+                    ]},
+                })
         if role == "workflow":
             schema = bind_workflow_schema(schema, data)
         if role == "skillx" and phase == "repair":
@@ -801,8 +811,7 @@ class LearningAgentPipeline:
             if isinstance(exc, AgentOutputValidationError):
                 raw_output = exc.candidate
             transport = (getattr(exc, "reported_error", None) or {}).get("outputParseError")
-            graph_json_error = (role == "workflow" and phase == "graph"
-                and isinstance(exc, AgentHostError) and exc.code == "MODEL_MALFORMED_OUTPUT"
+            transport_json_error = (isinstance(exc, AgentHostError) and exc.code == "MODEL_MALFORMED_OUTPUT"
                 and isinstance(transport, dict) and transport.get("kind") == "invalid_json"
                 and transport.get("stopReason") == "toolUse" and transport.get("truncated") is False
                 and isinstance(transport.get("rawArguments"), str))
@@ -811,17 +820,19 @@ class LearningAgentPipeline:
             await self._record(
                 key,
                 {"status": "failed", "error": feedback, "finishedAt": rfc3339(utcnow()),
-                 **({"formatRepairCandidate": transport, "output": None} if graph_json_error else {}),
+                 **({"formatRepairCandidate": transport, "output": None} if transport_json_error else {}),
                  **({"output": raw_output} if raw_output is not None else {})},
                 "learning.agent.failed",
             )
             # A malformed output is not an execution failure. Repair once with
-            # exact Host feedback; the same durable job budget covers both calls.
+            # exact Host feedback across every generation stage; the same durable
+            # job budget covers both calls. This boundary exposes no execution
+            # tools, so repairing a submission cannot replay external effects.
             from app.application.learning_profile_contract import examples_only_error
             examples_only = (role == "skillx" and not phase and isinstance(raw_output, dict)
                              and isinstance(raw_output.get("skillx"), dict)
                              and raw_output["skillx"].get("source") and examples_only_error(exc))
-            if (isinstance(exc, AgentOutputValidationError) or graph_json_error) and not cached.get("formatRepairCount") and not examples_only:
+            if (isinstance(exc, AgentOutputValidationError) or transport_json_error) and not cached.get("formatRepairCount") and not examples_only:
                 await self._record(key, {"formatRepairCount": 1})
                 return await self.call(
                     role, schema_model, data, name=name, validate=validate, phase=phase)
@@ -1324,6 +1335,8 @@ class LearningAgentPipeline:
             target = fragment.reuseSkillId if group == "skills" else fragment.reuseVersionId
             if not target:
                 return False
+            from app.application.learning_context import require_available_reuse
+            require_available_reuse(context, group, target)
             await self._record(self.stage_key(role, fragment.name), {
                 "role": role, "name": fragment.name, "status": "completed",
                 "output": {"decision": "skip", "reason": "直接复用已有能力 " + target},

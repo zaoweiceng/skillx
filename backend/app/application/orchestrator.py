@@ -99,6 +99,8 @@ class Orchestrator:
         turn_id: str | None = None,
         automatic_recovery: bool = False,
     ) -> Run:
+        from app.application.capability_availability import require_version_enabled
+        await require_version_enabled(session, workflow_version)
         definition = WorkflowDefinition.model_validate(workflow_version.definition_json)
         await validate_workflow_capabilities(session, definition)
         from app.application.schema_defaults import apply_input_defaults

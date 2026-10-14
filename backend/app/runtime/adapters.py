@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 from collections.abc import AsyncIterator
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -287,7 +287,30 @@ class SubprocessAgentAdapter:
     def extra_arguments(self, request: AgentRunRequest) -> list[str]:
         return []
 
+    @contextmanager
+    def request_arguments(self, request: AgentRunRequest):
+        yield [
+            *self.extra_arguments(request),
+            "--prompt",
+            request.prompt,
+            "--max-steps",
+            str(request.max_steps),
+            "--max-tokens",
+            str(request.max_tokens),
+            "--allowed-tools",
+            json.dumps(request.allowed_tools, ensure_ascii=False),
+            "--output-schema",
+            json.dumps(request.output_schema, ensure_ascii=False),
+        ]
+
     async def events(self, run_id: str, request: AgentRunRequest) -> AsyncIterator[dict[str, Any]]:
+        with self.request_arguments(request) as arguments:
+            async for event in self._events(run_id, request, arguments):
+                yield event
+
+    async def _events(
+        self, run_id: str, request: AgentRunRequest, arguments: list[str],
+    ) -> AsyncIterator[dict[str, Any]]:
         working_directory = request.working_directory.resolve()
         working_directory.mkdir(parents=True, exist_ok=True)
         runtime = self._runtime or agent_runtime_config()
@@ -306,17 +329,7 @@ class SubprocessAgentAdapter:
             provider_environment[runtime.api_key_env] = api_key
         process = await asyncio.create_subprocess_exec(
             *self.command,
-            *self.extra_arguments(request),
-            "--prompt",
-            request.prompt,
-            "--max-steps",
-            str(request.max_steps),
-            "--max-tokens",
-            str(request.max_tokens),
-            "--allowed-tools",
-            json.dumps(request.allowed_tools, ensure_ascii=False),
-            "--output-schema",
-            json.dumps(request.output_schema, ensure_ascii=False),
+            *arguments,
             cwd=working_directory,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,

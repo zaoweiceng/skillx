@@ -17,6 +17,8 @@ const navigation = [
 
 export default function AppShell() {
   const { isDark, toggleTheme } = useTheme()
+  // Frame identity survives client-side navigation and cross-origin embedding.
+  const embedded = window.self !== window.top
   const controls = isDark
     ? { hover: '#30343b', selected: '#343d49', selectedHover: '#414d5c', border: '#8b98a7', ring: 'rgba(139, 152, 167, .18)', text: '#ececec' }
     : { hover: '#f4f6f8', selected: '#edf1f5', selectedHover: '#e3eaf2', border: '#8695a7', ring: 'rgba(134, 149, 167, .16)', text: '#171717' }
@@ -64,8 +66,8 @@ export default function AppShell() {
     },
   }}>
     <AntApp>
-      <div className={`${styles.shell} ${collapsed ? styles.collapsed : ''}`}>
-        <aside className={styles.sidebar} aria-label="工作空间导航">
+      <div className={`${styles.shell} ${embedded ? styles.embedded : collapsed ? styles.collapsed : ''}`}>
+        {!embedded && <aside className={styles.sidebar} aria-label="工作空间导航">
           <div className={styles.sidebarHeader}>
             {collapsed ? (
               <Tooltip title="展开主导航">
@@ -107,7 +109,7 @@ export default function AppShell() {
             </Tooltip>
             </div>
           </div>
-        </aside>
+        </aside>}
         <main className={styles.workspace}><Outlet /></main>
       </div>
     </AntApp>

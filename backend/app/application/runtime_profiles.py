@@ -12,6 +12,7 @@ from app.application.runtime_config import (
     adapter_source_digest,
     agent_runtime_config,
 )
+from app.config import get_settings
 from app.infrastructure.database import RuntimeProfile
 from app.infrastructure.runtime_credentials import resolve_runtime_key
 
@@ -133,7 +134,11 @@ async def agent_snapshot(
             protocol="traex-cli-jsonl+mcp",
             endpoint=None,
             model=traex_model or config.get("model") or None,
-            adapter_digest=adapter_source_digest(bridge),
+            adapter_digest=(
+                current.adapter_digest
+                if current.type == "pi" and current.command
+                else adapter_source_digest(bridge)
+            ),
             adapter_version="traex-builtin/v1",
             source="profile",
         )
@@ -162,7 +167,11 @@ async def agent_snapshot(
                 replace(
                     current,
                     type="pi",
-                    command=(shutil.which("node") or "node", str(bridge)),
+                    command=(
+                        current.command
+                        if current.type == "pi" and current.command
+                        else (shutil.which("node") or "node", str(bridge))
+                    ),
                     allowed_executables=("node",),
                     provider="pi",
                     protocol="host-ndjson",
@@ -170,7 +179,11 @@ async def agent_snapshot(
                     model=current.model if current.type == "pi" else None,
                     reasoning_effort=None,
                     adapter_version="pi-sdk-bridge/v1",
-                    adapter_digest=adapter_source_digest(bridge),
+                    adapter_digest=(
+                        current.adapter_digest
+                        if current.type == "pi" and current.command
+                        else adapter_source_digest(bridge)
+                    ),
                 )
             )
         if model is None or model.kind != "model" or not model.active:
@@ -188,6 +201,7 @@ async def agent_snapshot(
             raise ValueError("所选模型不属于此服务")
         options = options or {"id": selected_model}
         options = {
+            **current.model_options,
             **options,
             "timeoutSeconds": model.config_json.get("timeoutSeconds", 300),
             "structuredMode": model.config_json.get("structuredMode", "json_schema"),
@@ -196,7 +210,11 @@ async def agent_snapshot(
         runtime = replace(
             current,
             type="pi",
-            command=(shutil.which("node") or "node", str(bridge)),
+            command=(
+                current.command
+                if current.type == "pi" and current.command
+                else (shutil.which("node") or "node", str(bridge))
+            ),
             allowed_executables=("node",),
             provider="pi",
             protocol="host-ndjson",
@@ -207,7 +225,11 @@ async def agent_snapshot(
             credential_configured=bool(resolve_runtime_key(model.config_json["apiKeyEnv"])),
             adapter_version="pi-sdk-bridge/v1",
             source="profile",
-            adapter_digest=adapter_source_digest(bridge),
+            adapter_digest=(
+                current.adapter_digest
+                if current.type == "pi" and current.command
+                else adapter_source_digest(bridge)
+            ),
         )
     return asdict(await with_reasoning(runtime, reasoning_effort))
 
@@ -226,7 +248,6 @@ def restore_agent_snapshot(snapshot: dict[str, Any] | None) -> AgentRuntimeConfi
 
 
 async def workflow_profiles(session: AsyncSession, definition: Any) -> dict[str, Any]:
-    from app.application.compiler import digest_json
 
     result = {}
     for node in definition.spec.nodes:
@@ -249,10 +270,14 @@ async def workflow_profiles(session: AsyncSession, definition: Any) -> dict[str,
             }
         elif node.type == "llm" and node.config.get("modelProfile") != "fake":
             from app.application.structured_generation import agent_structured_snapshot
-            result[node.id] = agent_structured_snapshot(await agent_snapshot(
-                session, node.config.get("agentProfileId"),
-                model_profile_id=node.config.get("modelProfileId"),
-            ))
+
+            result[node.id] = agent_structured_snapshot(
+                await agent_snapshot(
+                    session,
+                    node.config.get("agentProfileId"),
+                    model_profile_id=node.config.get("modelProfileId"),
+                )
+            )
     return result
 
 
@@ -263,6 +288,8 @@ async def initialize_profiles(session: AsyncSession) -> None:
 
     runtime = agent_runtime_config()
     if runtime.type in {"fixture", "unavailable"}:
+        return
+    if get_settings().runtime_profiles_from_environment:
         return
     builtin = await session.get(RuntimeProfile, "builtin-pi")
     if builtin is None:

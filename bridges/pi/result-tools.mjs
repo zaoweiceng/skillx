@@ -32,9 +32,18 @@ export function resultTools(schema) {
   return schema.anyOf.map(branch => {
     const action = branch.properties.action.const;
     const defaults = action === 'complete' ? metadata.completeDefaults : {};
+    // Evidence membership and follow-up gates depend on execution state. Keep
+    // that state in the Host's canonical schema, not in the provider prefix.
+    const branchProperties = { ...branch.properties,
+      evidence: { type: 'array', uniqueItems: true, items: { type: 'string' } },
+    };
+    if (branchProperties.evidenceGap) {
+      const { minLength: _dynamicMinimum, ...stableGap } = branchProperties.evidenceGap;
+      branchProperties.evidenceGap = stableGap;
+    }
     const omitted = new Set(['action', ...Object.keys(defaults),
-      ...Object.entries(branch.properties).filter(([, value]) => value.maxItems === 0).map(([key]) => key)]);
-    const properties = Object.fromEntries(Object.entries(branch.properties).filter(([key]) => !omitted.has(key)));
+      ...Object.entries(branchProperties).filter(([, value]) => value.maxItems === 0).map(([key]) => key)]);
+    const properties = Object.fromEntries(Object.entries(branchProperties).filter(([key]) => !omitted.has(key)));
     const relevant = {
       dispatch: ['summary', 'completionCriteria', 'remaining', 'calls', 'questions', 'evidence', 'evidenceGap'],
       'human.request': ['summary', 'completionCriteria', 'remaining', 'calls', 'questions', 'evidence'],
@@ -47,7 +56,7 @@ export function resultTools(schema) {
       properties.answer = { ...properties.answer, description: '直接回答用户：只表述一次核心结论，附必要的短原文依据和改变结论的适用边界。引用必须支持紧邻判断；检查否定词、必要/充分条件和例外与结论一致，不再逐段重复结论。' };
     }
     const parameters = { type: 'object', additionalProperties: false, properties,
-      required: branch.required.filter(key => !omitted.has(key)) };
+      required: branch.required.filter(key => !omitted.has(key) && !['evidence', 'evidenceGap'].includes(key)) };
     const definitions = {};
     const visit = value => {
       if (!value || typeof value !== 'object') return;

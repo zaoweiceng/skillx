@@ -437,3 +437,28 @@ async def test_catalog_propagates_local_validation_through_published_nested_work
     assert local['executionProfile'] == 'local-command'
     for id in ['local-skill', 'child', 'parent']:
         assert (await resolve_callable(session, id)).contract['interfaces']['execute']['requiresLocalValidation']
+
+
+@pytest.mark.parametrize("implementation", ["workflow", "skillx"])
+async def test_availability_persists_and_gates_discovery_and_invocation(implementation, tmp_path, monkeypatch):
+    from app.api.tasks import CapabilityAvailabilityUpdate, update_capability_availability
+    if implementation == "workflow":
+        _, version, _ = await _published()
+        interface, inputs = "execute", {"name": "Ada"}
+    else:
+        version = await skill_version(tmp_path, monkeypatch)
+        interface, inputs = "count", {"text": "hello"}
+    async with SessionLocal() as session:
+        contract = (await resolve_callable(session, version.id)).contract
+        await update_capability_availability(contract["capabilityId"], CapabilityAvailabilityUpdate(enabled=False), session)
+    async with SessionLocal() as session:
+        assert version.id not in {row["id"] for row in await callable_catalog(session)}
+        rows = await callable_catalog(session, include_disabled=True)
+        assert next(row for row in rows if row["id"] == version.id)["enabled"] is False
+        for kind, args in [("capability", {"capabilityVersionId": version.id, "interface": interface, "input": inputs}), (implementation, {"versionId": version.id, "interface": interface, "input": inputs})]:
+            with pytest.raises(ValueError, match="已关闭"):
+                await enqueue_invocation(session, kind=kind, arguments=args, key="disabled")
+        await update_capability_availability(contract["capabilityId"], CapabilityAvailabilityUpdate(enabled=True), session)
+        assert version.id in {row["id"] for row in await callable_catalog(session)}
+        invocation = await enqueue_invocation(session, kind="capability", arguments={"capabilityVersionId": version.id, "interface": interface, "input": inputs}, key="enabled")
+        assert invocation.id

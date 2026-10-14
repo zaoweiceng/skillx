@@ -5,6 +5,7 @@ from .base import TimestampMixin as TimestampMixin
 from .base import rfc3339 as rfc3339
 from .base import utcnow as utcnow
 from .capabilities import BrowserRuntimeHeartbeat as BrowserRuntimeHeartbeat
+from .capabilities import CapabilityAvailability as CapabilityAvailability
 from .capabilities import Capability as Capability
 from .capabilities import CapabilityVersion as CapabilityVersion
 from .capabilities import MCPServer as MCPServer
@@ -12,6 +13,7 @@ from .capabilities import MCPServerVersion as MCPServerVersion
 from .capabilities import MCPToolSnapshot as MCPToolSnapshot
 from .capabilities import RuntimeProfile as RuntimeProfile
 from .capabilities import SecretReference as SecretReference
+from .conversation_context import ConversationContextExchange as ConversationContextExchange
 from .conversations import Conversation as Conversation
 from .conversations import ConversationRun as ConversationRun
 from .conversations import ConversationRunEvent as ConversationRunEvent

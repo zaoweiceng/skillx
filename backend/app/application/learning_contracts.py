@@ -88,6 +88,7 @@ class HttpFixture(BaseModel):
     url: str = Field(pattern=r"^https?://", description="完整合成 URL，必须与候选实际请求精确匹配")
     requestJson: Any = Field(default=None, description="JSON 请求体；null 表示无请求体，按 JSON 值精确匹配")
     responseJson: Any
+    prepare: str = Field(default="", max_length=16384, description="可选的请求时独立 Python 准备脚本；在既有隔离目录读取当前运行状态，修改 requestJson/responseJson 变量。不给实际请求或候选模块，仍按完整请求精确匹配；不得调用候选实现生成预期。5 秒上限。")
     status: int = Field(default=200, ge=100, le=599)
 
 

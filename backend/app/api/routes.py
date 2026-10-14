@@ -13,7 +13,6 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from jsonschema import Draft202012Validator, FormatChecker
 from pydantic import ValidationError
-from app.application.conversation_extraction import ExtractionBudget
 from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,11 +20,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.schemas import AgentRunCreate as AgentRunCreate
 from app.api.schemas import CapabilityCreate as CapabilityCreate
 from app.api.schemas import CapabilityExecute as CapabilityExecute
+from app.api.schemas import (
+    ChatWorkspaceUpdate,
+    ConversationDirectoryUpdate,
+    ConversationTitleUpdate,
+)
 from app.api.schemas import ComponentConfirm as ComponentConfirm
 from app.api.schemas import ComponentCreate as ComponentCreate
 from app.api.schemas import ContractPatchApply as ContractPatchApply
 from app.api.schemas import ConversationCreate as ConversationCreate
-from app.api.schemas import ConversationDirectoryUpdate, ConversationTitleUpdate
 from app.api.schemas import ConversationModeUpdate as ConversationModeUpdate
 from app.api.schemas import ConversationRunCreate as ConversationRunCreate
 from app.api.schemas import Decision as Decision
@@ -80,6 +83,7 @@ from app.application.conversation import (
     candidate_message,
     candidate_snapshot_digest,
 )
+from app.application.conversation_extraction import ExtractionBudget
 from app.application.distillation import (
     DistillationError,
     distill_conversation_run,
@@ -3422,9 +3426,18 @@ async def register_capability(
 async def create_conversation(
     body: ConversationCreate, session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
+    from app.infrastructure.models.conversations import ChatWorkspace
+
+    workspace = (
+        await session.get(ChatWorkspace, body.workspace_path) if body.workspace_path else None
+    )
+    if body.workspace_path and workspace is None:
+        raise HTTPException(404, "工作区不存在，请重新选择")
     item = Conversation(
         id=str(uuid4()),
         title=body.title,
+        workspace_path=workspace.path if workspace else None,
+        working_directory=workspace.path if workspace else None,
         bound_component_id=body.bound_component_id,
         workflow_mode="enabled",
     )
@@ -3501,15 +3514,22 @@ async def extract_conversation_workflows(conversation_id: str, budget: Extractio
 async def list_chat_workspaces(session: AsyncSession = Depends(get_session)):
     from app.infrastructure.models.conversations import ChatWorkspace
 
-    saved = await session.scalars(select(ChatWorkspace.path))
-    existing = await session.scalars(select(Conversation.working_directory).where(
-        Conversation.deleted_at.is_(None), Conversation.working_directory.is_not(None)
-    ).distinct())
-    return {"items": sorted(set(saved.all()) | set(existing.all()))}
+    saved = await session.scalars(select(ChatWorkspace).order_by(ChatWorkspace.path))
+    return {
+        "items": [
+            {
+                "path": item.path,
+                "name": item.name or item.path.rstrip("/").split("/")[-1] or item.path,
+            }
+            for item in saved
+        ]
+    }
 
 
 @router.post("/chat-workspaces")
-async def add_chat_workspace(body: ConversationDirectoryUpdate, session: AsyncSession = Depends(get_session)):
+async def add_chat_workspace(
+    body: ConversationDirectoryUpdate, session: AsyncSession = Depends(get_session)
+):
     from app.application.local_execution import validate_working_directory
     from app.infrastructure.models.conversations import ChatWorkspace
 
@@ -3527,18 +3547,78 @@ async def add_chat_workspace(body: ConversationDirectoryUpdate, session: AsyncSe
             await session.rollback()
             if await session.get(ChatWorkspace, path) is None:
                 raise
-    return {"path": path}
+    workspace = await session.get(ChatWorkspace, path)
+    return {"path": path, "name": workspace.name or path.rstrip("/").split("/")[-1] or path}
+
+
+@router.patch("/chat-workspaces")
+async def update_chat_workspace(
+    body: ChatWorkspaceUpdate, session: AsyncSession = Depends(get_session)
+):
+    from app.application.local_execution import validate_working_directory
+    from app.infrastructure.models.conversations import ChatWorkspace
+
+    workspace = await session.get(ChatWorkspace, body.path)
+    if workspace is None:
+        raise HTTPException(404, "工作区不存在")
+    path = workspace.path
+    if body.working_directory is not None:
+        try:
+            path = str(validate_working_directory(body.working_directory))
+        except (OSError, ValueError) as exc:
+            raise HTTPException(400, "无法使用工作目录：" + str(exc)) from exc
+    if path != workspace.path:
+        if await session.get(ChatWorkspace, path):
+            raise HTTPException(409, "该目录已是工作区")
+        conversations = await session.scalars(
+            select(Conversation).where(Conversation.workspace_path == workspace.path)
+        )
+        for conversation in conversations:
+            if conversation.working_directory == workspace.path:
+                conversation.working_directory = path
+            conversation.workspace_path = path
+        if workspace.name is None:
+            workspace.name = workspace.path.rstrip("/").split("/")[-1] or workspace.path
+        workspace.path = path
+    if body.name is not None:
+        workspace.name = body.name
+    await session.commit()
+    return {"path": path, "name": workspace.name or path.rstrip("/").split("/")[-1] or path}
+
+
+@router.delete("/chat-workspaces")
+async def delete_chat_workspace(
+    path: str, delete_conversations: bool = False, session: AsyncSession = Depends(get_session)
+):
+    from app.infrastructure.models.conversations import ChatWorkspace
+
+    workspace = await session.get(ChatWorkspace, path)
+    if workspace is None:
+        raise HTTPException(404, "工作区不存在")
+    conversations = (
+        await session.scalars(select(Conversation).where(Conversation.workspace_path == path))
+    ).all()
+    for conversation in conversations:
+        if delete_conversations and conversation.deleted_at is None:
+            await _delete_conversation(session, conversation)
+        conversation.workspace_path = None
+    await session.delete(workspace)
+    await session.commit()
+    return {"deleted": True, "conversationIds": [item.id for item in conversations]}
 
 
 @router.get("/conversations")
 async def list_conversations(
     working_directory: Annotated[str | None, Query(alias="workingDirectory")] = None,
+    workspace_path: Annotated[str | None, Query(alias="workspacePath")] = None,
     cursor: str | None = None,
     limit: int = Query(default=30, ge=1, le=100),
     query: str | None = Query(default=None, max_length=200),
     session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
     statement = select(Conversation).where(Conversation.deleted_at.is_(None))
+    if workspace_path is not None:
+        statement = statement.where(Conversation.workspace_path == (workspace_path or None))
     if working_directory is not None:
         statement = statement.where(Conversation.working_directory == (working_directory or None))
     if query:
@@ -3627,28 +3707,32 @@ async def rename_conversation(
 async def delete_conversation(
     conversation_id: str, session: AsyncSession = Depends(get_session),
 ) -> dict[str, Any]:
-    from app.application.tasks import TERMINAL, cancel_task
-    from app.infrastructure.models.tasks import Task
-
     item = await session.get(Conversation, conversation_id)
     if item is None:
         raise HTTPException(404, "对话不存在")
-    if item.deleted_at is None:
-        # Retain execution audit references while removing the conversation from history.
-        item.deleted_at = utcnow()
-        tasks = await session.scalars(select(Task).where(
-            Task.conversation_id == item.id, Task.status.not_in(TERMINAL),
-        ))
-        for task in tasks:
-            await cancel_task(session, task)
-        runs = await session.scalars(select(ConversationRun).where(
-            ConversationRun.conversation_id == item.id,
-            ConversationRun.status.in_(["queued", "running"]),
-        ))
-        for run in runs:
-            await request_cancellation(session, run.id)
-        await session.commit()
+    await _delete_conversation(session, item)
+    await session.commit()
     return {"id": item.id, "deleted": True}
+
+
+async def _delete_conversation(session: AsyncSession, item: Conversation):
+    from app.application.tasks import TERMINAL, cancel_task
+    from app.infrastructure.models.tasks import Task
+
+    if item.deleted_at is not None:
+        return
+    item.deleted_at = utcnow()
+    tasks = await session.scalars(select(Task).where(
+        Task.conversation_id == item.id, Task.status.not_in(TERMINAL),
+    ))
+    for task in tasks:
+        await cancel_task(session, task)
+    runs = await session.scalars(select(ConversationRun).where(
+        ConversationRun.conversation_id == item.id,
+        ConversationRun.status.in_(["queued", "running"]),
+    ))
+    for run in runs:
+        await request_cancellation(session, run.id)
 
 
 @router.patch("/conversations/{conversation_id}/workflow-mode")

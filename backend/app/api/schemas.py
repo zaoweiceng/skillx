@@ -82,6 +82,7 @@ class SecretReferenceCreate(BaseModel):
 
 
 class ConversationCreate(BaseModel):
+    workspace_path: str | None = Field(default=None, alias="workspacePath", max_length=4096)
     title: str = "新对话"
     bound_component_id: str | None = Field(default=None, alias="boundComponentId")
 
@@ -220,3 +221,16 @@ class ConversationTitleUpdate(BaseModel):
 
 class ConversationDirectoryUpdate(BaseModel):
     working_directory: str | None = Field(alias="workingDirectory", max_length=4096)
+
+
+class ChatWorkspaceUpdate(BaseModel):
+    path: str = Field(min_length=1, max_length=4096)
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    working_directory: str | None = Field(
+        default=None, alias="workingDirectory", min_length=1, max_length=4096
+    )
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def trim_name(cls, value):
+        return value.strip() if isinstance(value, str) else value

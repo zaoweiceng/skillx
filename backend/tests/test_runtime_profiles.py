@@ -137,3 +137,35 @@ async def test_traex_conversation_model_is_frozen_and_not_shared(monkeypatch):
         conversation.traex_model = None
         third = await enqueue_agent_run(session, conversation, "third")
         assert third.config_json["agentRuntimeSnapshot"]["model"] == "profile-model"
+
+
+async def test_environment_pi_keeps_owned_adapter_and_options_without_persisting_profiles(
+    monkeypatch,
+):
+    from sqlalchemy import select
+
+    from app.application.runtime_profiles import initialize_profiles
+    from app.config import get_settings
+    from app.infrastructure.database import RuntimeProfile
+
+    monkeypatch.setenv("SKILLX_AGENT_RUNTIME_TYPE", "pi")
+    monkeypatch.setenv("SKILLX_RUNTIME_PROFILES_FROM_ENVIRONMENT", "true")
+    monkeypatch.setenv("SKILLX_AGENT_COMMAND", '["node", "/owned/bridge/pi/bridge.mjs"]')
+    monkeypatch.setenv("SKILLX_AGENT_ENDPOINT", "http://127.0.0.1:43123/v1")
+    monkeypatch.setenv("SKILLX_AGENT_MODEL", "deepseek-v4-pro")
+    monkeypatch.setenv(
+        "SKILLX_PI_MODEL_OPTIONS", '{"maxOutputTokens":32768,"supportsForcedToolChoice":false}'
+    )
+    get_settings.cache_clear()
+    try:
+        async with SessionLocal() as session:
+            await initialize_profiles(session)
+            assert await session.scalar(select(RuntimeProfile.id)) is None
+            snapshot = await agent_snapshot(session, None)
+            assert snapshot["command"] == ("node", "/owned/bridge/pi/bridge.mjs")
+            assert snapshot["model_options"]["maxOutputTokens"] == 32768
+            monkeypatch.setenv("SKILLX_AGENT_ENDPOINT", "http://127.0.0.1:43124/v1")
+            get_settings.cache_clear()
+            assert (await agent_snapshot(session, None))["endpoint"] == "http://127.0.0.1:43124/v1"
+    finally:
+        get_settings.cache_clear()

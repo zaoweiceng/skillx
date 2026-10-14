@@ -105,7 +105,7 @@ from contextlib import redirect_stdout
 from app.runtime.http_validation import HttpFixtures
 import urllib.request
 payload = json.load(sys.stdin)
-http = HttpFixtures(payload["httpFixtures"])
+http = HttpFixtures(payload["httpFixtures"], allow_prepare=True)
 urllib.request.urlopen = http.urlopen
 spec = importlib.util.spec_from_file_location("candidate", MODULE)
 module = importlib.util.module_from_spec(spec)

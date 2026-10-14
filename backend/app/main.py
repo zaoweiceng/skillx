@@ -9,6 +9,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import OperationalError
 
+from app.api.dsh import router as dsh_router
+from app.api.dsh_host_policy import router as dsh_host_policy_router
 from app.api.handoffs import router as handoffs_router
 from app.api.monitoring import router as monitoring_router
 from app.api.routes import router
@@ -51,6 +53,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(router, prefix="/api")
+app.include_router(dsh_router, prefix="/api")
+app.include_router(dsh_host_policy_router, prefix="/api")
 app.include_router(tasks_router, prefix="/api")
 app.include_router(monitoring_router, prefix="/api")
 app.include_router(profiles_router, prefix="/api")

@@ -13,6 +13,10 @@ const args = Object.fromEntries(process.argv.slice(2).reduce((items, value, inde
   if (value.startsWith('--')) items.push([value.slice(2), all[index + 1]]);
   return items;
 }, []));
+if (args['request-file']) {
+  const request = JSON.parse(readFileSync(args['request-file'], 'utf8'));
+  for (const [key, value] of Object.entries(request)) args[key] = typeof value === 'string' ? value : JSON.stringify(value);
+}
 const emit = (type, payload) => process.stdout.write(JSON.stringify({ type, payload }) + '\n');
 if ('probe' in args) {
   console.log(JSON.stringify({ installed: true, sdk: sdkVersion, protocol: 'host-ndjson', providerVerified: false }));
@@ -75,6 +79,8 @@ try {
   const key = process.env[process.env.SKILLX_AGENT_API_KEY_ENV ?? 'SKILLX_AGENT_API_KEY'];
   apiKey = key;
   const options = JSON.parse(process.env.SKILLX_PI_MODEL_OPTIONS ?? '{}');
+  const history = JSON.parse(args.messages ?? '[]');
+  if (!Array.isArray(history) || history.some(message => !message || !['user', 'assistant'].includes(message.role) || typeof message.content !== 'string')) throw new Error('Invalid conversation history');
   const outputSchema = JSON.parse(args['output-schema'] ?? '{}');
   const structuredMode = options.structuredMode ?? 'json_schema';
   const descriptors = JSON.parse(args['tool-descriptors'] ?? '[]');
@@ -83,8 +89,9 @@ try {
   let submittedResult;
   if (!['json_schema', 'json_object', 'prompt'].includes(structuredMode)) throw new Error('Invalid structured output mode');
   const imageReferences = JSON.parse(args.images ?? '[]');
-  if (imageReferences.length && !options.images) throw new Error('当前模型未声明支持图片输入');
-  const images = imageReferences.map(image => ({ type: 'image', mimeType: image.mimeType, data: readFileSync(image.path).toString('base64') }));
+  if ([...imageReferences, ...history.flatMap(message => message.images ?? [])].length && !options.images) throw new Error('当前模型未声明支持图片输入');
+  const loadImages = references => references.map(image => ({ type: 'image', mimeType: image.mimeType, data: readFileSync(image.path).toString('base64') }));
+  const images = loadImages(imageReferences);
   if (!endpoint || !modelId || !key) throw new Error('Pi model configuration unavailable');
   const cwd = process.cwd();
   const agentDir = join(cwd, '.pi-runtime');
@@ -100,8 +107,7 @@ try {
     + '除用户明确要求其他语言外，分析思考、执行说明和最终回答默认使用简体中文；代码、协议字段、标识符和引用原文保留原样。'
     + (submitResultMode
       ? '本阶段只生成结构化结果，没有文件、命令行或网络工具。选择一个提交工具并调用一次，参数以该工具 Schema 为准。已有证据充分就提交完成答案，不重新规划。不要尝试浏览环境，也不要输出占位标量。'
-      : '最终消息必须且只能是一个符合请求提供的 JSON Schema 的 JSON 对象，不得添加 Markdown 代码围栏、正文、注释或其他文字。')
-    + (submitResultMode ? '' : JSON.stringify(outputSchema));
+      : '最终消息必须且只能是一个符合请求提供的 JSON Schema 的 JSON 对象，不得添加 Markdown 代码围栏、正文、注释或其他文字。');
   const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, systemPrompt });
   await loader.reload();
   const tools = descriptors.map((descriptor, index) => ({
@@ -127,12 +133,21 @@ try {
     },
   });
   ({ session } = await createAgentSession({ cwd, agentDir, modelRuntime: runtime, model: runtime.getModel('skillx', modelId), thinkingLevel: process.env.SKILLX_REASONING_EFFORT || 'off', tools: tools.map(tool => tool.name), customTools: tools, resourceLoader: loader, settingsManager: settings, sessionManager: SessionManager.inMemory(cwd) }));
+  session.agent.state.messages = history.map(message => message.role === 'user'
+    ? { role: 'user', content: [{ type: 'text', text: message.content }, ...loadImages(message.images ?? [])], timestamp: 0 }
+    : { role: 'assistant', content: [{ type: 'text', text: message.content }],
+      api: 'openai-completions', provider: 'skillx', model: modelId,
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      stopReason: 'stop', timestamp: 0 });
   const rawArguments = new Map();
   let steps = 0; let totalTokens = 0; let usageComplete = true;
   let requestId; let startedAt; let rawUsage;
   let progressCharacters = 0; let lastProgressAt = 0;
   const stream = session.agent.streamFunction;
-  session.agent.streamFunction = (model, context, streamOptions) => stream(model, context, {
+  session.agent.streamFunction = (model, context, streamOptions) => stream(model, { ...context, systemPrompt }, {
+    // SDK appends cwd to custom prompts; retain the Host's fixed instructions
+    // at the provider boundary without changing the real task cwd.
     ...streamOptions, maxRetries: 0, timeoutMs: (options.timeoutSeconds ?? 300) * 1000,
     fetch: usageTrackingFetch(streamOptions?.fetch ?? globalThis.fetch, usage => { rawUsage = usage; }),
     maxTokens: Math.min(options.maxOutputTokens ?? 8192, Number(args['max-output-tokens'] ?? 8192), Number(args['max-tokens'] ?? 20000)),
@@ -141,8 +156,19 @@ try {
     // Enforce the configured output protocol at the provider boundary, before tracing.
     if (submitResultMode) {
       delete payload.response_format;
-      payload.tool_choice = submissionsTools.length === 1
-        ? { type: 'function', function: { name: submissionsTools[0].name } } : 'required';
+      // DeepSeek thinking mode supports auto tool choice only. Some compatible
+      // gateways accept forced choices anyway, but that is outside the model's
+      // protocol contract. Preserve thinking and let strict Host validation
+      // reject malformed output rather than sending an unsupported combination.
+      // https://api-docs.deepseek.com/api/create-chat-completion/
+      const thinking = Boolean(options.reasoning || process.env.SKILLX_REASONING_EFFORT)
+        && !['off', 'none'].includes(process.env.SKILLX_REASONING_EFFORT);
+      const forcedToolChoice = options.supportsForcedToolChoice
+        ?? !(modelId.toLowerCase().startsWith('deepseek') && thinking);
+      payload.tool_choice = forcedToolChoice
+        ? (submissionsTools.length === 1
+          ? { type: 'function', function: { name: submissionsTools[0].name } } : 'required')
+        : 'auto';
       payload.parallel_tool_calls = false;
     } else if (structuredMode === 'json_schema') {
       payload.response_format = { type: 'json_schema', json_schema: {

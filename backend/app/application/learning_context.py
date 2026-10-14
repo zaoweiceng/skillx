@@ -115,3 +115,11 @@ def requires_external_request_evidence(data):
     """Keep successful protocol evidence across formatting/implementation repairs."""
     fragment = data.get("fragment") or {}
     return isinstance(fragment, dict) and bool(fragment.get("requiredEffects"))
+
+
+def require_available_reuse(context, group, target):
+    """A model-selected reuse identity must come from this extraction's live catalog."""
+    entries = (context.get('existingSkills', []) if group == 'skills'
+               else context.get('catalog', {}).get('capabilities', []))
+    if target not in {item.get('id') for item in entries}:
+        raise ValueError('复用目标不在当前可用目录中，不能复用已禁用或删除的能力')

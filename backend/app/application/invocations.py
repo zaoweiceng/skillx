@@ -51,6 +51,12 @@ async def enqueue_invocation(
         kind, arguments = target.bind(
             arguments.get("interface", "execute"), arguments.get("input", {})
         )
+    if kind in {"skillx", "workflow"}:
+        from app.application.capability_availability import require_version_enabled
+        model = CapabilityVersion if kind == "skillx" else WorkflowVersion
+        version = await session.get(model, arguments.get("versionId"))
+        if version is not None:
+            await require_version_enabled(session, version)
     scope = task.id if task else "manual"
     existing = await session.scalar(
         select(Invocation).where(Invocation.scope == scope, Invocation.call_key == key)

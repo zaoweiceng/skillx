@@ -36,6 +36,8 @@ async def execute_skillx(
         version = _candidate_version or await session.get(CapabilityVersion, version_id)
         if version is None or version.status != "published":
             raise ValueError("SkillX 版本不存在")
+        from app.application.capability_availability import require_enabled
+        await require_enabled(session, version.capability_id)
         package = resolve_package_path(version.package_path)
         if package_digest(package) != version.digest:
             raise ValueError("SkillX 内容与锁定 digest 不一致")

@@ -103,6 +103,7 @@ def agent_runtime_config() -> AgentRuntimeConfig:
             ),
             adapter_version=f"{runtime_type}/configured",
             adapter_digest=adapter_digest,
+            model_options=settings.pi_model_options if runtime_type == "pi" else {},
         )
 
     if settings.agent_provider_type != "unavailable" or settings.traex_command:

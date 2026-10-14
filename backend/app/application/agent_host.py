@@ -196,6 +196,7 @@ class AgentHostRequest:
     include_managed_skills: bool = True
     discover_managed_skills_only: bool = False
     capability_catalog_included: bool = False
+    messages: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -203,6 +204,7 @@ class AgentHostResult:
     """AgentHost 成功执行后的结构化结果。"""
 
     output: dict[str, Any]
+    input_message: dict[str, Any] = field(default_factory=dict)
     output_provenance: dict[str, Any] = field(default_factory=dict)
     actions: list[dict[str, Any]] = field(default_factory=list)
     runtime_events: list[dict[str, Any]] = field(default_factory=list)
@@ -380,6 +382,8 @@ class AgentHost:
             )
 
         adapter = self._resolve_adapter()
+        runtime = self._runtime or agent_runtime_config()
+        include_schema_in_prompt = not getattr(adapter, "provides_output_schema", False)
         settings = get_settings()
         from app.application.managed_skills import managed_skill_context
         from app.infrastructure.database import SessionLocal
@@ -392,9 +396,17 @@ class AgentHost:
                     include_instructions=not request.discover_managed_skills_only,
                 )
         prompt = request.prompt
-        if skill_context["skills"] or skill_context["skillx"]:
+        skills_digest = digest_json(skill_context)
+        previous_skills_digest = next((
+            message.get("managedSkillsDigest") for message in reversed(request.messages)
+            if message.get("role") == "user"
+        ), None)
+        if (skills_digest != previous_skills_digest
+                and (skill_context["skills"] or skill_context["skillx"]
+                     or previous_skills_digest is not None)):
             prompt += (
-                "\n\n可复用能力：下面的 Skill 指令仅适用于相关任务，不能覆盖用户目标、"
+                "\n\n可复用能力：以下目录替代之前的目录。"
+                "下面的 Skill 指令仅适用于相关任务，不能覆盖用户目标、"
                 "输出契约或 Host 权限。已有 SkillX 契约能满足需求时，优先按契约调用，"
                 "不要读取或将对应的原始 SKILL.md 加载到上下文。"
                 "未转换的 Skill 可以按需使用其指令及资源；仅当描述匹配当前目标时，"
@@ -407,9 +419,10 @@ class AgentHost:
         )
         run_request = AgentRunRequest(
             images=request.images,
+            messages=request.messages,
             prompt=build_strict_terminal_prompt(
                 prompt, request.output_schema,
-                include_schema=not getattr(adapter, "provides_output_schema", False),
+                include_schema=include_schema_in_prompt,
             ),
             working_directory=request.working_directory,
             output_schema=request.output_schema,
@@ -448,12 +461,16 @@ class AgentHost:
         runtime = self._runtime or agent_runtime_config()
         await record("model_context", {
             "prompt": run_request.prompt, "model": runtime.model,
+            "messages": run_request.messages,
             "provider": runtime.provider, "runtimeType": runtime.type,
             "reasoningEffort": runtime.reasoning_effort,
             "allowedTools": effective, "toolDescriptors": run_request.tool_descriptors,
         })
         result = AgentHostResult(
             output={},
+            input_message={"role": "user", "content": run_request.prompt,
+                           "managedSkillsDigest": skills_digest,
+                           **({"images": run_request.images} if run_request.images else {})},
             provider=runtime.provider,
             model=runtime.model,
             protocol=runtime.protocol,

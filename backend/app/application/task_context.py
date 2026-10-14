@@ -60,11 +60,11 @@ def catalog_context(catalog, directory, *, discovery_only=False):
     """Expose selection metadata; load the exact contract only when relevant."""
     if discovery_only:
         return {
-            "catalogPath": context_record(directory, catalog),
             "capabilities": [{key: contract[key] for key in ("id", "name", "description")
                               if key in contract} for contract in catalog["capabilities"]],
             "tools": [{key: tool[key] for key in ("capabilityRef", "description", "effect")
                        if key in tool} for tool in catalog["tools"]],
+            "catalogPath": context_record(directory, catalog),
         }
     capabilities = []
     for contract in catalog["capabilities"]:

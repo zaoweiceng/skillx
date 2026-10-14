@@ -115,7 +115,7 @@
 .page :global(.message) { display: block; max-width: 720px; margin: 0 auto 32px; }
 .page :global(.message-avatar), .page :global(.message > div > small) { display: none; }
 .page :global(.message.user > div) { display: flex; flex-direction: column; align-items: flex-end; }
-.page :global(.message.user p) { max-width: 88%; padding: 12px 18px; border-radius: 22px; background: var(--panel-raised); font-size: 14px; line-height: 1.75; }
+.page :global(.message.user > div > p) { min-width: 0; max-width: 88%; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px 18px; border-radius: 22px; background: var(--panel-raised); font-size: 14px; line-height: 1.75; }
 .page :global(.message.assistant > div > p) { padding: 8px 0; font-size: 14px; line-height: 1.9; }
 .page :global(.turn-metrics) { gap: 10px; margin: 0 0 4px; opacity: .75; }
 .page :global(.turn-metrics .metric-chip) { border: 0; background: transparent; padding: 0; font-size: 11px; color: var(--muted); }
@@ -148,3 +148,15 @@
 .page :global(.history-item strong) { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .page :global(.workspace-group > nav) { margin-left: 16px; }
+
+.page :global(.conversation-group-heading > .ant-btn) { flex-shrink: 0; width: 28px; height: 28px; padding: 0; }
+.page :global(.workspace-menu) { opacity: 0; color: var(--muted); }
+.page :global(.conversation-group-heading:hover .workspace-menu),
+.page :global(.conversation-group-heading:focus-within .workspace-menu),
+.page :global(.workspace-menu.ant-dropdown-open) { opacity: 1; }
+:global(.workspace-edit-field) { display: flex; align-items: center; gap: 8px; }
+@media (hover: none) { .page :global(.workspace-menu) { opacity: 1; } }
+
+.page .traceHeader:global(.panel-heading) { flex-wrap: nowrap; gap: 12px; }
+.traceHeader > h2, .traceHeader > :global(.ant-btn) { flex-shrink: 0; }
+.traceHeader > :global(.ant-btn) { margin-left: auto; }

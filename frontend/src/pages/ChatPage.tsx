@@ -1,8 +1,9 @@
+import { terminalText } from '@/lib/terminalText'
 import MarkdownContent from '@/components/MarkdownContent'
-import { TaskTrace } from '@/features/chat/TaskTrace'
+import { TaskTraceTurns } from '@/features/chat/TaskTraceTurns'
 import { LLMTrace } from '@/components/LLMTrace'
 import TaskPanel from '@/components/TaskPanel'
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Button, Tag } from 'antd'
 import Form from '@/components/SchemaForm'
 import validator from '@rjsf/validator-ajv8'
@@ -32,7 +33,7 @@ import { AgentSelector } from '@/features/runtime/AgentSelector'
 export default function ChatPage() {
   const [historyCollapsed, setHistoryCollapsed] = useStoredBoolean('skillx-history-collapsed')
   const [runtimePending, setRuntimePending] = useState(false)
-  const { cacheUsage, canStop, stopping, refresh, workingDirectory, changeWorkingDirectory, draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill } = useConversation()
+  const { workspaceChanged, cacheUsage, canStop, stopping, refresh, workingDirectory, changeWorkingDirectory, draftSelection, setDraftSelection, renameConversation, deleteConversation, turnFor, elapsedLabel, tokenLabel, conversationId, messages, history, historyOpen, setHistoryOpen, traceOpen, setTraceOpen, input, setInput, sending, error, copyFeedback, drafts, candidateInputs, setCandidateInputs, confirming, startingAgent, activeRunId, runStatus, traceEvents, agentRuns, taskCheckpoints, workflowRuns, copyResult, send, createNewConversation, toggleWorkflowMode, startComponent, startAgent, cancelActiveRun, distill } = useConversation()
 
   // 候选卡片绑定产生它的用户消息：取该助手消息之前最近的一条用户消息文本，
   // 而不是全局最近 prompt，避免继续 Agent 时误用无关的新输入。
@@ -368,9 +369,20 @@ export default function ChatPage() {
     )
   }
 
+  function renderTraceHeader(selector?: ReactNode) {
+    return <div className={`panel-heading ${styles.traceHeader}`}>
+      <h2>执行轨迹</h2>
+      {selector}
+      <Button type="text" aria-label="收起执行轨迹" title="收起执行轨迹"
+        onClick={() => setTraceOpen(false)} icon={<PanelRightClose size={17} />} />
+      {!selector && runStatus && <span className={`status-badge ${runStatus}`}>{runStatus}</span>}
+    </div>
+  }
+
   function renderTrace() {
-    const taskId = [...messages].reverse().find(message => message.content.taskId)?.content.taskId
-    if (taskId) return traceOpen ? <TaskTrace key={taskId} id={taskId} /> : null
+    if (messages.some(message => message.content.taskId)) {
+      return <TaskTraceTurns key={conversationId} messages={messages} open={traceOpen} renderHeader={renderTraceHeader} />
+    }
     if (!activeRunId || traceEvents.length === 0) {
       return (
         <div className="trace-empty">
@@ -438,15 +450,7 @@ export default function ChatPage() {
       </header>
       <ChatWorkspace collapsed={historyCollapsed} traceOpen={traceOpen} trace={
         <aside id="execution-trace-sidebar" className="trace-sidebar" aria-label="执行轨迹" hidden={!traceOpen}>
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">EXECUTION TRACE</span>
-              <h2>执行轨迹</h2>
-            </div>
-            <Button type="text" aria-label="收起执行轨迹" title="收起执行轨迹"
-              onClick={() => setTraceOpen(false)} icon={<PanelRightClose size={17} />} />
-            {runStatus && <span className={`status-badge ${runStatus}`}>{runStatus}</span>}
-          </div>
+          {!messages.some(message => message.content.taskId) && renderTraceHeader()}
           {renderTrace()}
         </aside>
       } sidebar={
@@ -466,7 +470,7 @@ export default function ChatPage() {
           </div>
           <ConversationGroups history={history} conversationId={conversationId}
             onNavigate={() => setHistoryOpen(false)} onNew={createNewConversation}
-            onRename={renameConversation} onDelete={deleteConversation} />
+            onRename={renameConversation} onDelete={deleteConversation} onWorkspaceChanged={workspaceChanged} />
         </aside>}>
         <section className="message-column">
           <div className="message-stream">
@@ -498,7 +502,7 @@ export default function ChatPage() {
               <div>
                 <small>{message.role === 'assistant' ? 'SkillX Agent' : '用户'}</small>
                 {message.content.images && <ChatImageAttachments images={message.content.images} />}
-                {!message.content.taskId && (message.role === 'assistant' ? <MarkdownContent>{message.content.text ?? ''}</MarkdownContent> : <p>{message.content.text}</p>)}
+                {!message.content.taskId && (message.role === 'assistant' ? <MarkdownContent>{message.content.text ?? ''}</MarkdownContent> : <p>{terminalText(message.content.text ?? '')}</p>)}
                 {!!message.content.referenceFiles?.length && <div className={styles.attachments}>
                   {message.content.referenceFiles.map((file, index) => <Tag key={`${file.name}-${index}`}>{file.name}</Tag>)}
                 </div>}

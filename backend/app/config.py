@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     # Keep a few ordinary reference documents intact before compressing history.
     # This bounds business evidence, excluding the catalog and system contract.
     task_context_max_characters: int = 64000
+    # Append history unchanged until this boundary, then start an explicit checkpoint.
+    conversation_context_max_characters: int = Field(default=160000, ge=8192)
     task_max_active_seconds: int = 1800
     task_local_execution_enabled: bool = True
     mcp_allowed_executables: list[str] = [
@@ -55,6 +57,8 @@ class Settings(BaseSettings):
         "fixture",
         "unavailable",
     ] = "unavailable"
+    runtime_profiles_from_environment: bool = False
+    pi_model_options: dict = Field(default_factory=dict)
     agent_builtin_enabled: bool = True
     agent_command: list[str] | None = None
     agent_allowed_executables: list[str] = ["traex"]

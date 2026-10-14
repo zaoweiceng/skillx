@@ -460,6 +460,10 @@ class LearningDriver:
             if job.result_json.get("automatic"):
                 nominated_ids = set(job.result_json["nomination"]["sourceInvocationIds"])
                 calls = [call for call in calls if call.id in nominated_ids]
+            # User-triggered imported observations keep a distinct in-memory type
+            # and provenance; they are never fabricated Invocation database rows.
+            from app.application.dsh_extraction import external_extraction_calls
+            calls.extend(external_extraction_calls(task.state_json.get("extractionSource", {})))
             evidence = {x.id: x for x in calls}
             job_id, task_id, kind = job.id, task.id, job.kind
             attempts = job.attempts
@@ -494,6 +498,7 @@ class LearningDriver:
                         "output": x.output_json,
                         "observedOutput": observed_output(x),
                         "error": x.error_json,
+                        **({"provenance": x.provenance} if hasattr(x, "provenance") else {}),
                     }
                     for x in calls
                 ],

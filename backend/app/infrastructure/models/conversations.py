@@ -22,6 +22,7 @@ class ChatWorkspace(Base, TimestampMixin):
     __tablename__ = "chat_workspaces"
 
     path: Mapped[str] = mapped_column(String(4096), primary_key=True)
+    name: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
 
 class Conversation(Base, TimestampMixin):
@@ -39,6 +40,7 @@ class Conversation(Base, TimestampMixin):
     model_profile_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     agent_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     reasoning_effort: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    workspace_path: Mapped[str | None] = mapped_column(String(4096), nullable=True, index=True)
     working_directory: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     traex_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     workflow_mode: Mapped[str] = mapped_column(String(16), default="enabled")
